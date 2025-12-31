@@ -291,4 +291,3 @@ bindkey -r '^R'
 
 # zle -N atuin-search-fullscreen-widget
 # bindkey '^R' atuin-search-fullscreen-widget
-

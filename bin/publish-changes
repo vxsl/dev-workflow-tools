@@ -39,9 +39,12 @@ if [ -f "$SCRIPT_DIR/.env" ]; then
 fi
 
 # Configuration
-JIRA_DOMAIN="${JIRA_DOMAIN:-urbanlogiq.atlassian.net}"
-JIRA_PROJECT="${JIRA_PROJECT:-UB}"
+JIRA_DOMAIN="${JIRA_DOMAIN}"
+JIRA_PROJECT="${JIRA_PROJECT}"
 CACHE_DIR="$HOME/.cache/jira-fzf"
+
+# Validate required environment variables (only if Jira integration is used)
+# Note: publish-changes can work without Jira if --no-jira flag is used
 MR_CACHE_FILE="$CACHE_DIR/mr_cache.json"
 
 # Arguments

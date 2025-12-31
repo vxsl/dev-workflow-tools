@@ -9,10 +9,15 @@ REFLOG_COUNT=50
 DISPLAY_COUNT=10
 SORT_BY_COMMIT=false
 SEARCH_ORIGIN=false
-JIRA_DOMAIN="urbanlogiq.atlassian.net"  # Set your JIRA domain
-JIRA_PROJECT="UB"  # Set your JIRA project key
-# JIRA_ME="${JIRA_ME:-}"  # Your JIRA display name (e.g. "Kyle Grimsrud-M") - must match exactly (case-insensitive)
-JIRA_ME="kylegm"  # Your JIRA display name (e.g. "Kyle Grimsrud-M") - must match exactly (case-insensitive)
+JIRA_DOMAIN="${JIRA_DOMAIN}"
+JIRA_PROJECT="${JIRA_PROJECT}"
+JIRA_ME="${JIRA_ME:-}"  # Your JIRA display name - must match exactly (case-insensitive)
+
+# Validate required environment variables
+if [ -z "$JIRA_DOMAIN" ] || [ -z "$JIRA_PROJECT" ]; then
+    echo "Error: JIRA_DOMAIN and JIRA_PROJECT must be set in .env or environment" >&2
+    exit 1
+fi
 
 # Cache directory
 CACHE_DIR="$HOME/.cache/rr"

@@ -143,13 +143,15 @@ nvim .env
 ```
 
 Required:
+- `JIRA_DOMAIN` - Your Jira domain (e.g., `company.atlassian.net`)
+- `JIRA_PROJECT` - Your project key (e.g., `PROJ`, `DEV`)
 - `JIRA_EMAIL` - Your Jira email
 - `JIRA_API_TOKEN` - Get from https://id.atlassian.com/manage-profile/security/api-tokens
 
 Optional:
+- `JIRA_ME` - Your Jira display name (highlights your tickets in rr.sh)
 - `TICKET_CREATOR_BOT_TOKEN` - Slack bot token for oneshot
-- `JIRA_DOMAIN` - Default: urbanlogiq.atlassian.net
-- `JIRA_PROJECT` - Default: UB
+- `JIRA_QA_BRANCH_FIELD` - Custom field ID for QA branch (auto-detected if not set)
 
 ### 3. Add to your shell
 
@@ -234,18 +236,16 @@ sudo apt install fzf jq curl xclip wmctrl bat eza
 All tools respect these environment variables (set in `.env` or shell):
 
 ```bash
-# Jira
-JIRA_EMAIL="your-email@company.com"
-JIRA_API_TOKEN="your-api-token"
+# Jira (Required)
 JIRA_DOMAIN="company.atlassian.net"
 JIRA_PROJECT="PROJ"
-JIRA_QA_BRANCH_FIELD="customfield_xxxxx"  # Auto-detected if not set
+JIRA_EMAIL="your-email@company.com"
+JIRA_API_TOKEN="your-api-token"
 
-# Slack
-TICKET_CREATOR_BOT_TOKEN="xoxb-..."
-
-# Display
-JIRA_ME="Your Name"  # Highlight your tickets in rr.sh
+# Optional
+JIRA_ME="Your Name"                      # Highlight your tickets in rr.sh
+JIRA_QA_BRANCH_FIELD="customfield_xxxxx" # Auto-detected if not set
+TICKET_CREATOR_BOT_TOKEN="xoxb-..."      # Slack integration
 ```
 
 ### Customization
@@ -334,4 +334,3 @@ publish-changes
 ## 🤝 Contributing
 
 [Your Contributing Guidelines Here]
-

@@ -113,9 +113,15 @@ select_project_dir() {
 }
 
 # Configuration
-JIRA_DOMAIN="${JIRA_DOMAIN:-urbanlogiq.atlassian.net}"
-JIRA_PROJECT="${JIRA_PROJECT:-UB}"
+JIRA_DOMAIN="${JIRA_DOMAIN}"
+JIRA_PROJECT="${JIRA_PROJECT}"
 CACHE_DIR="$HOME/.cache/jira-fzf"
+
+# Validate required environment variables
+if [ -z "$JIRA_DOMAIN" ] || [ -z "$JIRA_PROJECT" ]; then
+    echo "Error: JIRA_DOMAIN and JIRA_PROJECT must be set in .env or environment" >&2
+    exit 1
+fi
 MR_CACHE_FILE="$CACHE_DIR/mr_cache.json"
 
 # Initialize MR cache if it doesn't exist

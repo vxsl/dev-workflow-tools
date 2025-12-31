@@ -149,4 +149,3 @@ You can remove the originals once you've verified everything works:
 cd ~/bin
 rm jira-fzf create-jira-ticket oneshot publish-changes restage apply_staged_to_commit
 ```
-
