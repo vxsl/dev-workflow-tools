@@ -1,0 +1,130 @@
+#!/bin/bash
+set -e
+
+# Script to apply staged changes to a specific commit in the past
+# Usage: ./apply_staged_to_commit.sh <commit-sha>
+
+if [ $# -eq 0 ]; then
+    echo "Error: No commit SHA provided"
+    echo "Usage: $0 <commit-sha>"
+    exit 1
+fi
+
+TARGET_COMMIT="$1"
+
+# Verify the commit exists
+if ! git rev-parse --verify "$TARGET_COMMIT" >/dev/null 2>&1; then
+    echo "Error: Commit '$TARGET_COMMIT' not found"
+    exit 1
+fi
+
+# Check if there are any staged changes
+if git diff --cached --quiet; then
+    echo "Error: No staged changes to apply"
+    exit 1
+fi
+
+# Check if we're already in the middle of a rebase
+GIT_DIR=$(git rev-parse --git-dir)
+if [ -d "$GIT_DIR/rebase-merge" ] || [ -d "$GIT_DIR/rebase-apply" ]; then
+    echo "Error: A rebase is already in progress"
+    echo "Please complete or abort the current rebase before running this script"
+    echo "  To continue: git rebase --continue"
+    echo "  To abort: git rebase --abort"
+    exit 1
+fi
+
+# Check if the target commit is in the current branch's history
+if ! git merge-base --is-ancestor "$TARGET_COMMIT" HEAD; then
+    echo "Error: Commit '$TARGET_COMMIT' is not in the current branch's history"
+    exit 1
+fi
+
+echo "Target commit: $TARGET_COMMIT"
+echo "$(git log -1 --oneline "$TARGET_COMMIT")"
+echo ""
+echo "Staged changes:"
+git diff --cached --stat
+echo ""
+
+# Save unstaged changes (including untracked files) while keeping staged changes
+echo "Stashing unstaged changes..."
+STASH_OUTPUT=$(git stash push --keep-index -u -m "temp-unstaged-changes-$(date +%s)" 2>&1 || true)
+
+# Check if anything was actually stashed
+if echo "$STASH_OUTPUT" | grep -q "No local changes to save"; then
+    STASHED=false
+    echo "No unstaged changes to stash"
+else
+    STASHED=true
+    STASH_NAME=$(git stash list | head -1 | cut -d: -f1)
+    echo "Unstaged changes stashed as: $STASH_NAME"
+fi
+
+# Cleanup function in case of error
+cleanup_on_error() {
+    if [ "$STASHED" = true ] && git stash list | grep -q "$STASH_NAME"; then
+        echo ""
+        echo "⚠ Error occurred. Your unstaged changes are saved in: $STASH_NAME"
+        echo "⚠ Restore them with: git stash apply $STASH_NAME"
+    fi
+}
+
+trap cleanup_on_error ERR
+
+# Create a fixup commit for the target commit
+echo "Creating fixup commit..."
+git commit --fixup="$TARGET_COMMIT"
+
+# Perform the rebase with autosquash
+echo "Rebasing to apply changes to target commit..."
+if ! GIT_SEQUENCE_EDITOR=: git rebase -i --autosquash "$TARGET_COMMIT~1"; then
+    echo ""
+    echo "⚠ REBASE CONFLICT DETECTED"
+    echo ""
+    echo "Your unstaged changes are safely stashed as: $STASH_NAME"
+    echo ""
+    echo "To complete this operation:"
+    echo "  1. Resolve the conflicts in the affected files"
+    echo "  2. git add <resolved-files>"
+    echo "  3. git rebase --continue"
+    echo "  4. git stash pop    # to restore your unstaged changes"
+    echo ""
+    echo "Or to abort:"
+    echo "  1. git rebase --abort"
+    echo "  2. git reset HEAD~1  # to remove the fixup commit"
+    echo "  3. git stash pop     # to restore your unstaged changes"
+    exit 1
+fi
+
+# Restore unstaged changes if they were stashed
+if [ "$STASHED" = true ]; then
+    echo "Restoring unstaged changes..."
+    if git stash pop; then
+        echo -e "\033[0;32m✓ Unstaged changes restored\033[0m"
+    else
+        echo "⚠ Conflicts while restoring unstaged changes"
+        echo "⚠ Your changes are still in stash: $STASH_NAME"
+        echo "⚠ Resolve conflicts and run: git stash drop $STASH_NAME"
+        exit 1
+    fi
+fi
+
+echo ""
+echo -e "\033[0;32m═══════════════════════════════════════════════════════════════"
+echo -e "✓ SUCCESS - Staged changes applied to commit"
+echo -e "═══════════════════════════════════════════════════════════════\033[0m"
+echo ""
+echo "Target commit (updated):"
+git log -1 --pretty=format:"  %C(yellow)%h%C(reset) - %s %C(green)(%cr)%C(reset)" "$TARGET_COMMIT"
+echo ""
+echo ""
+echo "Files modified in this commit:"
+git diff-tree --no-commit-id --name-status -r "$TARGET_COMMIT" | sed 's/^/  /'
+echo ""
+if [ "$STASHED" = false ]; then
+    echo -e "\033[0;32m✓ No unstaged changes to preserve\033[0m"
+else
+    echo -e "\033[0;32m✓ Unstaged changes preserved in working directory\033[0m"
+fi
+echo ""

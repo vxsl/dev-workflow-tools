@@ -1,0 +1,174 @@
+#!/usr/bin/env bash
+# fzf-persist - A library for creating fzf interfaces that stay open
+#
+# This library provides common patterns for fzf utilities that:
+# - Stay open after executing actions (enter doesn't close)
+# - Support reload after actions
+# - Have consistent keybindings and styling
+#
+# Usage:
+#   source ~/bin/lib/fzf-persist
+#   
+#   # Simple usage - just wrap your fzf call
+#   generate_list | fzp_run \
+#       --prompt="My Tool > " \
+#       --preview='...' \
+#       --bind "enter:execute(do_something {})+reload(generate_list)"
+#
+#   # Or use the helper to build bindings
+#   generate_list | fzp_run \
+#       --prompt="My Tool > " \
+#       $(fzp_action_bind enter "handle_action {}" "generate_list")
+#
+
+# Find fzf binary
+FZP_FZF="${FZP_FZF:-}"
+if [ -z "$FZP_FZF" ]; then
+    if [ -x "$HOME/.zsh/fzf/bin/fzf" ]; then
+        FZP_FZF="$HOME/.zsh/fzf/bin/fzf"
+    elif command -v fzf &>/dev/null; then
+        FZP_FZF="fzf"
+    else
+        echo "Error: fzf not found" >&2
+        exit 1
+    fi
+fi
+
+# Default styling options
+FZP_DEFAULT_OPTS=(
+    --ansi
+    -i
+    --height=100%
+    --reverse
+    --info=inline
+    --pointer='▶'
+    --marker='✓'
+    --sync
+)
+
+# Default keybindings for navigation
+FZP_NAV_BINDS=(
+    --bind 'ctrl-d:half-page-down'
+    --bind 'ctrl-u:half-page-up'
+    --bind 'ctrl-n:down'
+    --bind 'ctrl-p:up'
+    --bind 'ctrl-/:toggle-preview'
+    --bind 'change:first'
+)
+
+# Bindings that keep the interface open (ignore prevents closing)
+FZP_PERSIST_BINDS=(
+    --bind 'esc:ignore'
+    --bind 'ctrl-c:ignore'
+)
+
+# Helper: Create a binding that executes a command and reloads
+# Usage: fzp_action_bind KEY "command {}" "reload_command"
+# Example: fzp_action_bind enter "handle_action {}" "generate_list"
+fzp_action_bind() {
+    local key="$1"
+    local action="$2"
+    local reload_cmd="$3"
+    local silent="${4:-}"  # pass "silent" for execute-silent
+    
+    local exec_type="execute"
+    [ "$silent" = "silent" ] && exec_type="execute-silent"
+    
+    if [ -n "$reload_cmd" ]; then
+        echo "--bind '${key}:${exec_type}(${action})+reload(${reload_cmd})'"
+    else
+        echo "--bind '${key}:${exec_type}(${action})'"
+    fi
+}
+
+# Helper: Create a binding that runs silently and reloads
+# Usage: fzp_silent_bind KEY "command {}" "reload_command"
+fzp_silent_bind() {
+    fzp_action_bind "$1" "$2" "$3" "silent"
+}
+
+# Helper: Create a reload-only binding
+# Usage: fzp_reload_bind KEY "reload_command"
+fzp_reload_bind() {
+    local key="$1"
+    local reload_cmd="$2"
+    echo "--bind '${key}:reload(${reload_cmd})'"
+}
+
+# Main runner function
+# Usage: generate_list | fzp_run [fzf options...]
+# 
+# This applies defaults but allows overriding with explicit options.
+# Custom bindings should be passed as arguments.
+fzp_run() {
+    local custom_opts=("$@")
+    
+    # Build the command with defaults first, then custom options
+    # Custom options will override defaults where there's a conflict
+    "$FZP_FZF" \
+        "${FZP_DEFAULT_OPTS[@]}" \
+        "${FZP_NAV_BINDS[@]}" \
+        "${FZP_PERSIST_BINDS[@]}" \
+        "${custom_opts[@]}"
+}
+
+# Alternative: Run fzf with minimal defaults (just persist behavior)
+fzp_run_minimal() {
+    "$FZP_FZF" \
+        --ansi \
+        "${FZP_PERSIST_BINDS[@]}" \
+        "$@"
+}
+
+# Utility: Extract a field from a selection line
+# Usage: fzp_extract_field "full line" PATTERN
+# Example: fzp_extract_field "$line" '\[([A-Z0-9:]+)\]'  # Extract MAC address
+fzp_extract_field() {
+    local line="$1"
+    local pattern="$2"
+    echo "$line" | grep -oE "$pattern" | head -1
+}
+
+# Utility: Strip ANSI color codes from a string
+fzp_strip_ansi() {
+    echo "$1" | sed 's/\x1b\[[0-9;]*m//g'
+}
+
+# Utility: Expand ~ to $HOME in a path
+fzp_expand_home() {
+    local path="$1"
+    echo "${path/#\~/$HOME}"
+}
+
+# Common prompt formats
+fzp_prompt_with_bindings() {
+    local main_action="$1"
+    shift
+    local bindings=("$@")
+    
+    local prompt="$main_action"
+    for bind in "${bindings[@]}"; do
+        prompt="$prompt | $bind"
+    done
+    echo "$prompt > "
+}
+
+# Export the fzf path for subprocesses
+export FZP_FZF
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

@@ -1,0 +1,701 @@
+#!/usr/bin/env bash
+# Create a GitLab Merge Request with optional Jira integration
+#
+# Usage:
+#   publish-changes                           Interactive MR creation from current branch
+#   publish-changes UB-1234                   Create MR and link to Jira ticket
+#   publish-changes --branch feature/foo      Create MR for specific branch
+#   publish-changes --target main             Pre-select target branch
+#   publish-changes --draft                   Create as draft MR
+#   publish-changes --no-jira                 Skip Jira integration even if ticket detected
+#
+# Features:
+#   - Interactive branch selection with fzf
+#   - Preview of commits in MR
+#   - Auto-push to origin
+#   - Clipboard copy of MR URL
+#   - Opens MR in browser
+#   - Jira integration: adds MR link comment, updates status, sets QA branch
+#
+# Requirements:
+#   - glab (GitLab CLI)
+#   - fzf
+#   - jq (for Jira integration)
+#   - curl (for Jira integration)
+#
+# Environment variables (for Jira integration):
+#   JIRA_EMAIL          - Your Jira email
+#   JIRA_API_TOKEN      - Jira API token
+#   JIRA_DOMAIN         - Jira domain (default: urbanlogiq.atlassian.net)
+#   JIRA_PROJECT        - Jira project key (default: UB)
+#   JIRA_QA_BRANCH_FIELD - Custom field ID for QA branch (optional)
+
+set -e
+
+# Load environment from same directory as jira-fzf
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -f "$SCRIPT_DIR/.env" ]; then
+    source "$SCRIPT_DIR/.env"
+fi
+
+# Configuration
+JIRA_DOMAIN="${JIRA_DOMAIN:-urbanlogiq.atlassian.net}"
+JIRA_PROJECT="${JIRA_PROJECT:-UB}"
+CACHE_DIR="$HOME/.cache/jira-fzf"
+MR_CACHE_FILE="$CACHE_DIR/mr_cache.json"
+
+# Arguments
+TICKET_KEY=""
+SOURCE_BRANCH=""
+TARGET_BRANCH=""
+IS_DRAFT=""
+NO_JIRA=false
+SKIP_PUSH=false
+OUTPUT_URL=false
+NO_DRAFT_PROMPT=false
+
+# Colors
+RED='\033[38;5;167m'
+GREEN='\033[38;5;114m'
+YELLOW='\033[38;5;221m'
+BLUE='\033[38;5;81m'
+PURPLE='\033[38;5;141m'
+CYAN='\033[38;5;109m'
+DIM='\033[2m'
+UNDERLINE='\033[4m'
+RESET='\033[0m'
+
+# Parse arguments
+while [[ "$#" -gt 0 ]]; do
+    case $1 in
+        --branch|-b)
+            SOURCE_BRANCH="$2"
+            shift 2
+            ;;
+        --target|-t)
+            TARGET_BRANCH="$2"
+            shift 2
+            ;;
+        --draft|-d)
+            IS_DRAFT="--draft"
+            shift
+            ;;
+        --no-jira)
+            NO_JIRA=true
+            shift
+            ;;
+        --skip-push)
+            SKIP_PUSH=true
+            shift
+            ;;
+        --output-url)
+            OUTPUT_URL=true
+            shift
+            ;;
+        --no-draft-prompt)
+            NO_DRAFT_PROMPT=true
+            shift
+            ;;
+        --help|-h)
+            head -35 "$0" | tail -33
+            exit 0
+            ;;
+        *)
+            # Check if it looks like a Jira ticket
+            if [[ "$1" =~ ^${JIRA_PROJECT}-[0-9]+$ ]]; then
+                TICKET_KEY="$1"
+            elif [[ "$1" =~ ^[A-Z]+-[0-9]+$ ]]; then
+                TICKET_KEY="$1"
+            else
+                echo "Unknown argument: $1" >&2
+                exit 1
+            fi
+            shift
+            ;;
+    esac
+done
+
+# Find fzf
+if [ -x "$HOME/.zsh/fzf/bin/fzf" ]; then
+    FZF="$HOME/.zsh/fzf/bin/fzf"
+elif command -v fzf &> /dev/null; then
+    FZF="fzf"
+else
+    echo "Error: fzf not found. Please install fzf first." >&2
+    exit 1
+fi
+
+# Add vim-style scroll bindings
+export FZF_DEFAULT_OPTS="${FZF_DEFAULT_OPTS} --bind 'ctrl-d:half-page-down,ctrl-u:half-page-up'"
+
+# Check required tools
+if ! command -v glab &> /dev/null; then
+    echo -e "${RED}Error: glab CLI not found${RESET}" >&2
+    echo -e "${DIM}Install: https://gitlab.com/gitlab-org/cli${RESET}" >&2
+    exit 1
+fi
+
+# Ensure we're in a git repo
+if ! git rev-parse --git-dir >/dev/null 2>&1; then
+    echo -e "${RED}Error: Not in a git repository${RESET}" >&2
+    exit 1
+fi
+
+# Function to open URL in browser
+open_url() {
+    local url="$1"
+    
+    # Try to find Firefox window with firefox_scm class using wmctrl
+    if command -v wmctrl &> /dev/null; then
+        local win_id=$(wmctrl -lx | grep -i "firefox_scm" | head -1 | awk '{print $1}')
+        if [ -n "$win_id" ]; then
+            wmctrl -i -a "$win_id"
+            setsid firefox --new-tab "$url" </dev/null >/dev/null 2>&1 &
+            return 0
+        fi
+    fi
+    
+    # Fallback to xdg-open (setsid fully detaches from parent)
+    if command -v xdg-open &> /dev/null; then
+        setsid xdg-open "$url" </dev/null >/dev/null 2>&1 &
+    elif command -v open &> /dev/null; then
+        setsid open "$url" </dev/null >/dev/null 2>&1 &
+    else
+        echo "$url"
+    fi
+}
+
+# Function to copy to clipboard
+copy_to_clipboard() {
+    local text="$1"
+    if command -v xclip &> /dev/null; then
+        echo -n "$text" | xclip -selection clipboard
+        return 0
+    elif command -v wl-copy &> /dev/null; then
+        echo -n "$text" | wl-copy
+        return 0
+    fi
+    return 1
+}
+
+# Initialize MR cache
+init_mr_cache() {
+    mkdir -p "$CACHE_DIR"
+    if [ ! -f "$MR_CACHE_FILE" ]; then
+        echo '{}' > "$MR_CACHE_FILE"
+    fi
+}
+
+# Save MR info to cache
+save_mr_to_cache() {
+    local ticket_key="$1"
+    local mr_url="$2"
+    local branch="$3"
+    init_mr_cache
+    local tmp_file=$(mktemp)
+    jq --arg key "$ticket_key" --arg url "$mr_url" --arg branch "$branch" \
+        '.[$key] = {url: $url, branch: $branch, created: now | todate}' \
+        "$MR_CACHE_FILE" > "$tmp_file" 2>/dev/null && mv "$tmp_file" "$MR_CACHE_FILE"
+}
+
+# Check if Jira integration is available
+has_jira_credentials() {
+    [ -n "$JIRA_EMAIL" ] && [ -n "$JIRA_API_TOKEN" ]
+}
+
+# Get ticket summary from Jira
+get_ticket_summary() {
+    local key="$1"
+    if ! has_jira_credentials; then
+        return 1
+    fi
+    curl -s -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
+        "https://${JIRA_DOMAIN}/rest/api/3/issue/${key}?fields=summary" \
+        -H "Content-Type: application/json" 2>/dev/null | \
+        jq -r '.fields.summary // empty' 2>/dev/null
+}
+
+# Update Jira ticket with MR info
+update_jira_ticket() {
+    local key="$1"
+    local mr_url="$2"
+    local branch="$3"
+    local is_draft="$4"
+    
+    if ! has_jira_credentials; then
+        echo -e "  ${YELLOW}⚠${RESET} Jira: Credentials not configured" >&2
+        return 1
+    fi
+    
+    echo "" >&2
+    echo -e "  ${DIM}Updating Jira ticket ${key}...${RESET}" >&2
+    
+    # Fetch current issue state
+    local qa_field_id="${JIRA_QA_BRANCH_FIELD:-}"
+    local qa_fields=""
+    if [ -n "$qa_field_id" ]; then
+        qa_fields=",$qa_field_id"
+    fi
+    local issue_data=$(curl -s --max-time 10 -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
+        "https://${JIRA_DOMAIN}/rest/api/3/issue/${key}?fields=assignee,status${qa_fields}" 2>/dev/null)
+    local current_status=$(echo "$issue_data" | jq -r '.fields.status.name // "Unknown"')
+    local current_assignee=$(echo "$issue_data" | jq -r '.fields.assignee.displayName // empty')
+    local current_assignee_email=$(echo "$issue_data" | jq -r '.fields.assignee.emailAddress // empty')
+    
+    # Get my info
+    local my_info=$(curl -s --max-time 10 -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
+        "https://${JIRA_DOMAIN}/rest/api/3/myself" 2>/dev/null)
+    local my_account_id=$(echo "$my_info" | jq -r '.accountId')
+    local my_name=$(echo "$my_info" | jq -r '.displayName')
+    
+    # Show current state
+    echo "" >&2
+    echo -e "  ${CYAN}┌─ Current State ─────────────────────────────────────────┐${RESET}" >&2
+    printf "  ${CYAN}│${RESET} Status:   ${BLUE}%-46s${RESET} ${CYAN}│${RESET}\n" "$current_status" >&2
+    printf "  ${CYAN}│${RESET} Assignee: %-46s ${CYAN}│${RESET}\n" "${current_assignee:-Unassigned}" >&2
+    echo -e "  ${CYAN}└──────────────────────────────────────────────────────────┘${RESET}" >&2
+    echo "" >&2
+    
+    # 1. Add MR Comment
+    local existing_comments=$(curl -s --max-time 10 -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
+        "https://${JIRA_DOMAIN}/rest/api/3/issue/${key}/comment" 2>/dev/null)
+    
+    if echo "$existing_comments" | grep -q "$mr_url"; then
+        echo -e "  ${DIM}─${RESET} Comment: ${DIM}MR link already exists${RESET}" >&2
+    else
+        local comment_body=$(jq -n --arg url "$mr_url" '{
+            "body": {
+                "type": "doc",
+                "version": 1,
+                "content": [
+                    {
+                        "type": "paragraph",
+                        "content": [
+                            {"type": "text", "text": "MR: "},
+                            {"type": "text", "text": $url, "marks": [{"type": "link", "attrs": {"href": $url}}]}
+                        ]
+                    }
+                ]
+            }
+        }')
+        local comment_result=$(curl -s --max-time 10 -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
+            -X POST \
+            "https://${JIRA_DOMAIN}/rest/api/3/issue/${key}/comment" \
+            -H "Content-Type: application/json" \
+            -d "$comment_body" 2>/dev/null)
+        if echo "$comment_result" | jq -e '.id' >/dev/null 2>&1; then
+            echo -e "  ${GREEN}✓${RESET} Comment: Added MR link" >&2
+        else
+            echo -e "  ${RED}✗${RESET} Comment: Failed to add" >&2
+        fi
+    fi
+    
+    # 2. QA Branch field
+    local qa_branch="${branch}.home.urbanlogiq.us"
+    if [ -z "$qa_field_id" ]; then
+        local editmeta=$(curl -s --max-time 10 -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
+            "https://${JIRA_DOMAIN}/rest/api/3/issue/${key}/editmeta" 2>/dev/null)
+        qa_field_id=$(echo "$editmeta" | jq -r '.fields | to_entries[] | select(.value.name | test("[Qq][Aa].*[Bb]ranch|[Bb]ranch.*[Qq][Aa]"; "i")) | .key' | head -1)
+    fi
+    
+    if [ -n "$qa_field_id" ]; then
+        local current_qa=$(echo "$issue_data" | jq -r ".fields.${qa_field_id} // empty")
+        if [ "$current_qa" = "$qa_branch" ]; then
+            echo -e "  ${DIM}─${RESET} QA Branch: ${DIM}${qa_branch} (already set)${RESET}" >&2
+        else
+            local qa_field_result=$(curl -s --max-time 10 -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
+                -X PUT \
+                "https://${JIRA_DOMAIN}/rest/api/3/issue/${key}" \
+                -H "Content-Type: application/json" \
+                -d "{\"fields\": {\"$qa_field_id\": \"$qa_branch\"}}" 2>/dev/null)
+            if [ -z "$qa_field_result" ]; then
+                if [ -n "$current_qa" ]; then
+                    echo -e "  ${GREEN}✓${RESET} QA Branch: ${current_qa} → ${qa_branch}" >&2
+                else
+                    echo -e "  ${GREEN}✓${RESET} QA Branch: ${qa_branch}" >&2
+                fi
+            else
+                echo -e "  ${RED}✗${RESET} QA Branch: Could not set" >&2
+            fi
+        fi
+    else
+        echo -e "  ${YELLOW}⚠${RESET} QA Branch: Field not found (set JIRA_QA_BRANCH_FIELD)" >&2
+    fi
+    
+    # 3. Status transition (skip for draft MRs)
+    if [ -n "$is_draft" ]; then
+        echo -e "  ${DIM}─${RESET} Status: ${DIM}${current_status} (draft MR, not moving to review)${RESET}" >&2
+    else
+        local transitions=$(curl -s --max-time 10 -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
+            "https://${JIRA_DOMAIN}/rest/api/3/issue/${key}/transitions" 2>/dev/null)
+        local mr_transition_id=$(echo "$transitions" | jq -r '[.transitions[] | select(.name | test("MR|[Mm]erge|[Rr]eview"; "i"))][0].id // empty' 2>/dev/null)
+        local mr_transition_name=$(echo "$transitions" | jq -r '[.transitions[] | select(.name | test("MR|[Mm]erge|[Rr]eview"; "i"))][0].name // empty' 2>/dev/null)
+        
+        if echo "$current_status" | grep -qi "MR\|merge\|review"; then
+            echo -e "  ${DIM}─${RESET} Status: ${DIM}${current_status} (already in review)${RESET}" >&2
+        elif [ -n "$mr_transition_id" ]; then
+            local transition_result=$(curl -s --max-time 10 -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
+                -X POST \
+                "https://${JIRA_DOMAIN}/rest/api/3/issue/${key}/transitions" \
+                -H "Content-Type: application/json" \
+                -d "{\"transition\": {\"id\": \"$mr_transition_id\"}}" 2>/dev/null)
+            if [ -z "$transition_result" ]; then
+                echo -e "  ${GREEN}✓${RESET} Status: ${current_status} → ${mr_transition_name}" >&2
+            else
+                echo -e "  ${RED}✗${RESET} Status: Could not transition" >&2
+            fi
+        else
+            echo -e "  ${YELLOW}⚠${RESET} Status: No MR transition available from ${current_status}" >&2
+        fi
+    fi
+    
+    # 4. Assignee
+    if [ -z "$current_assignee" ]; then
+        local assign_result=$(curl -s --max-time 10 -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
+            -X PUT \
+            "https://${JIRA_DOMAIN}/rest/api/3/issue/${key}/assignee" \
+            -H "Content-Type: application/json" \
+            -d "{\"accountId\": \"$my_account_id\"}" 2>/dev/null)
+        if [ -z "$assign_result" ]; then
+            echo -e "  ${GREEN}✓${RESET} Assignee: Unassigned → ${my_name}" >&2
+        else
+            echo -e "  ${RED}✗${RESET} Assignee: Could not assign" >&2
+        fi
+    elif [ "$current_assignee_email" = "$JIRA_EMAIL" ]; then
+        echo -e "  ${DIM}─${RESET} Assignee: ${DIM}${current_assignee} (you)${RESET}" >&2
+    else
+        echo -e "  ${YELLOW}⚠${RESET} Assignee: ${current_assignee} (not you)" >&2
+        printf "    ${DIM}Reassign to yourself? (y/N)${RESET} " >&2
+        local reassign_choice
+        read -n 1 reassign_choice < /dev/tty
+        echo "" >&2
+        if [[ "$reassign_choice" =~ ^[Yy]$ ]]; then
+            local assign_result=$(curl -s -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
+                -X PUT \
+                "https://${JIRA_DOMAIN}/rest/api/3/issue/${key}/assignee" \
+                -H "Content-Type: application/json" \
+                -d "{\"accountId\": \"$my_account_id\"}" 2>/dev/null)
+            if [ -z "$assign_result" ]; then
+                echo -e "    ${GREEN}✓${RESET} Reassigned to ${my_name}" >&2
+            else
+                echo -e "    ${RED}✗${RESET} Could not reassign" >&2
+            fi
+        fi
+    fi
+}
+
+# Try to detect ticket from branch name
+detect_ticket_from_branch() {
+    local branch="$1"
+    if [[ "$branch" =~ (${JIRA_PROJECT}-[0-9]+) ]]; then
+        echo "${BASH_REMATCH[1]}"
+    fi
+}
+
+# ============================================================================
+# Main flow
+# ============================================================================
+
+echo "" >&2
+echo -e "${PURPLE}=== Create Merge Request ===${RESET}" >&2
+echo "" >&2
+
+# Step 1: Select source branch
+echo -e "${CYAN}┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓${RESET}" >&2
+echo -e "${CYAN}┃${RESET} ${BLUE}Step 1/4:${RESET} Select branch to push                        ${CYAN}┃${RESET}" >&2
+echo -e "${CYAN}┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛${RESET}" >&2
+
+current_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+
+if [ -n "$SOURCE_BRANCH" ]; then
+    selected_branch="$SOURCE_BRANCH"
+    echo -e "  ${GREEN}✓${RESET} Branch: ${selected_branch} ${DIM}(from argument)${RESET}" >&2
+else
+    # Prepare branch list with current branch first
+    branches=$(
+        echo "$current_branch (current)"
+        git branch --format='%(refname:short)' | grep -v "^${current_branch}$"
+    )
+    
+    selected_branch=$(echo "$branches" | $FZF \
+        --prompt="  Branch > " \
+        --height=15 \
+        --reverse \
+        --border=rounded \
+        --header="Press ESC to cancel")
+    
+    if [ -z "$selected_branch" ]; then
+        echo -e "${RED}  ✗ Cancelled${RESET}" >&2
+        exit 1
+    fi
+    
+    # Strip " (current)" suffix if present
+    selected_branch=$(echo "$selected_branch" | sed 's/ (current)$//')
+    echo -e "  ${GREEN}✓${RESET} Branch: ${selected_branch}" >&2
+fi
+
+# Auto-detect ticket from branch name if not provided
+if [ -z "$TICKET_KEY" ] && [ "$NO_JIRA" != "true" ]; then
+    detected_ticket=$(detect_ticket_from_branch "$selected_branch")
+    if [ -n "$detected_ticket" ]; then
+        TICKET_KEY="$detected_ticket"
+        echo -e "  ${DIM}Detected ticket: ${TICKET_KEY}${RESET}" >&2
+    fi
+fi
+
+# Show ticket info if we have one
+if [ -n "$TICKET_KEY" ] && [ "$NO_JIRA" != "true" ]; then
+    summary=$(get_ticket_summary "$TICKET_KEY")
+    if [ -n "$summary" ]; then
+        echo "" >&2
+        echo -e "  ${CYAN}Ticket:${RESET} ${TICKET_KEY}" >&2
+        echo -e "  ${CYAN}Title:${RESET}  ${summary}" >&2
+    fi
+fi
+
+echo "" >&2
+
+# Step 2: Push the branch
+if [ "$SKIP_PUSH" != "true" ]; then
+    echo -e "${CYAN}┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓${RESET}" >&2
+    echo -e "${CYAN}┃${RESET} ${BLUE}Step 2/4:${RESET} Pushing branch to remote                      ${CYAN}┃${RESET}" >&2
+    echo -e "${CYAN}┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛${RESET}" >&2
+    
+    echo -e "  ${DIM}Running: git push -u origin ${selected_branch}${RESET}" >&2
+    
+    git push -u origin "$selected_branch" 2>&1 | while read -r line; do
+        echo -e "  ${DIM}${line}${RESET}" >&2
+    done
+    
+    if [ ${PIPESTATUS[0]} -eq 0 ]; then
+        echo -e "  ${GREEN}✓${RESET} Push successful" >&2
+    else
+        echo -e "  ${RED}✗${RESET} Push failed" >&2
+        exit 1
+    fi
+    echo "" >&2
+fi
+
+# Step 3: Choose target branch
+echo -e "${CYAN}┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓${RESET}" >&2
+echo -e "${CYAN}┃${RESET} ${BLUE}Step 3/4:${RESET} Select target branch (MR base)                ${CYAN}┃${RESET}" >&2
+echo -e "${CYAN}┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛${RESET}" >&2
+
+if [ -n "$TARGET_BRANCH" ]; then
+    target_branch="$TARGET_BRANCH"
+    echo -e "  ${GREEN}✓${RESET} Target: ${target_branch} ${DIM}(from argument)${RESET}" >&2
+else
+    # Try to detect default branch
+    default_branch=$(git remote show origin 2>/dev/null | grep "HEAD branch" | sed 's/.*: //')
+    if [ -z "$default_branch" ]; then
+        default_branch="main"
+    fi
+    
+    # Get remote branches, prioritizing common targets
+    target_branches=$(
+        # Common targets first
+        for b in "$default_branch" "main" "master" "develop" "dev"; do
+            if git show-ref --verify --quiet "refs/remotes/origin/$b" 2>/dev/null; then
+                if [ "$b" = "$default_branch" ]; then
+                    echo "$b (default)"
+                else
+                    echo "$b"
+                fi
+            fi
+        done | sort -u
+        # Then other remote branches
+        git branch -r --format='%(refname:short)' 2>/dev/null | \
+            sed 's|^origin/||' | \
+            grep -vE "^(HEAD|$default_branch|main|master|develop|dev)$" | \
+            sort
+    )
+    
+    target_branch=$(echo "$target_branches" | $FZF \
+        --prompt="  Target branch > " \
+        --height=80% \
+        --reverse \
+        --border=rounded \
+        --header="Select target branch │ Preview: commits in MR │ Ctrl-T: open tig" \
+        --preview="target=\$(echo {} | sed 's/ (default)\$//'); git log --oneline --graph --color=always \"\$target\"..\"$selected_branch\" 2>/dev/null | head -50 || echo 'No commits or branch not found'" \
+        --preview-window=right:60% \
+        --bind "ctrl-t:execute(target=\$(echo {} | sed 's/ (default)\$//'); tig \"\$target\"..\"$selected_branch\" < /dev/tty > /dev/tty 2>&1)")
+    
+    if [ -z "$target_branch" ]; then
+        echo -e "${RED}  ✗ Cancelled${RESET}" >&2
+        exit 1
+    fi
+    
+    # Strip " (default)" suffix if present
+    target_branch=$(echo "$target_branch" | sed 's/ (default)$//')
+fi
+
+echo -e "  ${GREEN}✓${RESET} Target: ${target_branch}" >&2
+echo "" >&2
+
+# Step 4: Draft option (only if not already set via argument)
+if [ -z "$IS_DRAFT" ] && [ "$NO_DRAFT_PROMPT" != "true" ]; then
+    echo -e "${CYAN}┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓${RESET}" >&2
+    echo -e "${CYAN}┃${RESET} ${BLUE}Step 4/5:${RESET} Create as draft? ${DIM}(y/N)${RESET}                       ${CYAN}┃${RESET}" >&2
+    echo -e "${CYAN}┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛${RESET}" >&2
+    printf "  ${DIM}Draft MRs cannot be merged until marked ready.${RESET} " >&2
+    read -n 1 draft_choice < /dev/tty
+    echo "" >&2
+    if [[ "$draft_choice" =~ ^[Yy]$ ]]; then
+        IS_DRAFT="--draft"
+        echo -e "  ${GREEN}✓${RESET} Creating as: ${YELLOW}Draft${RESET}" >&2
+    else
+        echo -e "  ${GREEN}✓${RESET} Creating as: ${GREEN}Ready${RESET}" >&2
+    fi
+    echo "" >&2
+fi
+
+# Step 5: Create the MR
+echo -e "${CYAN}┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓${RESET}" >&2
+echo -e "${CYAN}┃${RESET} ${BLUE}Step 5/5:${RESET} Creating Merge Request                        ${CYAN}┃${RESET}" >&2
+echo -e "${CYAN}┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛${RESET}" >&2
+
+# Set MR title based on whether we have a ticket
+if [ -n "$TICKET_KEY" ] && [ "$NO_JIRA" != "true" ] && [ -n "$summary" ]; then
+    mr_title="$TICKET_KEY $summary"
+    mr_description="Closes $TICKET_KEY"
+else
+    mr_title="$selected_branch"
+    mr_description=""
+fi
+
+echo -e "  ${DIM}Title: ${mr_title}${RESET}" >&2
+echo -e "  ${DIM}Source: ${selected_branch} → Target: ${target_branch}${RESET}" >&2
+echo "" >&2
+
+# First check if an MR already exists for this branch
+echo -e "  ${DIM}$ glab mr list --source-branch=\"${selected_branch}\" --state=opened${RESET}" >&2
+existing_mr=$(glab mr list --source-branch="$selected_branch" --state=opened 2>/dev/null | head -1)
+
+if [ -n "$existing_mr" ]; then
+    # MR already exists - get its URL and open it
+    echo -e "  ${DIM}$ glab mr view \"${selected_branch}\"${RESET}" >&2
+    mr_url=$(glab mr view "$selected_branch" 2>/dev/null | grep -oE 'https://[^ ]+merge_requests/[0-9]+' | head -1)
+    
+    echo "" >&2
+    echo "" >&2
+    echo -e "  ${BLUE}Merge Request already exists${RESET}" >&2
+    
+    if [ -n "$mr_url" ]; then
+        echo -e "  ${DIM}URL:${RESET}  ${UNDERLINE}${BLUE}${mr_url}${RESET}" >&2
+        
+        if copy_to_clipboard "$mr_url"; then
+            echo -e "  ${DIM}(URL copied to clipboard)${RESET}" >&2
+        fi
+        
+        echo -e "  ${DIM}Opening in browser...${RESET}" >&2
+        open_url "${mr_url}/diffs"
+    else
+        echo -e "  ${DIM}${existing_mr}${RESET}" >&2
+    fi
+else
+    # No existing MR - create one
+    draft_flag_display=""
+    [ -n "$IS_DRAFT" ] && draft_flag_display="--draft "
+    echo -e "  ${DIM}$ glab mr create ${draft_flag_display}--title \"${mr_title}\" --description \"${mr_description}\" \\\\${RESET}" >&2
+    echo -e "  ${DIM}    --source-branch \"${selected_branch}\" --target-branch \"${target_branch}\" --push=false${RESET}" >&2
+    
+    mr_output=$(glab mr create \
+        $IS_DRAFT \
+        --title "$mr_title" \
+        --description "$mr_description" \
+        --source-branch "$selected_branch" \
+        --target-branch "$target_branch" \
+        --push=false \
+        --yes \
+        < /dev/null 2>&1)
+    mr_exit_code=$?
+    
+    if [ $mr_exit_code -eq 0 ]; then
+        # Extract MR URL from output
+        mr_url=$(echo "$mr_output" | grep -oE 'https://[^ ]+merge_requests/[0-9]+' | head -1)
+        
+        mr_type="Merge Request"
+        [ -n "$IS_DRAFT" ] && mr_type="Draft Merge Request"
+        
+        echo "" >&2
+        echo -e "  ${GREEN}✓ ${mr_type} created!${RESET}" >&2
+        
+        if [ -n "$mr_url" ]; then
+            echo -e "  ${DIM}URL:${RESET}  ${UNDERLINE}${BLUE}${mr_url}${RESET}" >&2
+            
+            # Cache MR info (only for ticket entries)
+            if [ -n "$TICKET_KEY" ]; then
+                save_mr_to_cache "$TICKET_KEY" "$mr_url" "$selected_branch"
+            fi
+            
+            # Copy to clipboard (skip if --output-url to avoid blocking)
+            if [ "$OUTPUT_URL" != "true" ]; then
+                if copy_to_clipboard "$mr_url"; then
+                    echo -e "  ${DIM}(URL copied to clipboard)${RESET}" >&2
+                fi
+            fi
+            
+            # Update Jira ticket if we have one
+            if [ -n "$TICKET_KEY" ] && [ "$NO_JIRA" != "true" ]; then
+                update_jira_ticket "$TICKET_KEY" "$mr_url" "$selected_branch" "$IS_DRAFT"
+                
+                # Open both MR and Jira (skip if --output-url to avoid blocking)
+                if [ "$OUTPUT_URL" != "true" ]; then
+                    echo "" >&2
+                    echo -e "  ${DIM}Opening in browser...${RESET}" >&2
+                    jira_url="https://${JIRA_DOMAIN}/browse/${TICKET_KEY}"
+                    open_url "${mr_url}/diffs"
+                    sleep 0.3
+                    open_url "$jira_url"
+                fi
+            else
+                # Just open MR (skip if --output-url to avoid blocking)
+                if [ "$OUTPUT_URL" != "true" ]; then
+                    echo "" >&2
+                    echo -e "  ${DIM}Opening MR in browser...${RESET}" >&2
+                    open_url "${mr_url}/diffs"
+                fi
+            fi
+        else
+            echo -e "  ${DIM}${mr_output}${RESET}" >&2
+        fi
+    elif echo "$mr_output" | grep -qi "already exists"; then
+        # MR already exists (409 conflict)
+        echo -e "  ${DIM}$ glab mr view \"${selected_branch}\"${RESET}" >&2
+        mr_url=$(glab mr view "$selected_branch" 2>/dev/null | grep -oE 'https://[^ ]+merge_requests/[0-9]+' | head -1)
+        
+        echo "" >&2
+        echo -e "  ${BLUE}Merge Request already exists${RESET}" >&2
+        
+        if [ -n "$mr_url" ]; then
+            echo -e "  ${DIM}URL:${RESET}  ${UNDERLINE}${BLUE}${mr_url}${RESET}" >&2
+            
+            if [ -n "$TICKET_KEY" ]; then
+                save_mr_to_cache "$TICKET_KEY" "$mr_url" "$selected_branch"
+            fi
+            
+            # Skip clipboard and browser if --output-url to avoid blocking
+            if [ "$OUTPUT_URL" != "true" ]; then
+                if copy_to_clipboard "$mr_url"; then
+                    echo -e "  ${DIM}(URL copied to clipboard)${RESET}" >&2
+                fi
+                echo -e "  ${DIM}Opening in browser...${RESET}" >&2
+                open_url "${mr_url}/diffs"
+            fi
+        else
+            echo -e "  ${DIM}${mr_output}${RESET}" >&2
+        fi
+    else
+        echo -e "${RED}  ✗ Error creating MR:${RESET}" >&2
+        echo -e "  ${DIM}${mr_output}${RESET}" >&2
+        exit 1
+    fi
+fi
+
+echo "" >&2
+
+# Output URL to stdout if requested (for scripting)
+if [ "$OUTPUT_URL" = true ] && [ -n "$mr_url" ]; then
+    echo "$mr_url"
+    exit 0
+fi

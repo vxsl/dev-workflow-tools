@@ -1,0 +1,1745 @@
+#!/usr/bin/env bash
+# Jira ticket explorer/creator with fuzzy search
+# Inspired by fzedit's continuous fzf pattern and rr.sh's Jira integration
+#
+# Features:
+# - Fuzzy search through all Jira tickets in your project
+# - Create new tickets with interactive form (Ctrl+N)
+# - Open tickets in browser (Enter or Ctrl+O)
+# - Live preview of ticket details
+# - Automatic caching for performance
+#
+# Usage:
+#   jira-fzf                              Start interactive explorer
+#   jira-fzf --dry-run                    Test ticket creation without creating
+#   jira-fzf --labels "front-end,bug"    Set default labels for new tickets
+#   
+# Keybindings:
+#   <CR> maximize preview  <C-y> copy  <C-o> open  <C-t> new  <C-s> sort  <C-r> refresh
+#   <C-g> create MR  <C-c> checkout  <C-n>/<C-p> nav  <C-d>/<C-u> page  q/esc close preview
+
+source ~/bin/lib/fzf-persist
+
+# Load environment variables
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -f "$SCRIPT_DIR/.env" ]; then
+    source "$SCRIPT_DIR/.env"
+fi
+
+# Function to get or set the project directory for git operations
+get_project_dir() {
+    local project_dir_file="$CACHE_DIR/project_dir"
+    # Check if we have a cached project directory
+    if [ -f "$project_dir_file" ]; then
+        local cached_dir=$(cat "$project_dir_file")
+        # Verify it still exists and is a git repo
+        if [ -d "$cached_dir" ] && git -C "$cached_dir" rev-parse --git-dir >/dev/null 2>&1; then
+            echo "$cached_dir"
+            return 0
+        fi
+        # Invalid cache, remove it
+        rm -f "$project_dir_file"
+    fi
+    return 1
+}
+
+select_project_dir() {
+    local project_dir_file="$CACHE_DIR/project_dir"
+    
+    echo "" >&2
+    printf "\033[38;5;109m┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\033[0m\n" >&2
+    printf "\033[38;5;109m┃\033[0m \033[38;5;81mSetup:\033[0m Select your project git repository             \033[38;5;109m┃\033[0m\n" >&2
+    printf "\033[38;5;109m┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\033[0m\n" >&2
+    printf "  \033[2mThis will be cached permanently for MR creation.\033[0m\n" >&2
+    echo "" >&2
+    
+    # Find git repositories in common locations
+    local search_dirs=("$HOME/work" "$HOME/repos" "$HOME/projects" "$HOME/code" "$HOME/dev" "$HOME/src" "$HOME")
+    local git_repos=""
+    
+    printf "  \033[2mSearching for git repositories...\033[0m\n" >&2
+    
+    for search_dir in "${search_dirs[@]}"; do
+        if [ -d "$search_dir" ]; then
+            # Find .git directories, get parent, limit depth for performance
+            local found=$(find "$search_dir" -maxdepth 4 -type d -name ".git" 2>/dev/null | \
+                sed 's|/\.git$||' | \
+                grep -v '/\.' | \
+                head -50)
+            if [ -n "$found" ]; then
+                git_repos="${git_repos}${found}"$'\n'
+            fi
+        fi
+    done
+    
+    # Remove duplicates and empty lines
+    git_repos=$(echo "$git_repos" | sort -u | grep -v '^$')
+    
+    if [ -z "$git_repos" ]; then
+        printf "\033[38;5;167m  ✗ No git repositories found\033[0m\n" >&2
+        printf "  \033[2mEnter the path manually:\033[0m " >&2
+        read -e selected_dir < /dev/tty
+    else
+        # Let user select with fzf
+        selected_dir=$(echo "$git_repos" | $FZF \
+            --prompt="  📁 Project > " \
+            --height=20 \
+            --reverse \
+            --border=rounded \
+            --header="Select your project's git repository" \
+            --preview='ls -la {} 2>/dev/null | head -20')
+    fi
+    
+    if [ -z "$selected_dir" ]; then
+        printf "\033[38;5;167m  ✗ Cancelled\033[0m\n" >&2
+        return 1
+    fi
+    
+    # Verify it's a git repo
+    if ! git -C "$selected_dir" rev-parse --git-dir >/dev/null 2>&1; then
+        printf "\033[38;5;167m  ✗ Error: %s is not a git repository\033[0m\n" "$selected_dir" >&2
+        sleep 2
+        return 1
+    fi
+    
+    # Cache it permanently
+    mkdir -p "$CACHE_DIR"
+    echo "$selected_dir" > "$project_dir_file"
+    printf "  \033[38;5;114m✓\033[0m Project directory set: \033[0m%s\033[0m\n" "$selected_dir" >&2
+    echo "" >&2
+    
+    echo "$selected_dir"
+    return 0
+}
+
+# Configuration
+JIRA_DOMAIN="${JIRA_DOMAIN:-urbanlogiq.atlassian.net}"
+JIRA_PROJECT="${JIRA_PROJECT:-UB}"
+CACHE_DIR="$HOME/.cache/jira-fzf"
+MR_CACHE_FILE="$CACHE_DIR/mr_cache.json"
+
+# Initialize MR cache if it doesn't exist
+init_mr_cache() {
+    if [ ! -f "$MR_CACHE_FILE" ]; then
+        echo '{}' > "$MR_CACHE_FILE"
+    fi
+}
+
+# Get cached MR info for a ticket
+get_cached_mr() {
+    local ticket_key="$1"
+    if [ -f "$MR_CACHE_FILE" ]; then
+        jq -r ".\"$ticket_key\" // empty" "$MR_CACHE_FILE" 2>/dev/null
+    fi
+}
+
+# Save MR info to cache
+save_mr_to_cache() {
+    local ticket_key="$1"
+    local mr_url="$2"
+    local branch="$3"
+    init_mr_cache
+    local tmp_file=$(mktemp)
+    jq --arg key "$ticket_key" --arg url "$mr_url" --arg branch "$branch" \
+        '.[$key] = {url: $url, branch: $branch, created: now | todate}' \
+        "$MR_CACHE_FILE" > "$tmp_file" 2>/dev/null && mv "$tmp_file" "$MR_CACHE_FILE"
+}
+
+# Function to open URL in browser, preferring the SCM Firefox window if available
+open_url() {
+    local url="$1"
+    
+    # Try to find Firefox window with firefox_scm class using wmctrl
+    if command -v wmctrl &> /dev/null; then
+        local win_id=$(wmctrl -lx | grep -i "firefox_scm" | head -1 | awk '{print $1}')
+        if [ -n "$win_id" ]; then
+            # Found the SCM Firefox window - activate it and open URL there
+            wmctrl -i -a "$win_id"
+            firefox --new-tab "$url" 2>/dev/null &
+            return 0
+        fi
+    fi
+    
+    # Fallback to xdg-open (works for everyone)
+    if command -v xdg-open &> /dev/null; then
+        xdg-open "$url" >/dev/null 2>&1 &
+    elif command -v open &> /dev/null; then
+        open "$url" &
+    else
+        echo "$url"
+    fi
+}
+TICKETS_CACHE="$CACHE_DIR/tickets.json"
+SORT_ORDER_FILE="$CACHE_DIR/sort_order"
+CACHE_TTL=300  # 5 minutes
+DRY_RUN=false
+DEFAULT_LABELS="front-end"  # Default labels to add to new tickets
+DEFAULT_SORT="updated DESC"  # Default sort order
+
+# Parse command line arguments
+while [[ "$#" -gt 0 ]]; do
+    case $1 in
+        --dry-run) DRY_RUN=true; shift ;;
+        --labels) DEFAULT_LABELS="$2"; shift 2 ;;
+        *) break ;;
+    esac
+done
+
+# Find fzf - check multiple locations
+if [ -x "$HOME/.zsh/fzf/bin/fzf" ]; then
+    FZF="$HOME/.zsh/fzf/bin/fzf"
+elif command -v fzf &> /dev/null; then
+    FZF="fzf"
+else
+    echo "Error: fzf not found. Please install fzf first."
+    exit 1
+fi
+
+# Add vim-style scroll bindings to all fzf dialogs
+export FZF_DEFAULT_OPTS="${FZF_DEFAULT_OPTS} --bind 'ctrl-d:half-page-down,ctrl-u:half-page-up'"
+
+# Find editor - prefer nvim, fallback to vim or vi
+if command -v nvim &> /dev/null; then
+    EDITOR="nvim"
+elif command -v vim &> /dev/null; then
+    EDITOR="vim"
+else
+    EDITOR="vi"
+fi
+
+# Ensure cache directory exists
+mkdir -p "$CACHE_DIR"
+
+# Check required tools
+for tool in jq curl; do
+    if ! command -v $tool &> /dev/null; then
+        echo "Error: $tool is required but not installed"
+        exit 1
+    fi
+done
+
+# Check Jira credentials
+if [ -z "$JIRA_EMAIL" ] || [ -z "$JIRA_API_TOKEN" ]; then
+    echo "Error: JIRA_EMAIL and JIRA_API_TOKEN must be set in $SCRIPT_DIR/.env"
+    exit 1
+fi
+
+# Function to call Jira API (v3)
+jira_api() {
+    local endpoint="$1"
+    curl -s -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
+        "https://${JIRA_DOMAIN}/rest/api/3/${endpoint}" \
+        -H "Content-Type: application/json"
+}
+
+# Function to call Jira API with POST (v3)
+jira_api_post() {
+    local endpoint="$1"
+    local data="$2"
+    curl -s -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
+        -X POST \
+        "https://${JIRA_DOMAIN}/rest/api/3/${endpoint}" \
+        -H "Content-Type: application/json" \
+        -d "$data"
+}
+
+# Function to get current user's name (cached)
+get_current_user() {
+    local cache_file="$CACHE_DIR/current_user.txt"
+    
+    # Check cache validity
+    if [ -f "$cache_file" ]; then
+        local cache_age=$(($(date +%s) - $(stat -c %Y "$cache_file" 2>/dev/null || echo 0)))
+        if [ $cache_age -lt 86400 ]; then  # Cache for 24 hours
+            cat "$cache_file"
+            return
+        fi
+    fi
+    
+    # Fetch current user
+    local response=$(jira_api "myself")
+    local name=$(echo "$response" | jq -r '.displayName // empty' 2>/dev/null)
+    
+    if [ -n "$name" ]; then
+        echo "$name" > "$cache_file"
+        echo "$name"
+    fi
+}
+
+# Function to get all tickets (cached) - WITH PAGINATION
+get_all_tickets() {
+    local force_refresh="$1"
+    
+    # Check cache validity
+    if [ "$force_refresh" != "true" ] && [ -f "$TICKETS_CACHE" ]; then
+        local cache_age=$(($(date +%s) - $(stat -c %Y "$TICKETS_CACHE" 2>/dev/null || echo 0)))
+        if [ $cache_age -lt $CACHE_TTL ]; then
+            cat "$TICKETS_CACHE"
+            return
+        fi
+    fi
+    
+    # Get sort order
+    local sort_order="$DEFAULT_SORT"
+    if [ -f "$SORT_ORDER_FILE" ]; then
+        sort_order=$(cat "$SORT_ORDER_FILE")
+    fi
+    
+    # Fetch fresh data with pagination - API limits to 100 per page
+    local jql="project=${JIRA_PROJECT} ORDER BY ${sort_order}"
+    local jql_encoded=$(echo "$jql" | jq -sRr @uri)
+    local all_issues="[]"
+    local next_page_token=""
+    local page=0
+    local max_pages=10  # Fetch up to 1000 tickets (10 pages × 100)
+    
+    while [ $page -lt $max_pages ]; do
+        local url="https://${JIRA_DOMAIN}/rest/api/3/search/jql?jql=${jql_encoded}&maxResults=100&fields=summary,status,priority,assignee,issuetype,created,updated"
+        if [ -n "$next_page_token" ]; then
+            url="${url}&nextPageToken=${next_page_token}"
+        fi
+        
+        local response=$(curl -s -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" "$url")
+        
+        if [ $? -ne 0 ] || ! echo "$response" | jq -e '.issues' >/dev/null 2>&1; then
+            if [ $page -eq 0 ]; then
+                echo "Error fetching tickets" >&2
+                echo "$response" | jq '.' >&2
+                return 1
+            fi
+            break
+        fi
+        
+        # Append issues to all_issues
+        all_issues=$(echo "$all_issues" $(echo "$response" | jq '.issues') | jq -s 'add')
+        
+        # Check if there are more pages
+        local is_last=$(echo "$response" | jq -r '.isLast // true')
+        if [ "$is_last" = "true" ]; then
+            break
+        fi
+        
+        next_page_token=$(echo "$response" | jq -r '.nextPageToken // empty')
+        if [ -z "$next_page_token" ]; then
+            break
+        fi
+        
+        page=$((page + 1))
+    done
+    
+    # Create combined response
+    local combined=$(jq -n --argjson issues "$all_issues" '{issues: $issues}')
+    echo "$combined" > "$TICKETS_CACHE"
+    echo "$combined"
+}
+
+# Function to format ticket for display
+format_ticket() {
+    local ticket="$1"
+    local me_name="$2"
+    local key=$(echo "$ticket" | jq -r '.key')
+    local summary=$(echo "$ticket" | jq -r '.fields.summary')
+    local status=$(echo "$ticket" | jq -r '.fields.status.name')
+    local type=$(echo "$ticket" | jq -r '.fields.issuetype.name')
+    local priority=$(echo "$ticket" | jq -r '.fields.priority.name // "None"')
+    local assignee=$(echo "$ticket" | jq -r '.fields.assignee.displayName // "Unassigned"')
+    
+    # Check if this ticket has a cached MR
+    local mr_indicator=" "
+    if [ -f "$MR_CACHE_FILE" ]; then
+        local cached_mr=$(jq -r ".\"$key\".url // empty" "$MR_CACHE_FILE" 2>/dev/null)
+        if [ -n "$cached_mr" ]; then
+            mr_indicator="⎇"  # Branch symbol to indicate MR exists
+        fi
+    fi
+    
+    # Truncate fields for display - optimized column order
+    # MR: 1 char (indicator)
+    # Key: 7 chars (UB-XXXX)
+    # Assignee: 12 chars (first - who's working on it)
+    # Status: 15 chars (second - what state it's in)
+    # Summary: 100 chars (last - more space available)
+    local key_display=$(printf "%-7s" "$key")
+    
+    # Shorten assignee to first name if it has spaces
+    local assignee_short="$assignee"
+    if [[ "$assignee" == *" "* ]]; then
+        assignee_short=$(echo "$assignee" | awk '{print $1}')
+    fi
+    
+    # Convert to uppercase and lowercase
+    local status_upper=$(echo "$status" | tr "[:lower:]" "[:upper:]")
+    local assignee_lower=$(echo "$assignee_short" | tr "[:upper:]" "[:lower:]")
+    
+    # Determine assignee color (256-color palette)
+    local assignee_color="\033[2m"  # dim gray for unassigned
+    if [ "$assignee_lower" != "unassigned" ]; then
+        if [ -n "$me_name" ] && [ "$(echo "$assignee" | tr "[:upper:]" "[:lower:]")" = "$(echo "$me_name" | tr "[:upper:]" "[:lower:]")" ]; then
+            assignee_color="\033[38;5;141m"  # Mellow purple for me
+        else
+            assignee_color="\033[0m"  # White for others
+        fi
+    fi
+    
+    local status_display=$(printf "%-15s" "$status_upper")
+    local assignee_display=$(printf "%-12.12s" "@$assignee_lower")
+    local summary_display=$(printf "%-100.100s" "$summary")
+    
+    # Color code based on status (256-color palette for mellow tones)
+    # Order: MR | Key | Assignee | Status | Summary
+    local mr_color="\033[38;5;81m"  # Cyan for MR indicator
+    case "$(echo "$status" | tr "[:upper:]" "[:lower:]")" in
+        *done*|*closed*|*resolved*|*abandoned*)
+            printf "\033[2;38;5;244m%s\033[0m \033[2;38;5;244m%s\033[0m │ \033[2;38;5;244m%s\033[0m │ \033[2;38;5;244m%s\033[0m │ \033[2;38;5;244m%s\033[0m\n" \
+                "$mr_indicator" "$key_display" "$assignee_display" "$status_display" "$summary_display"
+            ;;
+        *progress*|*dev*)
+            printf "%b%s\033[0m \033[38;5;109m%s\033[0m │ %b%s\033[0m │ \033[38;5;221m%s\033[0m │ %s\n" \
+                "$mr_color" "$mr_indicator" "$key_display" "$assignee_color" "$assignee_display" "$status_display" "$summary_display"
+            ;;
+        *review*|*mr*|*qa*)
+            printf "%b%s\033[0m \033[38;5;109m%s\033[0m │ %b%s\033[0m │ \033[38;5;81m%s\033[0m │ %s\n" \
+                "$mr_color" "$mr_indicator" "$key_display" "$assignee_color" "$assignee_display" "$status_display" "$summary_display"
+            ;;
+        *todo*|*open*|*backlog*)
+            printf "%b%s\033[0m \033[38;5;109m%s\033[0m │ %b%s\033[0m │ \033[38;5;250m%s\033[0m │ %s\n" \
+                "$mr_color" "$mr_indicator" "$key_display" "$assignee_color" "$assignee_display" "$status_display" "$summary_display"
+            ;;
+        *blocked*)
+            printf "%b%s\033[0m \033[38;5;109m%s\033[0m │ %b%s\033[0m │ \033[38;5;167m%s\033[0m │ %s\n" \
+                "$mr_color" "$mr_indicator" "$key_display" "$assignee_color" "$assignee_display" "$status_display" "$summary_display"
+            ;;
+        *)
+            printf "%b%s\033[0m \033[38;5;109m%s\033[0m │ %b%s\033[0m │ \033[0m%s\033[0m │ %s\n" \
+                "$mr_color" "$mr_indicator" "$key_display" "$assignee_color" "$assignee_display" "$status_display" "$summary_display"
+            ;;
+    esac
+}
+
+# Function to get recent branches that don't have Jira ticket patterns
+get_recent_branches_without_tickets() {
+    local project_dir=$(get_project_dir)
+    if [ -z "$project_dir" ]; then
+        return
+    fi
+    
+    local max_branches="${1:-10}"
+    
+    # Get branches sorted by most recent commit, excluding ones with ticket patterns
+    git -C "$project_dir" for-each-ref \
+        --sort=-committerdate \
+        --format='%(refname:short)|%(committerdate:relative)|%(subject)' \
+        refs/heads/ 2>/dev/null | \
+        grep -vE "^(main|master|develop|dev|release|hotfix)$" | \
+        grep -viE "^${JIRA_PROJECT}-[0-9]+" | \
+        head -n "$max_branches"
+}
+
+# Function to format branch for display (optimized - no MR check for speed)
+format_branch() {
+    local branch_line="$1"
+    local branch=$(echo "$branch_line" | cut -d'|' -f1)
+    local date_rel=$(echo "$branch_line" | cut -d'|' -f2)
+    local subject=$(echo "$branch_line" | cut -d'|' -f3-)
+    
+    # Format: 🌿branch | date | subject
+    # Note: MR status is checked in the preview for the selected branch (for speed)
+    local branch_display=$(printf "🌿%-20.20s" "$branch")
+    local date_display=$(printf "%-12.12s" "$date_rel")
+    local subject_display=$(printf "%-90.90s" "$subject")
+    
+    # Branch entries get a distinct green color scheme
+    printf "  \033[38;5;114m%s\033[0m │ \033[38;5;250m%s\033[0m │ %s\n" \
+        "$branch_display" "$date_display" "$subject_display"
+}
+
+# Function to search tickets by text query via API
+search_tickets_by_query() {
+    local query="$1"
+    
+    # If query is empty or too short, skip API search
+    if [ -z "$query" ] || [ ${#query} -lt 3 ]; then
+        echo '{"issues": []}'
+        return 0
+    fi
+    
+    # Build JQL for text search
+    local jql="project=${JIRA_PROJECT} AND text ~ \"${query}*\" ORDER BY updated DESC"
+    local jql_encoded=$(echo "$jql" | jq -sRr @uri)
+    
+    # Fetch search results (limit to 50 to keep it fast)
+    local response=$(curl -s --max-time 5 -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
+        "https://${JIRA_DOMAIN}/rest/api/3/search/jql?jql=${jql_encoded}&maxResults=50&fields=summary,status,priority,assignee,issuetype,created,updated" 2>/dev/null)
+    
+    if [ $? -ne 0 ] || ! echo "$response" | jq -e '.issues' >/dev/null 2>&1; then
+        # On error, return empty results
+        echo '{"issues": []}'
+        return 0
+    fi
+    
+    echo "$response"
+}
+
+# Function to generate ticket list
+generate_ticket_list() {
+    local force_refresh="$1"
+    local search_query="$2"
+    
+    # Print header with search status
+    print_header "$search_query"
+    
+    local tickets=$(get_all_tickets "$force_refresh")
+    
+    if [ $? -ne 0 ]; then
+        echo "Failed to fetch tickets"
+        return 1
+    fi
+    
+    # Get current user name once
+    local me_name=$(get_current_user)
+    
+    # Buffer all output to avoid flickering during reload
+    local output=""
+    
+    # Display cached tickets
+    while read -r ticket; do
+        output+="$(format_ticket "$ticket" "$me_name")"$'\n'
+    done < <(echo "$tickets" | jq -c '.issues[]')
+    
+    # If there's a search query, fetch additional results from API and append at bottom
+    if [ -n "$search_query" ] && [[ "$search_query" != @* ]]; then
+        local search_results=$(search_tickets_by_query "$search_query")
+        
+        # Filter out tickets already in cache to avoid duplicates
+        local new_tickets=$(echo "$tickets" "$search_results" | jq -s '
+            (.[0].issues | map(.key)) as $cached_keys |
+            .[1].issues | map(select(.key as $k | $cached_keys | index($k) | not))
+        ')
+        
+        # If we found new tickets, add them to the cache permanently
+        local new_count=$(echo "$new_tickets" | jq 'length')
+        if [ "$new_count" -gt 0 ]; then
+            # Append to cache file (do this in background to not block display)
+            (
+                local updated_cache=$(echo "$tickets" "$new_tickets" | jq -s '
+                    {issues: (.[0].issues + .[1])}
+                ')
+                echo "$updated_cache" > "$TICKETS_CACHE"
+            ) &
+            
+            # Add separator and results
+            output+=$'\n'"\033[2;38;5;244m──────────────────────────────────────── Found ${new_count} additional results ────────────────────────────────────────\033[0m"$'\n'
+            
+            # Display the new tickets at the bottom
+            while read -r ticket; do
+                output+="$(format_ticket "$ticket" "$me_name")"$'\n'
+            done < <(echo "$new_tickets" | jq -c '.[]')
+        fi
+    fi
+    
+    # Add recent branches without Jira tickets
+    local branches=$(get_recent_branches_without_tickets 15)
+    if [ -n "$branches" ]; then
+        output+=$'\n'"\033[2;38;5;244m──────────────────────────────────────── Recent branches (no ticket) ────────────────────────────────────────\033[0m"$'\n'
+        
+        while IFS= read -r branch_line; do
+            if [ -n "$branch_line" ]; then
+                output+="$(format_branch "$branch_line")"$'\n'
+            fi
+        done <<< "$branches"
+    fi
+    
+    # Output everything at once
+    printf "%s" "$output"
+}
+
+
+# Function to create a new ticket interactively
+# This now delegates to the standalone create-jira-ticket script
+create_ticket_interactive() {
+    local initial_summary="$1"
+    
+    # Clear screen for clean output
+    clear >&2
+    
+    # Build arguments for create-jira-ticket
+    local args=()
+    if [ "$DRY_RUN" = true ]; then
+        args+=(--dry-run)
+    fi
+    if [ -n "$DEFAULT_LABELS" ]; then
+        args+=(--labels "$DEFAULT_LABELS")
+    fi
+    if [ -n "$initial_summary" ]; then
+        args+=(--summary "$initial_summary")
+    fi
+    
+    # Call the standalone create-jira-ticket script
+    if command -v create-jira-ticket &> /dev/null; then
+        create-jira-ticket "${args[@]}" < /dev/tty > /dev/tty 2>&1
+    else
+        printf "\033[38;5;167m  ✗ Error: create-jira-ticket not found in PATH\033[0m\n" >&2
+        printf "\033[2m  Make sure ~/bin is in your PATH\033[0m\n" >&2
+        sleep 2
+        return 1
+    fi
+    
+    echo "" >&2
+    printf "\033[2mPress Enter to continue...\033[0m" >&2
+    read < /dev/tty
+}
+
+# Function to create a Merge Request for a ticket or branch
+# This now delegates to the standalone publish-changes script
+create_mr_interactive() {
+    local line="$1"
+    # Extract ticket key - it's the second field (first is MR indicator ⎇ or space)
+    local key=$(echo "$line" | sed 's/\x1b\[[0-9;]*m//g' | awk '{print $2}')
+    # If second field isn't a ticket, try first field (for lines without MR indicator)
+    if ! [[ "$key" =~ ^${JIRA_PROJECT}-[0-9]+$ ]]; then
+        key=$(echo "$line" | sed 's/\x1b\[[0-9;]*m//g' | awk '{print $1}')
+    fi
+    local branch_arg=""
+    
+    # Clear screen for clean output
+    clear >&2
+    
+    # Check if this is a branch entry (no ticket)
+    if [[ "$line" == *"🌿"* ]]; then
+        local branch_from_entry=$(echo "$line" | grep -oE '🌿[^ ]+' | sed 's/🌿//')
+        branch_arg="--branch $branch_from_entry"
+        key=""  # No Jira ticket
+    elif ! [[ "$key" =~ ^${JIRA_PROJECT}-[0-9]+$ ]]; then
+        echo "" >&2
+        printf "\033[38;5;167m  ✗ Error: No valid ticket or branch selected\033[0m\n" >&2
+        printf "\033[2m  Select a ticket or branch first, then press Ctrl+G\033[0m\n" >&2
+        sleep 2
+        return 1
+    fi
+    
+    # Get project directory (cached or prompt user to select)
+    local project_dir=$(get_project_dir)
+    if [ -z "$project_dir" ]; then
+        project_dir=$(select_project_dir)
+        if [ -z "$project_dir" ]; then
+            return 1
+        fi
+    fi
+    
+    # Change to the project directory for git operations
+    cd "$project_dir" || {
+        printf "\033[38;5;167m  ✗ Error: Could not access project directory: %s\033[0m\n" "$project_dir" >&2
+        rm -f "$CACHE_DIR/project_dir"
+        sleep 2
+        return 1
+    }
+    
+    # Call the standalone publish-changes script
+    if [ -n "$key" ]; then
+        publish-changes $branch_arg "$key"
+    else
+        publish-changes $branch_arg --no-jira
+    fi
+    
+    echo "" >&2
+    printf "\033[2mPress Enter to continue...\033[0m\n" >&2
+    read < /dev/tty
+}
+
+# Function to show copy dialog and copy selected format
+copy_ticket_dialog() {
+    local line="$1"
+    # Extract ticket key - it's the second field (first is MR indicator ⎇ or space)
+    local key=$(echo "$line" | sed 's/\x1b\[[0-9;]*m//g' | awk '{print $2}')
+    # If second field isn't a ticket, try first field (for lines without MR indicator)
+    if ! [[ "$key" =~ ^${JIRA_PROJECT}-[0-9]+$ ]]; then
+        key=$(echo "$line" | sed 's/\x1b\[[0-9;]*m//g' | awk '{print $1}')
+    fi
+    
+    # Clear screen for clean output
+    clear >&2
+    
+    if [[ "$key" =~ ^${JIRA_PROJECT}-[0-9]+$ ]]; then
+        local url="https://${JIRA_DOMAIN}/browse/$key"
+        
+        # Get ticket summary from cache if available
+        local summary=""
+        if [ -f "$TICKETS_CACHE" ]; then
+            summary=$(jq -r ".issues[] | select(.key == \"$key\") | .fields.summary // empty" "$TICKETS_CACHE" 2>/dev/null)
+        fi
+        
+        # Show copy format options
+        local copy_options="Ticket Key ($key)
+URL ($url)
+Markdown Link ([$key]($url))"
+        
+        if [ -n "$summary" ]; then
+            copy_options="${copy_options}
+Key + Summary ($key: $summary)
+Markdown Link with Summary ([$key: $summary]($url))"
+        fi
+        
+        local choice=$(echo "$copy_options" | $FZF \
+            --prompt="  📋 Copy Format > " \
+            --height=12 \
+            --reverse \
+            --border=rounded \
+            --header="Select format to copy")
+        
+        if [ -n "$choice" ]; then
+            local to_copy=""
+            case "$choice" in
+                "Ticket Key"*)
+                    to_copy="$key"
+                    ;;
+                "URL"*)
+                    to_copy="$url"
+                    ;;
+                "Markdown Link with Summary"*)
+                    to_copy="[$key: $summary]($url)"
+                    ;;
+                "Markdown Link"*)
+                    to_copy="[$key]($url)"
+                    ;;
+                "Key + Summary"*)
+                    to_copy="$key: $summary"
+                    ;;
+            esac
+            
+            if [ -n "$to_copy" ]; then
+                # Copy to clipboard
+                if command -v xclip &> /dev/null; then
+                    echo -n "$to_copy" | xclip -selection clipboard
+                    echo "✓ Copied to clipboard: $to_copy" >&2
+                else
+                    echo "$to_copy" >&2
+                    echo "⚠ xclip not found - Text printed above" >&2
+                fi
+            fi
+        fi
+    elif [[ "$line" == *"🌿"* ]]; then
+        # This is a branch entry - extract branch name
+        local branch=$(echo "$line" | grep -oE '🌿[^ ]+' | sed 's/🌿//')
+        
+        if [ -n "$branch" ]; then
+            local project_dir=$(get_project_dir)
+            local mr_url=""
+            
+            if [ -n "$project_dir" ] && command -v glab &> /dev/null; then
+                mr_url=$(cd "$project_dir" && glab mr view "$branch" 2>/dev/null | grep -oE 'https://[^ ]+/merge_requests/[0-9]+' | head -1)
+            fi
+            
+            # Show copy format options for branch
+            local copy_options="Branch name ($branch)"
+            if [ -n "$mr_url" ]; then
+                copy_options="${copy_options}
+MR URL ($mr_url)
+Markdown Link ([$branch]($mr_url))"
+            fi
+            
+            local choice=$(echo "$copy_options" | $FZF \
+                --prompt="  📋 Copy Format > " \
+                --height=8 \
+                --reverse \
+                --border=rounded \
+                --header="Select format to copy")
+            
+            if [ -n "$choice" ]; then
+                local to_copy=""
+                case "$choice" in
+                    "Branch name"*)
+                        to_copy="$branch"
+                        ;;
+                    "MR URL"*)
+                        to_copy="$mr_url"
+                        ;;
+                    "Markdown Link"*)
+                        to_copy="[$branch]($mr_url)"
+                        ;;
+                esac
+                
+                if [ -n "$to_copy" ]; then
+                    if command -v xclip &> /dev/null; then
+                        echo -n "$to_copy" | xclip -selection clipboard
+                        echo "✓ Copied to clipboard: $to_copy" >&2
+                    else
+                        echo "$to_copy" >&2
+                        echo "⚠ xclip not found - Text printed above" >&2
+                    fi
+                fi
+            fi
+        fi
+    fi
+}
+
+# Helper function to fetch MR URL from ticket comments or GitLab search
+# Sets global _FETCHED_MR_URL on success
+fetch_mr_url_for_ticket() {
+    local ticket_key="$1"
+    _FETCHED_MR_URL=""
+    
+    printf "\n  \033[2m◌ Checking Jira comments for MR link...\033[0m" >&2
+    
+    # Fetch comments
+    local comments=$(curl -s -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
+        "https://${JIRA_DOMAIN}/rest/api/3/issue/${ticket_key}/comment" 2>/dev/null)
+    
+    # Look for GitLab merge request URLs in comments - use tail -1 to get most recent
+    _FETCHED_MR_URL=$(echo "$comments" | grep -oE 'https://[^"]+/merge_requests/[0-9]+' | tail -1)
+    
+    if [ -n "$_FETCHED_MR_URL" ]; then
+        printf "\r  \033[38;5;114m✓\033[0m Found MR in Jira comments: %s\033[K\n" "$_FETCHED_MR_URL" >&2
+        return 0
+    fi
+    
+    printf "\r  \033[38;5;244m○\033[0m No MR link in Jira comments\033[K\n" >&2
+    
+    # No MR in comments - try searching GitLab for open MRs mentioning this ticket
+    printf "  \033[2m◌ Searching GitLab for open MRs mentioning '%s'...\033[0m" "$ticket_key" >&2
+    
+    if ! command -v glab &> /dev/null; then
+        printf "\r  \033[38;5;167m✗\033[0m glab CLI not installed - cannot search GitLab\033[K\n" >&2
+        printf "\n  \033[2mNo MR found. Press Enter to continue...\033[0m" >&2
+        read < /dev/tty
+        return 1
+    fi
+    
+    local project_dir=$(get_project_dir 2>/dev/null)
+    if [ -z "$project_dir" ]; then
+        printf "\r  \033[38;5;167m✗\033[0m No project directory configured - cannot search GitLab\033[K\n" >&2
+        printf "\n  \033[2mNo MR found. Press Enter to continue...\033[0m" >&2
+        read < /dev/tty
+        return 1
+    fi
+    
+    # Search for open MRs with the ticket key in title or source branch
+    printf "\r  \033[2m◌ Running: glab mr list --state=opened\033[0m\033[K\n" >&2
+    local mr_json=$(cd "$project_dir" && glab mr list --state=opened -F json 2>/dev/null)
+    local mr_count=$(echo "$mr_json" | jq 'length' 2>/dev/null || echo "0")
+    
+    if [ -z "$mr_json" ] || [ "$mr_json" = "null" ] || [ "$mr_json" = "[]" ]; then
+        printf "  \033[38;5;244m○\033[0m No open MRs found in repository\033[K\n" >&2
+        printf "\n  \033[38;5;167m✗ No MR found for %s\033[0m\n" "$ticket_key" >&2
+        printf "  \033[2mPress Enter to continue...\033[0m" >&2
+        read < /dev/tty
+        return 1
+    fi
+    
+    printf "  \033[2m◌ Searching %s open MRs for '%s' in title or branch...\033[0m" "$mr_count" "$ticket_key" >&2
+    
+    # Look for MRs where title or source_branch contains the ticket key (case-insensitive)
+    local ticket_lower=$(echo "$ticket_key" | tr '[:upper:]' '[:lower:]')
+    _FETCHED_MR_URL=$(echo "$mr_json" | jq -r --arg key "$ticket_lower" '
+        .[] | select(
+            (.title | ascii_downcase | contains($key)) or
+            (.source_branch | ascii_downcase | contains($key))
+        ) | .web_url
+    ' 2>/dev/null | head -1)
+    
+    if [ -n "$_FETCHED_MR_URL" ] && [ "$_FETCHED_MR_URL" != "null" ]; then
+        printf "\r  \033[38;5;114m✓\033[0m Found open MR matching '%s': %s\033[K\n" "$ticket_key" "$_FETCHED_MR_URL" >&2
+        return 0
+    fi
+    
+    printf "\r  \033[38;5;244m○\033[0m No open MRs match '%s' in title or branch\033[K\n" "$ticket_key" >&2
+    printf "\n  \033[38;5;167m✗ No MR found for %s\033[0m\n" "$ticket_key" >&2
+    printf "  \033[2mSearched: Jira comments + %s open GitLab MRs\033[0m\n" "$mr_count" >&2
+    printf "  \033[2mPress Enter to continue...\033[0m" >&2
+    read < /dev/tty
+    return 1
+}
+
+# Function to open ticket in browser
+open_ticket() {
+    local line="$1"
+    # Extract ticket key - it's the second field (first is MR indicator ⎇ or space)
+    local key=$(echo "$line" | sed 's/\x1b\[[0-9;]*m//g' | awk '{print $2}')
+    # If second field isn't a ticket, try first field (for lines without MR indicator)
+    if ! [[ "$key" =~ ^${JIRA_PROJECT}-[0-9]+$ ]]; then
+        key=$(echo "$line" | sed 's/\x1b\[[0-9;]*m//g' | awk '{print $1}')
+    fi
+    
+    # Clear screen for clean output
+    clear >&2
+    
+    if [[ "$key" =~ ^${JIRA_PROJECT}-[0-9]+$ ]]; then
+        local jira_url="https://${JIRA_DOMAIN}/browse/$key"
+        local mr_url=""
+        
+        local url_to_open=""
+        
+        # Show options dialog immediately - MR lookup happens lazily when needed
+        local options="Jira ticket
+MR
+MR (diff)
+MR (pipelines)
+MR (latest pipeline)
+Both (MR + Jira ticket)"
+        local choice=$(echo "$options" | $FZF \
+            --prompt="  🔗 Open > " \
+            --height=11 \
+            --reverse \
+            --border=rounded \
+            --header="$key - Choose what to open")
+        
+        case "$choice" in
+            "MR (diff)")
+                if fetch_mr_url_for_ticket "$key"; then
+                    mr_url="$_FETCHED_MR_URL"
+                    url_to_open="${mr_url}/diffs"
+                else
+                    printf "  \033[2mOpening Jira ticket instead...\033[0m\n" >&2
+                    url_to_open="$jira_url"
+                fi
+                ;;
+            "MR")
+                if fetch_mr_url_for_ticket "$key"; then
+                    mr_url="$_FETCHED_MR_URL"
+                    url_to_open="${mr_url}"
+                else
+                    printf "  \033[2mOpening Jira ticket instead...\033[0m\n" >&2
+                    url_to_open="$jira_url"
+                fi
+                ;;
+            "MR (pipelines)")
+                if fetch_mr_url_for_ticket "$key"; then
+                    mr_url="$_FETCHED_MR_URL"
+                    url_to_open="${mr_url}/pipelines"
+                else
+                    printf "  \033[2mOpening Jira ticket instead...\033[0m\n" >&2
+                    url_to_open="$jira_url"
+                fi
+                ;;
+            "MR (latest pipeline)")
+                if ! fetch_mr_url_for_ticket "$key"; then
+                    printf "  \033[2mOpening Jira ticket instead...\033[0m\n" >&2
+                    url_to_open="$jira_url"
+                else
+                    mr_url="$_FETCHED_MR_URL"
+                    # Get latest pipeline URL using glab
+                    echo "" >&2
+                    local pipeline_url=""
+                    local pipeline_fell_back=false
+                    if command -v glab &> /dev/null; then
+                        local project_dir=$(get_project_dir 2>/dev/null)
+                        if [ -n "$project_dir" ]; then
+                            cd "$project_dir" 2>/dev/null
+                            # Extract MR IID
+                            local mr_iid=$(echo "$mr_url" | grep -oE 'merge_requests/[0-9]+' | grep -oE '[0-9]+')
+                            
+                            # Get branch using JSON output for reliable parsing
+                            printf "  \033[2m$ glab mr view %s -F json\033[0m\n" "$mr_iid" >&2
+                            local mr_json=$(glab mr view "$mr_iid" -F json 2>&1)
+                            local branch=$(echo "$mr_json" | jq -r '.source_branch // empty' 2>/dev/null)
+                            
+                            if [ -n "$branch" ] && [ "$branch" != "null" ]; then
+                                printf "  \033[38;5;114m✓\033[0m Source branch: %s\n" "$branch" >&2
+                                printf "  \033[2m$ glab ci list --ref=\"%s\" -F json\033[0m\n" "$branch" >&2
+                                local ci_json=$(glab ci list --ref="$branch" -F json 2>&1)
+                                pipeline_url=$(echo "$ci_json" | jq -r '.[0].web_url // empty' 2>/dev/null)
+                                
+                                if [ -n "$pipeline_url" ] && [ "$pipeline_url" != "null" ]; then
+                                    printf "  \033[38;5;114m✓\033[0m Found pipeline: %s\n" "$pipeline_url" >&2
+                                    
+                                    # Try to find incomplete job to navigate directly to it
+                                    # Only if there's exactly 1 incomplete job and all others are success
+                                    local pipeline_id=$(echo "$ci_json" | jq -r '.[0].id // empty')
+                                    if [ -n "$pipeline_id" ]; then
+                                        printf "  \033[2m$ glab api projects/:id/pipelines/%s/jobs\033[0m\n" "$pipeline_id" >&2
+                                        local jobs_json=$(glab api "projects/:id/pipelines/${pipeline_id}/jobs" 2>/dev/null)
+                                        
+                                        # Count jobs by status (excluding manual jobs)
+                                        local total_jobs=$(echo "$jobs_json" | jq 'length')
+                                        local success_count=$(echo "$jobs_json" | jq '[.[] | select(.status == "success")] | length')
+                                        local manual_count=$(echo "$jobs_json" | jq '[.[] | select(.status == "manual")] | length')
+                                        local incomplete_jobs=$(echo "$jobs_json" | jq -c '[.[] | select(.status == "running" or .status == "pending" or .status == "failed")]')
+                                        local incomplete_count=$(echo "$incomplete_jobs" | jq 'length')
+                                        
+                                        printf "  \033[2m  jobs: %s total, %s success, %s manual, %s incomplete\033[0m\n" "$total_jobs" "$success_count" "$manual_count" "$incomplete_count" >&2
+                                        
+                                        # Jump to job if exactly 1 incomplete and all others are success/manual
+                                        local expected_complete=$((success_count + manual_count + 1))
+                                        if [ "$incomplete_count" -eq 1 ] && [ "$expected_complete" -eq "$total_jobs" ]; then
+                                            local incomplete_job=$(echo "$incomplete_jobs" | jq -r '.[0].web_url // empty')
+                                            local job_name=$(echo "$incomplete_jobs" | jq -r '.[0].name // empty')
+                                            local job_status=$(echo "$incomplete_jobs" | jq -r '.[0].status // empty')
+                                            printf "  \033[38;5;114m✓\033[0m All others complete → jumping to %s job: %s\n" "$job_status" "$job_name" >&2
+                                            url_to_open="$incomplete_job"
+                                        else
+                                            url_to_open="$pipeline_url"
+                                        fi
+                                    else
+                                        url_to_open="$pipeline_url"
+                                    fi
+                                else
+                                    printf "  \033[38;5;167m✗ No pipeline found for branch: %s\033[0m\n" "$branch" >&2
+                                    printf "  \033[2mResponse: %s\033[0m\n" "$(echo "$ci_json" | head -c 200)" >&2
+                                    url_to_open="${mr_url}/pipelines"
+                                    pipeline_fell_back=true
+                                fi
+                            else
+                                printf "  \033[38;5;167m✗ Could not get source_branch from MR JSON\033[0m\n" >&2
+                                printf "  \033[2mResponse: %s\033[0m\n" "$(echo "$mr_json" | head -c 300)" >&2
+                                url_to_open="${mr_url}/pipelines"
+                                pipeline_fell_back=true
+                            fi
+                        else
+                            printf "  \033[38;5;167m✗ No project directory configured\033[0m\n" >&2
+                            url_to_open="${mr_url}/pipelines"
+                            pipeline_fell_back=true
+                        fi
+                    else
+                        printf "  \033[38;5;167m✗ glab not installed\033[0m\n" >&2
+                        url_to_open="${mr_url}/pipelines"
+                        pipeline_fell_back=true
+                    fi
+                    
+                    printf "\n  \033[2mOpening: %s\033[0m\n" "$url_to_open" >&2
+                    if [ "$pipeline_fell_back" = true ]; then
+                        printf "\n  \033[2mPress Enter to continue...\033[0m" >&2
+                        read < /dev/tty
+                    fi
+                fi
+                ;;
+            "Jira ticket")
+                url_to_open="$jira_url"
+                ;;
+            "Both (MR + Jira ticket)")
+                if fetch_mr_url_for_ticket "$key"; then
+                    mr_url="$_FETCHED_MR_URL"
+                    open_url "${mr_url}/diffs"
+                    sleep 0.2
+                    open_url "$jira_url"
+                    echo "✓ Opened MR diff and Jira ticket" >&2
+                else
+                    open_url "$jira_url"
+                    echo "✓ Opened Jira ticket (no MR found)" >&2
+                fi
+                return
+                ;;
+            *)
+                return
+                ;;
+        esac
+        
+        if [ -n "$url_to_open" ]; then
+            # Copy to clipboard
+            if command -v xclip &> /dev/null; then
+                echo -n "$url_to_open" | xclip -selection clipboard
+            elif command -v wl-copy &> /dev/null; then
+                echo -n "$url_to_open" | wl-copy
+            fi
+            
+            # Open in browser (prefer SCM Firefox window)
+            open_url "$url_to_open"
+            echo "✓ Opened: $url_to_open" >&2
+        fi
+    elif [[ "$line" == *"🌿"* ]]; then
+        # This is a branch entry - extract branch name
+        local branch=$(echo "$line" | grep -oE '🌿[^ ]+' | sed 's/🌿//')
+        
+        if [ -z "$branch" ]; then
+            printf "\033[38;5;167m  ✗ Could not extract branch name\033[0m\n" >&2
+            sleep 2
+            return
+        fi
+        
+        local project_dir=$(get_project_dir)
+        if [ -z "$project_dir" ]; then
+            printf "\033[38;5;167m  ✗ No project directory configured\033[0m\n" >&2
+            sleep 2
+            return
+        fi
+        
+        # Show branch info
+        printf "\n" >&2
+        printf "  \033[38;5;109m╭──────────────────────────────────────╮\033[0m\n" >&2
+        printf "  \033[38;5;109m│\033[0m  \033[38;5;114m🌿 %s\033[0m%*s\033[38;5;109m│\033[0m\n" "$branch" $((32 - ${#branch})) "" >&2
+        printf "  \033[38;5;109m│\033[0m  \033[2m◌ Checking for MR...\033[0m               \033[38;5;109m│\033[0m\n" >&2
+        printf "  \033[38;5;109m╰──────────────────────────────────────╯\033[0m\n" >&2
+        
+        local mr_url=""
+        local mr_state=""
+        
+        if command -v glab &> /dev/null; then
+            local mr_info=$(cd "$project_dir" && glab mr view "$branch" 2>/dev/null)
+            if [ -n "$mr_info" ]; then
+                mr_url=$(echo "$mr_info" | grep -oE 'https://[^ ]+/merge_requests/[0-9]+' | head -1)
+                mr_state=$(echo "$mr_info" | grep "^state:" | sed 's/^state:[[:space:]]*//')
+            fi
+        fi
+        
+        clear >&2
+        
+        local url_to_open=""
+        
+        if [ -n "$mr_url" ]; then
+            # MR exists - show dialog with options
+            local options="MR
+MR (diff)
+MR (pipelines)
+MR (latest pipeline)"
+            local choice=$(echo "$options" | $FZF \
+                --prompt="  🔗 Open > " \
+                --height=10 \
+                --reverse \
+                --border=rounded \
+                --header="🌿 $branch ($mr_state)")
+            
+            case "$choice" in
+                "MR (diff)")
+                    url_to_open="${mr_url}/diffs"
+                    ;;
+                "MR")
+                    url_to_open="${mr_url}"
+                    ;;
+                "MR (pipelines)")
+                    url_to_open="${mr_url}/pipelines"
+                    ;;
+                "MR (latest pipeline)")
+                    # Get latest pipeline URL
+                    cd "$project_dir" 2>/dev/null
+                    local ci_json=$(glab ci list --ref="$branch" -F json 2>&1)
+                    local pipeline_url=$(echo "$ci_json" | jq -r '.[0].web_url // empty' 2>/dev/null)
+                    if [ -n "$pipeline_url" ] && [ "$pipeline_url" != "null" ]; then
+                        url_to_open="$pipeline_url"
+                    else
+                        url_to_open="${mr_url}/pipelines"
+                    fi
+                    ;;
+                *)
+                    return
+                    ;;
+            esac
+        else
+            # No MR - offer to create one or just show info
+            printf "\n  \033[38;5;244mNo MR found for branch: %s\033[0m\n" "$branch" >&2
+            printf "  \033[2mUse Ctrl+G to create a merge request\033[0m\n\n" >&2
+            printf "  \033[2mPress Enter to return...\033[0m" >&2
+            read < /dev/tty
+            return
+        fi
+        
+        if [ -n "$url_to_open" ]; then
+            # Copy to clipboard
+            if command -v xclip &> /dev/null; then
+                echo -n "$url_to_open" | xclip -selection clipboard
+            elif command -v wl-copy &> /dev/null; then
+                echo -n "$url_to_open" | wl-copy
+            fi
+            
+            open_url "$url_to_open"
+            echo "✓ Opened: $url_to_open" >&2
+        fi
+    fi
+}
+
+# Function to print header
+print_header() {
+    local search_query="$1"
+    local search_status=""
+    
+    if [ -n "$search_query" ]; then
+        search_status=" \033[38;5;109m🔍 '\033[1m${search_query}\033[0m\033[38;5;109m'\033[0m"
+    fi
+    
+    if [ "$DRY_RUN" = true ]; then
+    printf "\033[38;5;109m╭────────────────────────────────────────────────────────────────────────────────╮\033[0m\n"
+    printf "\033[38;5;109m│\033[0m \033[38;5;141mJira\033[0m \033[38;5;81m%s\033[0m \033[38;5;167m[DRY RUN]\033[0m%b%-56s\033[38;5;109m│\033[0m\n" "${JIRA_PROJECT}" "$search_status" ""
+    printf "\033[38;5;109m├────────────────────────────────────────────────────────────────────────────────┤\033[0m\n"
+    printf "\033[38;5;109m│\033[0m \033[38;5;114m<CR>\033[0m prev \033[38;5;114m<C-y>\033[0m cpy \033[38;5;114m<C-o>\033[0m open \033[38;5;114m<C-t>\033[0m new \033[38;5;114m<C-g>\033[0m MR \033[38;5;114m<C-c>\033[0m co \033[38;5;114m<C-s>\033[0m srt \033[38;5;114m<C-r>\033[0m rfsh \033[38;5;114mq\033[0m cls \033[38;5;109m│\033[0m\n"
+    printf "\033[38;5;109m╰────────────────────────────────────────────────────────────────────────────────╯\033[0m\n"
+    else
+    printf "\033[38;5;109m╭────────────────────────────────────────────────────────────────────────────────╮\033[0m\n"
+    printf "\033[38;5;109m│\033[0m \033[38;5;141mJira\033[0m \033[38;5;81m%s\033[0m%b%-67s\033[38;5;109m│\033[0m\n" "${JIRA_PROJECT}" "$search_status" ""
+    printf "\033[38;5;109m├────────────────────────────────────────────────────────────────────────────────┤\033[0m\n"
+    printf "\033[38;5;109m│\033[0m \033[38;5;114m<CR>\033[0m prev \033[38;5;114m<C-y>\033[0m cpy \033[38;5;114m<C-o>\033[0m open \033[38;5;114m<C-t>\033[0m new \033[38;5;114m<C-g>\033[0m MR \033[38;5;114m<C-c>\033[0m co \033[38;5;114m<C-s>\033[0m srt \033[38;5;114m<C-r>\033[0m rfsh \033[38;5;114mq\033[0m cls \033[38;5;109m│\033[0m\n"
+    printf "\033[38;5;109m╰────────────────────────────────────────────────────────────────────────────────╯\033[0m\n"
+    fi
+    printf "\n"
+}
+
+# Function to switch to a branch associated with a ticket or branch entry
+switch_to_branch_interactive() {
+    local line="$1"
+    # Extract ticket key - it's the second field (first is MR indicator ⎇ or space)
+    local key=$(echo "$line" | sed 's/\x1b\[[0-9;]*m//g' | awk '{print $2}')
+    # If second field isn't a ticket, try first field (for lines without MR indicator)
+    if ! [[ "$key" =~ ^${JIRA_PROJECT}-[0-9]+$ ]]; then
+        key=$(echo "$line" | sed 's/\x1b\[[0-9;]*m//g' | awk '{print $1}')
+    fi
+    local target_branch=""
+    
+    # Clear screen for clean output
+    clear >&2
+    
+    # Check if this is a branch entry (🌿)
+    if [[ "$line" == *"🌿"* ]]; then
+        target_branch=$(echo "$line" | grep -oE '🌿[^ ]+' | sed 's/🌿//')
+    elif [[ "$key" =~ ^${JIRA_PROJECT}-[0-9]+$ ]]; then
+        # This is a ticket - find matching branch
+        target_branch="$key"
+    else
+        echo "" >&2
+        printf "\033[38;5;167m  ✗ Error: No valid ticket or branch selected\033[0m\n" >&2
+        printf "\033[2m  Select a ticket or branch first, then press Ctrl+B\033[0m\n" >&2
+        sleep 2
+        return 1
+    fi
+    
+    # Get project directory
+    local project_dir=$(get_project_dir)
+    if [ -z "$project_dir" ]; then
+        project_dir=$(select_project_dir)
+        if [ -z "$project_dir" ]; then
+            return 1
+        fi
+    fi
+    
+    # Change to project directory
+    cd "$project_dir" || {
+        printf "\033[38;5;167m  ✗ Error: Could not access project directory: %s\033[0m\n" "$project_dir" >&2
+        rm -f "$CACHE_DIR/project_dir"
+        sleep 2
+        return 1
+    }
+    
+    local current_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+    
+    # If target is a ticket key, find a matching branch
+    local found_branch=""
+    if [[ "$target_branch" =~ ^${JIRA_PROJECT}-[0-9]+$ ]]; then
+        # Look for branches containing this ticket key
+        local matching_branches=$(git branch --format='%(refname:short)' 2>/dev/null | grep -i "$target_branch")
+        local branch_count=$(echo "$matching_branches" | grep -c .)
+        
+        if [ "$branch_count" -eq 0 ] || [ -z "$matching_branches" ]; then
+            printf "\033[38;5;167m  ✗ No branch found containing '%s'\033[0m\n" "$target_branch" >&2
+            printf "\033[2m  Create a branch for this ticket first\033[0m\n" >&2
+            sleep 2
+            return 1
+        elif [ "$branch_count" -eq 1 ]; then
+            found_branch="$matching_branches"
+        else
+            # Multiple branches - let user select
+            echo "" >&2
+            printf "\033[38;5;221m  ⚠ Multiple branches found for %s:\033[0m\n" "$target_branch" >&2
+            found_branch=$(echo "$matching_branches" | $FZF \
+                --prompt="  🌿 Select branch > " \
+                --height=10 \
+                --reverse \
+                --border=rounded \
+                --header="Select branch for $target_branch")
+            
+            if [ -z "$found_branch" ]; then
+                printf "\033[2m  Cancelled\033[0m\n" >&2
+                sleep 1
+                return 1
+            fi
+        fi
+        target_branch="$found_branch"
+    fi
+    
+    # Check if already on target branch
+    if [ "$current_branch" = "$target_branch" ]; then
+        echo "" >&2
+        printf "\033[38;5;114m  ✓ Already on branch '%s'\033[0m\n" "$target_branch" >&2
+        sleep 1
+        return 0
+    fi
+    
+    # Fancy header
+    echo "" >&2
+    printf "\033[38;5;141m╔══════════════════════════════════════════════════════════════╗\033[0m\n" >&2
+    printf "\033[38;5;141m║\033[0m          \033[38;5;109m🌿  Switch to Branch\033[0m                             \033[38;5;141m║\033[0m\n" >&2
+    printf "\033[38;5;141m╚══════════════════════════════════════════════════════════════╝\033[0m\n" >&2
+    echo "" >&2
+    printf "  \033[38;5;109mFrom:\033[0m   %s\n" "$current_branch" >&2
+    printf "  \033[38;5;109mTo:\033[0m     %s\n" "$target_branch" >&2
+    echo "" >&2
+    
+    # Check for unstaged or uncommitted changes
+    local has_changes=false
+    local staged_count=0
+    local unstaged_count=0
+    local untracked_count=0
+    
+    staged_count=$(git diff --cached --name-only 2>/dev/null | wc -l)
+    unstaged_count=$(git diff --name-only 2>/dev/null | wc -l)
+    untracked_count=$(git ls-files --others --exclude-standard 2>/dev/null | wc -l)
+    
+    local total_changes=$((staged_count + unstaged_count + untracked_count))
+    
+    if [ "$total_changes" -gt 0 ]; then
+        has_changes=true
+        printf "\033[38;5;221m  ⚠ Uncommitted changes detected:\033[0m\n" >&2
+        [ "$staged_count" -gt 0 ] && printf "    • %d staged file(s)\n" "$staged_count" >&2
+        [ "$unstaged_count" -gt 0 ] && printf "    • %d modified file(s)\n" "$unstaged_count" >&2
+        [ "$untracked_count" -gt 0 ] && printf "    • %d untracked file(s)\n" "$untracked_count" >&2
+        echo "" >&2
+        
+        # Run wip command
+        printf "  \033[2mRunning: wip\033[0m\n" >&2
+        
+        if command -v wip &> /dev/null; then
+            local wip_output=$(wip 2>&1)
+            local wip_exit=$?
+            
+            if [ $wip_exit -eq 0 ]; then
+                printf "\033[38;5;114m  ✓ WIP commit created for %d file(s)\033[0m\n" "$total_changes" >&2
+                
+                # Show the commit that was created
+                local last_commit=$(git log -1 --oneline 2>/dev/null)
+                printf "    \033[2m%s\033[0m\n" "$last_commit" >&2
+            else
+                printf "\033[38;5;167m  ✗ WIP command failed:\033[0m\n" >&2
+                printf "    %s\n" "$wip_output" >&2
+                sleep 2
+                return 1
+            fi
+        else
+            printf "\033[38;5;167m  ✗ 'wip' command not found in PATH\033[0m\n" >&2
+            printf "\033[2m  Cannot safely switch branches with uncommitted changes\033[0m\n" >&2
+            sleep 2
+            return 1
+        fi
+        echo "" >&2
+    fi
+    
+    # Perform the checkout
+    printf "  \033[2mRunning: git checkout %s\033[0m\n" "$target_branch" >&2
+    
+    local checkout_output=$(git checkout "$target_branch" 2>&1)
+    local checkout_exit=$?
+    
+    if [ $checkout_exit -eq 0 ]; then
+        printf "\033[38;5;114m  ✓ Switched to branch '%s'\033[0m\n" "$target_branch" >&2
+        
+        # Show branch status
+        local ahead_behind=$(git rev-list --left-right --count origin/"$target_branch"...HEAD 2>/dev/null)
+        if [ -n "$ahead_behind" ]; then
+            local behind=$(echo "$ahead_behind" | awk '{print $1}')
+            local ahead=$(echo "$ahead_behind" | awk '{print $2}')
+            if [ "$behind" -gt 0 ] || [ "$ahead" -gt 0 ]; then
+                printf "    \033[2m↓%d ↑%d compared to origin\033[0m\n" "$behind" "$ahead" >&2
+            fi
+        fi
+    else
+        printf "\033[38;5;167m  ✗ Checkout failed:\033[0m\n" >&2
+        printf "    %s\n" "$checkout_output" >&2
+        sleep 2
+        return 1
+    fi
+    
+    echo "" >&2
+    printf "\033[2mPress Enter to continue...\033[0m" >&2
+    read
+}
+
+# Handle --generate-list for fzf reload
+if [ "$1" = "--generate-list" ]; then
+    generate_ticket_list "$2" "$3"
+    exit 0
+fi
+
+# Handle --create-ticket for fzf execute
+if [ "$1" = "--create-ticket" ]; then
+    shift
+    # Inherit settings from parent if set via environment
+    if [ -n "$JIRA_FZF_DRY_RUN" ]; then
+        DRY_RUN="$JIRA_FZF_DRY_RUN"
+    fi
+    if [ -n "${JIRA_FZF_DEFAULT_LABELS+x}" ]; then
+        DEFAULT_LABELS="$JIRA_FZF_DEFAULT_LABELS"
+    fi
+    create_ticket_interactive "$@"
+    exit 0
+fi
+
+# Handle --open-ticket for fzf execute
+if [ "$1" = "--open-ticket" ]; then
+    shift
+    open_ticket "$@"
+    exit 0
+fi
+
+# Handle --copy-dialog for fzf execute
+if [ "$1" = "--copy-dialog" ]; then
+    shift
+    copy_ticket_dialog "$@"
+    exit 0
+fi
+
+# Handle --create-mr for fzf execute
+if [ "$1" = "--create-mr" ]; then
+    shift
+    create_mr_interactive "$@"
+    exit 0
+fi
+
+# Handle --switch-branch for fzf execute
+if [ "$1" = "--switch-branch" ]; then
+    shift
+    switch_to_branch_interactive "$@"
+    exit 0
+fi
+
+# Handle --sort-menu for fzf execute
+if [ "$1" = "--sort-menu" ]; then
+    # Clear screen for clean output
+    clear >&2
+    
+    # Show sort options
+    current_sort="updated DESC"
+    if [ -f "$SORT_ORDER_FILE" ]; then
+        current_sort=$(cat "$SORT_ORDER_FILE")
+    fi
+    
+    echo "Recently Updated" > /tmp/sort_options_$$
+    echo "Recently Created" >> /tmp/sort_options_$$
+    echo "Status" >> /tmp/sort_options_$$
+    echo "Priority" >> /tmp/sort_options_$$
+    echo "Assignee" >> /tmp/sort_options_$$
+    
+    selected=$(cat /tmp/sort_options_$$ | $FZF \
+        --prompt="Sort by > " \
+        --height=10 \
+        --reverse \
+        --border=rounded \
+        --header="Current: $(
+            case "$current_sort" in
+                "updated DESC") echo "Recently Updated" ;;
+                "created DESC") echo "Recently Created" ;;
+                "status ASC") echo "Status" ;;
+                "priority DESC") echo "Priority" ;;
+                "assignee ASC") echo "Assignee" ;;
+                *) echo "Unknown" ;;
+            esac
+        )")
+    
+    rm -f /tmp/sort_options_$$
+    
+    if [ -n "$selected" ]; then
+        case "$selected" in
+            "Recently Updated")
+                echo "updated DESC" > "$SORT_ORDER_FILE" ;;
+            "Recently Created")
+                echo "created DESC" > "$SORT_ORDER_FILE" ;;
+            "Status")
+                echo "status ASC" > "$SORT_ORDER_FILE" ;;
+            "Priority")
+                echo "priority DESC" > "$SORT_ORDER_FILE" ;;
+            "Assignee")
+                echo "assignee ASC" > "$SORT_ORDER_FILE" ;;
+        esac
+        # Invalidate cache to force refresh
+        rm -f "$TICKETS_CACHE"
+    fi
+    
+    exit 0
+fi
+
+# Export settings for subshells
+export JIRA_FZF_DRY_RUN="$DRY_RUN"
+export JIRA_FZF_DEFAULT_LABELS="$DEFAULT_LABELS"
+
+# Main interactive loop
+{
+    generate_ticket_list
+} | {
+    # Clean up state on start
+    rm -f "$CACHE_DIR/maximized"
+    fzp_run \
+    --prompt="🔍 Tickets & branches > " \
+    --preview='
+        # Extract key
+        key=$(echo {} | awk "{print \$1}" | sed "s/\x1b\[[0-9;]*m//g");
+        if [[ "$key" =~ ^'"${JIRA_PROJECT}"'-[0-9]+$ ]]; then
+            tmpfile="/tmp/jira-preview-${key}.json"
+            
+            # Check if we have recent cached data (within 60 seconds)
+            need_fetch=true
+            if [ -f "$tmpfile" ]; then
+                cache_age=$(($(date +%s) - $(stat -c %Y "$tmpfile" 2>/dev/null || echo 0)))
+                if [ $cache_age -lt 60 ]; then
+                    need_fetch=false
+                fi
+            fi
+            
+            if [ "$need_fetch" = true ]; then
+                # Show loading skeleton only on first fetch
+                (
+                    if [ -f "'"$CACHE_DIR"'/maximized" ]; then
+                        # Maximized loading skeleton - single column
+                        printf "\033[38;5;109m%s\033[0m\n" "$key"
+                        printf "\033[2mLoading summary...\033[0m\n\n"
+                        printf "Status:   \033[2m...\033[0m\n"
+                        printf "Type:     \033[2m...\033[0m\n"
+                        printf "Priority: \033[2m...\033[0m\n"
+                        printf "Assignee: \033[2m...\033[0m\n"
+                        printf "Reporter: \033[2m...\033[0m\n"
+                        printf "Created:  \033[2m...\033[0m\n"
+                        printf "Updated:  \033[2m...\033[0m\n\n"
+                        printf "\033[2mLoading description...\033[0m\n"
+                    else
+                        # Minimized loading skeleton - two column
+                        printf "\033[38;5;109m%-35s\033[0m │\n" "$key"
+                        printf "\033[2m%-35s\033[0m │ \033[2m%s\033[0m\n" "Loading summary..." "Loading..."
+                        printf "%-35s │\n" ""
+                        printf "Status:   \033[2m%-25s\033[0m │ \033[2m%s\033[0m\n" "..." "..."
+                        printf "Type:     \033[2m%-25s\033[0m │\n" "..."
+                        printf "Priority: \033[2m%-25s\033[0m │\n" "..."
+                        printf "Assignee: \033[2m%-25s\033[0m │\n" "..."
+                        printf "Reporter: \033[2m%-25s\033[0m │\n" "..."
+                        printf "Created:  \033[2m%-25s\033[0m │\n" "..."
+                        printf "Updated:  \033[2m%-25s\033[0m │\n" "..."
+                    fi
+                ) &
+                
+                # Fetch data
+                curl -s --max-time 10 -u "'"${JIRA_EMAIL}"':'"${JIRA_API_TOKEN}"'" \
+                    "https://'"${JIRA_DOMAIN}"'/rest/api/3/issue/${key}" \
+                    -H "Content-Type: application/json" \
+                    -o "$tmpfile" 2>/dev/null
+                
+                curl_exit=$?
+                wait
+                
+                # Clear loading state
+                printf "\033[2J\033[H"
+            else
+                # Data is cached, no loading state needed
+                curl_exit=0
+            fi
+            
+            if [ $curl_exit -ne 0 ]; then
+                rm -f "$tmpfile" 2>/dev/null
+                printf "\033[1;31m✗ Network Error\033[0m - Failed to fetch ${key}\n"
+                exit 0
+            fi
+            
+            if ! jq -e ".fields" "$tmpfile" >/dev/null 2>&1; then
+                error_msg=$(jq -r ".errorMessages[]? // .message? // \"Invalid response\"" "$tmpfile" 2>/dev/null)
+                printf "\033[1;31m✗ API Error:\033[0m %s\n" "$error_msg"
+                rm -f "$tmpfile" 2>/dev/null
+                exit 0
+            fi
+            
+            # Get current user name for comparison
+            me_response=$(curl -s --max-time 5 -u "'"${JIRA_EMAIL}"':'"${JIRA_API_TOKEN}"'" \
+                "https://'"${JIRA_DOMAIN}"'/rest/api/3/myself" 2>/dev/null)
+            me_name=$(echo "$me_response" | jq -r ".displayName // empty" 2>/dev/null)
+            
+            # Extract fields
+            summary=$(jq -r ".fields.summary // \"N/A\"" "$tmpfile" 2>/dev/null)
+            ticket_status=$(jq -r ".fields.status.name // \"N/A\"" "$tmpfile" 2>/dev/null)
+            issuetype=$(jq -r ".fields.issuetype.name // \"N/A\"" "$tmpfile" 2>/dev/null)
+            priority=$(jq -r ".fields.priority.name // \"None\"" "$tmpfile" 2>/dev/null)
+            assignee=$(jq -r ".fields.assignee.displayName // \"Unassigned\"" "$tmpfile" 2>/dev/null)
+            reporter=$(jq -r ".fields.reporter.displayName // \"Unknown\"" "$tmpfile" 2>/dev/null)
+            created=$(jq -r ".fields.created // \"N/A\"" "$tmpfile" 2>/dev/null | cut -dT -f1)
+            updated=$(jq -r ".fields.updated // \"N/A\"" "$tmpfile" 2>/dev/null | cut -dT -f1)
+            
+            # Status color (256-color palette for mellow tones)
+            status_color="\033[0m"
+            is_done=false
+            case "$(echo "$ticket_status" | tr "[:upper:]" "[:lower:]")" in
+                *done*|*closed*|*resolved*|*abandoned*)
+                    status_color="\033[2;38;5;244m"  # Dim gray
+                    is_done=true
+                    ;;
+                *progress*|*dev*)
+                    status_color="\033[38;5;221m" ;;  # Mellow yellow
+                *review*|*mr*|*qa*)
+                    status_color="\033[38;5;81m" ;;   # Mellow cyan
+                *blocked*)
+                    status_color="\033[38;5;167m" ;;  # Mellow red
+                *)
+                    status_color="\033[38;5;250m" ;;  # Light gray
+            esac
+            
+            # Priority color (256-color palette)
+            priority_color="\033[0m"
+            case "$(echo "$priority" | tr "[:upper:]" "[:lower:]")" in
+                *high*|*critical*|*blocker*)
+                    priority_color="\033[38;5;167m" ;;  # Mellow red
+                *medium*)
+                    priority_color="\033[38;5;173m" ;;  # Mellow orange
+                *low*)
+                    priority_color="\033[38;5;109m" ;;  # Mellow blue
+            esac
+            
+            # Convert to uppercase/lowercase
+            ticket_status=$(echo "$ticket_status" | tr "[:lower:]" "[:upper:]")
+            assignee=$(echo "$assignee" | tr "[:upper:]" "[:lower:]")
+            
+            # Assignee color (256-color palette)
+            assignee_color="\033[0m"
+            if [ "$assignee" = "unassigned" ]; then
+                assignee_color="\033[2;37m"  # dim gray for unassigned
+            elif [ -n "$me_name" ] && [ "$(echo "$me_name" | tr "[:upper:]" "[:lower:]")" = "$assignee" ]; then
+                assignee_color="\033[38;5;141m"  # Mellow purple for me
+                assignee="$assignee (me)"
+            else
+                assignee_color="\033[0m"  # White for others assigned
+            fi
+            
+            # Description
+            desc_type=$(jq -r "(.fields.description | type) // \"null\"" "$tmpfile" 2>/dev/null)
+            if [ "$desc_type" = "null" ]; then
+                desc_content="(No description)"
+            elif [ "$desc_type" = "string" ]; then
+                desc_content=$(jq -r ".fields.description" "$tmpfile" 2>/dev/null)
+            elif [ "$desc_type" = "object" ]; then
+                desc_content=$(jq -r ".fields.description | .. | select(.type? == \"text\") | .text" "$tmpfile" 2>/dev/null | sed "/^$/d")
+            else
+                desc_content="(View in browser for formatted content)"
+            fi
+            
+            # Calculate relative dates
+            created_epoch=$(date -d "$created" +%s 2>/dev/null || echo 0)
+            updated_epoch=$(date -d "$updated" +%s 2>/dev/null || echo 0)
+            now_epoch=$(date +%s)
+            
+            created_days=$(( (now_epoch - created_epoch) / 86400 ))
+            updated_days=$(( (now_epoch - updated_epoch) / 86400 ))
+            
+            if [ $created_days -lt 1 ]; then
+                created_rel="today"
+            elif [ $created_days -lt 7 ]; then
+                created_rel="${created_days}d ago"
+            elif [ $created_days -lt 30 ]; then
+                created_rel="$(( created_days / 7 ))w ago"
+            elif [ $created_days -lt 365 ]; then
+                created_rel="$(( created_days / 30 ))mo ago"
+            else
+                created_rel="$(( created_days / 365 ))y ago"
+            fi
+            
+            if [ $updated_days -lt 1 ]; then
+                updated_rel="today"
+            elif [ $updated_days -lt 7 ]; then
+                updated_rel="${updated_days}d ago"
+            elif [ $updated_days -lt 30 ]; then
+                updated_rel="$(( updated_days / 7 ))w ago"
+            elif [ $updated_days -lt 365 ]; then
+                updated_rel="$(( updated_days / 30 ))mo ago"
+            else
+                updated_rel="$(( updated_days / 365 ))y ago"
+            fi
+            
+            # Detect if we are in maximized mode
+            # In minimized mode (40%), show compact 2-column
+            # In maximized mode (95%), show full single-column
+            
+            # Apply dimming to done tickets
+            local dim_prefix=""
+            local dim_suffix=""
+            if [ "$is_done" = true ]; then
+                dim_prefix="\033[2;38;5;244m"
+                dim_suffix="\033[0m"
+            fi
+            
+            if [ -f "'"$CACHE_DIR"'/maximized" ]; then
+                # MAXIMIZED MODE - Single column, full content
+                printf "%b\033[38;5;109m%s\033[0m%b\n" "$dim_prefix" "$key" "$dim_suffix"
+                printf "%b%s%b\n\n" "$dim_prefix" "$summary" "$dim_suffix"
+                printf "%bStatus:   %b%s\033[0m%b\n" "$dim_prefix" "$status_color" "$ticket_status" "$dim_suffix"
+                printf "%bType:     %s%b\n" "$dim_prefix" "$issuetype" "$dim_suffix"
+                printf "%bPriority: %b%s\033[0m%b\n" "$dim_prefix" "$priority_color" "$priority" "$dim_suffix"
+                printf "%bAssignee: %b%s\033[0m%b\n" "$dim_prefix" "$assignee_color" "$assignee" "$dim_suffix"
+                printf "%bReporter: %s%b\n" "$dim_prefix" "$reporter" "$dim_suffix"
+                printf "%bCreated:  %s (%s)%b\n" "$dim_prefix" "$created" "$created_rel" "$dim_suffix"
+                printf "%bUpdated:  %s (%s)%b\n\n" "$dim_prefix" "$updated" "$updated_rel" "$dim_suffix"
+                printf "%b%s%b\n" "$dim_prefix" "$(printf "%80s" | tr " " "-")" "$dim_suffix"
+                printf "%b%s%b\n\n" "$dim_prefix" "$desc_content" "$dim_suffix"
+                printf "\033[2m🔗 https://%s/browse/%s\033[0m\n" "'"${JIRA_DOMAIN}"'" "$key"
+            else
+                # MINIMIZED MODE - Two column, compact
+                desc_wrapped=$(echo "$desc_content" | fold -s -w 70)
+                
+                printf "%b\033[38;5;109m%-35s\033[0m%b │\n" "$dim_prefix" "$key" "$dim_suffix"
+                printf "%b%-35s%b │ %b%s%b\n" "$dim_prefix" "$(echo "$summary" | head -c 35)" "$dim_suffix" "$dim_prefix" "$(echo "$desc_wrapped" | sed -n 1p)" "$dim_suffix"
+                printf "%b%-35s%b │ %b%s%b\n" "$dim_prefix" "" "$dim_suffix" "$dim_prefix" "$(echo "$desc_wrapped" | sed -n 2p)" "$dim_suffix"
+                printf "%bStatus:   %b%-25s\033[0m%b │ %b%s%b\n" "$dim_prefix" "$status_color" "$ticket_status" "$dim_suffix" "$dim_prefix" "$(echo "$desc_wrapped" | sed -n 3p)" "$dim_suffix"
+                printf "%bType:     %-25s%b │ %b%s%b\n" "$dim_prefix" "$issuetype" "$dim_suffix" "$dim_prefix" "$(echo "$desc_wrapped" | sed -n 4p)" "$dim_suffix"
+                printf "%bPriority: %b%-25s\033[0m%b │ %b%s%b\n" "$dim_prefix" "$priority_color" "$priority" "$dim_suffix" "$dim_prefix" "$(echo "$desc_wrapped" | sed -n 5p)" "$dim_suffix"
+                printf "%bAssignee: %b%-25s\033[0m%b │ %b%s%b\n" "$dim_prefix" "$assignee_color" "$assignee" "$dim_suffix" "$dim_prefix" "$(echo "$desc_wrapped" | sed -n 6p)" "$dim_suffix"
+                printf "%bReporter: %-25s%b │ %b%s%b\n" "$dim_prefix" "$reporter" "$dim_suffix" "$dim_prefix" "$(echo "$desc_wrapped" | sed -n 7p)" "$dim_suffix"
+                printf "%bCreated:  %-15s %-9s%b │ %b%s%b\n" "$dim_prefix" "$created" "($created_rel)" "$dim_suffix" "$dim_prefix" "$(echo "$desc_wrapped" | sed -n 8p)" "$dim_suffix"
+                printf "%bUpdated:  %-15s %-9s%b │ %b%s%b\n" "$dim_prefix" "$updated" "($updated_rel)" "$dim_suffix" "$dim_prefix" "$(echo "$desc_wrapped" | sed -n 9p)" "$dim_suffix"
+                printf "%b%-35s%b │ %b%s%b\n" "$dim_prefix" "" "$dim_suffix" "$dim_prefix" "$(echo "$desc_wrapped" | sed -n 10p)" "$dim_suffix"
+                
+                # Print remaining description lines
+                remaining_lines=$(echo "$desc_wrapped" | tail -n +11)
+                if [ -n "$remaining_lines" ]; then
+                    echo "$remaining_lines" | while IFS= read -r line; do
+                        printf "%b%-35s%b │ %b%s%b\n" "$dim_prefix" "" "$dim_suffix" "$dim_prefix" "$line" "$dim_suffix"
+                    done
+                fi
+                
+                printf "\n\033[2m🔗 https://%s/browse/%s\033[0m\n" "'"${JIRA_DOMAIN}"'" "$key"
+            fi
+            
+            rm -f "$tmpfile" 2>/dev/null
+        elif [[ "$key" == "🌿"* ]] || [[ $(echo {} | grep -c "🌿") -gt 0 ]]; then
+            # This is a branch entry - extract branch name
+            branch=$(echo {} | grep -oE "🌿[^ ]+" | sed "s/🌿//")
+            project_dir_file="'"$CACHE_DIR"'/project_dir"
+            project_dir=""
+            if [ -f "$project_dir_file" ]; then
+                project_dir=$(cat "$project_dir_file")
+            fi
+            
+            if [ -n "$project_dir" ] && [ -d "$project_dir" ]; then
+                printf "\033[38;5;114m🌿 %s\033[0m\n\n" "$branch"
+                
+                # Check for MR
+                if command -v glab &> /dev/null; then
+                    mr_info=$(cd "$project_dir" && glab mr view "$branch" 2>/dev/null)
+                    if [ -n "$mr_info" ]; then
+                        mr_url=$(echo "$mr_info" | grep -oE "https://[^ ]+/merge_requests/[0-9]+")
+                        mr_title=$(echo "$mr_info" | grep "^title:" | sed "s/^title:[[:space:]]*//")
+                        mr_state=$(echo "$mr_info" | grep "^state:" | sed "s/^state:[[:space:]]*//")
+                        
+                        if [ -n "$mr_url" ]; then
+                            printf "MR:       \033[38;5;81m%s\033[0m\n" "$mr_state"
+                            if [ -n "$mr_title" ]; then
+                                printf "Title:    %s\n" "$mr_title"
+                            fi
+                            printf "URL:      \033[2;4m%s\033[0m\n\n" "$mr_url"
+                        fi
+                    else
+                        printf "MR:       \033[38;5;244mNo MR found\033[0m\n\n"
+                    fi
+                fi
+                
+                printf "\033[38;5;109m─── Recent commits ───\033[0m\n\n"
+                git -C "$project_dir" log --oneline --graph --color=always "$branch" -15 2>/dev/null || echo "Could not read git log"
+            else
+                printf "\033[2mNo project directory configured\033[0m\n"
+            fi
+        else
+            printf "\033[2m← Select a ticket or branch to view details\033[0m\n"
+        fi
+    ' \
+    --preview-window=down:40% \
+    --bind 'ctrl-j:preview-down' \
+    --bind 'ctrl-k:preview-up' \
+    --bind "ctrl-r:reload($0 --generate-list true {q})" \
+    --bind "ctrl-s:execute($0 --sort-menu < /dev/tty > /dev/tty 2>&1)+reload($0 --generate-list true)" \
+    --bind "change:reload:sleep 0.3; $0 --generate-list false {q}" \
+    --bind "ctrl-t:execute($0 --create-ticket {q} < /dev/tty > /dev/tty 2>&1)+reload($0 --generate-list false)" \
+    --bind "ctrl-o:execute($0 --open-ticket {} < /dev/tty > /dev/tty 2>&1)" \
+    --bind "enter:transform:[ ! -f $CACHE_DIR/maximized ] && echo 'execute-silent(touch $CACHE_DIR/maximized)+change-preview-window(down:95%)+refresh-preview' || echo 'ignore'" \
+    --bind "esc:transform:[ -f $CACHE_DIR/maximized ] && echo 'execute-silent(rm -f $CACHE_DIR/maximized)+change-preview-window(down:40%)+refresh-preview' || echo 'ignore'" \
+    --bind "q:transform:[ -f $CACHE_DIR/maximized ] && echo 'execute-silent(rm -f $CACHE_DIR/maximized)+change-preview-window(down:40%)+refresh-preview' || echo 'ignore'" \
+    --bind "ctrl-y:execute($0 --copy-dialog {} < /dev/tty > /dev/tty 2>&1)" \
+    --bind "ctrl-g:execute($0 --create-mr {} < /dev/tty > /dev/tty 2>&1)" \
+    --bind "ctrl-c:execute($0 --switch-branch {} < /dev/tty > /dev/tty 2>&1)" \
+    --info=inline \
+    --pointer='▶' \
+    --marker='✓' \
+    --sync \
+    --header-lines=6
+}

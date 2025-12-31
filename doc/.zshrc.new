@@ -1,0 +1,294 @@
+# PLUGINS --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+# things that conflict with zsh-vi-mode
+function zvm_after_init() {
+    # allow ctrl space autosuggest accept with zsh-vi-mode
+    zvm_bindkey viins '^@' autosuggest-accept
+    
+    # FZF
+    # git clone https://github.com/junegunn/fzf/ ~/.zsh/fzf
+    export FZF_DEFAULT_COMMAND="ag --hidden --ignore .git -f -g \"\""
+    source ~/.zsh/fzf/shell/key-bindings.zsh
+    source ~/.zsh/fzf/shell/completion.zsh
+
+    # Atuin - must be in zvm_after_init to not get overwritten
+    bindkey '^R' undefined-key
+    eval "$(atuin init zsh)"
+    bindkey -M viins '^R' atuin-search
+    bindkey -M vicmd '^R' atuin-search
+
+    # k for simple up-line, but Ctrl+R opens atuin with current buffer
+    bindkey -M vicmd k up-line-or-history
+
+    # Tab for j triggers fzf zoxide search
+    _j_fzf_tab_widget() {
+        if [[ "$BUFFER" =~ ^j[[:space:]]* ]]; then
+            local query="${BUFFER#j }"
+            local dir
+            dir=$(zoxide query -ls | awk -v home="$HOME" '
+                {
+                    score = $1
+                    $1 = ""
+                    path = substr($0, 2)
+                    gsub("^" home, "~", path)
+                    
+                    # Split path into prefix (dim) and suffix (colored)
+                    n = split(path, parts, "/")
+                    if (n <= 2) {
+                        prefix = ""
+                        suffix = path
+                    } else {
+                        prefix = ""
+                        for (i = 1; i <= n - 2; i++) {
+                            prefix = prefix parts[i] "/"
+                        }
+                        suffix = parts[n-1] "/" parts[n]
+                    }
+                    
+                    # Orange/yellow gradient based on frecency score (bright → dim)
+                    if (score >= 50) color = "\033[38;5;214m"      # bright orange
+                    else if (score >= 20) color = "\033[38;5;208m" # orange
+                    else if (score >= 10) color = "\033[38;5;172m" # darker orange
+                    else if (score >= 5) color = "\033[38;5;130m"  # dim orange/brown
+                    else color = "\033[38;5;239m"                  # gray
+                    
+                    printf "\033[90m%s\033[0m%s%s\033[0m\n", prefix, color, suffix
+                }
+            ' | fzf \
+                --ansi \
+                --height 40% --reverse \
+                --query "$query" \
+                --bind 'ctrl-d:half-page-down,ctrl-u:half-page-up' \
+                --preview 'p=$(echo {} | sed "s/\x1b\[[0-9;]*m//g; s|^~|'"$HOME"'|"); eza -a --color=always "$p" 2>/dev/null || ls -la "$p" 2>/dev/null | head -n 30' \
+                --preview-window right:50%)
+            if [[ -n "$dir" ]]; then
+                # Strip ANSI codes and expand ~ back to full path
+                dir=$(echo "$dir" | sed 's/\x1b\[[0-9;]*m//g')
+                dir="${dir/#\~/$HOME}"
+                BUFFER="cd ${(q)dir}"
+                zle accept-line
+            else
+                zle reset-prompt
+            fi
+        else
+            zle expand-or-complete
+        fi
+    }
+    zle -N _j_fzf_tab_widget
+    bindkey -M viins '^I' _j_fzf_tab_widget
+}
+
+export FZF_PATH="$HOME/.zsh/fzf"
+
+# [[ ! "$PATH" =~ "autojump" ]] && export PATH="$PATH:$HOME/.zsh/autojump/bin"
+
+setopt HIST_IGNORE_SPACE
+
+# use antigen
+source ~/.zsh/antigen.zsh
+
+# p10k
+source ~/.zsh/powerlevel10k/powerlevel10k.zsh-theme
+
+ZSH_SYSTEM_CLIPBOARD_METHOD=tmux
+
+# wakatime
+# antigen bundle unixorn/fzf-zsh-plugin@main
+antigen bundle zsh-users/zsh-autosuggestions
+antigen bundle jeffreytse/zsh-vi-mode
+antigen bundle zsh-users/zsh-syntax-highlighting
+antigen bundle kutsan/zsh-system-clipboard
+antigen apply
+
+
+if [[ -r "${XDG_CACHE_HOME:-$HOME/.cache}/p10k-instant-prompt-${(%):-%n}.zsh" ]]; then
+    source "${XDG_CACHE_HOME:-$HOME/.cache}/p10k-instant-prompt-${(%):-%n}.zsh"
+fi
+
+setopt INC_APPEND_HISTORY
+
+export PYENV_ROOT="$HOME/.pyenv"
+[[ -d $PYENV_ROOT/bin ]] && export PATH="$PYENV_ROOT/bin:$PATH"
+if command -v pyenv >/dev/null 2>&1; then
+    eval "$(pyenv init - zsh)"
+    eval "$(pyenv init --path)"
+    eval "$(pyenv init -)"
+    eval "$(pyenv virtualenv-init -)"
+fi
+
+
+# INITIAL SETUP --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+# Enable colors and change prompt:
+autoload -U colors && colors
+PS1="%B%{$fg[red]%}[%{$fg[yellow]%}%n%{$fg[green]%}@%{$fg[blue]%}%M %{$fg[magenta]%}%~%{$fg[red]%}]%{$reset_color%}$%b "
+
+# Custom Variables
+EDITOR=nvim
+
+# History in cache directory:
+HISTSIZE=10000
+SAVEHIST=10000
+HISTFILE=~/.cache/zshhistory
+setopt appendhistory
+
+# Basic auto/tab complete:
+autoload -U compinit
+zstyle ':completion:*' menu select
+zmodload zsh/complist
+compinit
+_comp_options+=(globdots)               # Include hidden files.
+
+# Custom ZSH Binds
+bindkey '^ ' autosuggest-accept
+
+# Load aliases and shortcuts if existent.
+[ -f "$HOME/zsh/aliasrc" ] && source "$HOME/zsh/aliasrc"
+
+# ============================================================================
+# dev-workflow-tools integration
+# Git + Jira + GitLab workflow tools with fzf interfaces
+# ============================================================================
+if [[ -f "$HOME/bin/dev-workflow-tools/shell/dev-workflow.zsh" ]]; then
+    source "$HOME/bin/dev-workflow-tools/shell/dev-workflow.zsh"
+fi
+
+# typical ctrl-arrow behaviour
+bindkey ";5C" forward-word
+bindkey ";5D" backward-word
+
+# 10ms for key sequences
+KEYTIMEOUT=1
+
+# ALIASES --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+unsetopt nomatch
+
+# source $HOME/bin/personal/dr.zsh
+
+alias rw="reword"
+alias rs="rescreen"
+# alias ra="yazi"
+# alias rang="ranger"
+# alias ran="ranger"
+alias ls="lsd --icon never"
+alias copy="xclip -selection clipboard"
+alias dnf="sudo dnf"
+alias pacman="sudo pacman"
+alias mv="mv -vn"
+alias remobar="killall -9 xmobar; xmobar-top &; xmobar-main &"
+alias ls="eza -a"
+# alias ls='ls --color=auto'
+alias lsr="ls -ltr"
+alias lsar="ls -las modified"
+alias fn="sudo find . -name"
+alias itig="dof"
+alias ir="dof r"
+alias rr="dof r"
+alias ita="dof a"
+alias ta="dof a"
+alias it="dof"
+alias t="dof"
+alias s="dof s"
+# alias y="dof y"
+alias m="dof"
+alias cat="bat"
+
+alias LOWER="setxkbmap -option ctrl:nocaps && xcape -e '#66=Escape"
+alias lower="setxkbmap -option ctrl:nocaps && xcape -e '#66=Escape"
+
+alias lzd="lazydocker"
+
+# ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+if [ -d "$HOME/.zsh/powerlevel10k" ] && [ ! -f "$HOME/.zsh/powerlevel10k/.env" ]; then
+    cat <<EOF > $HOME/.zsh/powerlevel10k/.env
+P10K_WIZARD_CHOICE_STYLE=4
+P10K_WIZARD_CHOICE_COLOR_SCHEME=2
+P10K_WIZARD_CHOICE_NON_PERMANENT_CONTENT_LOCATION=2
+P10K_WIZARD_CHOICE_TIME=2
+P10K_WIZARD_CHOICE_HEIGHT=1
+P10K_WIZARD_CHOICE_SPACING=1
+P10K_WIZARD_CHOICE_TRANSIENT=y
+P10K_WIZARD_CHOICE_INSTANT_PROMPT_MODE=1
+P10K_WIZARD_CHOICE_APPLY_CHANGES=n
+EOF
+fi
+
+# source $HOME/.zsh/autojump/bin/autojump.zsh
+
+[ -f ~/.fzf.zsh ] && source ~/.fzf.zsh
+if [ -f "$HOME/.p10k.zsh" ]; then
+    source "$HOME/.p10k.zsh"
+else
+    p10k configure
+fi
+
+
+# Load Angular CLI autocompletion.
+# source <(ng completion script)
+
+# pnpm
+export PNPM_HOME="/home/kyle/.local/share/pnpm"
+case ":$PATH:" in
+  *":$PNPM_HOME:"*) ;;
+  *) export PATH="$PNPM_HOME:$PATH" ;;
+esac
+# pnpm end
+
+KEYTIMEOUT=1
+
+if [ -z $VIRTUAL_ENV ]; then
+    pyenv activate ulcli
+fi
+alias ul='python3 /home/kyle/work/repos/ul/tools/ulcli/main.py'
+alias ul-wip='python3 /home/kyle/work/repos/ul-alt/tools/ulcli/main.py'
+alias ulwip='ul-wip'
+alias ulcli='python3 /home/kyle/work/repos/ul-alt/tools/ulcli/main.py'
+alias ulog='python3 /home/kyle/work/repos/ul/tools/ulcli/main.py'
+
+export NVM_DIR="$HOME/.nvm"
+[ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"  # This loads nvm
+[ -s "$NVM_DIR/bash_completion" ] && \. "$NVM_DIR/bash_completion"  # This loads nvm bash_completion
+
+function ra() {
+    local tmp="$(mktemp -t "yazi-cwd.XXXXXX")" cwd
+    yazi "$@" --cwd-file="$tmp"
+    if cwd="$(command cat -- "$tmp")" && [ -n "$cwd" ] && [ "$cwd" != "$PWD" ]; then
+        builtin cd -- "$cwd"
+    fi
+    rm -f -- "$tmp"
+}
+
+source /home/kyle/.config/broot/launcher/bash/br
+
+. "$HOME/.atuin/bin/env"
+
+eval "$(zoxide init zsh)"
+alias j='z'
+# --- fzf + zoxide interactive jump ---
+zj() {
+    local dir
+    dir=$(zoxide query -l | fzf \
+        --height 20 --reverse \
+        --preview 'ls -la {} | head -n 50' \
+        --preview-window right:50%) || return
+    cd "$dir"
+}
+
+# alias j to interactive zoxide
+alias jj=zj
+
+
+# Disable Atuin's inline search (important)
+bindkey -r '^R'
+
+# # Bind Ctrl-R to Atuin fullscreen search
+# atuin-search-fullscreen-widget() {
+#   zle reset-prompt
+#   BUFFER="$(atuin search --fullscreen --cmd-only)"
+#   CURSOR=${#BUFFER}
+# }
+
+# zle -N atuin-search-fullscreen-widget
+# bindkey '^R' atuin-search-fullscreen-widget
+

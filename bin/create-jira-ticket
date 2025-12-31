@@ -1,0 +1,545 @@
+#!/usr/bin/env bash
+# Shared Jira ticket creation script
+# Used by jira-fzf, oneshot, and other tools
+#
+# Usage:
+#   create-jira-ticket                                    Interactive creation
+#   create-jira-ticket --summary "Fix bug"                Quick creation with summary
+#   create-jira-ticket --summary "..." --slack-url URL    Link to Slack thread
+#   create-jira-ticket --dry-run                          Test without creating
+#
+# Output:
+#   Prints JSON to stdout on success: {"key": "UB-1234", "summary": "Ticket summary"}
+#   Prints errors to stderr
+#   Exit code 0 on success, 1 on failure
+
+set -e
+
+# Load environment variables
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -f "$SCRIPT_DIR/.env" ]; then
+    source "$SCRIPT_DIR/.env"
+fi
+
+# Configuration
+JIRA_DOMAIN="${JIRA_DOMAIN:-urbanlogiq.atlassian.net}"
+JIRA_PROJECT="${JIRA_PROJECT:-UB}"
+CACHE_DIR="$HOME/.cache/jira-fzf"
+DRY_RUN=false
+DEFAULT_LABELS="front-end"
+
+# Parse command line arguments
+INITIAL_SUMMARY=""
+SLACK_URL=""
+USER_DESCRIPTION=""
+while [[ "$#" -gt 0 ]]; do
+    case $1 in
+        --dry-run) DRY_RUN=true; shift ;;
+        --summary) INITIAL_SUMMARY="$2"; shift 2 ;;
+        --slack-url) SLACK_URL="$2"; shift 2 ;;
+        --description) USER_DESCRIPTION="$2"; shift 2 ;;
+        --labels) DEFAULT_LABELS="$2"; shift 2 ;;
+        *) 
+            echo "Unknown argument: $1" >&2
+            exit 1
+            ;;
+    esac
+done
+
+# Find fzf
+if [ -x "$HOME/.zsh/fzf/bin/fzf" ]; then
+    FZF="$HOME/.zsh/fzf/bin/fzf"
+elif command -v fzf &> /dev/null; then
+    FZF="fzf"
+else
+    echo "Error: fzf not found" >&2
+    exit 1
+fi
+
+export FZF_DEFAULT_OPTS="${FZF_DEFAULT_OPTS} --bind 'ctrl-d:half-page-down,ctrl-u:half-page-up'"
+
+# Find editor
+if command -v nvim &> /dev/null; then
+    EDITOR="nvim"
+elif command -v vim &> /dev/null; then
+    EDITOR="vim"
+else
+    EDITOR="vi"
+fi
+
+# Check required tools
+for tool in jq curl; do
+    if ! command -v $tool &> /dev/null; then
+        echo "Error: $tool is required but not installed" >&2
+        exit 1
+    fi
+done
+
+# Check Jira credentials
+if [ -z "$JIRA_EMAIL" ] || [ -z "$JIRA_API_TOKEN" ]; then
+    echo "Error: JIRA_EMAIL and JIRA_API_TOKEN must be set in $SCRIPT_DIR/.env" >&2
+    exit 1
+fi
+
+# Function to call Jira API (v3)
+jira_api() {
+    local endpoint="$1"
+    curl -s -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
+        "https://${JIRA_DOMAIN}/rest/api/3/${endpoint}" \
+        -H "Content-Type: application/json"
+}
+
+# Function to call Jira API with POST (v3)
+jira_api_post() {
+    local endpoint="$1"
+    local data="$2"
+    curl -s -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
+        -X POST \
+        "https://${JIRA_DOMAIN}/rest/api/3/${endpoint}" \
+        -H "Content-Type: application/json" \
+        -d "$data"
+}
+
+# Function to get issue types from Jira
+get_issue_types() {
+    local response=$(jira_api "project/${JIRA_PROJECT}")
+    echo "$response" | jq -r '.issueTypes[].name' 2>/dev/null || echo -e "Story\nTask\nBug\nEpic"
+}
+
+# Function to get priorities from Jira (with Medium first as default)
+get_priorities() {
+    local response=$(jira_api "priority")
+    local priorities=$(echo "$response" | jq -r '.[].name' 2>/dev/null || echo -e "Highest\nHigh\nMedium\nLow\nLowest")
+    
+    # Reorder to put Medium first (as default)
+    echo "$priorities" | grep -x "Medium"
+    echo "$priorities" | grep -vx "Medium"
+}
+
+# Function to search for parent issues (Epics/Stories)
+get_parent_issues() {
+    local jql="project=${JIRA_PROJECT} AND (type=Epic OR type=Story) ORDER BY updated DESC"
+    local jql_encoded=$(echo "$jql" | jq -sRr @uri)
+    local response=$(curl -s -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
+        "https://${JIRA_DOMAIN}/rest/api/3/search/jql?jql=${jql_encoded}&maxResults=50&fields=summary,issuetype" 2>/dev/null)
+    
+    echo "None"
+    echo "$response" | jq -r '.issues[] | .key + " - " + .fields.summary' 2>/dev/null
+}
+
+# Function to get available labels (with default label guaranteed first)
+get_labels() {
+    local response=$(jira_api "label?maxResults=500")
+    local labels=$(echo "$response" | jq -r '.values[]' 2>/dev/null | sort -u)
+    
+    # Always put default label first in list
+    if [ -n "$DEFAULT_LABELS" ]; then
+        local default_label=$(echo "$DEFAULT_LABELS" | cut -d',' -f1)
+        # Remove it from the list if present, then add it at the top
+        labels=$(echo "$labels" | grep -vx "$default_label")
+        echo "$default_label"
+    fi
+    
+    echo "$labels"
+}
+
+# Function to get active sprints (returns most recent active sprint first, then "No sprint")
+get_sprints() {
+    # Get the board ID first (use Agile API)
+    local boards=$(curl -s -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
+        "https://${JIRA_DOMAIN}/rest/agile/1.0/board?projectKeyOrId=${JIRA_PROJECT}" 2>/dev/null)
+    local board_id=$(echo "$boards" | jq -r '.values[0].id' 2>/dev/null)
+    
+    if [ -z "$board_id" ] || [ "$board_id" = "null" ]; then
+        echo "0 - No sprint"
+        return
+    fi
+    
+    # Get active and future sprints
+    local sprints=$(curl -s -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
+        "https://${JIRA_DOMAIN}/rest/agile/1.0/board/${board_id}/sprint?state=active,future" 2>/dev/null)
+    
+    local sprint_list=$(echo "$sprints" | jq -r '.values[] | (.id|tostring) + " - " + .name + " (" + .state + ")"' 2>/dev/null)
+    
+    if [ -n "$sprint_list" ]; then
+        # Put active sprints first, then "No sprint"
+        echo "$sprint_list" | grep "(active)" || true
+        echo "$sprint_list" | grep -v "(active)" || true
+        echo "0 - No sprint"
+    else
+        echo "0 - No sprint"
+    fi
+}
+
+# ============================================================================
+# Main interactive ticket creation
+# ============================================================================
+
+mkdir -p "$CACHE_DIR"
+tmpdir="$CACHE_DIR/create_tmp"
+mkdir -p "$tmpdir"
+
+# Clear screen for clean output
+clear >&2
+
+# Fancy header with mellow colors
+echo "" >&2
+printf "\033[38;5;141m╔══════════════════════════════════════════════════════════════╗\033[0m\n" >&2
+if [ "$DRY_RUN" = true ]; then
+    printf "\033[38;5;141m║\033[0m  \033[38;5;109m🎫  Creating New Jira Ticket\033[0m  \033[38;5;167m[DRY RUN]\033[0m             \033[38;5;141m║\033[0m\n" >&2
+else
+    printf "\033[38;5;141m║\033[0m          \033[38;5;109m🎫  Creating New Jira Ticket\033[0m                   \033[38;5;141m║\033[0m\n" >&2
+fi
+printf "\033[38;5;141m╚══════════════════════════════════════════════════════════════╝\033[0m\n" >&2
+echo "" >&2
+
+# Step 1: Summary
+printf "\033[38;5;109m┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\033[0m\n" >&2
+printf "\033[38;5;109m┃\033[0m \033[38;5;81mStep 1/8:\033[0m Enter ticket summary                         \033[38;5;109m┃\033[0m\n" >&2
+printf "\033[38;5;109m┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\033[0m\n" >&2
+echo -n "  ✏️  " >&2
+summary=""
+read -e -i "$INITIAL_SUMMARY" summary < /dev/tty
+summary=$(echo "$summary" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+
+if [ -z "$summary" ]; then
+    echo "" >&2
+    printf "\033[38;5;167m  ✗ Cancelled: Summary cannot be empty\033[0m\n" >&2
+    rm -rf "$tmpdir"
+    exit 1
+fi
+
+# JSON-encode the summary to handle special characters
+summary_json=$(echo "$summary" | jq -Rs .)
+
+printf "  \033[38;5;114m✓\033[0m Summary: \033[0m%s\033[0m\n" "$summary" >&2
+echo "" >&2
+
+# Step 2: Issue Type
+printf "\033[38;5;109m┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\033[0m\n" >&2
+printf "\033[38;5;109m┃\033[0m \033[38;5;81mStep 2/8:\033[0m Select issue type                             \033[38;5;109m┃\033[0m\n" >&2
+printf "\033[38;5;109m┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\033[0m\n" >&2
+issue_type=$(get_issue_types | $FZF --prompt="  🏷️  Issue Type > " --height=12 --reverse --border=rounded)
+if [ -z "$issue_type" ]; then
+    echo "" >&2
+    printf "\033[38;5;167m  ✗ Cancelled\033[0m\n" >&2
+    rm -rf "$tmpdir"
+    exit 1
+fi
+printf "  \033[38;5;114m✓\033[0m Type: \033[0m%s\033[0m\n" "$issue_type" >&2
+echo "" >&2
+
+# Step 3: Priority (default to Medium - first in list)
+printf "\033[38;5;109m┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\033[0m\n" >&2
+printf "\033[38;5;109m┃\033[0m \033[38;5;81mStep 3/8:\033[0m Select priority \033[2m(default: Medium)\033[0m            \033[38;5;109m┃\033[0m\n" >&2
+printf "\033[38;5;109m┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\033[0m\n" >&2
+priority=$(get_priorities | $FZF --prompt="  ⚡ Priority > " --height=10 --reverse --border=rounded --header="Press Enter for default (Medium)")
+if [ -z "$priority" ]; then
+    priority="Medium"
+fi
+printf "  \033[38;5;114m✓\033[0m Priority: \033[0m%s\033[0m\n" "$priority" >&2
+echo "" >&2
+
+# Step 4: Parent Issue (optional, default: None)
+printf "\033[38;5;109m┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\033[0m\n" >&2
+printf "\033[38;5;109m┃\033[0m \033[38;5;81mStep 4/8:\033[0m Select parent issue \033[2m(default: None)\033[0m          \033[38;5;109m┃\033[0m\n" >&2
+printf "\033[38;5;109m┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\033[0m\n" >&2
+parent_line=$(get_parent_issues | $FZF --prompt="  🔗 Parent Issue > " --height=15 --reverse --border=rounded --header="Press Enter for no parent")
+parent_key=""
+if [ -n "$parent_line" ] && [ "$parent_line" != "None" ]; then
+    parent_key=$(echo "$parent_line" | awk '{print $1}')
+    printf "  \033[38;5;114m✓\033[0m Parent: \033[0m%s\033[0m\n" "$parent_key" >&2
+else
+    printf "  \033[38;5;114m✓\033[0m Parent: \033[2mNone\033[0m\n" >&2
+fi
+echo "" >&2
+
+# Step 5: Labels (default to front-end)
+printf "\033[38;5;109m┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\033[0m\n" >&2
+printf "\033[38;5;109m┃\033[0m \033[38;5;81mStep 5/8:\033[0m Select labels \033[2m(TAB=multi, default: $DEFAULT_LABELS)\033[0m \033[38;5;109m┃\033[0m\n" >&2
+printf "\033[38;5;109m┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\033[0m\n" >&2
+labels_input=$(get_labels | $FZF --prompt="  🏷️  Labels > " --height=15 --reverse --border=rounded --multi --bind 'tab:toggle+down' --header="TAB to select multiple, Enter to use default ($DEFAULT_LABELS)")
+labels=""
+if [ -n "$labels_input" ]; then
+    # Convert newline-separated labels to comma-separated
+    labels=$(echo "$labels_input" | tr '\n' ',' | sed 's/,$//')
+    printf "  \033[38;5;114m✓\033[0m Labels: \033[0m%s\033[0m\n" "$labels" >&2
+else
+    labels="$DEFAULT_LABELS"
+    printf "  \033[38;5;114m✓\033[0m Labels: \033[0m%s\033[0m\n" "$labels" >&2
+fi
+echo "" >&2
+
+# Step 6: Sprint (defaults to most recent active sprint)
+printf "\033[38;5;109m┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\033[0m\n" >&2
+printf "\033[38;5;109m┃\033[0m \033[38;5;81mStep 6/8:\033[0m Select sprint \033[2m(default: current active)\033[0m     \033[38;5;109m┃\033[0m\n" >&2
+printf "\033[38;5;109m┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\033[0m\n" >&2
+sprint_line=$(get_sprints | $FZF --prompt="  🏃 Sprint > " --height=12 --reverse --border=rounded --header="Press Enter for default")
+sprint_id=""
+if [ -n "$sprint_line" ]; then
+    sprint_id=$(echo "$sprint_line" | awk '{print $1}')
+    # Check if "No sprint" was selected (ID = 0)
+    if [ "$sprint_id" = "0" ]; then
+        sprint_id=""
+        printf "  \033[38;5;114m✓\033[0m Sprint: \033[2mNone\033[0m\n" >&2
+    else
+        printf "  \033[38;5;114m✓\033[0m Sprint: \033[0m%s\033[0m\n" "$(echo "$sprint_line" | cut -d' ' -f3-)" >&2
+    fi
+else
+    printf "  \033[38;5;114m✓\033[0m Sprint: \033[2mNone\033[0m\n" >&2
+fi
+echo "" >&2
+
+# Step 7: Description
+printf "\033[38;5;109m┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\033[0m\n" >&2
+printf "\033[38;5;109m┃\033[0m \033[38;5;81mStep 7/8:\033[0m Enter description \033[2m(save & quit to continue)\033[0m \033[38;5;109m┃\033[0m\n" >&2
+printf "\033[38;5;109m┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\033[0m\n" >&2
+
+# Pre-populate with user description if provided
+initial_desc=""
+if [ -n "$USER_DESCRIPTION" ]; then
+    initial_desc="$USER_DESCRIPTION"$'\n\n'
+fi
+
+cat > "$tmpdir/description" << EOFDESC
+# Enter ticket description below (lines starting with # will be removed)
+# 
+# Ticket: $summary
+# Type: $issue_type
+# Priority: $priority
+#
+# You can use Jira markup:
+# - *bold* _italic_ {{code}}
+# - h1. Heading
+# - * bullet points
+# - # numbered lists
+
+${initial_desc}
+EOFDESC
+
+$EDITOR "$tmpdir/description" < /dev/tty > /dev/tty 2>&1
+desc_text=$(grep -v '^#' "$tmpdir/description")
+desc_preview=$(echo "$desc_text" | head -c 50)
+
+# Convert plain text to Atlassian Document Format (ADF) for API v3
+# Split into paragraphs and create ADF structure
+description=$(echo "$desc_text" | jq -Rs 'split("\n\n") | map(select(length > 0)) | map({
+    type: "paragraph",
+    content: [
+        {
+            type: "text",
+            text: .
+        }
+    ]
+}) | {
+    type: "doc",
+    version: 1,
+    content: (if length > 0 then . else [{
+        type: "paragraph",
+        content: []
+    }] end)
+}')
+
+# Add Slack link if provided
+if [ -n "$SLACK_URL" ]; then
+    slack_paragraph=$(jq -n --arg url "$SLACK_URL" '{
+        type: "paragraph",
+        content: [
+            {type: "text", text: "Slack thread: "},
+            {type: "text", text: $url, marks: [{type: "link", attrs: {href: $url}}]}
+        ]
+    }')
+    description=$(echo "$description" | jq --argjson p "$slack_paragraph" '.content += [$p]')
+fi
+
+if [ ${#desc_preview} -gt 0 ]; then
+    printf "  \033[38;5;114m✓\033[0m Description: \033[2m%s...\033[0m\n" "${desc_preview}" >&2
+else
+    printf "  \033[38;5;114m✓\033[0m Description: \033[2m(empty)\033[0m\n" >&2
+fi
+echo "" >&2
+
+# Step 8: Assignee (defaults to current user)
+printf "\033[38;5;109m┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\033[0m\n" >&2
+printf "\033[38;5;109m┃\033[0m \033[38;5;81mStep 8/8:\033[0m Select assignee \033[2m(default: yourself)\033[0m         \033[38;5;109m┃\033[0m\n" >&2
+printf "\033[38;5;109m┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\033[0m\n" >&2
+# Try to get current user as default option (first in list)
+if [ -n "$JIRA_EMAIL" ]; then
+    me_response=$(jira_api "user/search?query=$(echo "$JIRA_EMAIL" | jq -sRr @uri)&maxResults=1")
+    me_name=$(echo "$me_response" | jq -r '.[0].displayName // empty')
+    if [ -n "$me_name" ]; then
+        echo "$me_name (me)" > "$tmpdir/assignee_options"
+        echo "Unassigned" >> "$tmpdir/assignee_options"
+    else
+        echo "Unassigned" > "$tmpdir/assignee_options"
+    fi
+else
+    echo "Unassigned" > "$tmpdir/assignee_options"
+fi
+assignee_name=$(cat "$tmpdir/assignee_options" | $FZF --prompt="  👤 Assignee > " --height=10 --reverse --border=rounded --header="Press Enter to assign to yourself" --print-query | tail -1)
+
+# Clean up assignee name
+assignee_name=$(echo "$assignee_name" | sed 's/ (me)$//')
+
+# Get assignee account ID if not "Unassigned"
+assignee_field=""
+if [ -n "$assignee_name" ] && [ "$assignee_name" != "Unassigned" ]; then
+    assignee_response=$(jira_api "user/search?query=$(echo "$assignee_name" | jq -sRr @uri)&maxResults=1")
+    assignee_id=$(echo "$assignee_response" | jq -r '.[0].accountId // empty')
+    if [ -n "$assignee_id" ]; then
+        assignee_field=", \"assignee\": {\"accountId\": \"$assignee_id\"}"
+        printf "  \033[38;5;114m✓\033[0m Assignee: \033[0m%s\033[0m\n" "$assignee_name" >&2
+    else
+        printf "  \033[38;5;114m✓\033[0m Assignee: \033[2mUnassigned (user not found)\033[0m\n" >&2
+    fi
+else
+    printf "  \033[38;5;114m✓\033[0m Assignee: \033[2mUnassigned\033[0m\n" >&2
+fi
+echo "" >&2
+
+# Get issue type ID
+printf "\033[38;5;141m╔══════════════════════════════════════════════════════════════╗\033[0m\n" >&2
+printf "\033[38;5;141m║\033[0m  \033[38;5;109mCreating ticket in Jira...\033[0m                               \033[38;5;141m║\033[0m\n" >&2
+printf "\033[38;5;141m╚══════════════════════════════════════════════════════════════╝\033[0m\n" >&2
+project_response=$(jira_api "project/${JIRA_PROJECT}")
+issuetype_id=$(echo "$project_response" | jq -r ".issueTypes[] | select(.name == \"$issue_type\") | .id")
+
+if [ -z "$issuetype_id" ]; then
+    echo "" >&2
+    printf "\033[38;5;167m  ✗ Error: Could not find issue type '%s'\033[0m\n" "$issue_type" >&2
+    rm -rf "$tmpdir"
+    exit 1
+fi
+
+# Get priority ID
+priority_response=$(jira_api "priority")
+priority_id=$(echo "$priority_response" | jq -r ".[] | select(.name == \"$priority\") | .id")
+
+if [ -z "$priority_id" ]; then
+    echo "" >&2
+    printf "\033[38;5;167m  ✗ Error: Could not find priority '%s'\033[0m\n" "$priority" >&2
+    rm -rf "$tmpdir"
+    exit 1
+fi
+
+# Build optional fields
+parent_field=""
+if [ -n "$parent_key" ]; then
+    parent_field=", \"parent\": {\"key\": \"$parent_key\"}"
+fi
+
+labels_field=""
+if [ -n "$labels" ]; then
+    # Convert comma-separated labels to JSON array
+    labels_json=$(echo "$labels" | tr ',' '\n' | jq -R . | jq -s .)
+    labels_field=", \"labels\": $labels_json"
+fi
+
+# Create the ticket
+payload=$(cat <<EOFPAYLOAD
+{
+  "fields": {
+    "project": {
+      "key": "$JIRA_PROJECT"
+    },
+    "summary": $summary_json,
+    "description": $description,
+    "issuetype": {
+      "id": "$issuetype_id"
+    },
+    "priority": {
+      "id": "$priority_id"
+    }
+    $assignee_field
+    $parent_field
+    $labels_field
+  }
+}
+EOFPAYLOAD
+)
+
+if [ "$DRY_RUN" = true ]; then
+    echo "" >&2
+    printf "\033[38;5;141m╔══════════════════════════════════════════════════════════════╗\033[0m\n" >&2
+    printf "\033[38;5;141m║\033[0m  \033[38;5;114m✓ DRY RUN\033[0m - Would create ticket with:                   \033[38;5;141m║\033[0m\n" >&2
+    printf "\033[38;5;141m╚══════════════════════════════════════════════════════════════╝\033[0m\n" >&2
+    echo "" >&2
+    printf "  \033[2mProject:\033[0m     \033[0m%s\033[0m\n" "$JIRA_PROJECT" >&2
+    printf "  \033[2mSummary:\033[0m     \033[0m%s\033[0m\n" "$summary" >&2
+    printf "  \033[2mType:\033[0m        \033[0m%s\033[0m \033[2m(ID: %s)\033[0m\n" "$issue_type" "$issuetype_id" >&2
+    printf "  \033[2mPriority:\033[0m    \033[0m%s\033[0m \033[2m(ID: %s)\033[0m\n" "$priority" "$priority_id" >&2
+    printf "  \033[2mDescription:\033[0m \033[2m%s...\033[0m\n" "${desc_preview}" >&2
+    if [ -n "$assignee_field" ]; then
+        printf "  \033[2mAssignee:\033[0m    \033[0m%s\033[0m\n" "$assignee_name" >&2
+    else
+        printf "  \033[2mAssignee:\033[0m    \033[2mUnassigned\033[0m\n" >&2
+    fi
+    if [ -n "$parent_key" ]; then
+        printf "  \033[2mParent:\033[0m      \033[0m%s\033[0m\n" "$parent_key" >&2
+    fi
+    if [ -n "$labels" ]; then
+        printf "  \033[2mLabels:\033[0m      \033[0m%s\033[0m\n" "$labels" >&2
+    fi
+    if [ -n "$sprint_id" ]; then
+        printf "  \033[2mSprint:\033[0m      \033[0m%s\033[0m \033[2m(will be added via Agile API)\033[0m\n" "$sprint_id" >&2
+    fi
+    echo "" >&2
+    rm -rf "$tmpdir"
+    jq -nc --arg key "${JIRA_PROJECT}-9999" --arg summary "$summary" '{key: $key, summary: $summary}'
+    exit 0
+else
+    response=$(jira_api_post "issue" "$payload")
+    
+    if echo "$response" | jq -e '.key' >/dev/null 2>&1; then
+        new_key=$(echo "$response" | jq -r '.key')
+        ticket_url="https://${JIRA_DOMAIN}/browse/$new_key"
+        
+        echo "" >&2
+        printf "\033[38;5;141m╔══════════════════════════════════════════════════════════════╗\033[0m\n" >&2
+        printf "\033[38;5;141m║\033[0m  \033[38;5;114m✓ Successfully created ticket!\033[0m                         \033[38;5;141m║\033[0m\n" >&2
+        printf "\033[38;5;141m╚══════════════════════════════════════════════════════════════╝\033[0m\n" >&2
+        echo "" >&2
+        printf "  \033[2mKey:\033[0m  \033[38;5;109m%s\033[0m\n" "$new_key" >&2
+        printf "  \033[2mURL:\033[0m  \033[4;38;5;81m%s\033[0m\n" "$ticket_url" >&2
+        
+        # Add to sprint if one was selected
+        if [ -n "$sprint_id" ]; then
+            printf "  \033[2mAdding to sprint...\033[0m " >&2
+            issue_id=$(echo "$response" | jq -r '.id')
+            sprint_response=$(curl -s -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
+                -X POST \
+                "https://${JIRA_DOMAIN}/rest/agile/1.0/sprint/${sprint_id}/issue" \
+                -H "Content-Type: application/json" \
+                -d "{\"issues\": [\"$issue_id\"]}" 2>/dev/null)
+            
+            if [ $? -eq 0 ]; then
+                printf "\033[38;5;114m✓\033[0m\n" >&2
+            else
+                printf "\033[38;5;167m✗ (failed - add manually)\033[0m\n" >&2
+            fi
+        fi
+        
+        # Invalidate cache so new ticket shows up in jira-fzf
+        rm -f "$CACHE_DIR/tickets.json"
+        
+        # Copy ticket URL to clipboard if xclip is available
+        if command -v xclip &> /dev/null; then
+            echo -n "$ticket_url" | xclip -selection clipboard
+            printf "  \033[2m(URL copied to clipboard)\033[0m\n" >&2
+        fi
+        
+        rm -rf "$tmpdir"
+        jq -nc --arg key "$new_key" --arg summary "$summary" '{key: $key, summary: $summary}'
+        exit 0
+    else
+        echo "" >&2
+        printf "\033[38;5;141m╔══════════════════════════════════════════════════════════════╗\033[0m\n" >&2
+        printf "\033[38;5;141m║\033[0m  \033[38;5;167m✗ Error creating ticket\033[0m                               \033[38;5;141m║\033[0m\n" >&2
+        printf "\033[38;5;141m╚══════════════════════════════════════════════════════════════╝\033[0m\n" >&2
+        echo "" >&2
+        printf "\033[2m  Response:\033[0m\n" >&2
+        echo "$response" | jq . >&2
+        rm -rf "$tmpdir"
+        exit 1
+    fi
+fi

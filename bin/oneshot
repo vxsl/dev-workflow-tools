@@ -1,0 +1,593 @@
+#!/usr/bin/env bash
+# One-shot change: commit staged changes to a new branch and create MR
+#
+# Usage:
+#   one-shot                              Interactive ticket selection (or create new)
+#   one-shot UB-1234                      Use existing ticket
+#   one-shot https://slack.com/...        Create ticket + link to Slack thread
+#   one-shot --dry-run                    Show what would be done
+#
+# Workflow:
+#   1. Check for staged changes
+#   2. Select existing Jira ticket OR create new ticket interactively
+#   3. Create new branch from origin/main named after the ticket
+#   4. Commit staged changes with "TICKET: summary" as message
+#   5. Run publish-changes to create MR
+#   6. (If Slack URL) Post ticket link back to thread
+
+set -e
+
+# Load environment variables
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -f "$SCRIPT_DIR/.env" ]; then
+    source "$SCRIPT_DIR/.env"
+fi
+
+# Configuration
+JIRA_DOMAIN="${JIRA_DOMAIN:-urbanlogiq.atlassian.net}"
+JIRA_PROJECT="${JIRA_PROJECT:-UB}"
+CACHE_DIR="$HOME/.cache/jira-fzf"
+TICKETS_CACHE="$CACHE_DIR/tickets.json"
+DRY_RUN=false
+BASE_BRANCH="origin/main"
+SLACK_URL=""
+SLACK_CHANNEL=""
+SLACK_THREAD_TS=""
+
+# Colors
+RED='\033[38;5;167m'
+GREEN='\033[38;5;114m'
+YELLOW='\033[38;5;221m'
+BLUE='\033[38;5;81m'
+PURPLE='\033[38;5;141m'
+CYAN='\033[38;5;109m'
+DIM='\033[2m'
+RESET='\033[0m'
+
+# Parse arguments
+TICKET_KEY=""
+while [[ "$#" -gt 0 ]]; do
+    case $1 in
+        --dry-run|-n)
+            DRY_RUN=true
+            shift
+            ;;
+        --base|-b)
+            BASE_BRANCH="$2"
+            shift 2
+            ;;
+        --help|-h)
+            head -20 "$0" | tail -19
+            exit 0
+            ;;
+        *)
+            # Check if it's a Slack URL
+            if [[ "$1" =~ ^https://.*slack\.com/archives/([A-Z0-9]+)/p([0-9]+) ]]; then
+                SLACK_URL="$1"
+                SLACK_CHANNEL="${BASH_REMATCH[1]}"
+                # Convert p1234567890123456 to 1234567890.123456 format
+                raw_ts="${BASH_REMATCH[2]}"
+                SLACK_THREAD_TS="${raw_ts:0:10}.${raw_ts:10}"
+            # Check if it looks like a Jira ticket
+            elif [[ "$1" =~ ^${JIRA_PROJECT}-[0-9]+$ ]]; then
+                TICKET_KEY="$1"
+            elif [[ "$1" =~ ^[0-9]+$ ]]; then
+                # Just a number - prefix with project
+                TICKET_KEY="${JIRA_PROJECT}-$1"
+            else
+                echo -e "${RED}Unknown argument: $1${RESET}" >&2
+                exit 1
+            fi
+            shift
+            ;;
+    esac
+done
+
+# Find fzf
+if [ -x "$HOME/.zsh/fzf/bin/fzf" ]; then
+    FZF="$HOME/.zsh/fzf/bin/fzf"
+elif command -v fzf &> /dev/null; then
+    FZF="fzf"
+else
+    echo -e "${RED}Error: fzf not found${RESET}" >&2
+    exit 1
+fi
+
+export FZF_DEFAULT_OPTS="${FZF_DEFAULT_OPTS} --bind 'ctrl-d:half-page-down,ctrl-u:half-page-up'"
+
+# Ensure we're in a git repo
+if ! git rev-parse --git-dir >/dev/null 2>&1; then
+    echo -e "${RED}Error: Not in a git repository${RESET}" >&2
+    exit 1
+fi
+
+# ============================================================================
+# Functions
+# ============================================================================
+
+# Call Jira API
+jira_api() {
+    local endpoint="$1"
+    curl -s -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
+        "https://${JIRA_DOMAIN}/rest/api/3/${endpoint}" \
+        -H "Content-Type: application/json"
+}
+
+# Call Jira API with POST
+jira_api_post() {
+    local endpoint="$1"
+    local data="$2"
+    curl -s -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
+        -X POST \
+        "https://${JIRA_DOMAIN}/rest/api/3/${endpoint}" \
+        -H "Content-Type: application/json" \
+        -d "$data"
+}
+
+# Get ticket summary from Jira
+get_ticket_summary() {
+    local key="$1"
+    if [ -z "$JIRA_EMAIL" ] || [ -z "$JIRA_API_TOKEN" ]; then
+        return 1
+    fi
+    jira_api "issue/${key}?fields=summary" 2>/dev/null | \
+        jq -r '.fields.summary // empty' 2>/dev/null
+}
+
+# Get current user's account ID
+get_current_user_id() {
+    if [ -z "$JIRA_EMAIL" ] || [ -z "$JIRA_API_TOKEN" ]; then
+        return 1
+    fi
+    jira_api "myself" 2>/dev/null | jq -r '.accountId // empty' 2>/dev/null
+}
+
+# Get cached tickets for fzf selection
+get_cached_tickets() {
+    if [ -f "$TICKETS_CACHE" ]; then
+        jq -r '.issues[] | .key + "\t" + .fields.summary' "$TICKETS_CACHE" 2>/dev/null
+    fi
+}
+
+# Post message to Slack thread
+post_to_slack() {
+    local channel="$1"
+    local thread_ts="$2"
+    local message_type="$3"  # "ticket" or "mr"
+    local url="$4"
+    local title="$5"
+    
+    if [ -z "$TICKET_CREATOR_BOT_TOKEN" ]; then
+        echo -e "  ${YELLOW}⚠ TICKET_CREATOR_BOT_TOKEN not set, skipping Slack post${RESET}" >&2
+        return 1
+    fi
+    
+    local text
+    case "$message_type" in
+        ticket)
+            text=$':jira: A ticket was created referencing this thread:\n'"<${url}|${title}>"
+            ;;
+        mr)
+            local mr_num=$(echo "$url" | grep -oE '[0-9]+$')
+            text=$':gitlab: MR: <'"${url}|!${mr_num} \"${title}\""$'> :shipit:'
+            ;;
+        *)
+            text="$url"
+            ;;
+    esac
+    
+    local response
+    response=$(curl -s -X POST "https://slack.com/api/chat.postMessage" \
+        -H "Authorization: Bearer ${TICKET_CREATOR_BOT_TOKEN}" \
+        -H "Content-Type: application/json" \
+        -d "$(jq -n \
+            --arg channel "$channel" \
+            --arg thread_ts "$thread_ts" \
+            --arg text "$text" \
+            '{channel: $channel, thread_ts: $thread_ts, text: $text, unfurl_links: true, mrkdwn: true}')")
+    
+    if echo "$response" | jq -e '.ok == true' >/dev/null 2>&1; then
+        return 0
+    else
+        local error=$(echo "$response" | jq -r '.error // "unknown error"')
+        echo -e "  ${RED}✗ Slack API error: ${error}${RESET}" >&2
+        return 1
+    fi
+}
+
+# Select ticket interactively (or create new)
+select_ticket_or_slack() {
+    echo -e "${CYAN}┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓${RESET}" >&2
+    echo -e "${CYAN}┃${RESET} ${BLUE}Select ticket${RESET} or create new                            ${CYAN}┃${RESET}" >&2
+    echo -e "${CYAN}┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛${RESET}" >&2
+    
+    local selection
+    selection=$( { echo -e "NEW\t✨ Create new ticket"; get_cached_tickets; } | $FZF \
+        --prompt="  🎫 Ticket > " \
+        --height=20 \
+        --reverse \
+        --border=rounded \
+        --delimiter='\t' \
+        --with-nth=1,2 \
+        --preview='key=$(echo {} | cut -f1); if [ "$key" = "NEW" ]; then echo "Create a new Jira ticket"; else curl -s -u "'"${JIRA_EMAIL}:${JIRA_API_TOKEN}"'" "https://'"${JIRA_DOMAIN}"'/rest/api/3/issue/${key}?fields=summary,status,assignee" 2>/dev/null | jq -r "\"Status: \" + .fields.status.name + \"\nAssignee: \" + (.fields.assignee.displayName // \"Unassigned\") + \"\n\n\" + .fields.summary" 2>/dev/null || echo "Loading..."; fi' \
+        --preview-window=right:40%:wrap \
+        --header="Enter: select │ Paste Slack URL to link thread" \
+        --print-query)
+    
+    # Check what user entered
+    local query=$(echo "$selection" | head -1)
+    local selected=$(echo "$selection" | tail -1)
+    
+    # Check if it's a Slack URL
+    if [[ "$query" =~ ^https://.*slack\.com/archives/([A-Z0-9]+)/p([0-9]+) ]]; then
+        echo "SLACK:$query"
+        return 0
+    fi
+    
+    # Check if user selected "Create new ticket"
+    if [[ "$selected" =~ ^NEW ]]; then
+        echo "NEW"
+        return 0
+    fi
+    
+    if [ -n "$selected" ]; then
+        echo "$selected" | cut -f1
+    elif [[ "$query" =~ ^${JIRA_PROJECT}-[0-9]+$ ]]; then
+        echo "$query"
+    elif [[ "$query" =~ ^[0-9]+$ ]]; then
+        echo "${JIRA_PROJECT}-$query"
+    else
+        echo ""
+    fi
+}
+
+# ============================================================================
+# Main flow
+# ============================================================================
+
+echo "" >&2
+echo -e "${PURPLE}=== One-Shot Change ===${RESET}" >&2
+if [ "$DRY_RUN" = true ]; then
+    echo -e "${YELLOW}[DRY RUN]${RESET}" >&2
+fi
+echo "" >&2
+
+# Step 1: Check for staged changes
+echo -e "${CYAN}┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓${RESET}" >&2
+echo -e "${CYAN}┃${RESET} ${BLUE}Step 1/4:${RESET} Checking staged changes                       ${CYAN}┃${RESET}" >&2
+echo -e "${CYAN}┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛${RESET}" >&2
+
+staged_files=$(git diff --cached --name-only)
+staged_count=$(echo "$staged_files" | grep -c . || true)
+
+if [ "$staged_count" -eq 0 ]; then
+    echo -e "  ${RED}✗ No staged changes${RESET}" >&2
+    echo -e "  ${DIM}Stage changes first: git add <files>${RESET}" >&2
+    exit 1
+fi
+
+echo -e "  ${GREEN}✓${RESET} ${staged_count} file(s) staged:" >&2
+echo "$staged_files" | head -5 | while read -r file; do
+    echo -e "    ${DIM}${file}${RESET}" >&2
+done
+if [ "$staged_count" -gt 5 ]; then
+    echo -e "    ${DIM}... and $((staged_count - 5)) more${RESET}" >&2
+fi
+echo "" >&2
+
+# Step 2: Select ticket or handle Slack URL
+echo -e "${CYAN}┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓${RESET}" >&2
+echo -e "${CYAN}┃${RESET} ${BLUE}Step 2/4:${RESET} Select Jira ticket                            ${CYAN}┃${RESET}" >&2
+echo -e "${CYAN}┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛${RESET}" >&2
+
+# Handle Slack URL from argument
+if [ -n "$SLACK_URL" ]; then
+    echo -e "  ${CYAN}Slack thread:${RESET} ${DIM}${SLACK_URL}${RESET}" >&2
+    echo "" >&2
+    
+    # Build flags for create-jira-ticket
+    dry_run_flag=""
+    if [ "$DRY_RUN" = true ]; then
+        dry_run_flag="--dry-run"
+    fi
+    
+    slack_flag=""
+    if [ -n "$SLACK_URL" ]; then
+        slack_flag="--slack-url $SLACK_URL"
+    fi
+    
+    # Call the shared create-jira-ticket script
+    result=$("$SCRIPT_DIR/create-jira-ticket" $dry_run_flag $slack_flag < /dev/tty 2>&1 | tee /dev/tty | tail -1)
+    TICKET_KEY=$(echo "$result" | jq -r '.key')
+    summary=$(echo "$result" | jq -r '.summary')
+    
+    if [ -z "$TICKET_KEY" ] || ! [[ "$TICKET_KEY" =~ ^${JIRA_PROJECT}-[0-9]+$ ]]; then
+        echo -e "  ${RED}✗ Failed to create ticket${RESET}" >&2
+        exit 1
+    fi
+    
+    # Post to Slack if we have a thread
+    if [ -n "$SLACK_URL" ] && [ "$DRY_RUN" != true ]; then
+        echo "" >&2
+        echo -e "  ${DIM}Posting to Slack thread...${RESET}" >&2
+        
+        jira_url="https://${JIRA_DOMAIN}/browse/${TICKET_KEY}"
+        if post_to_slack "$SLACK_CHANNEL" "$SLACK_THREAD_TS" "ticket" "$jira_url" "${TICKET_KEY}: ${summary}"; then
+            echo -e "  ${GREEN}✓${RESET} Posted ticket link to Slack" >&2
+        fi
+    fi
+
+# Handle ticket from argument
+elif [ -n "$TICKET_KEY" ]; then
+    TICKET_KEY=$(echo "$TICKET_KEY" | tr '[:lower:]' '[:upper:]')
+    summary=$(get_ticket_summary "$TICKET_KEY")
+    if [ -n "$summary" ]; then
+        echo -e "  ${GREEN}✓${RESET} Ticket: ${CYAN}${TICKET_KEY}${RESET}" >&2
+        echo -e "    ${DIM}${summary}${RESET}" >&2
+    else
+        echo -e "  ${GREEN}✓${RESET} Ticket: ${CYAN}${TICKET_KEY}${RESET}" >&2
+        echo -e "    ${YELLOW}⚠ Could not fetch summary${RESET}" >&2
+    fi
+
+# Interactive selection
+else
+    selection=$(select_ticket_or_slack)
+    
+    # Check if user wants to create a new ticket
+    if [ "$selection" = "NEW" ]; then
+        echo -e "  ${CYAN}Creating new ticket${RESET}" >&2
+        echo "" >&2
+        
+        # Build flags for create-jira-ticket
+        dry_run_flag=""
+        if [ "$DRY_RUN" = true ]; then
+            dry_run_flag="--dry-run"
+        fi
+        
+        # Call the shared create-jira-ticket script
+        result=$("$SCRIPT_DIR/create-jira-ticket" $dry_run_flag < /dev/tty 2>&1 | tee /dev/tty | tail -1)
+        TICKET_KEY=$(echo "$result" | jq -r '.key')
+        summary=$(echo "$result" | jq -r '.summary')
+        
+        if [ -z "$TICKET_KEY" ] || ! [[ "$TICKET_KEY" =~ ^${JIRA_PROJECT}-[0-9]+$ ]]; then
+            echo -e "  ${RED}✗ Failed to create ticket${RESET}" >&2
+            exit 1
+        fi
+    # Check if user entered a Slack URL
+    elif [[ "$selection" =~ ^SLACK:(.+)$ ]]; then
+        SLACK_URL="${BASH_REMATCH[1]}"
+        
+        # Parse Slack URL
+        if [[ "$SLACK_URL" =~ ^https://.*slack\.com/archives/([A-Z0-9]+)/p([0-9]+) ]]; then
+            SLACK_CHANNEL="${BASH_REMATCH[1]}"
+            raw_ts="${BASH_REMATCH[2]}"
+            SLACK_THREAD_TS="${raw_ts:0:10}.${raw_ts:10}"
+        fi
+        
+        echo "" >&2
+        echo -e "  ${CYAN}Slack thread:${RESET} ${DIM}${SLACK_URL}${RESET}" >&2
+        echo "" >&2
+        
+        # Build flags for create-jira-ticket
+        dry_run_flag=""
+        if [ "$DRY_RUN" = true ]; then
+            dry_run_flag="--dry-run"
+        fi
+        
+        # Call the shared create-jira-ticket script with Slack URL
+        result=$("$SCRIPT_DIR/create-jira-ticket" $dry_run_flag --slack-url "$SLACK_URL" < /dev/tty 2>&1 | tee /dev/tty | tail -1)
+        TICKET_KEY=$(echo "$result" | jq -r '.key')
+        summary=$(echo "$result" | jq -r '.summary')
+        
+        if [ -z "$TICKET_KEY" ] || ! [[ "$TICKET_KEY" =~ ^${JIRA_PROJECT}-[0-9]+$ ]]; then
+            echo -e "  ${RED}✗ Failed to create ticket${RESET}" >&2
+            exit 1
+        fi
+        
+        # Post to Slack
+        if [ "$DRY_RUN" != true ]; then
+            echo "" >&2
+            echo -e "  ${DIM}Posting to Slack thread...${RESET}" >&2
+            
+            jira_url="https://${JIRA_DOMAIN}/browse/${TICKET_KEY}"
+            if post_to_slack "$SLACK_CHANNEL" "$SLACK_THREAD_TS" "ticket" "$jira_url" "${TICKET_KEY}: ${summary}"; then
+                echo -e "  ${GREEN}✓${RESET} Posted ticket link to Slack" >&2
+            fi
+        fi
+    else
+        TICKET_KEY="$selection"
+        
+        if [ -z "$TICKET_KEY" ]; then
+            echo -e "  ${RED}✗ No ticket selected${RESET}" >&2
+            exit 1
+        fi
+        
+        # Normalize ticket key to uppercase
+        TICKET_KEY=$(echo "$TICKET_KEY" | tr '[:lower:]' '[:upper:]')
+        
+        # Get ticket summary
+        summary=$(get_ticket_summary "$TICKET_KEY")
+        if [ -n "$summary" ]; then
+            echo -e "  ${GREEN}✓${RESET} Ticket: ${CYAN}${TICKET_KEY}${RESET}" >&2
+            echo -e "    ${DIM}${summary}${RESET}" >&2
+        else
+            echo -e "  ${GREEN}✓${RESET} Ticket: ${CYAN}${TICKET_KEY}${RESET}" >&2
+            echo -e "    ${YELLOW}⚠ Could not fetch summary${RESET}" >&2
+        fi
+    fi
+fi
+
+echo "" >&2
+
+# Step 3: Create branch and commit
+echo -e "${CYAN}┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓${RESET}" >&2
+echo -e "${CYAN}┃${RESET} ${BLUE}Step 3/4:${RESET} Create branch and commit                      ${CYAN}┃${RESET}" >&2
+echo -e "${CYAN}┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛${RESET}" >&2
+
+branch_name="$TICKET_KEY"
+if [ -n "$summary" ]; then
+    commit_message="$TICKET_KEY: $summary"
+else
+    commit_message="$TICKET_KEY"
+fi
+
+# Check if branch already exists
+if git show-ref --verify --quiet "refs/heads/$branch_name"; then
+    echo -e "  ${YELLOW}⚠ Branch ${branch_name} already exists${RESET}" >&2
+    echo -e "  ${DIM}Switching to existing branch...${RESET}" >&2
+    
+    if [ "$DRY_RUN" = true ]; then
+        echo -e "  ${DIM}[DRY RUN] Would run: git checkout ${branch_name}${RESET}" >&2
+    else
+        git checkout "$branch_name"
+    fi
+else
+    echo -e "  ${DIM}Creating branch: ${branch_name} from ${BASE_BRANCH}${RESET}" >&2
+    
+    if [ "$DRY_RUN" = true ]; then
+        echo -e "  ${DIM}[DRY RUN] Would run: git checkout -b ${branch_name} ${BASE_BRANCH}${RESET}" >&2
+    else
+        # Fetch latest main first
+        echo -e "  ${DIM}$ git fetch origin main${RESET}" >&2
+        git fetch origin main 2>&1 | while read -r line; do echo -e "    ${DIM}${line}${RESET}" >&2; done
+        
+        # Create branch from origin/main
+        echo -e "  ${DIM}$ git checkout -b ${branch_name} ${BASE_BRANCH}${RESET}" >&2
+        git checkout -b "$branch_name" "$BASE_BRANCH" 2>&1 | while read -r line; do echo -e "    ${DIM}${line}${RESET}" >&2; done
+    fi
+fi
+
+echo -e "  ${GREEN}✓${RESET} Branch: ${branch_name}" >&2
+echo "" >&2
+
+# Prompt for first commit message
+echo -e "  ${CYAN}Commit message:${RESET}" >&2
+echo -e "  ${DIM}Default: \"${commit_message}\"${RESET}" >&2
+echo -e "  ${DIM}(Press Enter to use default, or type custom message)${RESET}" >&2
+read -p "  > " -r user_message < /dev/tty
+
+if [ -z "$user_message" ]; then
+    current_commit_message="$commit_message"  # Use ticket summary
+else
+    # Auto-prefix with ticket key if not present
+    if [[ ! "$user_message" =~ ^${TICKET_KEY}: ]]; then
+        current_commit_message="$TICKET_KEY: $user_message"
+    else
+        current_commit_message="$user_message"
+    fi
+fi
+
+echo "" >&2
+
+# Commit loop - support multiple commits interactively
+commit_count=0
+
+while true; do
+    commit_count=$((commit_count + 1))
+    
+    # Show what we're about to commit
+    if [ $commit_count -eq 1 ]; then
+        echo -e "  ${DIM}Committing with message: ${current_commit_message}${RESET}" >&2
+    else
+        echo -e "  ${DIM}Commit #${commit_count}: ${current_commit_message}${RESET}" >&2
+    fi
+    
+    if [ "$DRY_RUN" = true ]; then
+        echo -e "  ${DIM}[DRY RUN] Would run: git commit -m \"${current_commit_message}\"${RESET}" >&2
+    else
+        echo -e "  ${DIM}$ git commit -m \"${current_commit_message}\"${RESET}" >&2
+        git commit -m "$current_commit_message" 2>&1 | while read -r line; do echo -e "    ${DIM}${line}${RESET}" >&2; done
+    fi
+    
+    echo -e "  ${GREEN}✓${RESET} Committed (#${commit_count})" >&2
+    
+    # Ask if user wants to make another commit
+    echo "" >&2
+    echo -e "  ${CYAN}Make another commit?${RESET} ${DIM}(y/n)${RESET}" >&2
+    read -p "  > " -n 1 -r make_another < /dev/tty
+    echo "" >&2
+    
+    if [[ ! $make_another =~ ^[Yy]$ ]]; then
+        break
+    fi
+    
+    echo "" >&2
+    echo -e "  ${CYAN}Stage your changes, then press Enter to continue${RESET}" >&2
+    echo -e "  ${DIM}(In another terminal: git add <files>)${RESET}" >&2
+    read -p "  > Press Enter when ready..." < /dev/tty
+    echo "" >&2
+    
+    # Check for newly staged changes
+    new_staged_files=$(git diff --cached --name-only)
+    new_staged_count=$(echo "$new_staged_files" | grep -c . || true)
+    
+    if [ "$new_staged_count" -eq 0 ]; then
+        echo -e "  ${YELLOW}⚠ No new staged changes, skipping commit${RESET}" >&2
+        break
+    fi
+    
+    echo -e "  ${GREEN}✓${RESET} ${new_staged_count} file(s) staged:" >&2
+    echo "$new_staged_files" | head -5 | while read -r file; do
+        echo -e "    ${DIM}${file}${RESET}" >&2
+    done
+    if [ "$new_staged_count" -gt 5 ]; then
+        echo -e "    ${DIM}... and $((new_staged_count - 5)) more${RESET}" >&2
+    fi
+    echo "" >&2
+    
+    # Get commit message for this commit
+    echo -e "  ${CYAN}Enter commit message:${RESET}" >&2
+    echo -e "  ${DIM}(Leave empty to use: ${TICKET_KEY}: <message>)${RESET}" >&2
+    read -p "  > " -r user_message < /dev/tty
+    
+    if [ -z "$user_message" ]; then
+        # Ask for short description
+        echo -e "  ${CYAN}Short description:${RESET}" >&2
+        read -p "  > " -r short_desc < /dev/tty
+        if [ -n "$short_desc" ]; then
+            current_commit_message="$TICKET_KEY: $short_desc"
+        else
+            current_commit_message="$TICKET_KEY: additional changes"
+        fi
+    else
+        # If message doesn't start with ticket key, prepend it
+        if [[ ! "$user_message" =~ ^${TICKET_KEY}: ]]; then
+            current_commit_message="$TICKET_KEY: $user_message"
+        else
+            current_commit_message="$user_message"
+        fi
+    fi
+    
+    echo "" >&2
+done
+
+echo "" >&2
+
+# Step 4: Create MR
+echo -e "${CYAN}┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓${RESET}" >&2
+echo -e "${CYAN}┃${RESET} ${BLUE}Step 4/4:${RESET} Creating Merge Request                        ${CYAN}┃${RESET}" >&2
+echo -e "${CYAN}┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛${RESET}" >&2
+
+if [ "$DRY_RUN" = true ]; then
+    echo -e "  ${DIM}[DRY RUN] Would run: publish-changes --branch ${branch_name} --target main ${TICKET_KEY}${RESET}" >&2
+    if [ -n "$SLACK_URL" ]; then
+        echo -e "  ${DIM}[DRY RUN] Would post MR link to Slack thread${RESET}" >&2
+    fi
+    echo "" >&2
+    echo -e "${GREEN}=== Dry run complete ===${RESET}" >&2
+else
+    # Run publish-changes and capture the MR URL from stdout
+    mr_url=$("$SCRIPT_DIR/publish-changes" --branch "$branch_name" --target main --output-url --no-draft-prompt "$TICKET_KEY")
+    
+    # Post MR link to Slack if we have a thread
+    if [ -n "$SLACK_URL" ] && [ -n "$mr_url" ]; then
+        echo "" >&2
+        echo -e "  ${DIM}Posting MR link to Slack thread...${RESET}" >&2
+        if post_to_slack "$SLACK_CHANNEL" "$SLACK_THREAD_TS" "mr" "$mr_url" "$commit_message"; then
+            echo -e "  ${GREEN}✓${RESET} Posted MR link to Slack" >&2
+        fi
+    fi
+    
+    echo "" >&2
+    echo -e "${GREEN}=== Done ===${RESET}" >&2
+fi
