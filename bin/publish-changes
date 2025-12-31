@@ -26,9 +26,10 @@
 # Environment variables (for Jira integration):
 #   JIRA_EMAIL          - Your Jira email
 #   JIRA_API_TOKEN      - Jira API token
-#   JIRA_DOMAIN         - Jira domain (default: urbanlogiq.atlassian.net)
-#   JIRA_PROJECT        - Jira project key (default: UB)
-#   JIRA_QA_BRANCH_FIELD - Custom field ID for QA branch (optional)
+#   JIRA_DOMAIN         - Jira domain (e.g., company.atlassian.net)
+#   JIRA_PROJECT        - Jira project key (e.g., PROJ)
+#   JIRA_QA_BRANCH_FIELD - Custom field ID for QA branch (optional, auto-detected)
+#   JIRA_QA_BRANCH_DOMAIN - Domain for QA branches (optional, defaults to JIRA_DOMAIN)
 
 set -e
 
@@ -294,7 +295,8 @@ update_jira_ticket() {
     fi
     
     # 2. QA Branch field
-    local qa_branch="${branch}.home.urbanlogiq.us"
+    local qa_branch_domain="${JIRA_QA_BRANCH_DOMAIN:-$JIRA_DOMAIN}"
+    local qa_branch="${branch}.${qa_branch_domain}"
     if [ -z "$qa_field_id" ]; then
         local editmeta=$(curl -s --max-time 10 -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
             "https://${JIRA_DOMAIN}/rest/api/3/issue/${key}/editmeta" 2>/dev/null)
