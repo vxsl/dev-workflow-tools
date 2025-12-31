@@ -33,10 +33,10 @@
 
 set -e
 
-# Load environment from same directory as jira-fzf
+# Load environment from parent directory
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-if [ -f "$SCRIPT_DIR/.env" ]; then
-    source "$SCRIPT_DIR/.env"
+if [ -f "$SCRIPT_DIR/../.env" ]; then
+    source "$SCRIPT_DIR/../.env"
 fi
 
 # Configuration
