@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Jira ticket explorer/creator with fuzzy search
-# Inspired by fzedit's continuous fzf pattern and rr.sh's Jira integration
+# Inspired by rr.sh's Jira integration and fzf-helpers library
 #
 # Features:
 # - Fuzzy search through all Jira tickets in your project
@@ -18,10 +18,9 @@
 #   <CR> maximize preview  <C-y> copy  <C-o> open  <C-t> new  <C-s> sort  <C-r> refresh
 #   <C-g> create MR  <C-c> checkout  <C-n>/<C-p> nav  <C-d>/<C-u> page  q/esc close preview
 
-source ~/bin/lib/fzf-persist
-
 # Load environment variables
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/../lib/fzf-helpers"
 if [ -f "$SCRIPT_DIR/../.env" ]; then
     source "$SCRIPT_DIR/../.env"
 fi
@@ -361,7 +360,7 @@ format_ticket() {
     
     # Truncate fields for display - optimized column order
     # MR: 1 char (indicator)
-    # Key: 7 chars (UB-XXXX)
+    # Key: 7 chars (e.g. PROJ-123)
     # Assignee: 12 chars (first - who's working on it)
     # Status: 15 chars (second - what state it's in)
     # Summary: 100 chars (last - more space available)

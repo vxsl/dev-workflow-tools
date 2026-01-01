@@ -3,7 +3,7 @@
 #
 # Usage:
 #   one-shot                              Interactive ticket selection (or create new)
-#   one-shot UB-1234                      Use existing ticket
+#   one-shot PROJ-1234                    Use existing ticket
 #   one-shot https://slack.com/...        Create ticket + link to Slack thread
 #   one-shot --dry-run                    Show what would be done
 #
@@ -171,7 +171,7 @@ post_to_slack() {
     local text
     case "$message_type" in
         ticket)
-            text=$':jira: A ticket was created referencing this thread:\n'"<${url}|${title}>"
+            text=$':jira: A ticket was created referencing this thread: '"<${url}|${title}>"
             ;;
         mr)
             local mr_num=$(echo "$url" | grep -oE '[0-9]+$')
@@ -303,9 +303,21 @@ if [ -n "$SLACK_URL" ]; then
     fi
     
     # Call the shared create-jira-ticket script
-    result=$("$SCRIPT_DIR/create-jira-ticket" $dry_run_flag $slack_flag < /dev/tty 2>&1 | tee /dev/tty | tail -1)
-    TICKET_KEY=$(echo "$result" | jq -r '.key')
-    summary=$(echo "$result" | jq -r '.summary')
+    # Use temp file to avoid pipe buffering issues with tail
+    result_file=$(mktemp)
+    trap "rm -f '$result_file'" EXIT
+    
+    # Run with timeout to prevent indefinite hangs (90 seconds)
+    if ! timeout 90 bash -c "\"$SCRIPT_DIR/create-jira-ticket\" $dry_run_flag $slack_flag < /dev/tty 2>&1 | tee /dev/tty | tail -1 > '$result_file'"; then
+        echo -e "  ${RED}✗ Timeout waiting for ticket creation${RESET}" >&2
+        rm -f "$result_file"
+        exit 1
+    fi
+    echo "" >&2
+    echo -e "  ${DIM}Processing ticket information...${RESET}" >&2
+    TICKET_KEY=$(jq -r '.key' < "$result_file")
+    summary=$(jq -r '.summary' < "$result_file")
+    rm -f "$result_file"
     
     if [ -z "$TICKET_KEY" ] || ! [[ "$TICKET_KEY" =~ ^${JIRA_PROJECT}-[0-9]+$ ]]; then
         echo -e "  ${RED}✗ Failed to create ticket${RESET}" >&2
@@ -314,7 +326,6 @@ if [ -n "$SLACK_URL" ]; then
     
     # Post to Slack if we have a thread
     if [ -n "$SLACK_URL" ] && [ "$DRY_RUN" != true ]; then
-        echo "" >&2
         echo -e "  ${DIM}Posting to Slack thread...${RESET}" >&2
         
         jira_url="https://${JIRA_DOMAIN}/browse/${TICKET_KEY}"
@@ -351,9 +362,21 @@ else
         fi
         
         # Call the shared create-jira-ticket script
-        result=$("$SCRIPT_DIR/create-jira-ticket" $dry_run_flag < /dev/tty 2>&1 | tee /dev/tty | tail -1)
-        TICKET_KEY=$(echo "$result" | jq -r '.key')
-        summary=$(echo "$result" | jq -r '.summary')
+        # Use temp file to avoid pipe buffering issues with tail
+        result_file=$(mktemp)
+        trap "rm -f '$result_file'" EXIT
+        
+        # Run with timeout to prevent indefinite hangs (90 seconds)
+        if ! timeout 90 bash -c "\"$SCRIPT_DIR/create-jira-ticket\" $dry_run_flag < /dev/tty 2>&1 | tee /dev/tty | tail -1 > '$result_file'"; then
+            echo -e "  ${RED}✗ Timeout waiting for ticket creation${RESET}" >&2
+            rm -f "$result_file"
+            exit 1
+        fi
+        echo "" >&2
+        echo -e "  ${DIM}Processing ticket information...${RESET}" >&2
+        TICKET_KEY=$(jq -r '.key' < "$result_file")
+        summary=$(jq -r '.summary' < "$result_file")
+        rm -f "$result_file"
         
         if [ -z "$TICKET_KEY" ] || ! [[ "$TICKET_KEY" =~ ^${JIRA_PROJECT}-[0-9]+$ ]]; then
             echo -e "  ${RED}✗ Failed to create ticket${RESET}" >&2
@@ -381,9 +404,21 @@ else
         fi
         
         # Call the shared create-jira-ticket script with Slack URL
-        result=$("$SCRIPT_DIR/create-jira-ticket" $dry_run_flag --slack-url "$SLACK_URL" < /dev/tty 2>&1 | tee /dev/tty | tail -1)
-        TICKET_KEY=$(echo "$result" | jq -r '.key')
-        summary=$(echo "$result" | jq -r '.summary')
+        # Use temp file to avoid pipe buffering issues with tail
+        result_file=$(mktemp)
+        trap "rm -f '$result_file'" EXIT
+        
+        # Run with timeout to prevent indefinite hangs (90 seconds)
+        if ! timeout 90 bash -c "\"$SCRIPT_DIR/create-jira-ticket\" $dry_run_flag --slack-url \"$SLACK_URL\" < /dev/tty 2>&1 | tee /dev/tty | tail -1 > '$result_file'"; then
+            echo -e "  ${RED}✗ Timeout waiting for ticket creation${RESET}" >&2
+            rm -f "$result_file"
+            exit 1
+        fi
+        echo "" >&2
+        echo -e "  ${DIM}Processing ticket information...${RESET}" >&2
+        TICKET_KEY=$(jq -r '.key' < "$result_file")
+        summary=$(jq -r '.summary' < "$result_file")
+        rm -f "$result_file"
         
         if [ -z "$TICKET_KEY" ] || ! [[ "$TICKET_KEY" =~ ^${JIRA_PROJECT}-[0-9]+$ ]]; then
             echo -e "  ${RED}✗ Failed to create ticket${RESET}" >&2
@@ -392,7 +427,6 @@ else
         
         # Post to Slack
         if [ "$DRY_RUN" != true ]; then
-            echo "" >&2
             echo -e "  ${DIM}Posting to Slack thread...${RESET}" >&2
             
             jira_url="https://${JIRA_DOMAIN}/browse/${TICKET_KEY}"
@@ -587,7 +621,6 @@ else
     
     # Post MR link to Slack if we have a thread
     if [ -n "$SLACK_URL" ] && [ -n "$mr_url" ]; then
-        echo "" >&2
         echo -e "  ${DIM}Posting MR link to Slack thread...${RESET}" >&2
         if post_to_slack "$SLACK_CHANNEL" "$SLACK_THREAD_TS" "mr" "$mr_url" "$commit_message"; then
             echo -e "  ${GREEN}✓${RESET} Posted MR link to Slack" >&2

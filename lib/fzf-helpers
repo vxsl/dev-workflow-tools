@@ -1,13 +1,21 @@
 #!/usr/bin/env bash
-# fzf-persist - A library for creating fzf interfaces that stay open
+# fzf-helpers - A library for creating enhanced fzf interfaces
 #
 # This library provides common patterns for fzf utilities that:
 # - Stay open after executing actions (enter doesn't close)
 # - Support reload after actions
 # - Have consistent keybindings and styling
 #
+# Persistent Mode (for scratchpads/always-on windows):
+#   Set FZF_PERSIST_MODE=1 in your environment, or pass --persist flag
+#   Best for xmonad scratchpads or tmux popup windows
+#
+# One-Shot Mode (default):
+#   Exits after most actions, like normal CLI tools
+#   Pass --one-shot flag to force this mode
+#
 # Usage:
-#   source ~/bin/lib/fzf-persist
+#   source ~/bin/lib/fzf-helpers
 #   
 #   # Simple usage - just wrap your fzf call
 #   generate_list | fzp_run \
@@ -57,10 +65,41 @@ FZP_NAV_BINDS=(
 )
 
 # Bindings that keep the interface open (ignore prevents closing)
+# Only applied if FZP_PERSIST_MODE=1 or --persist flag is passed
 FZP_PERSIST_BINDS=(
     --bind 'esc:ignore'
     --bind 'ctrl-c:ignore'
 )
+
+# Determine if we should use persist mode
+# Can be controlled by:
+# 1. Environment variable FZF_PERSIST_MODE=1
+# 2. --persist flag passed to fzp_run
+# 3. --one-shot flag to force disable
+fzp_should_persist() {
+    # Check for explicit flags first (passed as arguments)
+    for arg in "$@"; do
+        if [ "$arg" = "--persist" ]; then
+            return 0  # true - use persist mode
+        elif [ "$arg" = "--one-shot" ]; then
+            return 1  # false - don't persist
+        fi
+    done
+    
+    # Fall back to environment variable (default: off)
+    [ "${FZF_PERSIST_MODE:-0}" = "1" ]
+}
+
+# Strip control flags from arguments
+fzp_strip_control_flags() {
+    local args=()
+    for arg in "$@"; do
+        if [ "$arg" != "--persist" ] && [ "$arg" != "--one-shot" ]; then
+            args+=("$arg")
+        fi
+    done
+    printf '%s\n' "${args[@]}"
+}
 
 # Helper: Create a binding that executes a command and reloads
 # Usage: fzp_action_bind KEY "command {}" "reload_command"
@@ -96,20 +135,42 @@ fzp_reload_bind() {
 }
 
 # Main runner function
-# Usage: generate_list | fzp_run [fzf options...]
+# Usage: generate_list | fzp_run [--persist|--one-shot] [fzf options...]
 # 
+# Flags:
+#   --persist   Force persistent mode (stay open after actions)
+#   --one-shot  Force one-shot mode (exit after selection)
+#
 # This applies defaults but allows overriding with explicit options.
 # Custom bindings should be passed as arguments.
 fzp_run() {
-    local custom_opts=("$@")
+    local should_persist=false
+    
+    # Check if we should use persist mode
+    if fzp_should_persist "$@"; then
+        should_persist=true
+    fi
+    
+    # Strip control flags and keep other options
+    local custom_opts=()
+    while IFS= read -r line; do
+        custom_opts+=("$line")
+    done < <(fzp_strip_control_flags "$@")
     
     # Build the command with defaults first, then custom options
     # Custom options will override defaults where there's a conflict
-    "$FZP_FZF" \
-        "${FZP_DEFAULT_OPTS[@]}" \
-        "${FZP_NAV_BINDS[@]}" \
-        "${FZP_PERSIST_BINDS[@]}" \
-        "${custom_opts[@]}"
+    if [ "$should_persist" = true ]; then
+        "$FZP_FZF" \
+            "${FZP_DEFAULT_OPTS[@]}" \
+            "${FZP_NAV_BINDS[@]}" \
+            "${FZP_PERSIST_BINDS[@]}" \
+            "${custom_opts[@]}"
+    else
+        "$FZP_FZF" \
+            "${FZP_DEFAULT_OPTS[@]}" \
+            "${FZP_NAV_BINDS[@]}" \
+            "${custom_opts[@]}"
+    fi
 }
 
 # Alternative: Run fzf with minimal defaults (just persist behavior)
@@ -155,20 +216,3 @@ fzp_prompt_with_bindings() {
 
 # Export the fzf path for subprocesses
 export FZP_FZF
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

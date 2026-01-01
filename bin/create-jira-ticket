@@ -9,7 +9,7 @@
 #   create-jira-ticket --dry-run                          Test without creating
 #
 # Output:
-#   Prints JSON to stdout on success: {"key": "UB-1234", "summary": "Ticket summary"}
+#   Prints JSON to stdout on success: {"key": "PROJ-1234", "summary": "Ticket summary"}
 #   Prints errors to stderr
 #   Exit code 0 on success, 1 on failure
 
@@ -407,7 +407,10 @@ echo "" >&2
 printf "\033[38;5;141m╔══════════════════════════════════════════════════════════════╗\033[0m\n" >&2
 printf "\033[38;5;141m║\033[0m  \033[38;5;109mCreating ticket in Jira...\033[0m                               \033[38;5;141m║\033[0m\n" >&2
 printf "\033[38;5;141m╚══════════════════════════════════════════════════════════════╝\033[0m\n" >&2
+echo "" >&2
+echo -e "  \033[2mFetching project metadata...\033[0m" >&2
 project_response=$(jira_api "project/${JIRA_PROJECT}")
+echo -e "  \033[38;5;114m✓\033[0m Project metadata fetched" >&2
 issuetype_id=$(echo "$project_response" | jq -r ".issueTypes[] | select(.name == \"$issue_type\") | .id")
 
 if [ -z "$issuetype_id" ]; then
@@ -418,7 +421,9 @@ if [ -z "$issuetype_id" ]; then
 fi
 
 # Get priority ID
+echo -e "  \033[2mFetching priority info...\033[0m" >&2
 priority_response=$(jira_api "priority")
+echo -e "  \033[38;5;114m✓\033[0m Priority info fetched" >&2
 priority_id=$(echo "$priority_response" | jq -r ".[] | select(.name == \"$priority\") | .id")
 
 if [ -z "$priority_id" ]; then
@@ -492,9 +497,15 @@ if [ "$DRY_RUN" = true ]; then
     echo "" >&2
     rm -rf "$tmpdir"
     jq -nc --arg key "${JIRA_PROJECT}-9999" --arg summary "$summary" '{key: $key, summary: $summary}'
+    
+    # Explicitly close stdout to ensure EOF is sent
+    exec 1>&-
     exit 0
 else
+    echo "" >&2
+    echo -e "  \033[2mSubmitting ticket to Jira API...\033[0m" >&2
     response=$(jira_api_post "issue" "$payload")
+    echo -e "  \033[38;5;114m✓\033[0m Ticket submitted" >&2
     
     if echo "$response" | jq -e '.key' >/dev/null 2>&1; then
         new_key=$(echo "$response" | jq -r '.key')
@@ -510,31 +521,35 @@ else
         
         # Add to sprint if one was selected
         if [ -n "$sprint_id" ]; then
-            printf "  \033[2mAdding to sprint...\033[0m " >&2
+            echo "" >&2
+            echo -e "  \033[2mAdding ticket to sprint ${sprint_id}...\033[0m" >&2
             issue_id=$(echo "$response" | jq -r '.id')
             sprint_response=$(curl -s -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
                 -X POST \
                 "https://${JIRA_DOMAIN}/rest/agile/1.0/sprint/${sprint_id}/issue" \
                 -H "Content-Type: application/json" \
-                -d "{\"issues\": [\"$issue_id\"]}" 2>/dev/null)
+                -d "{\"issues\": [\"$issue_id\"]}" 2>&1)
             
             if [ $? -eq 0 ]; then
-                printf "\033[38;5;114m✓\033[0m\n" >&2
+                echo -e "  \033[38;5;114m✓\033[0m Added to sprint" >&2
             else
-                printf "\033[38;5;167m✗ (failed - add manually)\033[0m\n" >&2
+                echo -e "  \033[38;5;167m✗ Failed to add to sprint (add manually)\033[0m" >&2
+                echo -e "  \033[2mError: $(echo "$sprint_response" | head -c 100)\033[0m" >&2
             fi
         fi
+        
+        echo "" >&2
+        echo -e "  \033[2mFinalizing...\033[0m" >&2
         
         # Invalidate cache so new ticket shows up in jira-fzf
         rm -f "$CACHE_DIR/tickets.json"
         
-        # Copy ticket URL to clipboard if xclip is available
-        if command -v xclip &> /dev/null; then
-            echo -n "$ticket_url" | xclip -selection clipboard
-            printf "  \033[2m(URL copied to clipboard)\033[0m\n" >&2
-        fi
-        
+        echo -e "  \033[2mReturning ticket info to caller...\033[0m" >&2
+        echo "" >&2
         rm -rf "$tmpdir"
+        
+        # Output JSON result and exit immediately (don't wait for bg jobs)
+        # Note: jq outputs to stdout which gets picked up by tail -1
         jq -nc --arg key "$new_key" --arg summary "$summary" '{key: $key, summary: $summary}'
         exit 0
     else

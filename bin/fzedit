@@ -1,0 +1,126 @@
+#!/usr/bin/env bash
+# ~/.local/bin/fzedit
+# fzf-based file editor - fzf stays running, uses continuous reload
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/../lib/fzf-helpers"
+
+HISTORY_FILE="$HOME/.fzedit_history"
+
+# Create history file if it doesn't exist
+[ ! -f "$HISTORY_FILE" ] && touch "$HISTORY_FILE"
+
+# Directories to exclude
+EXCLUDE_DIRS=(
+    -E node_modules
+    -E .git
+    -E dist
+    -E build
+    -E .next
+    -E .cache
+    -E target
+    -E vendor
+    -E __pycache__
+    -E .venv
+    -E venv
+)
+
+# Preferred directories (searched first)
+PREFERRED_DIRS=(
+    "$HOME/work/repos/client/web"
+    "$HOME/work"
+    "$HOME/.config"
+    "$HOME/.xmonad"
+    "$HOME/bin"
+)
+
+# Preferred file extensions (prioritized)
+PREFERRED_EXTS=(-e hs -e js -e ts -e tsx -e py -e sh -e md -e yaml -e toml)
+
+# Function to generate file list with colors
+generate_list() {
+    {
+        # Recently opened files (highest priority)
+        tac "$HISTORY_FILE" | while read -r f; do
+            [ -f "$f" ] && echo "$f"
+        done
+        
+        # Preferred directories with preferred extensions
+        for dir in "${PREFERRED_DIRS[@]}"; do
+            [ -d "$dir" ] && fd . "$dir" --type f --follow --hidden "${EXCLUDE_DIRS[@]}" "${PREFERRED_EXTS[@]}"
+        done
+        
+        # All preferred extensions in home
+        fd . ~/ --type f --follow --hidden "${EXCLUDE_DIRS[@]}" "${PREFERRED_EXTS[@]}"
+        
+        # Everything else (lower priority)
+        fd . ~/ --type f --follow --hidden "${EXCLUDE_DIRS[@]}"
+    } | awk '!seen[$0]++' | awk -v home="$HOME" '{
+        # Replace home directory with ~
+        path = $0
+        sub("^" home, "~", path)
+        
+        # Split path into directory and filename
+        n = split(path, parts, "/")
+        filename = parts[n]
+        dir = substr(path, 1, length(path) - length(filename))
+        
+        # Get file extension
+        split(filename, ext_parts, ".")
+        ext = ext_parts[length(ext_parts)]
+        
+        # Color based on file extension
+        if (ext == "hs" || ext == "lhs") {
+            color = "\033[38;5;141m"  # Purple (Haskell)
+        } else if (ext == "js" || ext == "jsx" || ext == "ts" || ext == "tsx") {
+            color = "\033[38;5;221m"  # Yellow (JavaScript/TypeScript)
+        } else if (ext == "py") {
+            color = "\033[38;5;81m"   # Cyan (Python)
+        } else if (ext == "sh" || ext == "bash" || ext == "zsh") {
+            color = "\033[38;5;114m"  # Green (Shell)
+        } else if (ext == "yaml" || ext == "yml" || ext == "toml" || ext == "json") {
+            color = "\033[38;5;173m"  # Orange (Config)
+        } else if (ext == "md" || ext == "markdown" || ext == "txt") {
+            color = "\033[38;5;250m"  # Light gray (Docs)
+        } else if (ext == "rs") {
+            color = "\033[38;5;208m"  # Orange-red (Rust)
+        } else if (ext == "go") {
+            color = "\033[38;5;86m"   # Bright cyan (Go)
+        } else {
+            color = "\033[0m"         # Default
+        }
+        
+        # Print: dimmed directory + colored filename
+        printf "\033[2m%s\033[0m%s%s\033[0m\n", dir, color, filename
+    }'
+}
+
+# If called with --generate-list, just generate and exit (used by reload)
+if [ "$1" = "--generate-list" ]; then
+    generate_list
+    exit 0
+fi
+
+# fzf runs continuously and reloads after each file edit
+generate_list | fzp_run \
+    --prompt="Enter nvim | ^O cursor | ^S shell | ^R refresh > " \
+    --preview='f=$(echo {}); f=${f/#\~/$HOME}; bat --color=always --style=numbers --line-range=:100 "$f" 2>/dev/null || cat "$f" 2>/dev/null || echo "Preview not available"' \
+    --preview-window=down:50%:wrap \
+    --bind 'ctrl-c:execute-silent(f=$(echo {}); f=${f/#\~/$HOME}; echo -n "$f" | xclip -selection clipboard)' \
+    --bind "ctrl-r:reload($0 --generate-list)" \
+    --bind "enter:execute(
+        f=\$(echo {}); 
+        f=\${f/#\~/$HOME}; 
+        echo \"\$f\" >> $HISTORY_FILE;
+        tail -100 $HISTORY_FILE > ${HISTORY_FILE}.tmp && mv ${HISTORY_FILE}.tmp $HISTORY_FILE;
+        nvim \"\$f\" < /dev/tty > /dev/tty 2>&1
+    )+reload($0 --generate-list)" \
+    --bind "ctrl-o:execute-silent(
+        f=\$(echo {}); 
+        f=\${f/#\~/$HOME}; 
+        echo \"\$f\" >> $HISTORY_FILE;
+        tail -100 $HISTORY_FILE > ${HISTORY_FILE}.tmp && mv ${HISTORY_FILE}.tmp $HISTORY_FILE;
+        cursor -r \"\$f\"
+    )+reload($0 --generate-list)" \
+    --bind 'ctrl-s:execute-silent(f={}; f=${f/#\~/$HOME}; tmux new-window -c "$(dirname "$f")")' \
+    --tiebreak=begin,index

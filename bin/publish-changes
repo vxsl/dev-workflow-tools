@@ -3,7 +3,7 @@
 #
 # Usage:
 #   publish-changes                           Interactive MR creation from current branch
-#   publish-changes UB-1234                   Create MR and link to Jira ticket
+#   publish-changes PROJ-1234                 Create MR and link to Jira ticket
 #   publish-changes --branch feature/foo      Create MR for specific branch
 #   publish-changes --target main             Pre-select target branch
 #   publish-changes --draft                   Create as draft MR
