@@ -36,6 +36,7 @@ fi
 DRY_RUN=false
 DEFAULT_LABELS="front-end"
 OUTPUT_FILE=""
+CLEAR_SCREEN=false
 
 # Parse command line arguments
 INITIAL_SUMMARY=""
@@ -49,6 +50,7 @@ while [[ "$#" -gt 0 ]]; do
         --description) USER_DESCRIPTION="$2"; shift 2 ;;
         --labels) DEFAULT_LABELS="$2"; shift 2 ;;
         --output-file) OUTPUT_FILE="$2"; shift 2 ;;
+        --clear) CLEAR_SCREEN=true; shift ;;
         *) 
             echo "Unknown argument: $1" >&2
             exit 1
@@ -189,8 +191,10 @@ mkdir -p "$CACHE_DIR"
 tmpdir="$CACHE_DIR/create_tmp"
 mkdir -p "$tmpdir"
 
-# Clear screen for clean output
-clear >&2
+# Clear screen for clean output (only if --clear specified)
+if [ "$CLEAR_SCREEN" = true ]; then
+    clear >&2
+fi
 
 # Fancy header with mellow colors
 echo "" >&2

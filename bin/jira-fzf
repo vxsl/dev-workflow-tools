@@ -573,7 +573,7 @@ create_ticket_interactive() {
     clear >&2
     
     # Build arguments for create-jira-ticket
-    local args=()
+    local args=(--clear)  # jira-fzf wants screen clearing
     if [ "$DRY_RUN" = true ]; then
         args+=(--dry-run)
     fi
