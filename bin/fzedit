@@ -1,11 +1,17 @@
 #!/usr/bin/env bash
 # ~/.local/bin/fzedit
 # fzf-based file editor - fzf stays running, uses continuous reload
+#
+# Usage:
+#   fzedit              # Use FZF_PERSIST_MODE env var (default: on)
+#   fzedit --persist    # Force persist mode (stays open)
+#   fzedit --one-shot   # Force one-shot mode (exits after selection)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/../lib/fzf-helpers"
 
 HISTORY_FILE="$HOME/.fzedit_history"
+PERSIST_MODE="--persist"  # Default to persist mode for fzedit
 
 # Create history file if it doesn't exist
 [ ! -f "$HISTORY_FILE" ] && touch "$HISTORY_FILE"
@@ -95,14 +101,31 @@ generate_list() {
     }'
 }
 
-# If called with --generate-list, just generate and exit (used by reload)
-if [ "$1" = "--generate-list" ]; then
-    generate_list
-    exit 0
-fi
+# Parse command line arguments
+while [[ "$#" -gt 0 ]]; do
+    case $1 in
+        --generate-list)
+            generate_list
+            exit 0
+            ;;
+        --persist)
+            PERSIST_MODE="--persist"
+            shift
+            ;;
+        --one-shot)
+            PERSIST_MODE="--one-shot"
+            shift
+            ;;
+        *)
+            echo "Unknown option: $1" >&2
+            echo "Usage: fzedit [--persist|--one-shot]" >&2
+            exit 1
+            ;;
+    esac
+done
 
 # fzf runs continuously and reloads after each file edit
-generate_list | fzp_run \
+generate_list | fzp_run $PERSIST_MODE \
     --prompt="Enter nvim | ^O cursor | ^S shell | ^R refresh > " \
     --preview='f=$(echo {}); f=${f/#\~/$HOME}; bat --color=always --style=numbers --line-range=:100 "$f" 2>/dev/null || cat "$f" 2>/dev/null || echo "Preview not available"' \
     --preview-window=down:50%:wrap \
