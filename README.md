@@ -37,7 +37,23 @@ TICKET_CREATOR_BOT_TOKEN="xoxb-..."
 FZF_PERSIST_MODE=1  # For xmonad scratchpads/tmux popups
 ```
 
-Get API token: https://id.atlassian.com/manage-profile/security/api-tokens
+Get Jira API token: https://id.atlassian.com/manage-profile/security/api-tokens
+
+### Slack Bot Token
+
+The `TICKET_CREATOR_BOT_TOKEN` is used by `oneshot` to post ticket and MR links to Slack threads. The bot requires these OAuth scopes:
+
+- `chat:write` - Post messages to channels/threads
+- `channels:read` - Verify bot membership in public channels
+- `groups:read` - Verify bot membership in private channels
+
+To add these scopes:
+1. Go to https://api.slack.com/apps → Your App → OAuth & Permissions
+2. Add the scopes under "Bot Token Scopes"
+3. Reinstall the app to your workspace
+4. Copy the "Bot User OAuth Token" (starts with `xoxb-`) to `.env`
+
+**Note:** The bot must be added to channels before it can post. Use `/invite @your-bot-name` in the channel.
 
 ### FZF Persist Mode
 

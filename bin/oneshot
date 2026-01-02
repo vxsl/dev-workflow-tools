@@ -161,6 +161,129 @@ get_cached_tickets() {
     fi
 }
 
+# Run pre-push checks
+run_prepush_checks() {
+    local repo_dir="$1"
+    
+    echo -e "${CYAN}┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓${RESET}" >&2
+    echo -e "${CYAN}┃${RESET} ${BLUE}Pre-push validation:${RESET} Running checks                     ${CYAN}┃${RESET}" >&2
+    echo -e "${CYAN}┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛${RESET}" >&2
+    echo "" >&2
+    
+    # Save current directory
+    local original_dir=$(pwd)
+    cd "$repo_dir" || return 1
+    
+    # Stash unstaged changes so we only validate what's staged
+    local stashed=false
+    if ! git diff-files --quiet; then
+        echo -e "  ${DIM}Stashing unstaged changes...${RESET}" >&2
+        git stash push --keep-index --quiet -m "oneshot: temporary stash for pre-push validation"
+        stashed=true
+    fi
+    
+    # Get git hooks path (could be custom via core.hooksPath)
+    local hooks_path=$(git config core.hooksPath || echo ".git/hooks")
+    local pre_push_hook="${hooks_path}/pre-push"
+    
+    local result=0
+    
+    # If pre-push hook exists and is executable, run it
+    if [ -x "$pre_push_hook" ]; then
+        echo -e "  ${DIM}Running pre-push hook...${RESET}" >&2
+        
+        # Pre-push hooks read from stdin: <local ref> <local sha> <remote ref> <remote sha>
+        # Provide dummy data so it thinks there are commits to check
+        local current_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "HEAD")
+        local current_sha=$(git rev-parse HEAD 2>/dev/null || echo "0000000000000000000000000000000000000000")
+        
+        # Run hook and capture exit code
+        local exit_code=0
+        echo "refs/heads/${current_branch} ${current_sha} refs/heads/main 0000000000000000000000000000000000000000" | "$pre_push_hook" 2>&1 >&2
+        exit_code=${PIPESTATUS[1]}
+        
+        if [ $exit_code -eq 0 ]; then
+            echo -e "  ${GREEN}✓${RESET} Pre-push hook passed" >&2
+            result=0
+        else
+            echo -e "  ${RED}✗ Pre-push hook failed${RESET}" >&2
+            result=1
+        fi
+    else
+        # No pre-push hook found, skip validation
+        echo -e "  ${YELLOW}⚠ No pre-push hook found, skipping validation${RESET}" >&2
+        echo -e "  ${DIM}Hook path checked: ${pre_push_hook}${RESET}" >&2
+    fi
+    
+    # Restore unstaged changes
+    if [ "$stashed" = true ]; then
+        echo -e "  ${DIM}Restoring unstaged changes...${RESET}" >&2
+        git stash pop --quiet
+    fi
+    
+    cd "$original_dir"
+    echo "" >&2
+    return $result
+}
+
+# Verify Slack bot has access to channel
+verify_slack_channel_access() {
+    local channel="$1"
+    
+    if [ -z "$TICKET_CREATOR_BOT_TOKEN" ]; then
+        return 0  # Skip if no token
+    fi
+    
+    echo -e "  ${DIM}Verifying bot channel access...${RESET}" >&2
+    
+    # Try conversations.info - if we get not_in_channel error, we know for sure bot isn't there
+    local response
+    response=$(curl -s -G "https://slack.com/api/conversations.info" \
+        -H "Authorization: Bearer ${TICKET_CREATOR_BOT_TOKEN}" \
+        --data-urlencode "channel=${channel}")
+    
+    if echo "$response" | jq -e '.ok == true' >/dev/null 2>&1; then
+        # API call succeeded, but check if bot is actually a member
+        local is_member=$(echo "$response" | jq -r '.channel.is_member // false')
+        if [ "$is_member" = "true" ]; then
+            echo -e "  ${GREEN}✓${RESET} Bot has channel access" >&2
+            return 0
+        else
+            echo -e "  ${RED}✗ Bot is not a member of the channel${RESET}" >&2
+            echo -e "  ${DIM}Add the bot to the channel with: /invite -> \"Add apps to this channel\"${RESET}" >&2
+            return 1
+        fi
+    else
+        local error=$(echo "$response" | jq -r '.error // "unknown error"')
+        
+        # Only fail on definitive "not in channel" errors
+        case "$error" in
+            not_in_channel|channel_not_found)
+                echo -e "  ${RED}✗ Bot cannot access channel: ${error}${RESET}" >&2
+                echo -e "  ${DIM}Add the bot to the channel with: /invite -> \"Add apps to this channel\"${RESET}" >&2
+                return 1
+                ;;
+            missing_scope)
+                # Bot token lacks scope to check membership, but that doesn't mean it can't post
+                echo -e "  ${YELLOW}⚠ Cannot verify channel access (missing scope), continuing anyway${RESET}" >&2
+                echo -e "  ${DIM}If posting fails later, add the bot with: /invite -> \"Add apps to this channel\"${RESET}" >&2
+                return 0
+                ;;
+            invalid_auth|token_revoked|account_inactive)
+                echo -e "  ${RED}✗ Bot token error: ${error}${RESET}" >&2
+                echo -e "  ${DIM}Check TICKET_CREATOR_BOT_TOKEN${RESET}" >&2
+                return 1
+                ;;
+            *)
+                # Unknown error - warn but don't block
+                echo -e "  ${YELLOW}⚠ Could not verify channel access: ${error}${RESET}" >&2
+                echo -e "  ${DIM}Continuing anyway${RESET}" >&2
+                return 0
+                ;;
+        esac
+    fi
+}
+
 # Post message to Slack thread
 post_to_slack() {
     local channel="$1"
@@ -287,6 +410,16 @@ if [ "$staged_count" -gt 5 ]; then
 fi
 echo "" >&2
 
+# Step 1.5: Run pre-push checks
+if [ "$DRY_RUN" != true ]; then
+    # Determine repository root
+    repo_root=$(git rev-parse --show-toplevel)
+    
+    if ! run_prepush_checks "$repo_root"; then
+        exit 1
+    fi
+fi
+
 # Step 2: Select ticket or handle Slack URL
 echo -e "${CYAN}┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓${RESET}" >&2
 echo -e "${CYAN}┃${RESET} ${BLUE}Step 2/4:${RESET} Select Jira ticket                            ${CYAN}┃${RESET}" >&2
@@ -295,6 +428,14 @@ echo -e "${CYAN}┗━━━━━━━━━━━━━━━━━━━━�
 # Handle Slack URL from argument
 if [ -n "$SLACK_URL" ]; then
     echo -e "  ${CYAN}Slack thread:${RESET} ${DIM}${SLACK_URL}${RESET}" >&2
+    
+    # Verify bot can post to the channel
+    if [ "$DRY_RUN" != true ] && [ -n "$TICKET_CREATOR_BOT_TOKEN" ]; then
+        if ! verify_slack_channel_access "$SLACK_CHANNEL"; then
+            exit 1
+        fi
+    fi
+    
     echo "" >&2
     
     # Build flags for create-jira-ticket
@@ -399,6 +540,14 @@ else
         
         echo "" >&2
         echo -e "  ${CYAN}Slack thread:${RESET} ${DIM}${SLACK_URL}${RESET}" >&2
+        
+        # Verify bot can post to the channel
+        if [ "$DRY_RUN" != true ] && [ -n "$TICKET_CREATOR_BOT_TOKEN" ]; then
+            if ! verify_slack_channel_access "$SLACK_CHANNEL"; then
+                exit 1
+            fi
+        fi
+        
         echo "" >&2
         
         # Build flags for create-jira-ticket
@@ -698,7 +847,7 @@ echo -e "${CYAN}┗━━━━━━━━━━━━━━━━━━━━�
 target_branch="${BASE_BRANCH#origin/}"
 
 if [ "$DRY_RUN" = true ]; then
-    echo -e "  ${DIM}[DRY RUN] Would run: publish-changes --branch ${branch_name} --target ${target_branch} ${TICKET_KEY}${RESET}" >&2
+    echo -e "  ${DIM}[DRY RUN] Would run: SKIP_PRE_PUSH_CHECKS=true publish-changes --branch ${branch_name} --target ${target_branch} ${TICKET_KEY}${RESET}" >&2
     if [ -n "$SLACK_URL" ]; then
         echo -e "  ${DIM}[DRY RUN] Would post MR link to Slack thread${RESET}" >&2
     fi
@@ -706,7 +855,8 @@ if [ "$DRY_RUN" = true ]; then
     echo -e "${GREEN}=== Dry run complete ===${RESET}" >&2
 else
     # Run publish-changes and capture the MR URL from stdout
-    mr_url=$("$SCRIPT_DIR/publish-changes" --branch "$branch_name" --target "$target_branch" --output-url --no-draft-prompt "$TICKET_KEY")
+    # Skip pre-push checks since we already ran them earlier
+    mr_url=$(SKIP_PRE_PUSH_CHECKS=true "$SCRIPT_DIR/publish-changes" --branch "$branch_name" --target "$target_branch" --output-url --no-draft-prompt "$TICKET_KEY")
     
     # Post MR link to Slack if we have a thread
     if [ -n "$SLACK_URL" ] && [ -n "$mr_url" ]; then
