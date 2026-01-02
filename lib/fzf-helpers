@@ -91,14 +91,14 @@ fzp_should_persist() {
 }
 
 # Strip control flags from arguments
+# Returns filtered args as null-terminated strings to handle multi-line arguments
 fzp_strip_control_flags() {
-    local args=()
+    local arg
     for arg in "$@"; do
         if [ "$arg" != "--persist" ] && [ "$arg" != "--one-shot" ]; then
-            args+=("$arg")
+            printf '%s\0' "$arg"
         fi
     done
-    printf '%s\n' "${args[@]}"
 }
 
 # Helper: Create a binding that executes a command and reloads
@@ -152,9 +152,10 @@ fzp_run() {
     fi
     
     # Strip control flags and keep other options
+    # Read null-terminated strings to handle multi-line arguments (like --preview)
     local custom_opts=()
-    while IFS= read -r line; do
-        custom_opts+=("$line")
+    while IFS= read -r -d '' arg; do
+        custom_opts+=("$arg")
     done < <(fzp_strip_control_flags "$@")
     
     # Build the command with defaults first, then custom options
