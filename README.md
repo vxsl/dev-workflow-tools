@@ -48,6 +48,10 @@ By default, fzf tools exit after selection (normal CLI behavior). Set `FZF_PERSI
 ### `jira-fzf`
 Browse/search Jira tickets, create new tickets, checkout branches, create MRs.
 
+**Usage:** `jira-fzf [--persist] [--one-shot] [--dry-run] [--labels "bug,ui"]`
+- `--persist` - Keep open after actions (for scratchpads/tmux popups)
+- `--one-shot` - Exit after selection (default)
+
 **Keys:** `<CR>` maximize | `^y` copy | `^o` open | `^t` new ticket | `^g` create MR | `^c` checkout | `^s` sort | `^r` refresh
 
 ### `create-jira-ticket`
