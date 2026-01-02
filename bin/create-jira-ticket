@@ -18,7 +18,9 @@ set -e
 # Load environment variables
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [ -f "$SCRIPT_DIR/../.env" ]; then
+    set -a  # automatically export all variables
     source "$SCRIPT_DIR/../.env"
+    set +a
 fi
 
 # Configuration
@@ -33,6 +35,7 @@ if [ -z "$JIRA_DOMAIN" ] || [ -z "$JIRA_PROJECT" ]; then
 fi
 DRY_RUN=false
 DEFAULT_LABELS="front-end"
+OUTPUT_FILE=""
 
 # Parse command line arguments
 INITIAL_SUMMARY=""
@@ -45,6 +48,7 @@ while [[ "$#" -gt 0 ]]; do
         --slack-url) SLACK_URL="$2"; shift 2 ;;
         --description) USER_DESCRIPTION="$2"; shift 2 ;;
         --labels) DEFAULT_LABELS="$2"; shift 2 ;;
+        --output-file) OUTPUT_FILE="$2"; shift 2 ;;
         *) 
             echo "Unknown argument: $1" >&2
             exit 1
@@ -90,20 +94,20 @@ fi
 # Function to call Jira API (v3)
 jira_api() {
     local endpoint="$1"
-    curl -s -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
+    curl -s --max-time 10 -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
         "https://${JIRA_DOMAIN}/rest/api/3/${endpoint}" \
-        -H "Content-Type: application/json"
+        -H "Content-Type: application/json" 2>&1
 }
 
 # Function to call Jira API with POST (v3)
 jira_api_post() {
     local endpoint="$1"
     local data="$2"
-    curl -s -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
+    curl -s --max-time 30 -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
         -X POST \
         "https://${JIRA_DOMAIN}/rest/api/3/${endpoint}" \
         -H "Content-Type: application/json" \
-        -d "$data"
+        -d "$data" 2>&1
 }
 
 # Function to get issue types from Jira
@@ -126,8 +130,8 @@ get_priorities() {
 get_parent_issues() {
     local jql="project=${JIRA_PROJECT} AND (type=Epic OR type=Story) ORDER BY updated DESC"
     local jql_encoded=$(echo "$jql" | jq -sRr @uri)
-    local response=$(curl -s -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
-        "https://${JIRA_DOMAIN}/rest/api/3/search/jql?jql=${jql_encoded}&maxResults=50&fields=summary,issuetype" 2>/dev/null)
+    local response=$(curl -s --max-time 10 -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
+        "https://${JIRA_DOMAIN}/rest/api/3/search/jql?jql=${jql_encoded}&maxResults=50&fields=summary,issuetype" 2>&1)
     
     echo "None"
     echo "$response" | jq -r '.issues[] | .key + " - " + .fields.summary' 2>/dev/null
@@ -152,8 +156,8 @@ get_labels() {
 # Function to get active sprints (returns most recent active sprint first, then "No sprint")
 get_sprints() {
     # Get the board ID first (use Agile API)
-    local boards=$(curl -s -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
-        "https://${JIRA_DOMAIN}/rest/agile/1.0/board?projectKeyOrId=${JIRA_PROJECT}" 2>/dev/null)
+    local boards=$(curl -s --max-time 10 -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
+        "https://${JIRA_DOMAIN}/rest/agile/1.0/board?projectKeyOrId=${JIRA_PROJECT}" 2>&1)
     local board_id=$(echo "$boards" | jq -r '.values[0].id' 2>/dev/null)
     
     if [ -z "$board_id" ] || [ "$board_id" = "null" ]; then
@@ -162,8 +166,8 @@ get_sprints() {
     fi
     
     # Get active and future sprints
-    local sprints=$(curl -s -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
-        "https://${JIRA_DOMAIN}/rest/agile/1.0/board/${board_id}/sprint?state=active,future" 2>/dev/null)
+    local sprints=$(curl -s --max-time 10 -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
+        "https://${JIRA_DOMAIN}/rest/agile/1.0/board/${board_id}/sprint?state=active,future" 2>&1)
     
     local sprint_list=$(echo "$sprints" | jq -r '.values[] | (.id|tostring) + " - " + .name + " (" + .state + ")"' 2>/dev/null)
     
@@ -205,7 +209,7 @@ printf "\033[38;5;109m┃\033[0m \033[38;5;81mStep 1/8:\033[0m Enter ticket summ
 printf "\033[38;5;109m┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\033[0m\n" >&2
 echo -n "  ✏️  " >&2
 summary=""
-read -e -i "$INITIAL_SUMMARY" summary < /dev/tty
+read -e -i "$INITIAL_SUMMARY" summary
 summary=$(echo "$summary" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
 
 if [ -z "$summary" ]; then
@@ -323,7 +327,7 @@ cat > "$tmpdir/description" << EOFDESC
 ${initial_desc}
 EOFDESC
 
-$EDITOR "$tmpdir/description" < /dev/tty > /dev/tty 2>&1
+$EDITOR "$tmpdir/description"
 desc_text=$(grep -v '^#' "$tmpdir/description")
 desc_preview=$(echo "$desc_text" | head -c 50)
 
@@ -496,10 +500,13 @@ if [ "$DRY_RUN" = true ]; then
     fi
     echo "" >&2
     rm -rf "$tmpdir"
-    jq -nc --arg key "${JIRA_PROJECT}-9999" --arg summary "$summary" '{key: $key, summary: $summary}'
     
-    # Explicitly close stdout to ensure EOF is sent
-    exec 1>&-
+    # Output JSON result
+    if [ -n "$OUTPUT_FILE" ]; then
+        jq -nc --arg key "${JIRA_PROJECT}-9999" --arg summary "$summary" '{key: $key, summary: $summary}' > "$OUTPUT_FILE"
+    else
+        jq -nc --arg key "${JIRA_PROJECT}-9999" --arg summary "$summary" '{key: $key, summary: $summary}'
+    fi
     exit 0
 else
     echo "" >&2
@@ -524,7 +531,7 @@ else
             echo "" >&2
             echo -e "  \033[2mAdding ticket to sprint ${sprint_id}...\033[0m" >&2
             issue_id=$(echo "$response" | jq -r '.id')
-            sprint_response=$(curl -s -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
+            sprint_response=$(curl -s --max-time 10 -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
                 -X POST \
                 "https://${JIRA_DOMAIN}/rest/agile/1.0/sprint/${sprint_id}/issue" \
                 -H "Content-Type: application/json" \
@@ -548,9 +555,12 @@ else
         echo "" >&2
         rm -rf "$tmpdir"
         
-        # Output JSON result and exit immediately (don't wait for bg jobs)
-        # Note: jq outputs to stdout which gets picked up by tail -1
-        jq -nc --arg key "$new_key" --arg summary "$summary" '{key: $key, summary: $summary}'
+        # Output JSON result
+        if [ -n "$OUTPUT_FILE" ]; then
+            jq -nc --arg key "$new_key" --arg summary "$summary" '{key: $key, summary: $summary}' > "$OUTPUT_FILE"
+        else
+            jq -nc --arg key "$new_key" --arg summary "$summary" '{key: $key, summary: $summary}'
+        fi
         exit 0
     else
         echo "" >&2
