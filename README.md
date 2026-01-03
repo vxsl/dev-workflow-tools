@@ -78,7 +78,7 @@ create-jira-ticket --summary "Fix bug"   # Quick
 create-jira-ticket --slack-url URL       # Link to Slack
 ```
 
-### `oneshot` (alias: `osgcm`)
+### `oneshot` (alias: `os`)
 One-shot workflow: staged changes → branch → commit → MR.
 ```bash
 oneshot                    # Interactive
@@ -168,7 +168,7 @@ The `shell/dev-workflow.zsh` provides:
 
 **Other:**
 - `push` / `mush` - Push changes
-- `osgcm` - Alias for oneshot
+- `os` - Alias for oneshot
 
 ## Troubleshooting
 

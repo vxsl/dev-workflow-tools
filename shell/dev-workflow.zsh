@@ -141,7 +141,7 @@ alias mush="git push"                         # Push changes (fat-finger friendl
 alias gds="git-branch-status"                 # Branch status (if available)
 
 # Jira + GitLab Integration Scripts
-alias osgcm="one-shot"                        # One-shot commit workflow with Jira integration
+alias os="oneshot"                        # One-shot commit workflow with Jira integration
 
 # ============================================================================
 # Configuration
@@ -167,8 +167,3 @@ fi
 # Completion
 # ============================================================================
 # Add completion for our custom commands (if needed in future)
-
-
-
-
-

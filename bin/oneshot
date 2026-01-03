@@ -2,11 +2,11 @@
 # One-shot change: commit staged changes to a new branch and create MR
 #
 # Usage:
-#   one-shot                              Interactive ticket selection (or create new)
-#   one-shot PROJ-1234                    Use existing ticket
-#   one-shot https://slack.com/...        Create ticket + link to Slack thread
-#   one-shot --dry-run                    Show what would be done
-#   one-shot --base origin/main           Explicitly set base branch (default: origin/main)
+#   oneshot                              Interactive ticket selection (or create new)
+#   oneshot PROJ-1234                    Use existing ticket
+#   oneshot https://slack.com/...        Create ticket + link to Slack thread
+#   oneshot --dry-run                    Show what would be done
+#   oneshot --base origin/main           Explicitly set base branch (default: origin/main)
 #
 # Workflow:
 #   1. Check for staged changes
