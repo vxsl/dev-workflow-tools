@@ -16,8 +16,15 @@
 #      - If on feature branch: prompts to branch from current or origin/main
 #      - Can override with --base flag
 #   4. Commit staged changes with "TICKET: summary" as message
+#      - Supports multiple commits interactively
+#      - Re-runs pre-push checks before publishing
 #   5. Run publish-changes to create MR
 #   6. (If Slack URL) Post ticket link back to thread
+#
+# Resumability:
+#   - State is saved after ticket creation
+#   - If script fails (e.g., pre-push checks fail), run 'oneshot' again to resume
+#   - You can add more commits and continue from where you left off
 
 set -e
 
@@ -33,6 +40,7 @@ fi
 JIRA_DOMAIN="${JIRA_DOMAIN}"
 JIRA_PROJECT="${JIRA_PROJECT}"
 CACHE_DIR="$HOME/.cache/jira-fzf"
+STATE_DIR="$HOME/.cache/oneshot-state"
 
 # Validate required environment variables
 if [ -z "$JIRA_DOMAIN" ] || [ -z "$JIRA_PROJECT" ]; then
@@ -40,6 +48,7 @@ if [ -z "$JIRA_DOMAIN" ] || [ -z "$JIRA_PROJECT" ]; then
     exit 1
 fi
 TICKETS_CACHE="$CACHE_DIR/tickets.json"
+mkdir -p "$STATE_DIR"
 DRY_RUN=false
 BASE_BRANCH="origin/main"
 SLACK_URL=""
@@ -198,8 +207,9 @@ run_prepush_checks() {
         local current_sha=$(git rev-parse HEAD 2>/dev/null || echo "0000000000000000000000000000000000000000")
         
         # Run hook and capture exit code
+        # Skip protected branch check since we're creating a new branch anyway
         local exit_code=0
-        echo "refs/heads/${current_branch} ${current_sha} refs/heads/main 0000000000000000000000000000000000000000" | "$pre_push_hook" 2>&1 >&2
+        echo "refs/heads/${current_branch} ${current_sha} refs/heads/main 0000000000000000000000000000000000000000" | SKIP_PROTECTED_BRANCH_CHECK=true "$pre_push_hook" 2>&1 >&2
         exit_code=${PIPESTATUS[1]}
         
         if [ $exit_code -eq 0 ]; then
@@ -330,6 +340,57 @@ post_to_slack() {
     fi
 }
 
+# Save state for resumption
+save_state() {
+    local ticket_key="$1"
+    local summary="$2"
+    local branch_name="$3"
+    local base_branch="$4"
+    local slack_url="$5"
+    local slack_channel="$6"
+    local slack_thread_ts="$7"
+    
+    local repo_root=$(git rev-parse --show-toplevel)
+    local state_file="${STATE_DIR}/$(echo "$repo_root" | sed 's|/|_|g').json"
+    
+    jq -n \
+        --arg ticket_key "$ticket_key" \
+        --arg summary "$summary" \
+        --arg branch_name "$branch_name" \
+        --arg base_branch "$base_branch" \
+        --arg slack_url "$slack_url" \
+        --arg slack_channel "$slack_channel" \
+        --arg slack_thread_ts "$slack_thread_ts" \
+        '{
+            ticket_key: $ticket_key,
+            summary: $summary,
+            branch_name: $branch_name,
+            base_branch: $base_branch,
+            slack_url: $slack_url,
+            slack_channel: $slack_channel,
+            slack_thread_ts: $slack_thread_ts,
+            timestamp: now | todate
+        }' > "$state_file"
+}
+
+# Load state for resumption
+load_state() {
+    local repo_root=$(git rev-parse --show-toplevel)
+    local state_file="${STATE_DIR}/$(echo "$repo_root" | sed 's|/|_|g').json"
+    
+    if [ -f "$state_file" ]; then
+        cat "$state_file"
+    fi
+}
+
+# Clear saved state
+clear_state() {
+    local repo_root=$(git rev-parse --show-toplevel)
+    local state_file="${STATE_DIR}/$(echo "$repo_root" | sed 's|/|_|g').json"
+    
+    rm -f "$state_file"
+}
+
 # Select ticket interactively (or create new)
 select_ticket_or_slack() {
     echo -e "${CYAN}┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓${RESET}" >&2
@@ -387,40 +448,107 @@ if [ "$DRY_RUN" = true ]; then
 fi
 echo "" >&2
 
-# Step 1: Check for staged changes
-echo -e "${CYAN}┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓${RESET}" >&2
-echo -e "${CYAN}┃${RESET} ${BLUE}Step 1/4:${RESET} Checking staged changes                       ${CYAN}┃${RESET}" >&2
-echo -e "${CYAN}┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛${RESET}" >&2
-
-staged_files=$(git diff --cached --name-only)
-staged_count=$(echo "$staged_files" | grep -c . || true)
-
-if [ "$staged_count" -eq 0 ]; then
-    echo -e "  ${RED}✗ No staged changes${RESET}" >&2
-    echo -e "  ${DIM}Stage changes first: git add <files>${RESET}" >&2
-    exit 1
-fi
-
-echo -e "  ${GREEN}✓${RESET} ${staged_count} file(s) staged:" >&2
-echo "$staged_files" | head -5 | while read -r file; do
-    echo -e "    ${DIM}${file}${RESET}" >&2
-done
-if [ "$staged_count" -gt 5 ]; then
-    echo -e "    ${DIM}... and $((staged_count - 5)) more${RESET}" >&2
-fi
-echo "" >&2
-
-# Step 1.5: Run pre-push checks
-if [ "$DRY_RUN" != true ]; then
-    # Determine repository root
-    repo_root=$(git rev-parse --show-toplevel)
+# Check for resumable state
+saved_state=$(load_state)
+if [ -n "$saved_state" ]; then
+    saved_ticket=$(echo "$saved_state" | jq -r '.ticket_key')
+    saved_branch=$(echo "$saved_state" | jq -r '.branch_name')
+    saved_summary=$(echo "$saved_state" | jq -r '.summary')
+    saved_timestamp=$(echo "$saved_state" | jq -r '.timestamp')
     
-    if ! run_prepush_checks "$repo_root"; then
+    echo -e "${YELLOW}⚠ Found incomplete oneshot from ${saved_timestamp}${RESET}" >&2
+    echo -e "  ${CYAN}Ticket:${RESET} ${saved_ticket}" >&2
+    echo -e "  ${CYAN}Branch:${RESET} ${saved_branch}" >&2
+    if [ -n "$saved_summary" ]; then
+        echo -e "  ${CYAN}Summary:${RESET} ${DIM}${saved_summary}${RESET}" >&2
+    fi
+    echo "" >&2
+    echo -e "  ${CYAN}Resume from saved state?${RESET} ${DIM}(y/n)${RESET}" >&2
+    read -p "  > " -n 1 -r resume_response < /dev/tty
+    echo "" >&2
+    echo "" >&2
+    
+    if [[ $resume_response =~ ^[Yy]$ ]]; then
+        # Load state variables
+        TICKET_KEY="$saved_ticket"
+        summary="$saved_summary"
+        branch_name="$saved_branch"
+        BASE_BRANCH=$(echo "$saved_state" | jq -r '.base_branch')
+        SLACK_URL=$(echo "$saved_state" | jq -r '.slack_url // empty')
+        SLACK_CHANNEL=$(echo "$saved_state" | jq -r '.slack_channel // empty')
+        SLACK_THREAD_TS=$(echo "$saved_state" | jq -r '.slack_thread_ts // empty')
+        
+        # Set commit_message for Slack post
+        if [ -n "$summary" ]; then
+            commit_message="$TICKET_KEY: $summary"
+        else
+            commit_message="$TICKET_KEY"
+        fi
+        
+        # Skip to Step 3
+        echo -e "${CYAN}┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓${RESET}" >&2
+        echo -e "${CYAN}┃${RESET} ${BLUE}Resuming:${RESET} On branch ${branch_name}                        ${CYAN}┃${RESET}" >&2
+        echo -e "${CYAN}┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛${RESET}" >&2
+        echo "" >&2
+        
+        # Verify we're on the correct branch
+        current_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+        if [ "$current_branch" != "$branch_name" ]; then
+            echo -e "  ${YELLOW}⚠ Currently on ${current_branch}, switching to ${branch_name}${RESET}" >&2
+            if [ "$DRY_RUN" != true ]; then
+                if ! git checkout "$branch_name" 2>&1 | while read -r line; do echo -e "    ${DIM}${line}${RESET}" >&2; done; then
+                    echo -e "  ${RED}✗ Failed to checkout branch${RESET}" >&2
+                    exit 1
+                fi
+            fi
+        fi
+        
+        # Jump to commit loop (skip steps 1-2)
+        SKIP_TO_COMMIT_LOOP=true
+    else
+        clear_state
+        echo -e "  ${DIM}Cleared saved state, starting fresh${RESET}" >&2
+        echo "" >&2
+    fi
+fi
+
+# Step 1: Check for staged changes
+if [ "${SKIP_TO_COMMIT_LOOP:-false}" != true ]; then
+    echo -e "${CYAN}┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓${RESET}" >&2
+    echo -e "${CYAN}┃${RESET} ${BLUE}Step 1/4:${RESET} Checking staged changes                       ${CYAN}┃${RESET}" >&2
+    echo -e "${CYAN}┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛${RESET}" >&2
+
+    staged_files=$(git diff --cached --name-only)
+    staged_count=$(echo "$staged_files" | grep -c . || true)
+
+    if [ "$staged_count" -eq 0 ]; then
+        echo -e "  ${RED}✗ No staged changes${RESET}" >&2
+        echo -e "  ${DIM}Stage changes first: git add <files>${RESET}" >&2
         exit 1
+    fi
+
+    echo -e "  ${GREEN}✓${RESET} ${staged_count} file(s) staged:" >&2
+    echo "$staged_files" | head -5 | while read -r file; do
+        echo -e "    ${DIM}${file}${RESET}" >&2
+    done
+    if [ "$staged_count" -gt 5 ]; then
+        echo -e "    ${DIM}... and $((staged_count - 5)) more${RESET}" >&2
+    fi
+    echo "" >&2
+
+    # Step 1.5: Run pre-push checks
+    if [ "$DRY_RUN" != true ]; then
+        # Determine repository root
+        repo_root=$(git rev-parse --show-toplevel)
+        
+        if ! run_prepush_checks "$repo_root"; then
+            exit 1
+        fi
     fi
 fi
 
 # Step 2: Select ticket or handle Slack URL
+if [ "${SKIP_TO_COMMIT_LOOP:-false}" != true ]; then
 echo -e "${CYAN}┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓${RESET}" >&2
 echo -e "${CYAN}┃${RESET} ${BLUE}Step 2/4:${RESET} Select Jira ticket                            ${CYAN}┃${RESET}" >&2
 echo -e "${CYAN}┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛${RESET}" >&2
@@ -609,140 +737,194 @@ else
     fi
 fi
 
+    echo "" >&2
+    
+    # Save state after ticket is created successfully
+    if [ "$DRY_RUN" != true ]; then
+        save_state "$TICKET_KEY" "$summary" "$TICKET_KEY" "$BASE_BRANCH" "$SLACK_URL" "$SLACK_CHANNEL" "$SLACK_THREAD_TS"
+        echo -e "  ${DIM}Saved progress (resumable if script fails)${RESET}" >&2
+    fi
+fi  # End of SKIP_TO_COMMIT_LOOP check
+
 echo "" >&2
 
 # Step 3: Create branch and commit
-echo -e "${CYAN}┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓${RESET}" >&2
-echo -e "${CYAN}┃${RESET} ${BLUE}Step 3/4:${RESET} Create branch and commit                      ${CYAN}┃${RESET}" >&2
-echo -e "${CYAN}┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛${RESET}" >&2
+if [ "${SKIP_TO_COMMIT_LOOP:-false}" != true ]; then
+    echo -e "${CYAN}┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓${RESET}" >&2
+    echo -e "${CYAN}┃${RESET} ${BLUE}Step 3/4:${RESET} Create branch and commit                      ${CYAN}┃${RESET}" >&2
+    echo -e "${CYAN}┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛${RESET}" >&2
 
-# Check if user is on a non-main branch and if BASE_BRANCH wasn't explicitly set
-current_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
-if [ "$BASE_BRANCH" = "origin/main" ] && [ "$current_branch" != "main" ] && [ "$current_branch" != "master" ]; then
-    # Try to get the remote tracking branch
-    remote_tracking=$(git rev-parse --abbrev-ref --symbolic-full-name @{u} 2>/dev/null)
-    
-    if [ -n "$remote_tracking" ]; then
-        echo -e "  ${YELLOW}⚠ You're currently on branch: ${current_branch} (tracking ${remote_tracking})${RESET}" >&2
-        echo -e "  ${CYAN}Base new branch off of:${RESET}" >&2
-        echo -e "    ${DIM}1) Current branch (${remote_tracking})${RESET}" >&2
-        echo -e "    ${DIM}2) origin/main${RESET}" >&2
-        read -p "  > " -n 1 -r base_choice < /dev/tty
-        echo "" >&2
+    # Check if user is on a non-main branch and if BASE_BRANCH wasn't explicitly set
+    current_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+    if [ "$BASE_BRANCH" = "origin/main" ] && [ "$current_branch" != "main" ] && [ "$current_branch" != "master" ]; then
+        # Try to get the remote tracking branch
+        remote_tracking=$(git rev-parse --abbrev-ref --symbolic-full-name @{u} 2>/dev/null)
         
-        if [[ $base_choice =~ ^[1]$ ]]; then
-            BASE_BRANCH="$remote_tracking"
-            echo -e "  ${GREEN}✓${RESET} Will branch from: ${remote_tracking}" >&2
+        if [ -n "$remote_tracking" ]; then
+            echo -e "  ${YELLOW}⚠ You're currently on branch: ${current_branch} (tracking ${remote_tracking})${RESET}" >&2
+            echo -e "  ${CYAN}Base new branch off of:${RESET}" >&2
+            echo -e "    ${DIM}1) Current branch (${remote_tracking})${RESET}" >&2
+            echo -e "    ${DIM}2) origin/main${RESET}" >&2
+            read -p "  > " -n 1 -r base_choice < /dev/tty
+            echo "" >&2
+            
+            if [[ $base_choice =~ ^[1]$ ]]; then
+                BASE_BRANCH="$remote_tracking"
+                echo -e "  ${GREEN}✓${RESET} Will branch from: ${remote_tracking}" >&2
+            else
+                echo -e "  ${GREEN}✓${RESET} Will branch from: origin/main" >&2
+            fi
         else
-            echo -e "  ${GREEN}✓${RESET} Will branch from: origin/main" >&2
+            echo -e "  ${YELLOW}⚠ You're currently on branch: ${current_branch} (no remote tracking)${RESET}" >&2
+            echo -e "  ${CYAN}Base new branch off of:${RESET}" >&2
+            echo -e "    ${DIM}1) Current branch (${current_branch})${RESET}" >&2
+            echo -e "    ${DIM}2) origin/main${RESET}" >&2
+            read -p "  > " -n 1 -r base_choice < /dev/tty
+            echo "" >&2
+            
+            if [[ $base_choice =~ ^[1]$ ]]; then
+                BASE_BRANCH="$current_branch"
+                echo -e "  ${GREEN}✓${RESET} Will branch from: ${current_branch}" >&2
+            else
+                echo -e "  ${GREEN}✓${RESET} Will branch from: origin/main" >&2
+            fi
+        fi
+        echo "" >&2
+    fi
+
+    branch_name="$TICKET_KEY"
+    if [ -n "$summary" ]; then
+        commit_message="$TICKET_KEY: $summary"
+    else
+        commit_message="$TICKET_KEY"
+    fi
+
+    # Check if branch already exists
+    if git show-ref --verify --quiet "refs/heads/$branch_name"; then
+        echo -e "  ${YELLOW}⚠ Branch ${branch_name} already exists${RESET}" >&2
+        echo -e "  ${DIM}Switching to existing branch...${RESET}" >&2
+        
+        if [ "$DRY_RUN" = true ]; then
+            echo -e "  ${DIM}[DRY RUN] Would run: git checkout ${branch_name}${RESET}" >&2
+        else
+            # Checkout existing branch - staged changes will come along automatically
+            echo -e "  ${DIM}$ git checkout ${branch_name}${RESET}" >&2
+            if ! git checkout "$branch_name" 2>&1 | while read -r line; do echo -e "    ${DIM}${line}${RESET}" >&2; done; then
+                echo -e "  ${RED}✗ Failed to checkout branch${RESET}" >&2
+                exit 1
+            fi
         fi
     else
-        echo -e "  ${YELLOW}⚠ You're currently on branch: ${current_branch} (no remote tracking)${RESET}" >&2
-        echo -e "  ${CYAN}Base new branch off of:${RESET}" >&2
-        echo -e "    ${DIM}1) Current branch (${current_branch})${RESET}" >&2
-        echo -e "    ${DIM}2) origin/main${RESET}" >&2
-        read -p "  > " -n 1 -r base_choice < /dev/tty
-        echo "" >&2
+        echo -e "  ${DIM}Creating branch: ${branch_name} from ${BASE_BRANCH}${RESET}" >&2
         
-        if [[ $base_choice =~ ^[1]$ ]]; then
-            BASE_BRANCH="$current_branch"
-            echo -e "  ${GREEN}✓${RESET} Will branch from: ${current_branch}" >&2
+        if [ "$DRY_RUN" = true ]; then
+            echo -e "  ${DIM}[DRY RUN] Would run: git fetch origin${RESET}" >&2
+            echo -e "  ${DIM}[DRY RUN] Would run: git checkout -b ${branch_name} ${BASE_BRANCH}${RESET}" >&2
         else
-            echo -e "  ${GREEN}✓${RESET} Will branch from: origin/main" >&2
+            # Fetch if base is a remote branch
+            if [[ "$BASE_BRANCH" =~ ^origin/ ]]; then
+                remote_branch="${BASE_BRANCH#origin/}"
+                echo -e "  ${DIM}$ git fetch origin ${remote_branch}${RESET}" >&2
+                git fetch origin "$remote_branch" 2>&1 | while read -r line; do echo -e "    ${DIM}${line}${RESET}" >&2; done
+            fi
+            
+            # Create branch from base - staged changes will come along automatically
+            echo -e "  ${DIM}$ git checkout -b ${branch_name} ${BASE_BRANCH}${RESET}" >&2
+            if ! git checkout -b "$branch_name" "$BASE_BRANCH" 2>&1 | while read -r line; do echo -e "    ${DIM}${line}${RESET}" >&2; done; then
+                echo -e "  ${RED}✗ Failed to create branch${RESET}" >&2
+                exit 1
+            fi
         fi
     fi
+
+    echo -e "  ${GREEN}✓${RESET} Branch: ${branch_name}" >&2
+
+    # Verify we're actually on the new branch
+    if [ "$DRY_RUN" != true ]; then
+        current_branch_check=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+        if [ "$current_branch_check" != "$branch_name" ]; then
+            echo -e "  ${RED}✗ Branch verification failed: expected ${branch_name}, but on ${current_branch_check}${RESET}" >&2
+            exit 1
+        fi
+        
+        # Verify we have staged changes to commit
+        staged_files_check=$(git diff --cached --name-only)
+        if [ -z "$staged_files_check" ]; then
+            echo -e "  ${RED}✗ No staged changes found after branch creation${RESET}" >&2
+            echo -e "  ${DIM}This might indicate an issue with git stash pop${RESET}" >&2
+            exit 1
+        fi
+    fi
+
     echo "" >&2
-fi
-
-branch_name="$TICKET_KEY"
-if [ -n "$summary" ]; then
-    commit_message="$TICKET_KEY: $summary"
-else
-    commit_message="$TICKET_KEY"
-fi
-
-# Check if branch already exists
-if git show-ref --verify --quiet "refs/heads/$branch_name"; then
-    echo -e "  ${YELLOW}⚠ Branch ${branch_name} already exists${RESET}" >&2
-    echo -e "  ${DIM}Switching to existing branch...${RESET}" >&2
-    
-    if [ "$DRY_RUN" = true ]; then
-        echo -e "  ${DIM}[DRY RUN] Would run: git checkout ${branch_name}${RESET}" >&2
-    else
-        # Checkout existing branch - staged changes will come along automatically
-        echo -e "  ${DIM}$ git checkout ${branch_name}${RESET}" >&2
-        if ! git checkout "$branch_name" 2>&1 | while read -r line; do echo -e "    ${DIM}${line}${RESET}" >&2; done; then
-            echo -e "  ${RED}✗ Failed to checkout branch${RESET}" >&2
-            exit 1
-        fi
-    fi
-else
-    echo -e "  ${DIM}Creating branch: ${branch_name} from ${BASE_BRANCH}${RESET}" >&2
-    
-    if [ "$DRY_RUN" = true ]; then
-        echo -e "  ${DIM}[DRY RUN] Would run: git fetch origin${RESET}" >&2
-        echo -e "  ${DIM}[DRY RUN] Would run: git checkout -b ${branch_name} ${BASE_BRANCH}${RESET}" >&2
-    else
-        # Fetch if base is a remote branch
-        if [[ "$BASE_BRANCH" =~ ^origin/ ]]; then
-            remote_branch="${BASE_BRANCH#origin/}"
-            echo -e "  ${DIM}$ git fetch origin ${remote_branch}${RESET}" >&2
-            git fetch origin "$remote_branch" 2>&1 | while read -r line; do echo -e "    ${DIM}${line}${RESET}" >&2; done
-        fi
-        
-        # Create branch from base - staged changes will come along automatically
-        echo -e "  ${DIM}$ git checkout -b ${branch_name} ${BASE_BRANCH}${RESET}" >&2
-        if ! git checkout -b "$branch_name" "$BASE_BRANCH" 2>&1 | while read -r line; do echo -e "    ${DIM}${line}${RESET}" >&2; done; then
-            echo -e "  ${RED}✗ Failed to create branch${RESET}" >&2
-            exit 1
-        fi
-    fi
-fi
-
-echo -e "  ${GREEN}✓${RESET} Branch: ${branch_name}" >&2
-
-# Verify we're actually on the new branch
-if [ "$DRY_RUN" != true ]; then
-    current_branch_check=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
-    if [ "$current_branch_check" != "$branch_name" ]; then
-        echo -e "  ${RED}✗ Branch verification failed: expected ${branch_name}, but on ${current_branch_check}${RESET}" >&2
-        exit 1
-    fi
-    
-    # Verify we have staged changes to commit
-    staged_files_check=$(git diff --cached --name-only)
-    if [ -z "$staged_files_check" ]; then
-        echo -e "  ${RED}✗ No staged changes found after branch creation${RESET}" >&2
-        echo -e "  ${DIM}This might indicate an issue with git stash pop${RESET}" >&2
-        exit 1
-    fi
-fi
-
-echo "" >&2
+fi  # End of branch creation (SKIP_TO_COMMIT_LOOP check)
 
 # Prompt for first commit message
-echo -e "  ${CYAN}Commit message:${RESET}" >&2
-echo -e "  ${DIM}Default: \"${commit_message}\"${RESET}" >&2
-echo -e "  ${DIM}(Press Enter to use default, or type custom message)${RESET}" >&2
-read -p "  > " -r user_message < /dev/tty
+if [ "${SKIP_TO_COMMIT_LOOP:-false}" != true ]; then
+    # Set commit message for new workflow
+    commit_message="$TICKET_KEY"
+    if [ -n "$summary" ]; then
+        commit_message="$TICKET_KEY: $summary"
+    fi
+    
+    echo -e "  ${CYAN}Commit message:${RESET}" >&2
+    echo -e "  ${DIM}Default: \"${commit_message}\"${RESET}" >&2
+    echo -e "  ${DIM}(Press Enter to use default, or type custom message)${RESET}" >&2
+    read -p "  > " -r user_message < /dev/tty
 
-if [ -z "$user_message" ]; then
-    current_commit_message="$commit_message"  # Use ticket summary
-else
-    # Auto-prefix with ticket key if not present
-    if [[ ! "$user_message" =~ ^${TICKET_KEY}: ]]; then
-        current_commit_message="$TICKET_KEY: $user_message"
+    if [ -z "$user_message" ]; then
+        current_commit_message="$commit_message"  # Use ticket summary
     else
-        current_commit_message="$user_message"
+        # Auto-prefix with ticket key if not present
+        if [[ ! "$user_message" =~ ^${TICKET_KEY}: ]]; then
+            current_commit_message="$TICKET_KEY: $user_message"
+        else
+            current_commit_message="$user_message"
+        fi
+    fi
+
+    echo "" >&2
+else
+    # Resuming - check if there are staged changes for a first commit
+    staged_files_check=$(git diff --cached --name-only)
+    if [ -z "$staged_files_check" ]; then
+        echo -e "  ${CYAN}No staged changes. Stage files and make commits, or press Enter to proceed to publish.${RESET}" >&2
+        SKIP_COMMIT_LOOP=true
+        extra_commits_made=false
+    else
+        # When resuming with commits, we need to re-run prepush
+        extra_commits_made=true
+        # Has staged changes, prompt for commit message
+        commit_message="$TICKET_KEY"
+        if [ -n "$summary" ]; then
+            commit_message="$TICKET_KEY: $summary"
+        fi
+        
+        echo -e "  ${CYAN}Commit message for staged changes:${RESET}" >&2
+        echo -e "  ${DIM}Default: \"${commit_message}\"${RESET}" >&2
+        echo -e "  ${DIM}(Press Enter to use default, or type custom message)${RESET}" >&2
+        read -p "  > " -r user_message < /dev/tty
+
+        if [ -z "$user_message" ]; then
+            current_commit_message="$commit_message"
+        else
+            if [[ ! "$user_message" =~ ^${TICKET_KEY}: ]]; then
+                current_commit_message="$TICKET_KEY: $user_message"
+            else
+                current_commit_message="$user_message"
+            fi
+        fi
+
+        echo "" >&2
     fi
 fi
 
-echo "" >&2
-
 # Commit loop - support multiple commits interactively
-commit_count=0
+if [ "${SKIP_COMMIT_LOOP:-false}" != true ]; then
+    commit_count=0
+    extra_commits_made=false
 
-while true; do
+    while true; do
     commit_count=$((commit_count + 1))
     
     # Show what we're about to commit
@@ -775,6 +957,11 @@ while true; do
     fi
     
     echo -e "  ${GREEN}✓${RESET} Committed (#${commit_count})" >&2
+    
+    # Track if we made extra commits beyond the first
+    if [ $commit_count -gt 1 ]; then
+        extra_commits_made=true
+    fi
     
     # Ask if user wants to make another commit
     echo "" >&2
@@ -834,7 +1021,35 @@ while true; do
     fi
     
     echo "" >&2
-done
+    done
+else
+    # If we skipped commit loop entirely (not resuming), no extra commits were made
+    extra_commits_made=false
+fi  # End of commit loop
+
+echo "" >&2
+
+# Step 3.5: Run pre-push checks again before publishing
+# This ensures any additional commits made in the loop are validated
+# Only run if extra commits were added after the initial validation
+if [ "$DRY_RUN" != true ] && [ "${extra_commits_made:-false}" = true ]; then
+    repo_root=$(git rev-parse --show-toplevel)
+    
+    echo -e "${CYAN}┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓${RESET}" >&2
+    echo -e "${CYAN}┃${RESET} ${BLUE}Pre-publish validation:${RESET} Running checks                  ${CYAN}┃${RESET}" >&2
+    echo -e "${CYAN}┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛${RESET}" >&2
+    echo "" >&2
+    
+    if ! run_prepush_checks "$repo_root"; then
+        echo -e "  ${RED}✗ Pre-push checks failed${RESET}" >&2
+        echo -e "  ${YELLOW}⚠ Fix the issues and run: oneshot${RESET}" >&2
+        echo -e "  ${DIM}(The script will resume from this point)${RESET}" >&2
+        exit 1
+    fi
+elif [ "$DRY_RUN" != true ]; then
+    echo -e "  ${DIM}Skipping pre-push checks (no additional commits since last validation)${RESET}" >&2
+    echo "" >&2
+fi
 
 echo "" >&2
 
@@ -865,6 +1080,9 @@ else
             echo -e "  ${GREEN}✓${RESET} Posted MR link to Slack" >&2
         fi
     fi
+    
+    # Clear saved state on successful completion
+    clear_state
     
     echo "" >&2
     echo -e "${GREEN}=== Done ===${RESET}" >&2
