@@ -314,7 +314,7 @@ post_to_slack() {
             ;;
         mr)
             local mr_num=$(echo "$url" | grep -oE '[0-9]+$')
-            text=$':gitlab: MR: <'"${url}|!${mr_num} \"${title}\""$'> :shipit:'
+            text=$':gitlab: MR: <'"${url}|!${mr_num}"$'> :shipit:'
             ;;
         *)
             text="$url"
