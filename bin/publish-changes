@@ -31,6 +31,7 @@
 #   JIRA_QA_BRANCH_FIELD - Custom field ID for QA branch (optional, auto-detected)
 #   JIRA_QA_BRANCH_DOMAIN - Domain for QA branches (required for QA branch update)
 #                           Can be a single domain or array (space/comma-separated)
+#                           Multiple domains will show an fzf menu to select
 #                           Example: "qa.example.com" or "qa1.example.com,qa2.example.com"
 
 set -e
@@ -301,38 +302,61 @@ update_jira_ticket() {
     if [ -z "$JIRA_QA_BRANCH_DOMAIN" ]; then
         echo -e "  ${YELLOW}⚠${RESET} QA Branch: JIRA_QA_BRANCH_DOMAIN not set" >&2
     else
-        # Support array of domains (space or comma-separated), use first one
-        qa_branch_domain=$(echo "$JIRA_QA_BRANCH_DOMAIN" | sed 's/,/ /g' | awk '{print $1}')
+        # Support array of domains (space or comma-separated)
+        local domains=$(echo "$JIRA_QA_BRANCH_DOMAIN" | sed 's/,/ /g' | tr ' ' '\n' | grep -v '^$')
+        local domain_count=$(echo "$domains" | wc -l)
         
-        local qa_branch="${branch}.${qa_branch_domain}"
-        if [ -z "$qa_field_id" ]; then
-            local editmeta=$(curl -s --max-time 10 -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
-                "https://${JIRA_DOMAIN}/rest/api/3/issue/${key}/editmeta" 2>/dev/null)
-            qa_field_id=$(echo "$editmeta" | jq -r '.fields | to_entries[] | select(.value.name | test("[Qq][Aa].*[Bb]ranch|[Bb]ranch.*[Qq][Aa]"; "i")) | .key' | head -1)
-        fi
-        
-        if [ -n "$qa_field_id" ]; then
-            local current_qa=$(echo "$issue_data" | jq -r ".fields.${qa_field_id} // empty")
-            if [ "$current_qa" = "$qa_branch" ]; then
-                echo -e "  ${DIM}─${RESET} QA Branch: ${DIM}${qa_branch} (already set)${RESET}" >&2
+        if [ "$domain_count" -gt 1 ]; then
+            # Multiple domains - show fzf menu
+            echo -e "  ${CYAN}Select QA domain:${RESET}" >&2
+            qa_branch_domain=$(echo "$domains" | $FZF \
+                --prompt="  QA Domain > " \
+                --height=10 \
+                --reverse \
+                --border=rounded \
+                --header="Select QA branch domain")
+            
+            if [ -z "$qa_branch_domain" ]; then
+                echo -e "  ${YELLOW}⚠${RESET} QA Branch: No domain selected" >&2
             else
-                local qa_field_result=$(curl -s --max-time 10 -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
-                    -X PUT \
-                    "https://${JIRA_DOMAIN}/rest/api/3/issue/${key}" \
-                    -H "Content-Type: application/json" \
-                    -d "{\"fields\": {\"$qa_field_id\": \"$qa_branch\"}}" 2>/dev/null)
-                if [ -z "$qa_field_result" ]; then
-                    if [ -n "$current_qa" ]; then
-                        echo -e "  ${GREEN}✓${RESET} QA Branch: ${current_qa} → ${qa_branch}" >&2
-                    else
-                        echo -e "  ${GREEN}✓${RESET} QA Branch: ${qa_branch}" >&2
-                    fi
-                else
-                    echo -e "  ${RED}✗${RESET} QA Branch: Could not set" >&2
-                fi
+                echo -e "  ${DIM}Selected: ${qa_branch_domain}${RESET}" >&2
             fi
         else
-            echo -e "  ${YELLOW}⚠${RESET} QA Branch: Field not found (set JIRA_QA_BRANCH_FIELD)" >&2
+            # Single domain - use it directly
+            qa_branch_domain="$domains"
+        fi
+        
+        if [ -n "$qa_branch_domain" ]; then
+            local qa_branch="${branch}.${qa_branch_domain}"
+            if [ -z "$qa_field_id" ]; then
+                local editmeta=$(curl -s --max-time 10 -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
+                    "https://${JIRA_DOMAIN}/rest/api/3/issue/${key}/editmeta" 2>/dev/null)
+                qa_field_id=$(echo "$editmeta" | jq -r '.fields | to_entries[] | select(.value.name | test("[Qq][Aa].*[Bb]ranch|[Bb]ranch.*[Qq][Aa]"; "i")) | .key' | head -1)
+            fi
+            
+            if [ -n "$qa_field_id" ]; then
+                local current_qa=$(echo "$issue_data" | jq -r ".fields.${qa_field_id} // empty")
+                if [ "$current_qa" = "$qa_branch" ]; then
+                    echo -e "  ${DIM}─${RESET} QA Branch: ${DIM}${qa_branch} (already set)${RESET}" >&2
+                else
+                    local qa_field_result=$(curl -s --max-time 10 -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
+                        -X PUT \
+                        "https://${JIRA_DOMAIN}/rest/api/3/issue/${key}" \
+                        -H "Content-Type: application/json" \
+                        -d "{\"fields\": {\"$qa_field_id\": \"$qa_branch\"}}" 2>/dev/null)
+                    if [ -z "$qa_field_result" ]; then
+                        if [ -n "$current_qa" ]; then
+                            echo -e "  ${GREEN}✓${RESET} QA Branch: ${current_qa} → ${qa_branch}" >&2
+                        else
+                            echo -e "  ${GREEN}✓${RESET} QA Branch: ${qa_branch}" >&2
+                        fi
+                    else
+                        echo -e "  ${RED}✗${RESET} QA Branch: Could not set" >&2
+                    fi
+                fi
+            else
+                echo -e "  ${YELLOW}⚠${RESET} QA Branch: Field not found (set JIRA_QA_BRANCH_FIELD)" >&2
+            fi
         fi
     fi
     
