@@ -244,22 +244,13 @@ update_jira_ticket() {
         qa_fields=",$qa_field_id"
     fi
     local issue_data=$(curl -s --max-time 10 -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
-        "https://${JIRA_DOMAIN}/rest/api/3/issue/${key}?fields=assignee,status${qa_fields}" 2>/dev/null)
+        "https://${JIRA_DOMAIN}/rest/api/3/issue/${key}?fields=status${qa_fields}" 2>/dev/null)
     local current_status=$(echo "$issue_data" | jq -r '.fields.status.name // "Unknown"')
-    local current_assignee=$(echo "$issue_data" | jq -r '.fields.assignee.displayName // empty')
-    local current_assignee_email=$(echo "$issue_data" | jq -r '.fields.assignee.emailAddress // empty')
-    
-    # Get my info
-    local my_info=$(curl -s --max-time 10 -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
-        "https://${JIRA_DOMAIN}/rest/api/3/myself" 2>/dev/null)
-    local my_account_id=$(echo "$my_info" | jq -r '.accountId')
-    local my_name=$(echo "$my_info" | jq -r '.displayName')
     
     # Show current state
     echo "" >&2
     echo -e "  ${CYAN}┌─ Current State ─────────────────────────────────────────┐${RESET}" >&2
-    printf "  ${CYAN}│${RESET} Status:   ${BLUE}%-46s${RESET} ${CYAN}│${RESET}\n" "$current_status" >&2
-    printf "  ${CYAN}│${RESET} Assignee: %-46s ${CYAN}│${RESET}\n" "${current_assignee:-Unassigned}" >&2
+    printf "  ${CYAN}│${RESET} Status: ${BLUE}%-48s${RESET} ${CYAN}│${RESET}\n" "$current_status" >&2
     echo -e "  ${CYAN}└──────────────────────────────────────────────────────────┘${RESET}" >&2
     echo "" >&2
     
@@ -384,40 +375,6 @@ update_jira_ticket() {
             fi
         else
             echo -e "  ${YELLOW}⚠${RESET} Status: No MR transition available from ${current_status}" >&2
-        fi
-    fi
-    
-    # 4. Assignee
-    if [ -z "$current_assignee" ]; then
-        local assign_result=$(curl -s --max-time 10 -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
-            -X PUT \
-            "https://${JIRA_DOMAIN}/rest/api/3/issue/${key}/assignee" \
-            -H "Content-Type: application/json" \
-            -d "{\"accountId\": \"$my_account_id\"}" 2>/dev/null)
-        if [ -z "$assign_result" ]; then
-            echo -e "  ${GREEN}✓${RESET} Assignee: Unassigned → ${my_name}" >&2
-        else
-            echo -e "  ${RED}✗${RESET} Assignee: Could not assign" >&2
-        fi
-    elif [ "$current_assignee_email" = "$JIRA_EMAIL" ]; then
-        echo -e "  ${DIM}─${RESET} Assignee: ${DIM}${current_assignee} (you)${RESET}" >&2
-    else
-        echo -e "  ${YELLOW}⚠${RESET} Assignee: ${current_assignee} (not you)" >&2
-        printf "    ${DIM}Reassign to yourself? (y/N)${RESET} " >&2
-        local reassign_choice
-        read -n 1 reassign_choice < /dev/tty
-        echo "" >&2
-        if [[ "$reassign_choice" =~ ^[Yy]$ ]]; then
-            local assign_result=$(curl -s -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
-                -X PUT \
-                "https://${JIRA_DOMAIN}/rest/api/3/issue/${key}/assignee" \
-                -H "Content-Type: application/json" \
-                -d "{\"accountId\": \"$my_account_id\"}" 2>/dev/null)
-            if [ -z "$assign_result" ]; then
-                echo -e "    ${GREEN}✓${RESET} Reassigned to ${my_name}" >&2
-            else
-                echo -e "    ${RED}✗${RESET} Could not reassign" >&2
-            fi
         fi
     fi
 }
