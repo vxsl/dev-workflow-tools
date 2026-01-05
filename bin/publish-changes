@@ -29,7 +29,9 @@
 #   JIRA_DOMAIN         - Jira domain (e.g., company.atlassian.net)
 #   JIRA_PROJECT        - Jira project key (e.g., PROJ)
 #   JIRA_QA_BRANCH_FIELD - Custom field ID for QA branch (optional, auto-detected)
-#   JIRA_QA_BRANCH_DOMAIN - Domain for QA branches (optional, defaults to JIRA_DOMAIN)
+#   JIRA_QA_BRANCH_DOMAIN - Domain for QA branches (required for QA branch update)
+#                           Can be a single domain or array (space/comma-separated)
+#                           Example: "qa.example.com" or "qa1.example.com,qa2.example.com"
 
 set -e
 
@@ -295,36 +297,43 @@ update_jira_ticket() {
     fi
     
     # 2. QA Branch field
-    local qa_branch_domain="${JIRA_QA_BRANCH_DOMAIN:-$JIRA_DOMAIN}"
-    local qa_branch="${branch}.${qa_branch_domain}"
-    if [ -z "$qa_field_id" ]; then
-        local editmeta=$(curl -s --max-time 10 -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
-            "https://${JIRA_DOMAIN}/rest/api/3/issue/${key}/editmeta" 2>/dev/null)
-        qa_field_id=$(echo "$editmeta" | jq -r '.fields | to_entries[] | select(.value.name | test("[Qq][Aa].*[Bb]ranch|[Bb]ranch.*[Qq][Aa]"; "i")) | .key' | head -1)
-    fi
-    
-    if [ -n "$qa_field_id" ]; then
-        local current_qa=$(echo "$issue_data" | jq -r ".fields.${qa_field_id} // empty")
-        if [ "$current_qa" = "$qa_branch" ]; then
-            echo -e "  ${DIM}─${RESET} QA Branch: ${DIM}${qa_branch} (already set)${RESET}" >&2
-        else
-            local qa_field_result=$(curl -s --max-time 10 -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
-                -X PUT \
-                "https://${JIRA_DOMAIN}/rest/api/3/issue/${key}" \
-                -H "Content-Type: application/json" \
-                -d "{\"fields\": {\"$qa_field_id\": \"$qa_branch\"}}" 2>/dev/null)
-            if [ -z "$qa_field_result" ]; then
-                if [ -n "$current_qa" ]; then
-                    echo -e "  ${GREEN}✓${RESET} QA Branch: ${current_qa} → ${qa_branch}" >&2
-                else
-                    echo -e "  ${GREEN}✓${RESET} QA Branch: ${qa_branch}" >&2
-                fi
-            else
-                echo -e "  ${RED}✗${RESET} QA Branch: Could not set" >&2
-            fi
-        fi
+    local qa_branch_domain=""
+    if [ -z "$JIRA_QA_BRANCH_DOMAIN" ]; then
+        echo -e "  ${YELLOW}⚠${RESET} QA Branch: JIRA_QA_BRANCH_DOMAIN not set" >&2
     else
-        echo -e "  ${YELLOW}⚠${RESET} QA Branch: Field not found (set JIRA_QA_BRANCH_FIELD)" >&2
+        # Support array of domains (space or comma-separated), use first one
+        qa_branch_domain=$(echo "$JIRA_QA_BRANCH_DOMAIN" | sed 's/,/ /g' | awk '{print $1}')
+        
+        local qa_branch="${branch}.${qa_branch_domain}"
+        if [ -z "$qa_field_id" ]; then
+            local editmeta=$(curl -s --max-time 10 -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
+                "https://${JIRA_DOMAIN}/rest/api/3/issue/${key}/editmeta" 2>/dev/null)
+            qa_field_id=$(echo "$editmeta" | jq -r '.fields | to_entries[] | select(.value.name | test("[Qq][Aa].*[Bb]ranch|[Bb]ranch.*[Qq][Aa]"; "i")) | .key' | head -1)
+        fi
+        
+        if [ -n "$qa_field_id" ]; then
+            local current_qa=$(echo "$issue_data" | jq -r ".fields.${qa_field_id} // empty")
+            if [ "$current_qa" = "$qa_branch" ]; then
+                echo -e "  ${DIM}─${RESET} QA Branch: ${DIM}${qa_branch} (already set)${RESET}" >&2
+            else
+                local qa_field_result=$(curl -s --max-time 10 -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
+                    -X PUT \
+                    "https://${JIRA_DOMAIN}/rest/api/3/issue/${key}" \
+                    -H "Content-Type: application/json" \
+                    -d "{\"fields\": {\"$qa_field_id\": \"$qa_branch\"}}" 2>/dev/null)
+                if [ -z "$qa_field_result" ]; then
+                    if [ -n "$current_qa" ]; then
+                        echo -e "  ${GREEN}✓${RESET} QA Branch: ${current_qa} → ${qa_branch}" >&2
+                    else
+                        echo -e "  ${GREEN}✓${RESET} QA Branch: ${qa_branch}" >&2
+                    fi
+                else
+                    echo -e "  ${RED}✗${RESET} QA Branch: Could not set" >&2
+                fi
+            fi
+        else
+            echo -e "  ${YELLOW}⚠${RESET} QA Branch: Field not found (set JIRA_QA_BRANCH_FIELD)" >&2
+        fi
     fi
     
     # 3. Status transition (skip for draft MRs)
