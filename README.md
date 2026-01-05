@@ -35,6 +35,10 @@ JIRA_API_TOKEN="your-api-token"
 JIRA_ME="Your Name"
 TICKET_CREATOR_BOT_TOKEN="xoxb-..."
 FZF_PERSIST_MODE=1  # For xmonad scratchpads/tmux popups
+
+# QA Branch Integration (for publish-changes)
+JIRA_QA_BRANCH_FIELD="customfield_12345"  # Auto-detected if not set
+JIRA_QA_BRANCH_DOMAIN="qa.example.com"    # Single domain or comma/space-separated list
 ```
 
 Get Jira API token: https://id.atlassian.com/manage-profile/security/api-tokens
@@ -54,6 +58,24 @@ To add these scopes:
 4. Copy the "Bot User OAuth Token" (starts with `xoxb-`) to `.env`
 
 **Note:** The bot must be added to channels before it can post. Use `/invite @your-bot-name` in the channel.
+
+### QA Branch Integration
+
+When creating a merge request with `publish-changes`, the tool can automatically set a "QA Branch" field in your Jira ticket. This is useful if your workflow includes deploying feature branches to QA environments.
+
+**Configuration:**
+- `JIRA_QA_BRANCH_DOMAIN` - The domain(s) where QA branches are deployed (e.g., `"qa.example.com"`)
+  - Supports multiple domains: `"qa1.example.com,qa2.example.com"` or `"qa1.example.com qa2.example.com"`
+  - Multiple domains will show an fzf menu to select which one to use
+  - The branch name will be formatted as: `branch-name.qa.example.com`
+- `JIRA_QA_BRANCH_FIELD` - The custom field ID in Jira (e.g., `"customfield_12345"`)
+  - If not set, the tool will auto-detect fields matching "QA Branch" or "Branch QA"
+
+**Example:**
+```bash
+JIRA_QA_BRANCH_DOMAIN="qa.example.com"
+# When you create an MR from branch "PROJ-123", Jira will show: PROJ-123.qa.example.com
+```
 
 ### FZF Persist Mode
 
