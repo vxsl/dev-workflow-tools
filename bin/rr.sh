@@ -582,8 +582,8 @@ selected_line=$(
 
 # Extract the full branch name by finding the matching line and getting field 7
 if [ -n "$selected_line" ]; then
-    # Extract the branch name directly from the first field (strip star indicator and whitespace)
-    branch=$(echo "$selected_line" | cut -d'│' -f1 | sed 's/^★[[:space:]]*//' | sed 's/^[[:space:]]*//' | sed 's/[[:space:]]*$//')
+    # Extract the branch name directly from the first field (strip star/dot indicator and whitespace)
+    branch=$(echo "$selected_line" | cut -d'│' -f1 | sed 's/^[★·][[:space:]]*//' | sed 's/^[[:space:]]*//' | sed 's/[[:space:]]*$//')
     
     # If the branch name is truncated (ends with ...), we need to find the full name
     if echo "$branch" | grep -q '\.\.\.$'; then
