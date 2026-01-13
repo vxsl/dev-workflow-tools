@@ -1,4 +1,4 @@
-#!/usr/bin/env zsh
+#!/usr/bin/env bash
 # dev-workflow-tools shell integration for Zsh
 # Source this file from your .zshrc:
 #   source ~/bin/dev-workflow-tools/shell/dev-workflow.zsh

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # One-shot change: commit staged changes to a new branch and create MR
+# Compatible with bash and zsh
 #
 # Usage:
 #   oneshot                              Interactive ticket selection (or create new)
@@ -28,8 +29,11 @@
 
 set -e
 
+# Load shell compatibility layer
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$SCRIPT_DIR/../lib/shell-compat.sh"
+
 # Load environment variables
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [ -f "$SCRIPT_DIR/../.env" ]; then
     set -a  # automatically export all variables
     source "$SCRIPT_DIR/../.env"
@@ -85,9 +89,9 @@ while [[ "$#" -gt 0 ]]; do
             # Check if it's a Slack URL
             if [[ "$1" =~ ^https://.*slack\.com/archives/([A-Z0-9]+)/p([0-9]+) ]]; then
                 SLACK_URL="$1"
-                SLACK_CHANNEL="${BASH_REMATCH[1]}"
+                SLACK_CHANNEL=$(shell_get_match 1)
                 # Convert p1234567890123456 to 1234567890.123456 format
-                raw_ts="${BASH_REMATCH[2]}"
+                raw_ts=$(shell_get_match 2)
                 SLACK_THREAD_TS="${raw_ts:0:10}.${raw_ts:10}"
             # Check if it looks like a Jira ticket
             elif [[ "$1" =~ ^${JIRA_PROJECT}-[0-9]+$ ]]; then
@@ -210,7 +214,7 @@ run_prepush_checks() {
         # Skip protected branch check since we're creating a new branch anyway
         local exit_code=0
         echo "refs/heads/${current_branch} ${current_sha} refs/heads/main 0000000000000000000000000000000000000000" | SKIP_PROTECTED_BRANCH_CHECK=true "$pre_push_hook" 2>&1 >&2
-        exit_code=${PIPESTATUS[1]}
+        exit_code=$(shell_get_pipe_status 1)
         
         if [ $exit_code -eq 0 ]; then
             echo -e "  ${GREEN}✓${RESET} Pre-push hook passed" >&2
@@ -464,7 +468,7 @@ if [ -n "$saved_state" ]; then
     fi
     echo "" >&2
     echo -e "  ${CYAN}Resume from saved state?${RESET} ${DIM}(y/n)${RESET}" >&2
-    read -p "  > " -n 1 -r resume_response < /dev/tty
+    shell_read_prompt "  > " resume_response "-k 1"
     echo "" >&2
     echo "" >&2
     
@@ -504,7 +508,7 @@ if [ -n "$saved_state" ]; then
         fi
         
         # Jump to commit loop (skip steps 1-2)
-        SKIP_TO_COMMIT_LOOP=true
+        SKIP_TO_COMMIT_LOOP
     else
         clear_state
         echo -e "  ${DIM}Cleared saved state, starting fresh${RESET}" >&2
@@ -567,14 +571,13 @@ if [ -n "$SLACK_URL" ]; then
     echo "" >&2
     
     # Build flags for create-jira-ticket
-    dry_run_flag=""
+    flags=()
     if [ "$DRY_RUN" = true ]; then
-        dry_run_flag="--dry-run"
+        flags+=(--dry-run)
     fi
     
-    slack_flag=""
     if [ -n "$SLACK_URL" ]; then
-        slack_flag="--slack-url $SLACK_URL"
+        flags+=(--slack-url "$SLACK_URL")
     fi
     
     # Call the shared create-jira-ticket script
@@ -582,7 +585,7 @@ if [ -n "$SLACK_URL" ]; then
     result_file=$(mktemp)
     trap "rm -f '$result_file'" EXIT
     
-    if ! "$SCRIPT_DIR/create-jira-ticket" $dry_run_flag $slack_flag --output-file "$result_file"; then
+    if ! "$SCRIPT_DIR/create-jira-ticket" "${flags[@]}" --output-file "$result_file"; then
         echo -e "  ${RED}✗ Failed to create ticket${RESET}" >&2
         rm -f "$result_file"
         exit 1
@@ -630,9 +633,9 @@ else
         echo "" >&2
         
         # Build flags for create-jira-ticket
-        dry_run_flag=""
+        flags=()
         if [ "$DRY_RUN" = true ]; then
-            dry_run_flag="--dry-run"
+            flags+=(--dry-run)
         fi
         
         # Call the shared create-jira-ticket script
@@ -640,7 +643,7 @@ else
         result_file=$(mktemp)
         trap "rm -f '$result_file'" EXIT
         
-        if ! "$SCRIPT_DIR/create-jira-ticket" $dry_run_flag --output-file "$result_file"; then
+        if ! "$SCRIPT_DIR/create-jira-ticket" "${flags[@]}" --output-file "$result_file"; then
             echo -e "  ${RED}✗ Failed to create ticket${RESET}" >&2
             rm -f "$result_file"
             exit 1
@@ -657,12 +660,12 @@ else
         fi
     # Check if user entered a Slack URL
     elif [[ "$selection" =~ ^SLACK:(.+)$ ]]; then
-        SLACK_URL="${BASH_REMATCH[1]}"
+        SLACK_URL=$(shell_get_match 1)
         
         # Parse Slack URL
         if [[ "$SLACK_URL" =~ ^https://.*slack\.com/archives/([A-Z0-9]+)/p([0-9]+) ]]; then
-            SLACK_CHANNEL="${BASH_REMATCH[1]}"
-            raw_ts="${BASH_REMATCH[2]}"
+            SLACK_CHANNEL=$(shell_get_match 1)
+            raw_ts=$(shell_get_match 2)
             SLACK_THREAD_TS="${raw_ts:0:10}.${raw_ts:10}"
         fi
         
@@ -679,9 +682,9 @@ else
         echo "" >&2
         
         # Build flags for create-jira-ticket
-        dry_run_flag=""
+        flags=()
         if [ "$DRY_RUN" = true ]; then
-            dry_run_flag="--dry-run"
+            flags+=(--dry-run)
         fi
         
         # Call the shared create-jira-ticket script with Slack URL
@@ -689,7 +692,7 @@ else
         result_file=$(mktemp)
         trap "rm -f '$result_file'" EXIT
         
-        if ! "$SCRIPT_DIR/create-jira-ticket" $dry_run_flag --slack-url "$SLACK_URL" --output-file "$result_file"; then
+        if ! "$SCRIPT_DIR/create-jira-ticket" "${flags[@]}" --slack-url "$SLACK_URL" --output-file "$result_file"; then
             echo -e "  ${RED}✗ Failed to create ticket${RESET}" >&2
             rm -f "$result_file"
             exit 1
@@ -765,7 +768,7 @@ if [ "${SKIP_TO_COMMIT_LOOP:-false}" != true ]; then
             echo -e "  ${CYAN}Base new branch off of:${RESET}" >&2
             echo -e "    ${DIM}1) Current branch (${remote_tracking})${RESET}" >&2
             echo -e "    ${DIM}2) origin/main${RESET}" >&2
-            read -p "  > " -n 1 -r base_choice < /dev/tty
+            shell_read_prompt "  > " base_choice "-k 1"
             echo "" >&2
             
             if [[ $base_choice =~ ^[1]$ ]]; then
@@ -779,7 +782,7 @@ if [ "${SKIP_TO_COMMIT_LOOP:-false}" != true ]; then
             echo -e "  ${CYAN}Base new branch off of:${RESET}" >&2
             echo -e "    ${DIM}1) Current branch (${current_branch})${RESET}" >&2
             echo -e "    ${DIM}2) origin/main${RESET}" >&2
-            read -p "  > " -n 1 -r base_choice < /dev/tty
+            shell_read_prompt "  > " base_choice "-k 1"
             echo "" >&2
             
             if [[ $base_choice =~ ^[1]$ ]]; then
@@ -870,7 +873,7 @@ if [ "${SKIP_TO_COMMIT_LOOP:-false}" != true ]; then
     echo -e "  ${CYAN}Commit message:${RESET}" >&2
     echo -e "  ${DIM}Default: \"${commit_message}\"${RESET}" >&2
     echo -e "  ${DIM}(Press Enter to use default, or type custom message)${RESET}" >&2
-    read -p "  > " -r user_message < /dev/tty
+    shell_read_prompt "  > " user_message
 
     if [ -z "$user_message" ]; then
         current_commit_message="$commit_message"  # Use ticket summary
@@ -903,7 +906,7 @@ else
         echo -e "  ${CYAN}Commit message for staged changes:${RESET}" >&2
         echo -e "  ${DIM}Default: \"${commit_message}\"${RESET}" >&2
         echo -e "  ${DIM}(Press Enter to use default, or type custom message)${RESET}" >&2
-        read -p "  > " -r user_message < /dev/tty
+        shell_read_prompt "  > " user_message
 
         if [ -z "$user_message" ]; then
             current_commit_message="$commit_message"
@@ -966,7 +969,7 @@ if [ "${SKIP_COMMIT_LOOP:-false}" != true ]; then
     # Ask if user wants to make another commit
     echo "" >&2
     echo -e "  ${CYAN}Make another commit?${RESET} ${DIM}(y/n)${RESET}" >&2
-    read -p "  > " -n 1 -r make_another < /dev/tty
+    shell_read_prompt "  > " make_another "-k 1"
     echo "" >&2
     
     if [[ ! $make_another =~ ^[Yy]$ ]]; then
@@ -976,7 +979,7 @@ if [ "${SKIP_COMMIT_LOOP:-false}" != true ]; then
     echo "" >&2
     echo -e "  ${CYAN}Stage your changes, then press Enter to continue${RESET}" >&2
     echo -e "  ${DIM}(In another terminal: git add <files>)${RESET}" >&2
-    read -p "  > Press Enter when ready..." < /dev/tty
+    shell_read_prompt "  > Press Enter when ready..." dummy
     echo "" >&2
     
     # Check for newly staged changes
@@ -1000,12 +1003,12 @@ if [ "${SKIP_COMMIT_LOOP:-false}" != true ]; then
     # Get commit message for this commit
     echo -e "  ${CYAN}Enter commit message:${RESET}" >&2
     echo -e "  ${DIM}(Leave empty to use: ${TICKET_KEY}: <message>)${RESET}" >&2
-    read -p "  > " -r user_message < /dev/tty
+    shell_read_prompt "  > " user_message
     
     if [ -z "$user_message" ]; then
         # Ask for short description
         echo -e "  ${CYAN}Short description:${RESET}" >&2
-        read -p "  > " -r short_desc < /dev/tty
+        shell_read_prompt "  > " short_desc
         if [ -n "$short_desc" ]; then
             current_commit_message="$TICKET_KEY: $short_desc"
         else

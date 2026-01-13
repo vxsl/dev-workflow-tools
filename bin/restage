@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # Unstage two "wip --no-verify" commits, keeping the oldest staged and newest unstaged
 
