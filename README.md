@@ -27,7 +27,7 @@ Optional: `xclip`, `bat`, `eza`, `fd`, `wmctrl`
 Edit `.env`:
 ```bash
 JIRA_DOMAIN="<your-company>.atlassian.net"
-JIRA_PROJECT="<DE|UL|PROJ>"
+JIRA_PROJECT="<PROJ|DEV|ENG>"
 JIRA_EMAIL="your-email@company.com"
 JIRA_API_TOKEN="your-api-token"
 
