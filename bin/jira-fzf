@@ -21,7 +21,7 @@
 #   <C-g> create MR  <C-c> checkout  <C-n>/<C-p> nav  <C-d>/<C-u> page  q/esc close preview
 
 # Load environment variables
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/../lib/fzf-helpers"
 if [ -f "$SCRIPT_DIR/../.env" ]; then
     source "$SCRIPT_DIR/../.env"
@@ -79,7 +79,7 @@ select_project_dir() {
     if [ -z "$git_repos" ]; then
         printf "\033[38;5;167m  ✗ No git repositories found\033[0m\n" >&2
         printf "  \033[2mEnter the path manually:\033[0m " >&2
-        read -e selected_dir < /dev/tty
+        read -r selected_dir < /dev/tty
     else
         # Let user select with fzf
         selected_dir=$(echo "$git_repos" | $FZF \

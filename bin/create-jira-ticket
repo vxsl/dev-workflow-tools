@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Shared Jira ticket creation script
+# Compatible with bash and zsh
 # Used by jira-fzf, oneshot, and other tools
 #
 # Usage:
@@ -15,8 +16,11 @@
 
 set -e
 
+# Load shell compatibility layer
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$SCRIPT_DIR/../lib/shell-compat.sh"
+
 # Load environment variables
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [ -f "$SCRIPT_DIR/../.env" ]; then
     set -a  # automatically export all variables
     source "$SCRIPT_DIR/../.env"
@@ -212,8 +216,17 @@ printf "\033[38;5;109m┏━━━━━━━━━━━━━━━━━━�
 printf "\033[38;5;109m┃\033[0m \033[38;5;81mStep 1/8:\033[0m Enter ticket summary                         \033[38;5;109m┃\033[0m\n" >&2
 printf "\033[38;5;109m┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\033[0m\n" >&2
 echo -n "  ✏️  " >&2
-summary=""
+# Cross-shell compatible read with pre-filled value
+if [ -n "$INITIAL_SUMMARY" ]; then
+    summary="$INITIAL_SUMMARY"
+    if [ "$SHELL_TYPE" = "bash" ]; then
 read -e -i "$INITIAL_SUMMARY" summary
+    else
+        vared summary
+    fi
+else
+    read summary
+fi
 summary=$(echo "$summary" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
 
 if [ -z "$summary" ]; then
@@ -333,11 +346,11 @@ EOFDESC
 
 $EDITOR "$tmpdir/description"
 desc_text=$(grep -v '^#' "$tmpdir/description")
-desc_preview=$(echo "$desc_text" | head -c 50)
+desc_preview=$(printf '%s' "$desc_text" | head -c 50)
 
 # Convert plain text to Atlassian Document Format (ADF) for API v3
 # Split into paragraphs and create ADF structure
-description=$(echo "$desc_text" | jq -Rs 'split("\n\n") | map(select(length > 0)) | map({
+description=$(printf '%s' "$desc_text" | jq -Rs 'split("\n\n") | map(select(length > 0)) | map({
     type: "paragraph",
     content: [
         {
@@ -363,7 +376,7 @@ if [ -n "$SLACK_URL" ]; then
             {type: "text", text: $url, marks: [{type: "link", attrs: {href: $url}}]}
         ]
     }')
-    description=$(echo "$description" | jq --argjson p "$slack_paragraph" '.content += [$p]')
+    description=$(printf '%s' "$description" | jq --argjson p "$slack_paragraph" '.content += [$p]')
 fi
 
 if [ ${#desc_preview} -gt 0 ]; then

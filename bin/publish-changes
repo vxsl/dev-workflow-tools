@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Create a GitLab Merge Request with optional Jira integration
+# Compatible with bash and zsh
 #
 # Usage:
 #   publish-changes                           Interactive MR creation from current branch
@@ -36,8 +37,11 @@
 
 set -e
 
+# Load shell compatibility layer
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$SCRIPT_DIR/../lib/shell-compat.sh"
+
 # Load environment from parent directory
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [ -f "$SCRIPT_DIR/../.env" ]; then
     source "$SCRIPT_DIR/../.env"
 fi
@@ -383,7 +387,7 @@ update_jira_ticket() {
 detect_ticket_from_branch() {
     local branch="$1"
     if [[ "$branch" =~ (${JIRA_PROJECT}-[0-9]+) ]]; then
-        echo "${BASH_REMATCH[1]}"
+        echo "$(shell_get_match 1)"
     fi
 }
 
@@ -462,7 +466,7 @@ if [ "$SKIP_PUSH" != "true" ]; then
         echo -e "  ${DIM}${line}${RESET}" >&2
     done
     
-    if [ ${PIPESTATUS[0]} -eq 0 ]; then
+    if [ $(shell_get_pipe_status 0) -eq 0 ]; then
         echo -e "  ${GREEN}✓${RESET} Push successful" >&2
     else
         echo -e "  ${RED}✗${RESET} Push failed" >&2

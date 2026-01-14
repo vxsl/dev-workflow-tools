@@ -7,7 +7,7 @@
 #   fzedit --persist    # Force persist mode (stays open)
 #   fzedit --one-shot   # Force one-shot mode (exits after selection)
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/../lib/fzf-helpers"
 
 HISTORY_FILE="$HOME/.fzedit_history"
