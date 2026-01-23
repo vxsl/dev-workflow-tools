@@ -9,6 +9,7 @@
 #   publish-changes --target main             Pre-select target branch
 #   publish-changes --draft                   Create as draft MR
 #   publish-changes --no-jira                 Skip Jira integration even if ticket detected
+#   publish-changes --include-ticket-description  Include ticket description in MR description
 #
 # Features:
 #   - Interactive branch selection with fzf
@@ -64,6 +65,8 @@ NO_JIRA=false
 SKIP_PUSH=false
 OUTPUT_URL=false
 NO_DRAFT_PROMPT=false
+INCLUDE_TICKET_DESCRIPTION=false
+TICKET_DESCRIPTION=""
 
 # Colors
 RED='\033[38;5;167m'
@@ -106,6 +109,14 @@ while [[ "$#" -gt 0 ]]; do
         --no-draft-prompt)
             NO_DRAFT_PROMPT=true
             shift
+            ;;
+        --include-ticket-description)
+            INCLUDE_TICKET_DESCRIPTION=true
+            shift
+            ;;
+        --ticket-description)
+            TICKET_DESCRIPTION="$2"
+            shift 2
             ;;
         --help|-h)
             head -35 "$0" | tail -33
@@ -226,6 +237,24 @@ get_ticket_summary() {
         jq -r '.fields.summary // empty' 2>/dev/null
 }
 
+# Get ticket description from Jira
+get_ticket_description() {
+    local key="$1"
+    if ! has_jira_credentials; then
+        return 1
+    fi
+    curl -s -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
+        "https://${JIRA_DOMAIN}/rest/api/3/issue/${key}?fields=description" \
+        -H "Content-Type: application/json" 2>/dev/null | \
+        jq -r '.fields.description.content[]? | 
+            if .type == "paragraph" then 
+                (.content[]?.text // "") + "\n"
+            else 
+                ""
+            end' 2>/dev/null | \
+        sed '/^$/d'
+}
+
 # Update Jira ticket with MR info
 update_jira_ticket() {
     local key="$1"
@@ -322,7 +351,7 @@ update_jira_ticket() {
         fi
         
         if [ -n "$qa_branch_domain" ]; then
-            local qa_branch="${branch}.${qa_branch_domain}"
+            local qa_branch="${qa_branch_domain}/branch/${branch}"
             if [ -z "$qa_field_id" ]; then
                 local editmeta=$(curl -s --max-time 10 -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
                     "https://${JIRA_DOMAIN}/rest/api/3/issue/${key}/editmeta" 2>/dev/null)
@@ -459,15 +488,39 @@ if [ "$SKIP_PUSH" != "true" ]; then
     echo -e "${CYAN}┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓${RESET}" >&2
     echo -e "${CYAN}┃${RESET} ${BLUE}Step 2/4:${RESET} Pushing branch to remote                      ${CYAN}┃${RESET}" >&2
     echo -e "${CYAN}┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛${RESET}" >&2
-    
+
     echo -e "  ${DIM}Running: git push -u origin ${selected_branch}${RESET}" >&2
-    
-    git push -u origin "$selected_branch" 2>&1 | while read -r line; do
+
+    push_tmp=$(mktemp)
+    trap "rm -f '$push_tmp'" EXIT
+    git push -u origin "$selected_branch" 2>&1 | tee "$push_tmp" | while read -r line; do
         echo -e "  ${DIM}${line}${RESET}" >&2
     done
-    
-    if [ $(shell_get_pipe_status 0) -eq 0 ]; then
+    push_exit_code=$(shell_get_pipe_status 0)
+
+    if [ $push_exit_code -eq 0 ]; then
         echo -e "  ${GREEN}✓${RESET} Push successful" >&2
+    elif grep -q "non-fast-forward\|fetch first\|tip of your current branch is behind" "$push_tmp"; then
+        echo -e "  ${RED}✗${RESET} Push rejected (remote has changes not in local branch)" >&2
+        echo "" >&2
+        printf "  ${YELLOW}Force push to overwrite remote?${RESET} ${DIM}(y/N)${RESET} " >&2
+        read -n 1 force_choice < /dev/tty
+        echo "" >&2
+        if [[ "$force_choice" =~ ^[Yy]$ ]]; then
+            echo -e "  ${DIM}Running: git push -u origin ${selected_branch} --force-with-lease${RESET}" >&2
+            git push -u origin "$selected_branch" --force-with-lease 2>&1 | while read -r line; do
+                echo -e "  ${DIM}${line}${RESET}" >&2
+            done
+            if [ ${PIPESTATUS[0]} -eq 0 ]; then
+                echo -e "  ${GREEN}✓${RESET} Force push successful" >&2
+            else
+                echo -e "  ${RED}✗${RESET} Force push failed" >&2
+                exit 1
+            fi
+        else
+            echo -e "  ${RED}✗${RESET} Push cancelled" >&2
+            exit 1
+        fi
     else
         echo -e "  ${RED}✗${RESET} Push failed" >&2
         exit 1
@@ -557,6 +610,23 @@ echo -e "${CYAN}┗━━━━━━━━━━━━━━━━━━━━�
 if [ -n "$TICKET_KEY" ] && [ "$NO_JIRA" != "true" ] && [ -n "$summary" ]; then
     mr_title="$TICKET_KEY $summary"
     mr_description="Closes $TICKET_KEY"
+    
+    # Include ticket description if requested
+    if [ "$INCLUDE_TICKET_DESCRIPTION" = true ]; then
+        # Use passed description if available, otherwise fetch from Jira
+        if [ -n "$TICKET_DESCRIPTION" ]; then
+            mr_description="$mr_description
+
+$TICKET_DESCRIPTION"
+        else
+            ticket_description=$(get_ticket_description "$TICKET_KEY")
+            if [ -n "$ticket_description" ]; then
+                mr_description="$mr_description
+
+$ticket_description"
+            fi
+        fi
+    fi
 else
     mr_title="$selected_branch"
     mr_description=""

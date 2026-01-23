@@ -520,9 +520,9 @@ if [ "$DRY_RUN" = true ]; then
     
     # Output JSON result
     if [ -n "$OUTPUT_FILE" ]; then
-        jq -nc --arg key "${JIRA_PROJECT}-9999" --arg summary "$summary" '{key: $key, summary: $summary}' > "$OUTPUT_FILE"
+        jq -nc --arg key "${JIRA_PROJECT}-9999" --arg summary "$summary" --arg description "$desc_text" '{key: $key, summary: $summary, description: $description}' > "$OUTPUT_FILE"
     else
-        jq -nc --arg key "${JIRA_PROJECT}-9999" --arg summary "$summary" '{key: $key, summary: $summary}'
+        jq -nc --arg key "${JIRA_PROJECT}-9999" --arg summary "$summary" --arg description "$desc_text" '{key: $key, summary: $summary, description: $description}'
     fi
     exit 0
 else
@@ -574,9 +574,9 @@ else
         
         # Output JSON result
         if [ -n "$OUTPUT_FILE" ]; then
-            jq -nc --arg key "$new_key" --arg summary "$summary" '{key: $key, summary: $summary}' > "$OUTPUT_FILE"
+            jq -nc --arg key "$new_key" --arg summary "$summary" --arg description "$desc_text" '{key: $key, summary: $summary, description: $description}' > "$OUTPUT_FILE"
         else
-            jq -nc --arg key "$new_key" --arg summary "$summary" '{key: $key, summary: $summary}'
+            jq -nc --arg key "$new_key" --arg summary "$summary" --arg description "$desc_text" '{key: $key, summary: $summary, description: $description}'
         fi
         exit 0
     else
