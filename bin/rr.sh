@@ -107,6 +107,11 @@ build_worktree_map() {
             # Save previous worktree if we have one
             if [[ -n "$current_branch" && -n "$current_wt_path" ]]; then
                 WORKTREE_MAP["$current_branch"]="$current_wt_path"
+                # Also map eponymous branch so navigation works even with guest branches
+                local _epo; _epo=$(get_eponymous_branch "$current_wt_path")
+                if [ -n "$_epo" ] && [ "$_epo" != "$current_branch" ] && [ "$current_wt_path" != "$GIT_ROOT" ]; then
+                    WORKTREE_MAP["$_epo"]="$current_wt_path"
+                fi
             fi
             # Start new worktree
             current_wt_path="${BASH_REMATCH[1]}"
@@ -148,6 +153,25 @@ build_worktree_map() {
     # Don't forget the last worktree
     if [[ -n "$current_branch" && -n "$current_wt_path" ]]; then
         WORKTREE_MAP["$current_branch"]="$current_wt_path"
+        # Also map eponymous branch (inferred from path name) so navigation works
+        # even when a different branch is checked out in this worktree
+        local _epo; _epo=$(get_eponymous_branch "$current_wt_path")
+        if [ -n "$_epo" ] && [ "$_epo" != "$current_branch" ] && [ "$current_wt_path" != "$GIT_ROOT" ]; then
+            WORKTREE_MAP["$_epo"]="$current_wt_path"
+        fi
+    fi
+}
+
+# Get the eponymous branch name for a worktree path (inferred from directory name)
+# e.g. /path/ul.UB-6506 -> UB-6506, /path/my-feature -> my-feature
+get_eponymous_branch() {
+    local wt_path="$1"
+    local wt_basename
+    wt_basename=$(basename "$wt_path")
+    if [[ "$wt_basename" =~ \.([^.]+)$ ]]; then
+        echo "${BASH_REMATCH[1]}"
+    else
+        echo "$wt_basename"
     fi
 }
 
@@ -787,12 +811,132 @@ else
     REFLOG_CACHE="$CACHE_DIR/reflog_${REFLOG_COUNT}.cache"
 fi
 
+# Generate TSV rows for all non-main worktrees instantly (no reflog parsing needed).
+# Outputs rows for the eponymous branch of each worktree; if a different branch is
+# currently checked out, the wt_indicator is set to "WT_MISMATCH:<actual_branch>".
+# Writes eponymous branch names to claimed_file so generate_branch_data can skip them.
+generate_worktree_data() {
+    local claimed_file="${1:-}"
+    local main_wt="$GIT_ROOT"
+    local current_wt="" current_actual_branch="" current_is_bare=false
+
+    _emit_worktree_data_row() {
+        local wt_path="$1"
+        local actual_branch="$2"
+
+        local eponymous_branch
+        eponymous_branch=$(get_eponymous_branch "$wt_path")
+
+        # JIRA data from in-memory cache (instant)
+        local ticket
+        ticket=$(echo "$eponymous_branch" | grep -oi "${JIRA_PROJECT}-[0-9]\+" | tr '[:lower:]' '[:upper:]' | head -1)
+        local title="<EMPTY>" jira_status="<EMPTY>" jira_assignee="<UNASSIGNED>"
+        if [ -n "$ticket" ]; then
+            title="${JIRA_TITLE_CACHE[$ticket]:-<EMPTY>}"
+            jira_status="${JIRA_STATUS_CACHE[$ticket]:-<EMPTY>}"
+            jira_assignee="${JIRA_ASSIGNEE_CACHE[$ticket]:-<UNASSIGNED>}"
+        fi
+
+        # Dirty status
+        local wt_status="CLEAN"
+        if ! git -C "$wt_path" diff --quiet HEAD 2>/dev/null || \
+           ! git -C "$wt_path" diff --quiet --cached 2>/dev/null; then
+            wt_status="DIRTY"
+        fi
+
+        # Commit info + author + timestamp in one git call (%cr = human-readable relative time)
+        local log_line
+        log_line=$(git -C "$wt_path" log -1 --format="%ct|%cr|%an" 2>/dev/null)
+        local commit_time="${log_line%%|*}"
+        local _rest="${log_line#*|}"
+        local commit_relative="${_rest%%|*}"
+        local author="${_rest#*|}"
+        author="${author:0:15}"
+
+        # Navigation timestamp (from access log) takes priority over commit time
+        local nav_time
+        nav_time=$(get_worktree_navigation_time "$wt_path")
+        local time_info
+        if [ -n "$nav_time" ]; then
+            time_info="checked:$nav_time"
+        elif [ -n "$commit_time" ]; then
+            time_info="checked:$commit_time"
+        else
+            time_info=""
+        fi
+
+        # Mismatch indicator
+        local wt_indicator="WT"
+        if [ -n "$actual_branch" ] && [ "$actual_branch" != "$eponymous_branch" ]; then
+            wt_indicator="WT_MISMATCH:$actual_branch"
+        fi
+
+        local truncated_branch
+        truncated_branch=$(truncate "$eponymous_branch" $BRANCH_MAX_LENGTH)
+
+        # Extract sort timestamp from time_info (checked:TIMESTAMP format)
+        local sort_ts=0
+        [[ "$time_info" =~ :([0-9]+)$ ]] && sort_ts="${BASH_REMATCH[1]}"
+
+        local _row
+        _row=$(printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s" \
+            "$truncated_branch" "$title" "$jira_status" "$author" \
+            "$time_info" "committed: ${commit_relative:-unknown}" \
+            "$eponymous_branch" "$jira_assignee" "$wt_indicator" "$wt_path" "$wt_status")
+
+        # Accumulate with sort key prefix; output is sorted at the end
+        if [ -z "$_collected_rows" ]; then
+            _collected_rows="${sort_ts}"$'\t'"${_row}"
+        else
+            _collected_rows="${_collected_rows}"$'\n'"${sort_ts}"$'\t'"${_row}"
+        fi
+
+        # Write to claimed file immediately (order doesn't matter for dedup)
+        [ -n "$claimed_file" ] && echo "$eponymous_branch" >> "$claimed_file"
+    }
+
+    local _collected_rows=""
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^worktree[[:space:]](.+)$ ]]; then
+            if [ -n "$current_wt" ] && [ "$current_wt" != "$main_wt" ] && [ "$current_is_bare" = false ]; then
+                _emit_worktree_data_row "$current_wt" "$current_actual_branch"
+            fi
+            current_wt="${BASH_REMATCH[1]}"
+            current_actual_branch=""
+            current_is_bare=false
+        elif [[ "$line" =~ ^branch[[:space:]]refs/heads/(.+)$ ]]; then
+            current_actual_branch="${BASH_REMATCH[1]}"
+        elif [[ "$line" == "bare" ]]; then
+            current_is_bare=true
+        fi
+    done < <(git worktree list --porcelain 2>/dev/null)
+
+    # Emit last entry
+    if [ -n "$current_wt" ] && [ "$current_wt" != "$main_wt" ] && [ "$current_is_bare" = false ]; then
+        _emit_worktree_data_row "$current_wt" "$current_actual_branch"
+    fi
+
+    # Output rows sorted by timestamp descending (most recently accessed first)
+    [ -n "$_collected_rows" ] && echo "$_collected_rows" | sort -t$'\t' -k1,1nr | cut -f2-
+
+    unset -f _emit_worktree_data_row
+}
+
 # Function to generate branch data for a specific count
 generate_branch_data() {
     local count="$1"
+    local claimed_file="${2:-}"
     local temp_cache_file
     local temp_reflog_cache
-    
+
+    # Load claimed branches (already output by generate_worktree_data) into a set
+    declare -A _wt_claimed=()
+    if [ -n "$claimed_file" ] && [ -s "$claimed_file" ]; then
+        while IFS= read -r _cb; do
+            _wt_claimed["$_cb"]=1
+        done < "$claimed_file"
+    fi
+
     if [ "$SEARCH_ORIGIN" = true ]; then
         temp_cache_file="$CACHE_DIR/branch_list_${count}_origin.cache"
         temp_reflog_cache="$CACHE_DIR/reflog_${count}_origin.cache"
@@ -824,12 +968,20 @@ generate_branch_data() {
             # 2. Cache is very fresh (< 2 seconds) regardless of access log
             if [ "$access_log_changed" = false ] && [ "$cache_age" -lt 60 ]; then
                 # Nothing changed - use cache
-                cat "$temp_cache_file"
+                if [ ${#_wt_claimed[@]} -gt 0 ]; then
+                    awk -F'\t' 'NR==FNR{skip[$1]=1; next} !skip[$7]' "$claimed_file" "$temp_cache_file"
+                else
+                    cat "$temp_cache_file"
+                fi
                 return
             elif [ "$cache_age" -lt 2 ]; then
                 # Cache is very fresh - use it even if access log changed
                 # (handles rapid successive rr calls during navigation)
-                cat "$temp_cache_file"
+                if [ ${#_wt_claimed[@]} -gt 0 ]; then
+                    awk -F'\t' 'NR==FNR{skip[$1]=1; next} !skip[$7]' "$claimed_file" "$temp_cache_file"
+                else
+                    cat "$temp_cache_file"
+                fi
                 return
             fi
         fi
@@ -849,13 +1001,19 @@ generate_branch_data() {
         if [[ "$current_branches_hash" == "$cached_branches_hash" ]]; then
             if [ "$access_log_changed" = false ]; then
                 # Branches and access log both unchanged - use cache
-                cat "$temp_cache_file"
+                if [ ${#_wt_claimed[@]} -gt 0 ]; then
+                    awk -F'\t' 'NR==FNR{skip[$1]=1; next} !skip[$7]' "$claimed_file" "$temp_cache_file"
+                else
+                    cat "$temp_cache_file"
+                fi
                 return
             else
                 # Access log changed, branches haven't - smart update timestamps only
                 # This is fast because we skip JIRA fetches
                 local updated_cache=""
                 while IFS=$'\t' read -r branch title status author time_info commit_info full_branch assignee wt_indicator wt_path wt_status; do
+                    # Skip branches claimed by generate_worktree_data
+                    [ -n "${_wt_claimed[$full_branch]+x}" ] && continue
                     local sort_timestamp=0
 
                     # Extract existing timestamp from time_info for sorting
@@ -1096,6 +1254,8 @@ generate_branch_data() {
     # Second pass: format output with cached data, streaming each line immediately.
     # branch_list is already in final sort order from the pre-sort above.
     while IFS=$'\t' read -r branch unix_time rest; do
+        # Skip branches claimed by generate_worktree_data
+        [ -n "${_wt_claimed[$branch]+x}" ] && continue
 
         local ref_path
         if [ "$SEARCH_ORIGIN" = true ]; then
@@ -1821,7 +1981,17 @@ fi
 
 # GENERATE_MORE_MODE: collect all data (streaming captured by $(...)) then format for fzf reload
 if [ "$GENERATE_MORE_MODE" = true ]; then
-    processed_data=$(generate_branch_data "$REFLOG_COUNT")
+    _wt_claimed_file=$(mktemp)
+    _wt_data=$(generate_worktree_data "$_wt_claimed_file")
+    processed_data=$(generate_branch_data "$REFLOG_COUNT" "$_wt_claimed_file")
+    rm -f "$_wt_claimed_file"
+    if [ -n "$_wt_data" ]; then
+        if [ -n "$processed_data" ]; then
+            processed_data="${_wt_data}"$'\n'"${processed_data}"
+        else
+            processed_data="$_wt_data"
+        fi
+    fi
 
     # Append branchless JIRA tickets
     if [ -n "$JIRA_EMAIL" ] && [ -n "$JIRA_API_TOKEN" ]; then
@@ -1938,16 +2108,20 @@ if [ "$GENERATE_MORE_MODE" = true ]; then
         [ "$branch_upper" = "$ticket_from_branch" ] && is_authoritative=true
         
         # Pad branch for display (with star/dot/spaces and worktree indicator)
-        # Worktree indicator: ⊙  (clean) or ⊙! (dirty, orange)
+        # Worktree indicator: ⊙  (clean), ⊙! (dirty), ⊙≠ (mismatch - different branch checked out)
         wt_display=""
         branch_width=$((BRANCH_MAX_LENGTH-2))
-        if [ "$wt_indicator" = "WT" ]; then
-            if [ "$wt_status" = "DIRTY" ]; then
+        _wt_mismatch_branch=""
+        [[ "$wt_indicator" == "WT_MISMATCH:"* ]] && _wt_mismatch_branch="${wt_indicator#WT_MISMATCH:}"
+        if [ "$wt_indicator" = "WT" ] || [ -n "$_wt_mismatch_branch" ]; then
+            if [ -n "$_wt_mismatch_branch" ]; then
+                wt_display=$(printf ' \033[38;5;214m⊙≠\033[0m ')
+            elif [ "$wt_status" = "DIRTY" ]; then
                 wt_display=$(printf ' \033[38;5;250m⊙\033[38;5;214m !\033[0m')
             else
                 wt_display=$(printf ' \033[38;5;250m⊙\033[0m  ')
             fi
-            # " ⊙ !" or " ⊙  " = space(1) + ⊙(1) + space(1) + !(1) or space(1) = 4 visual cols
+            # " ⊙≠ " / " ⊙ !" / " ⊙  " = 4 visual cols each
             wt_visual_width=4
 
             # Add pane indicators if enabled (based on real-time current directory)
@@ -2025,13 +2199,16 @@ selected_line=$(
         echo "$header_text"
 
         # Stream branch data (and branchless tickets after) through the display formatter.
-        # generate_branch_data writes to cache via tee internally; generate_branchless_ticket_data
-        # reads existing tickets from the cache file when called with no data argument.
+        # generate_worktree_data runs first for instant worktree rows; generate_branch_data
+        # skips those branches. generate_branchless_ticket_data appends unstarted tickets.
+        _wt_claimed_file=$(mktemp)
         {
-            generate_branch_data "$REFLOG_COUNT"
+            generate_worktree_data "$_wt_claimed_file"
+            generate_branch_data "$REFLOG_COUNT" "$_wt_claimed_file"
             if [ -n "$JIRA_EMAIL" ] && [ -n "$JIRA_API_TOKEN" ]; then
                 generate_branchless_ticket_data ""
             fi
+            rm -f "$_wt_claimed_file"
         } |
         # Use │ as delimiter with proper column spacing
         while IFS=$'\t' read -r branch title status author time_info commit_info full_branch assignee wt_indicator wt_path wt_status; do
@@ -2068,16 +2245,20 @@ selected_line=$(
             [ "$branch_upper" = "$ticket_from_branch" ] && is_authoritative=true
             
             # Pad branch for display (with star/dot/spaces and worktree indicator)
-            # Worktree indicator: ⊙  (clean) or ⊙! (dirty, orange)
+            # Worktree indicator: ⊙  (clean), ⊙! (dirty), ⊙≠ (mismatch - different branch checked out)
             wt_display=""
             branch_width=$((BRANCH_MAX_LENGTH-2))
-            if [ "$wt_indicator" = "WT" ]; then
-                if [ "$wt_status" = "DIRTY" ]; then
+            _wt_mismatch_branch=""
+            [[ "$wt_indicator" == "WT_MISMATCH:"* ]] && _wt_mismatch_branch="${wt_indicator#WT_MISMATCH:}"
+            if [ "$wt_indicator" = "WT" ] || [ -n "$_wt_mismatch_branch" ]; then
+                if [ -n "$_wt_mismatch_branch" ]; then
+                    wt_display=$(printf ' \033[38;5;214m⊙≠\033[0m ')
+                elif [ "$wt_status" = "DIRTY" ]; then
                     wt_display=$(printf ' \033[38;5;250m⊙\033[38;5;214m !\033[0m')
                 else
                     wt_display=$(printf ' \033[38;5;250m⊙\033[0m  ')
                 fi
-                # " ⊙ !" or " ⊙  " = space(1) + ⊙(1) + space(1) + !(1) or space(1) = 4 visual cols
+                # " ⊙≠ " / " ⊙ !" / " ⊙  " = 4 visual cols each
                 wt_visual_width=4
 
                 # Add pane indicators if enabled (based on real-time current directory)
