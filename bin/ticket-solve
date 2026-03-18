@@ -1,0 +1,613 @@
+#!/usr/bin/env bash
+# Headless ticket solver: creates worktree, runs Claude, prepares changes for review
+#
+# Usage:
+#   ticket-solve UB-1234                         Solve ticket (fetches description from Jira)
+#   ticket-solve UB-1234 https://slack.com/...   Include Slack thread context
+#   ticket-solve UB-1234 --context "extra info"  Pass additional context
+#   ticket-solve UB-1234 --dry-run               Show what would be done
+#   ticket-solve UB-1234 --model sonnet          Use a specific model (default: sonnet)
+#
+# When called by ticket-bot:
+#   ticket-solve UB-1234 --thread-ts 123.456 --dm-channel C0123 --session-id <uuid>
+#
+# End state:
+#   - Worktree at ../repo.TICKET-slug/ with all changes soft-reset (staged, not committed)
+#   - REVIEW.md in worktree root with tradeoffs, questions, uncertainties
+#   - Slack DM sent when ready for review
+#   - State saved to ~/.cache/ticket-solve/TICKET.json for resume
+#
+# To review:
+#   cd <worktree>/client/web && git diff --cached
+#
+# To finish:
+#   git commit -m "UB-1234: summary" && publish-changes
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# Load environment
+if [ -f "$SCRIPT_DIR/../.env" ]; then
+    set -a
+    source "$SCRIPT_DIR/../.env"
+    set +a
+fi
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+CYAN='\033[0;36m'
+DIM='\033[2m'
+RESET='\033[0m'
+
+# State directory
+STATE_DIR="$HOME/.cache/ticket-solve"
+mkdir -p "$STATE_DIR"
+
+# Defaults
+DRY_RUN=false
+MOCK=false
+FORCE=false
+MODEL="sonnet"
+EXTRA_CONTEXT=""
+SLACK_URLS=()
+THREAD_TS=""          # If set, reply in existing thread (from ticket-bot)
+DM_CHANNEL=""         # If set, use this DM channel (from ticket-bot)
+SESSION_ID=""         # If set, use this session ID (from ticket-bot)
+
+# Parse args
+TICKET=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --dry-run)
+            DRY_RUN=true
+            shift
+            ;;
+        --mock)
+            MOCK=true
+            shift
+            ;;
+        --force)
+            FORCE=true
+            shift
+            ;;
+        --model)
+            MODEL="$2"
+            shift 2
+            ;;
+        --context)
+            EXTRA_CONTEXT="$2"
+            shift 2
+            ;;
+        --thread-ts)
+            THREAD_TS="$2"
+            shift 2
+            ;;
+        --dm-channel)
+            DM_CHANNEL="$2"
+            shift 2
+            ;;
+        --session-id)
+            SESSION_ID="$2"
+            shift 2
+            ;;
+        https://*slack.com/archives/*)
+            SLACK_URLS+=("$1")
+            shift
+            ;;
+        *)
+            if [ -z "$TICKET" ]; then
+                TICKET="$1"
+            else
+                EXTRA_CONTEXT="${EXTRA_CONTEXT:+$EXTRA_CONTEXT\n}$1"
+            fi
+            shift
+            ;;
+    esac
+done
+
+if [ -z "$TICKET" ]; then
+    echo -e "${RED}Usage: ticket-solve <TICKET-ID> [slack-urls...] [--context \"...\"] [--model MODEL]${RESET}"
+    exit 1
+fi
+
+# Normalize ticket ID
+TICKET=$(echo "$TICKET" | tr '[:lower:]' '[:upper:]')
+if [[ "$TICKET" =~ ^[0-9]+$ ]]; then
+    TICKET="${JIRA_PROJECT:-UB}-${TICKET}"
+fi
+
+# Generate session ID if not provided
+if [ -z "$SESSION_ID" ]; then
+    SESSION_ID=$(python3 -c "import uuid; print(uuid.uuid4())")
+fi
+
+echo -e "${CYAN}ticket-solve${RESET} ${GREEN}${TICKET}${RESET} ${DIM}(session: ${SESSION_ID:0:8}...)${RESET}"
+echo ""
+
+# ── Fetch ticket description from Jira ──
+fetch_ticket() {
+    local ticket_key="$1"
+
+    if [ -z "$JIRA_EMAIL" ] || [ -z "$JIRA_API_TOKEN" ] || [ -z "$JIRA_DOMAIN" ]; then
+        echo -e "${RED}Missing Jira credentials (JIRA_EMAIL, JIRA_API_TOKEN, JIRA_DOMAIN)${RESET}" >&2
+        return 1
+    fi
+
+    local response
+    response=$(curl -sf -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
+        -H "Content-Type: application/json; charset=utf-8" \
+        "https://${JIRA_DOMAIN}/rest/api/3/issue/${ticket_key}?fields=summary,description,comment,issuetype,priority,labels,acceptance_criteria" 2>/dev/null) || {
+        echo -e "${RED}Failed to fetch ticket ${ticket_key}${RESET}" >&2
+        return 1
+    }
+
+    echo "$response"
+}
+
+format_ticket() {
+    local json="$1"
+
+    local summary
+    summary=$(echo "$json" | jq -r '.fields.summary // "N/A"')
+
+    local ticket_type
+    ticket_type=$(echo "$json" | jq -r '.fields.issuetype.name // "N/A"')
+
+    local priority
+    priority=$(echo "$json" | jq -r '.fields.priority.name // "N/A"')
+
+    local labels
+    labels=$(echo "$json" | jq -r '(.fields.labels // []) | join(", ")')
+
+    # Extract description text (handles ADF format)
+    local description
+    local desc_type
+    desc_type=$(echo "$json" | jq -r '(.fields.description | type) // "null"')
+    if [ "$desc_type" = "string" ]; then
+        description=$(echo "$json" | jq -r '.fields.description')
+    elif [ "$desc_type" = "object" ]; then
+        description=$(echo "$json" | jq -r '.fields.description | .. | select(.type? == "text") | .text' 2>/dev/null | sed '/^$/d')
+    else
+        description="No description"
+    fi
+
+    # Extract recent comments
+    local comments
+    comments=$(echo "$json" | jq -r '
+        [.fields.comment.comments // [] | .[-5:] | .[] |
+            "**" + (.author.displayName // "Unknown") + "** (" + (.created | split("T")[0]) + "):\n" +
+            (.. | select(.type? == "text") | .text)
+        ] | join("\n\n")' 2>/dev/null || echo "")
+
+    cat <<EOF
+# ${TICKET}: ${summary}
+
+**Type:** ${ticket_type} | **Priority:** ${priority}${labels:+ | **Labels:** ${labels}}
+
+## Description
+
+${description}
+EOF
+
+    if [ -n "$comments" ] && [ "$comments" != "null" ]; then
+        cat <<EOF
+
+## Comments
+
+${comments}
+EOF
+    fi
+}
+
+echo -e "  ${DIM}Fetching ticket from Jira...${RESET}"
+TICKET_JSON=$(fetch_ticket "$TICKET") || exit 1
+TICKET_SUMMARY=$(echo "$TICKET_JSON" | jq -r '.fields.summary // "N/A"')
+TICKET_FORMATTED=$(format_ticket "$TICKET_JSON")
+echo -e "  ${GREEN}${TICKET}:${RESET} ${TICKET_SUMMARY}"
+
+# ── Slack DM helper ──
+SLACK_DM_CHANNEL_ID="${DM_CHANNEL}"
+SLACK_THREAD_TS="${THREAD_TS}"
+
+slack_dm() {
+    local text="$1"
+    local capture_thread="${2:-false}"  # if "true", capture thread_ts from response
+
+    if [ -z "$TICKET_CREATOR_BOT_TOKEN" ] || [ -z "$SLACK_NOTIFY_USER_ID" ]; then
+        return 0
+    fi
+
+    # Open DM channel if we haven't already
+    if [ -z "$SLACK_DM_CHANNEL_ID" ]; then
+        local open_response
+        open_response=$(curl -sf -X POST "https://slack.com/api/conversations.open" \
+            -H "Authorization: Bearer ${TICKET_CREATOR_BOT_TOKEN}" \
+            -H "Content-Type: application/json; charset=utf-8" \
+            -d "$(jq -n --arg user "$SLACK_NOTIFY_USER_ID" '{users: $user}')" 2>/dev/null) || return 0
+
+        SLACK_DM_CHANNEL_ID=$(echo "$open_response" | jq -r '.channel.id // empty')
+        if [ -z "$SLACK_DM_CHANNEL_ID" ]; then
+            echo -e "  ${DIM}Could not open Slack DM channel${RESET}" >&2
+            return 0
+        fi
+    fi
+
+    local payload
+    if [ -n "$SLACK_THREAD_TS" ]; then
+        payload=$(jq -n \
+            --arg channel "$SLACK_DM_CHANNEL_ID" \
+            --arg thread_ts "$SLACK_THREAD_TS" \
+            --arg text "$text" \
+            '{channel: $channel, thread_ts: $thread_ts, text: $text, mrkdwn: true}')
+    else
+        payload=$(jq -n \
+            --arg channel "$SLACK_DM_CHANNEL_ID" \
+            --arg text "$text" \
+            '{channel: $channel, text: $text, mrkdwn: true}')
+    fi
+
+    local response
+    response=$(curl -sf -X POST "https://slack.com/api/chat.postMessage" \
+        -H "Authorization: Bearer ${TICKET_CREATOR_BOT_TOKEN}" \
+        -H "Content-Type: application/json; charset=utf-8" \
+        -d "$payload" 2>/dev/null) || return 0
+
+    # Capture thread_ts from first message (becomes the thread parent)
+    if [ "$capture_thread" = "true" ] && [ -z "$SLACK_THREAD_TS" ]; then
+        SLACK_THREAD_TS=$(echo "$response" | jq -r '.ts // empty')
+    fi
+}
+
+# ── Find git root ──
+GIT_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || {
+    echo -e "${RED}Not in a git repository${RESET}"
+    exit 1
+}
+REPO_NAME=$(basename "$GIT_ROOT")
+
+# ── Build prompt ──
+PROMPT="I need you to implement this Jira ticket. Read the ticket carefully, explore the codebase, implement the changes, then prepare everything for my review.
+
+${TICKET_FORMATTED}"
+
+# Add Slack context
+for url in "${SLACK_URLS[@]}"; do
+    PROMPT="${PROMPT}
+
+## Slack Thread
+
+Fetch this Slack thread for additional context: ${url}"
+done
+
+# Add extra context
+if [ -n "$EXTRA_CONTEXT" ]; then
+    PROMPT="${PROMPT}
+
+## Additional Context
+
+$(echo -e "$EXTRA_CONTEXT")"
+fi
+
+# Add slack-ask instructions and review instructions
+PROMPT="${PROMPT}
+
+## Asking Questions
+
+If you encounter ambiguities, need clarification, or face a design decision that could go multiple ways, ask me via Slack:
+
+\`\`\`bash
+slack-ask \"Your question here\"
+\`\`\`
+
+This posts to our Slack DM thread and blocks until I reply (up to 30 min). Use sparingly — only for genuine blockers or important design decisions where guessing wrong would waste significant effort. If no reply comes, proceed with your best judgment and note the assumption in REVIEW.md.
+
+## When you are done
+
+1. Write tests for your changes. If there are existing tests for the code you modified, update them. If not, add new test files following the existing test patterns in the codebase. Run \`yarn test:run\` and fix any failures.
+
+2. Run the pre-push checks and fix any failures:
+   \`\`\`bash
+   cd client/web
+   yarn prettier-write:since-main   # autofix formatting
+   yarn eslint-write:since-main     # autofix lint
+   yarn tsc --noEmit                # type check — fix any errors
+   yarn test:run                    # tests — fix any failures
+   \`\`\`
+   Commit the fixes. Repeat until all checks pass. The ticket is NOT done until these all pass.
+
+3. Write \`REVIEW.md\` in the git repo root (the parent of \`client/web\`). Do NOT \`git add\` this file — the wrapper manages it separately. Only include sections that have content — omit any section with nothing to say:
+   - **Summary**: What was done (1-3 sentences)
+   - **Changes**: Files changed and why (bullet list)
+   - **Tradeoffs**: Shortcuts taken, alternative approaches considered
+   - **Questions**: Assumptions you made about ambiguities
+   - **Uncertainties**: Things you're not confident about
+   - **Testing**: What tests were added/updated, what needs manual verification
+   Keep it concise — bullet points, not prose.
+
+4. As your very last output, print a one-line summary prefixed with \`SUMMARY:\` — e.g.:
+   \`SUMMARY: Removed empty aois param from URL by filtering it out in useWorkspaceQueryParams. Added tests. All checks pass.\`
+   This line is parsed by the wrapper for Slack notifications. Keep it concise (1-2 sentences max).
+
+Do NOT push, do NOT create an MR, do NOT run publish-changes. Do NOT run a soft reset — the wrapper handles that. Do NOT \`git add\` REVIEW.md, diff.html, or .claude-output.log."
+
+if $DRY_RUN; then
+    echo ""
+    echo -e "${CYAN}═══ DRY RUN ═══${RESET}"
+    echo -e "${DIM}Model:${RESET} $MODEL"
+    echo -e "${DIM}Session:${RESET} $SESSION_ID"
+    echo ""
+    echo -e "${DIM}Prompt:${RESET}"
+    echo "$PROMPT"
+    exit 0
+fi
+
+# ── Create worktree (always fresh from origin/main) ──
+echo -e "  ${DIM}Setting up worktree...${RESET}"
+
+# Check if worktree or branch already exists
+EXISTING_WT=$(git -C "$GIT_ROOT" worktree list --porcelain 2>/dev/null | \
+    grep "^worktree " | sed 's/^worktree //' | \
+    grep "${REPO_NAME}\.${TICKET}" | head -1 || true)
+BRANCH_EXISTS=$(git -C "$GIT_ROOT" rev-parse --verify "$TICKET" 2>/dev/null && echo "yes" || true)
+
+if [ -n "$EXISTING_WT" ] && [ -d "$EXISTING_WT" ]; then
+    # Check if it has diverged from origin/main (only tracked changes matter)
+    COMMITS_AHEAD=$(git -C "$EXISTING_WT" rev-list --count origin/main..HEAD 2>/dev/null || echo "0")
+    DIRTY=$(git -C "$EXISTING_WT" diff --name-only 2>/dev/null || true)
+    STAGED=$(git -C "$EXISTING_WT" diff --cached --name-only 2>/dev/null || true)
+
+    if [ "$COMMITS_AHEAD" != "0" ] || [ -n "$DIRTY" ] || [ -n "$STAGED" ]; then
+        REASON=""
+        [ "$COMMITS_AHEAD" != "0" ] && REASON="${COMMITS_AHEAD} commits ahead"
+        [ -n "$DIRTY" ] && REASON="${REASON:+$REASON, }uncommitted changes"
+        [ -n "$STAGED" ] && REASON="${REASON:+$REASON, }staged changes"
+        if $FORCE; then
+            echo -e "  ${DIM}Removing existing worktree (--force)...${RESET}"
+        else
+            echo -e "${RED}Existing worktree for ${TICKET} has work on it (${REASON}).${RESET}"
+            exit 1
+        fi
+    fi
+
+    # Remove and recreate fresh
+    echo -e "  ${DIM}Removing worktree...${RESET}"
+    git -C "$GIT_ROOT" worktree remove "$EXISTING_WT" --force 2>/dev/null || true
+    git -C "$GIT_ROOT" branch -D "$TICKET" 2>/dev/null || true
+elif [ -n "$BRANCH_EXISTS" ]; then
+    # Branch exists without worktree — check if it has work
+    COMMITS_AHEAD=$(git -C "$GIT_ROOT" rev-list --count origin/main.."$TICKET" 2>/dev/null || echo "0")
+    if [ "$COMMITS_AHEAD" != "0" ]; then
+        if $FORCE; then
+            echo -e "  ${DIM}Deleting existing branch (--force)...${RESET}"
+        else
+            echo -e "${RED}Branch ${TICKET} exists with ${COMMITS_AHEAD} commits.${RESET}"
+            exit 1
+        fi
+    fi
+    git -C "$GIT_ROOT" branch -D "$TICKET" 2>/dev/null || true
+fi
+
+# Check if remote branch exists with commits (prune stale refs first)
+git -C "$GIT_ROOT" fetch origin --prune 2>/dev/null || true
+REMOTE_EXISTS=$(git -C "$GIT_ROOT" rev-parse --verify "origin/$TICKET" 2>/dev/null && echo "yes" || true)
+if [ -n "$REMOTE_EXISTS" ]; then
+    REMOTE_AHEAD=$(git -C "$GIT_ROOT" rev-list --count "origin/main..origin/$TICKET" 2>/dev/null || echo "0")
+    if [ "$REMOTE_AHEAD" != "0" ]; then
+        if $FORCE; then
+            echo -e "  ${DIM}Deleting remote branch origin/${TICKET} (--force)...${RESET}"
+            git -C "$GIT_ROOT" push origin --delete "$TICKET" 2>/dev/null || true
+        else
+            echo -e "${RED}Remote branch origin/${TICKET} already exists with ${REMOTE_AHEAD} commits.${RESET}"
+            exit 1
+        fi
+    fi
+fi
+
+# Fetch latest and create worktree
+git -C "$GIT_ROOT" fetch origin main --prune 2>/dev/null || true
+CREATE_OUTPUT=$("$SCRIPT_DIR/create-wt" "$TICKET" 2>&1) || true
+echo "$CREATE_OUTPUT"
+
+# Parse path from "Creating worktree at <path>..."
+WORKTREE_PATH=$(echo "$CREATE_OUTPUT" | grep -oP '(?<=Creating worktree at ).*(?=\.\.\.)' || true)
+
+# Fallback: search for it by pattern
+if [ -z "$WORKTREE_PATH" ] || [ ! -d "$WORKTREE_PATH" ]; then
+    WORKTREE_PATH=$(find "$GIT_ROOT/.." -maxdepth 1 -type d -name "${REPO_NAME}.${TICKET}*" | head -1)
+fi
+
+# Verify worktree exists
+if [ -z "$WORKTREE_PATH" ] || [ ! -d "$WORKTREE_PATH" ]; then
+    echo -e "${RED}Worktree not found for ${TICKET}${RESET}"
+    exit 1
+fi
+
+WORK_DIR="$WORKTREE_PATH/client/web"
+
+# Ensure worktree starts from origin/main
+git -C "$WORKTREE_PATH" reset --hard origin/main 2>/dev/null || true
+
+echo -e "  ${GREEN}Worktree:${RESET} ${WORKTREE_PATH}"
+
+# ── Send starting DM (captures thread_ts if new thread) ──
+# Only send starting DM when running standalone (not from ticket-bot which has its own status message)
+if [ -z "$THREAD_TS" ]; then
+    slack_dm ":robot_face: Starting work on <https://${JIRA_DOMAIN}/browse/${TICKET}|${TICKET}>: ${TICKET_SUMMARY}" "true"
+fi
+
+# ── Save state ──
+save_state() {
+    local status="$1"
+    jq -n \
+        --arg ticket "$TICKET" \
+        --arg summary "$TICKET_SUMMARY" \
+        --arg worktree "$WORKTREE_PATH" \
+        --arg work_dir "$WORK_DIR" \
+        --arg thread_ts "$SLACK_THREAD_TS" \
+        --arg dm_channel "$SLACK_DM_CHANNEL_ID" \
+        --arg session_id "$SESSION_ID" \
+        --arg model "$MODEL" \
+        --arg status "$status" \
+        --arg updated_at "$(date -Iseconds)" \
+        '{ticket: $ticket, summary: $summary, worktree: $worktree, work_dir: $work_dir,
+          thread_ts: $thread_ts, dm_channel: $dm_channel, session_id: $session_id,
+          model: $model, status: $status, updated_at: $updated_at}' \
+        > "$STATE_DIR/${TICKET}.json"
+}
+
+save_state "in_progress"
+
+# ── Ensure copied files are present (may be missing on reused worktrees) ──
+source "$SCRIPT_DIR/../.env" 2>/dev/null || true
+for file in ${WT_FILES_TO_COPY:-client/web/ulweb/pkg}; do
+    src="$GIT_ROOT/$file"
+    dst="$WORKTREE_PATH/$file"
+    if [ -e "$src" ] && [ ! -e "$dst" ]; then
+        echo -e "  ${DIM}Copying ${file}...${RESET}"
+        mkdir -p "$(dirname "$dst")"
+        cp -r "$src" "$dst" 2>/dev/null || true
+    fi
+done
+
+# ── Ensure dependencies are installed ──
+if [ ! -f "$WORK_DIR/node_modules/.yarn-state.yml" ]; then
+    echo -e "  ${DIM}Installing dependencies...${RESET}"
+    (cd "$WORK_DIR" && yarn install 2>&1) || {
+        echo -e "  ${RED}yarn install failed${RESET}"
+    }
+fi
+
+# ── Build tailwind if output is missing ──
+if [ ! -f "$WORK_DIR/src/styles/css/tailwind.css" ]; then
+    echo -e "  ${DIM}Building tailwind...${RESET}"
+    (cd "$WORK_DIR" && yarn tailwind-build 2>&1) || true
+fi
+
+# ── Run Claude (or mock) ──
+if $MOCK; then
+    echo -e "  ${DIM}Mock mode — creating dummy changes...${RESET}"
+    cd "$WORK_DIR"
+    # Create a dummy change in an existing file
+    MOCK_FILE=$(set +o pipefail; git -C "$WORK_DIR" ls-files '*.ts' | head -1)
+    if [ -n "$MOCK_FILE" ]; then
+        echo "// ticket-solve mock $(date -Iseconds)" >> "$WORK_DIR/$MOCK_FILE"
+    else
+        echo "// ticket-solve mock $(date -Iseconds)" > "$WORK_DIR/mock-ticket-solve.ts"
+        MOCK_FILE="mock-ticket-solve.ts"
+    fi
+    git -C "$WORK_DIR" add -A
+    git -C "$WORK_DIR" commit -m "${TICKET}: mock implementation" --no-verify 2>/dev/null || true
+    # Create REVIEW.md (not tracked — will be excluded from diff)
+    cat > "$WORKTREE_PATH/REVIEW.md" <<MOCK_EOF
+## Summary
+Mock implementation for testing the ticket-solve pipeline.
+
+## Changes
+- \`${MOCK_FILE}\` — dummy change
+MOCK_EOF
+else
+    echo -e "  ${DIM}Running Claude (${MODEL})...${RESET}"
+    echo ""
+
+    # Export env vars for slack-ask
+    export SLACK_DM_CHANNEL_ID
+    export SLACK_THREAD_TS
+    export TICKET_CREATOR_BOT_TOKEN
+    export SLACK_NOTIFY_USER_ID
+
+    (cd "$WORK_DIR" && claude -p \
+        --model "$MODEL" \
+        --session-id "$SESSION_ID" \
+        --dangerously-skip-permissions \
+        --append-system-prompt "Do NOT run notify-send or notification-sound.sh. You are running headlessly — the wrapper script handles all notifications." \
+        "$PROMPT") \
+        2>&1 | tee "$WORKTREE_PATH/.claude-output.log"
+
+    EXIT_CODE=${PIPESTATUS[0]}
+
+    if [ $EXIT_CODE -ne 0 ]; then
+        echo ""
+        echo -e "${RED}Claude exited with code ${EXIT_CODE}${RESET}"
+        save_state "failed"
+        exit $EXIT_CODE
+    fi
+fi
+
+# ── Soft reset to merge-base ──
+echo ""
+cd "$WORK_DIR"
+echo -e "  ${DIM}Soft resetting to merge-base...${RESET}"
+git reset --soft "$(git merge-base HEAD origin/main)" 2>/dev/null || true
+
+# Unstage non-deliverable files (run from repo root so paths resolve)
+for f in REVIEW.md .claude-output.log diff.html; do
+    git -C "$WORKTREE_PATH" rm --cached -f "$f" 2>/dev/null || true
+done
+
+# ── Verify end state ──
+
+STAGED=$(git diff --cached --stat 2>/dev/null || true)
+if [ -z "$STAGED" ]; then
+    echo -e "${RED}Warning: No staged changes found after Claude ran${RESET}"
+    save_state "done_empty"
+else
+    CHANGED_FILES=$(echo "$STAGED" | tail -1)
+    echo -e "${GREEN}Ready for review:${RESET} ${CHANGED_FILES}"
+    save_state "done"
+fi
+
+# ── Generate HTML diff ──
+DIFF_HTML="$WORKTREE_PATH/diff.html"
+if [ -n "$STAGED" ]; then
+    if ! command -v diff2html &>/dev/null; then
+        echo -e "  ${DIM}Installing diff2html-cli...${RESET}"
+        npm install -g diff2html-cli 2>&1 || true
+    fi
+    if command -v diff2html &>/dev/null; then
+        (set +o pipefail; git diff --cached | diff2html -i stdin -s side -o stdout \
+            --title "${TICKET}: ${TICKET_SUMMARY}" \
+            > "$DIFF_HTML" 2>/dev/null) || true
+    fi
+fi
+
+if [ -f "$WORKTREE_PATH/REVIEW.md" ]; then
+    echo ""
+    echo -e "${CYAN}── REVIEW.md ──${RESET}"
+    cat "$WORKTREE_PATH/REVIEW.md"
+fi
+
+# ── Compute diff URL ──
+DIFF_PORT="${TICKET_BOT_DIFF_PORT:-9847}"
+WORKTREE_BASENAME=$(basename "$WORKTREE_PATH")
+DIFF_URL="http://localhost:${DIFF_PORT}/${WORKTREE_BASENAME}/diff.html"
+
+# ── Send completion DM (only when running standalone, not from ticket-bot) ──
+if [ -n "$STAGED" ] && [ -z "$THREAD_TS" ]; then
+    DM_TEXT=":memo: <https://${JIRA_DOMAIN}/browse/${TICKET}|*${TICKET}*>: ${TICKET_SUMMARY}"
+    DM_TEXT="${DM_TEXT}\n${CHANGED_FILES}"
+    DM_TEXT="${DM_TEXT}\n"
+    if [ -f "$DIFF_HTML" ]; then
+        DM_TEXT="${DM_TEXT}\n:mag: <${DIFF_URL}|View diff>"
+    fi
+    DM_TEXT="${DM_TEXT}\n\`cd ${WORK_DIR}\`"
+    if [ -f "$WORKTREE_PATH/.claude-output.log" ]; then
+        CLAUDE_SUMMARY=$(grep -m1 '^SUMMARY:' "$WORKTREE_PATH/.claude-output.log" 2>/dev/null | sed 's/^SUMMARY: *//')
+        if [ -n "$CLAUDE_SUMMARY" ]; then
+            DM_TEXT="${DM_TEXT}\n\n${CLAUDE_SUMMARY}"
+        fi
+    fi
+    DM_TEXT="${DM_TEXT}\n\n_Reply with feedback for another pass._"
+    slack_dm "$(echo -e "$DM_TEXT")"
+fi
+
+echo ""
+echo -e "${GREEN}Done.${RESET}"
+echo -e "  ${DIM}cd ${WORK_DIR}${RESET}"
+if [ -f "$DIFF_HTML" ]; then
+    echo -e "  ${DIM}${DIFF_URL}${RESET}"
+fi
+echo ""
+echo -e "${CYAN}To iterate with Claude:${RESET}"
+echo -e "  cd ${WORK_DIR} && claude --session-id ${SESSION_ID} --resume"

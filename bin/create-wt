@@ -1,0 +1,140 @@
+#!/bin/bash
+
+NAME="$1"
+if [ -z "$NAME" ]; then
+    echo "Usage: $0 <worktree-name>"
+    exit 1
+fi
+
+# Source environment for JIRA config
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -f "$SCRIPT_DIR/../.env" ]; then
+    set -a
+    source "$SCRIPT_DIR/../.env"
+    set +a
+fi
+
+# Default JIRA project if not set
+JIRA_PROJECT="${JIRA_PROJECT:-UB}"
+
+# Find git root
+GIT_ROOT=$(git rev-parse --show-toplevel 2>/dev/null)
+if [ -z "$GIT_ROOT" ]; then
+    echo "Error: Not in a git repository"
+    exit 1
+fi
+
+# Sanitize title for filesystem
+sanitize_title_for_path() {
+    local title="$1"
+    local max_length="${2:-40}"
+    local sanitized=$(echo "$title" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g' | sed 's/-\+/-/g' | sed 's/^-\+//g' | sed 's/-\+$//g')
+    if [ ${#sanitized} -gt $max_length ]; then
+        sanitized="${sanitized:0:$max_length}"
+        sanitized=$(echo "$sanitized" | sed 's/-\+$//g')
+    fi
+    echo "$sanitized"
+}
+
+# Get JIRA title from cache
+get_jira_title() {
+    local ticket=$1
+    if [[ $ticket =~ ^${JIRA_PROJECT}-[0-9]+$ ]] && [ -f ~/.jira_cache ]; then
+        grep "^${ticket}:" ~/.jira_cache | head -1 | cut -d: -f2-
+    fi
+}
+
+# Build worktree name with ticket title if available
+repo_name=$(basename "$GIT_ROOT")
+ticket=$(echo "$NAME" | grep -oi "${JIRA_PROJECT}-[0-9]\+" | tr '[:lower:]' '[:upper:]' | head -1)
+wt_name="$NAME"
+
+if [ -n "$ticket" ]; then
+    jira_title=$(get_jira_title "$ticket")
+    if [ -n "$jira_title" ]; then
+        sanitized_title=$(sanitize_title_for_path "$jira_title" 40)
+        wt_name="$NAME-$sanitized_title"
+    fi
+fi
+
+NEW_REPO="$GIT_ROOT/../$repo_name.$wt_name"
+
+# Create worktree
+echo "Creating worktree at $NEW_REPO..."
+if ! git worktree add -b "$NAME" "$NEW_REPO" 2>&1; then
+    echo "Failed to create worktree"
+    exit 1
+fi
+
+# Copy important files
+# Determine files to copy: use WT_FILES_TO_COPY env var or fall back to defaults
+files_to_copy_str="${WT_FILES_TO_COPY:-client/web/.env client/web/ulweb/pkg client/web/.cursor client/web/.vscode}"
+
+copied_count=0
+for file in $files_to_copy_str; do
+    src="$GIT_ROOT/$file"
+    dst="$NEW_REPO/$file"
+    if [ -e "$src" ] && [ ! -e "$dst" ]; then
+        if [ -n "$WORKTREE_COPY_EXCLUDE" ]; then
+            exclude_args=""
+            for pattern in $WORKTREE_COPY_EXCLUDE; do
+                exclude_args="$exclude_args --exclude=$pattern"
+            done
+            rsync -a $exclude_args "$src/" "$dst/" 2>/dev/null && ((copied_count++))
+        else
+            cp -r "$src" "$dst" 2>/dev/null && ((copied_count++))
+        fi
+    fi
+done
+
+if [ $copied_count -gt 0 ]; then
+    echo "✓ Copied $copied_count file(s) to worktree"
+fi
+
+# Inject VS Code workspace settings (if configured)
+if [ -n "$VSCODE_WORKSPACE_SETTINGS" ]; then
+    VSCODE_DIR="$NEW_REPO/client/web/.vscode"
+    VSCODE_SETTINGS="$VSCODE_DIR/settings.json"
+
+    mkdir -p "$VSCODE_DIR"
+
+    if [ -f "$VSCODE_SETTINGS" ]; then
+        # Settings file exists - merge using Python
+        python3 -c "
+import json
+import sys
+
+# Parse new settings from env
+new_settings = json.loads('$VSCODE_WORKSPACE_SETTINGS')
+
+# Load existing settings
+with open('$VSCODE_SETTINGS', 'r') as f:
+    settings = json.load(f)
+
+# Merge (new settings override existing)
+settings.update(new_settings)
+
+# Write back
+with open('$VSCODE_SETTINGS', 'w') as f:
+    json.dump(settings, f, indent=2)
+    f.write('\n')
+" && echo "✓ Merged VS Code workspace settings"
+    else
+        # Create new settings file
+        echo "$VSCODE_WORKSPACE_SETTINGS" | python3 -c "
+import json
+import sys
+settings = json.load(sys.stdin)
+print(json.dumps(settings, indent=2))
+" > "$VSCODE_SETTINGS" && echo "✓ Created VS Code workspace settings"
+    fi
+fi
+
+# Run post-worktree hook (if configured)
+if [ -n "$POST_WORKTREE_HOOK" ] && [ -x "$POST_WORKTREE_HOOK" ]; then
+    echo "Running post-worktree hook: $POST_WORKTREE_HOOK"
+    "$POST_WORKTREE_HOOK" "$NEW_REPO"
+fi
+
+echo "Switching to $NEW_REPO/client/web"
+cd "$NEW_REPO/client/web"

@@ -1,0 +1,1244 @@
+#!/usr/bin/env -S python3 -u
+"""
+ticket-bot: Slack-driven ticket solver
+
+Polls your DM channel for messages and dispatches ticket-solve jobs.
+
+Handles:
+  - "UB-1234" → starts ticket-solve
+  - "UB-1234 https://slack.com/..." → starts with Slack context
+  - "UB-1234 extra context here" → starts with extra context
+  - Thread replies on completed jobs → resumes Claude session with feedback
+
+Run:  ticket-bot
+Stop: Ctrl+C
+"""
+
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+from pathlib import Path
+
+if "--help" in sys.argv or "-h" in sys.argv:
+    print("""ticket-bot: Slack-driven ticket solver
+
+Watches your Slack DMs and dispatches Claude to solve tickets.
+
+Usage:
+  ticket-bot              Start the bot (runs in foreground)
+  ticket-bot --mock       Skip AI, use dummy changes (for testing the pipeline)
+  ticket-bot --help       Show this help
+
+Slack commands (DM the bot):
+  UB-1234                           Start working on a ticket
+  UB-1234 <slack-url>               Include Slack thread as context
+  UB-1234 extra instructions here   Add context for Claude
+  help                              Show usage in Slack
+  status                            List active/completed jobs
+
+Thread replies:
+  - Claude may ask questions mid-work — reply to unblock it
+  - After completion, reply with feedback to trigger another pass
+
+State is saved to ~/.cache/ticket-solve/*.json
+Logs are at ~/.cache/ticket-solve/*.log
+
+Requires in .env:
+  TICKET_CREATOR_BOT_TOKEN   Slack bot token (xoxb-...)
+  SLACK_NOTIFY_USER_ID       Your Slack user ID
+  JIRA_EMAIL, JIRA_API_TOKEN, JIRA_DOMAIN
+""")
+    sys.exit(0)
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+ENV_FILE = SCRIPT_DIR.parent / ".env"
+STATE_DIR = Path.home() / ".cache" / "ticket-solve"
+POLL_INTERVAL = 3
+
+
+def load_env():
+    if ENV_FILE.exists():
+        for line in ENV_FILE.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                key, _, value = line.partition("=")
+                key = key.strip()
+                value = value.strip().strip('"').strip("'")
+                # Expand $HOME and $VAR references
+                value = os.path.expandvars(value)
+                os.environ.setdefault(key, value)
+
+
+load_env()
+
+BOT_TOKEN = os.environ.get("TICKET_CREATOR_BOT_TOKEN", "")
+USER_ID = os.environ.get("SLACK_NOTIFY_USER_ID", "")
+JIRA_PROJECT = os.environ.get("JIRA_PROJECT", "UB")
+JIRA_DOMAIN = os.environ.get("JIRA_DOMAIN", "")
+PROJECT_ROOT = os.environ.get("TICKET_BOT_PROJECT_ROOT", "")
+
+if not BOT_TOKEN or not USER_ID:
+    print("Error: TICKET_CREATOR_BOT_TOKEN and SLACK_NOTIFY_USER_ID required in .env")
+    sys.exit(1)
+
+if not PROJECT_ROOT:
+    # Try to find it from common locations
+    for candidate in [
+        Path.home() / "work" / "repos" / "ul",
+        Path.cwd(),
+    ]:
+        if (candidate / ".git").exists():
+            PROJECT_ROOT = str(candidate)
+            break
+
+if not PROJECT_ROOT or not Path(PROJECT_ROOT).is_dir():
+    print("Error: TICKET_BOT_PROJECT_ROOT not set and could not find git repo")
+    print("Set TICKET_BOT_PROJECT_ROOT in .env to your main repo path")
+    sys.exit(1)
+
+MOCK_MODE = "--mock" in sys.argv
+
+
+# ── Slack API helpers ──
+
+
+def slack_post(method, **kwargs):
+    url = f"https://slack.com/api/{method}"
+    data = json.dumps(kwargs).encode()
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={
+            "Authorization": f"Bearer {BOT_TOKEN}",
+            "Content-Type": "application/json; charset=utf-8",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req) as resp:
+            return json.loads(resp.read())
+    except urllib.error.URLError as e:
+        print(f"  Slack API error ({method}): {e}")
+        return {"ok": False, "error": str(e)}
+
+
+def slack_get(method, **params):
+    """Call Slack API with GET (required for some methods like reactions.get)."""
+    qs = urllib.parse.urlencode(params)
+    url = f"https://slack.com/api/{method}?{qs}"
+    req = urllib.request.Request(
+        url, headers={"Authorization": f"Bearer {BOT_TOKEN}"}
+    )
+    try:
+        with urllib.request.urlopen(req) as resp:
+            return json.loads(resp.read())
+    except urllib.error.URLError as e:
+        print(f"  Slack API error ({method}): {e}")
+        return {"ok": False, "error": str(e)}
+
+
+def slack_reply(channel, thread_ts, text):
+    return slack_post(
+        "chat.postMessage",
+        channel=channel,
+        thread_ts=thread_ts,
+        text=text,
+        mrkdwn=True,
+    )
+
+
+# ── Open DM channel ──
+
+dm_resp = slack_post("conversations.open", users=USER_ID)
+if not dm_resp.get("ok"):
+    print(f"Error opening DM channel: {dm_resp.get('error')}")
+    print("Check TICKET_CREATOR_BOT_TOKEN and SLACK_NOTIFY_USER_ID")
+    sys.exit(1)
+
+DM_CHANNEL = dm_resp["channel"]["id"]
+
+# Get bot's own user ID
+auth_resp = slack_get("auth.test")
+BOT_USER_ID = auth_resp.get("user_id", "")
+
+STATE_DIR.mkdir(parents=True, exist_ok=True)
+
+# ── File server for diff links ──
+import http.server
+import threading
+
+DIFF_SERVER_PORT = 9847
+DIFF_SERVER_ROOT = str(Path(PROJECT_ROOT).parent)  # serves all worktrees
+
+
+def _start_file_server():
+    handler = http.server.SimpleHTTPRequestHandler
+    with http.server.HTTPServer(("127.0.0.1", DIFF_SERVER_PORT), handler) as httpd:
+        httpd.serve_forever()
+
+
+_server_thread = threading.Thread(
+    target=lambda: os.chdir(DIFF_SERVER_ROOT) or _start_file_server(),
+    daemon=True,
+)
+# Use a subprocess instead so os.chdir doesn't affect main process
+_file_server_proc = subprocess.Popen(
+    [sys.executable, "-m", "http.server", str(DIFF_SERVER_PORT),
+     "--bind", "127.0.0.1", "--directory", DIFF_SERVER_ROOT],
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+    start_new_session=True,
+)
+import atexit
+atexit.register(lambda: _file_server_proc.kill())
+
+
+def diff_url(worktree_path):
+    """Get a clickable localhost URL for a worktree's diff.html."""
+    rel = os.path.relpath(worktree_path, DIFF_SERVER_ROOT)
+    return f"http://localhost:{DIFF_SERVER_PORT}/{rel}/diff.html"
+
+
+# ── Test DM mode ──
+if "--test-dm" in sys.argv:
+    mock_ticket = "UB-9999"
+    mock_summary = "remove aois=%255B%255D from URL query params when AOIs array is empty"
+    mock_diff_url = f"http://localhost:{DIFF_SERVER_PORT}/ul.{mock_ticket}/diff.html"
+    mock_work_dir = f"/home/kyle/work/repos/ul.{mock_ticket}/client/web"
+
+    dm_text = "\n".join([
+        f":memo: <https://{JIRA_DOMAIN}/browse/{mock_ticket}|*{mock_ticket}*>: {mock_summary}",
+        "3 files changed, 12 insertions(+), 4 deletions(-)",
+        "",
+        f":mag: <{mock_diff_url}|View diff>",
+        f"`cd {mock_work_dir}`",
+        "",
+        "*Questions*",
+        "- Assumed empty array means no AOIs rather than 'all AOIs'",
+        "",
+        "*Uncertainties*",
+        "- Not sure if other query params have the same encoding issue",
+        "",
+        f"_Reply with feedback for another pass._",
+    ])
+
+    resp = slack_post(
+        "chat.postMessage",
+        channel=DM_CHANNEL,
+        text=dm_text,
+        mrkdwn=True,
+    )
+    if resp.get("ok"):
+        print(f"Test DM sent (ts: {resp.get('ts')})")
+    else:
+        print(f"Failed: {resp.get('error')}")
+    sys.exit(0)
+
+
+# Patterns
+TICKET_RE = re.compile(r"([A-Z]{2,10}-\d+)", re.IGNORECASE)
+SLACK_URL_RE = re.compile(r"<?(https://\S+slack\.com/archives/\S+?)>?")
+
+
+# ── State management ──
+
+
+def load_jobs():
+    """Load all job states from disk."""
+    jobs = {}
+    for f in STATE_DIR.glob("*.json"):
+        try:
+            state = json.loads(f.read_text())
+            thread_ts = state.get("thread_ts")
+            if thread_ts:
+                jobs[thread_ts] = state
+        except (json.JSONDecodeError, KeyError):
+            pass
+    return jobs
+
+
+def save_job(state):
+    """Save job state to disk."""
+    path = STATE_DIR / f"{state['ticket']}.json"
+    path.write_text(json.dumps(state, indent=2))
+
+
+# ── Job dispatch ──
+
+# Track running subprocesses: ticket → info dict
+running_procs = {}
+import signal
+
+def _handle_sigint(sig, frame):
+    """Force exit on Ctrl+C."""
+    print("\nStopping...")
+    os._exit(130)
+
+signal.signal(signal.SIGINT, _handle_sigint)
+
+
+def slack_update(channel, ts, text):
+    """Update an existing Slack message."""
+    return slack_post(
+        "chat.update",
+        channel=channel,
+        ts=ts,
+        text=text,
+        mrkdwn=True,
+    )
+
+
+def start_ticket_solve(ticket, thread_ts, slack_urls=None, extra_context=None, mock=False, force=False):
+    """Start ticket-solve as a background process."""
+
+    # Prevent duplicate runs
+    if ticket in running_procs:
+        slack_reply(DM_CHANNEL, thread_ts,
+                    f":warning: *{ticket}* is already running (PID {running_procs[ticket]['proc'].pid})")
+        return
+
+    # Post a status message that we'll update with progress
+    resp = slack_reply(
+        DM_CHANNEL, thread_ts,
+        f":hourglass_flowing_sand: *{ticket}* — setting up worktree..."
+    )
+    status_ts = resp.get("ts", "") if resp and resp.get("ok") else ""
+
+    session_id = str(uuid.uuid4())
+
+    cmd = [
+        str(SCRIPT_DIR / "ticket-solve"),
+        ticket,
+        "--thread-ts", thread_ts,
+        "--dm-channel", DM_CHANNEL,
+        "--session-id", session_id,
+    ]
+
+    for url in (slack_urls or []):
+        cmd.append(url)
+    if extra_context:
+        cmd.extend(["--context", extra_context])
+    if mock:
+        cmd.append("--mock")
+    if force:
+        cmd.append("--force")
+
+    print(f"  Starting: {' '.join(cmd[:4])}{'  (mock)' if mock else ''}{'  (force)' if force else ''}...")
+
+    log_path = STATE_DIR / f"{ticket}.log"
+    log_file = open(log_path, "w")
+
+    proc = subprocess.Popen(
+        cmd,
+        cwd=PROJECT_ROOT,
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+
+    running_procs[ticket] = {
+        "proc": proc,
+        "log_file": log_file,
+        "log_path": log_path,
+        "log_offset": 0,
+        "thread_ts": thread_ts,
+        "status_ts": status_ts,
+        "last_stage": "",
+        "last_activity_update": 0,
+        "last_files_snapshot": "",
+        "start_time": time.time(),
+        "ticket": ticket,
+    }
+
+    # Update jobs dict so ✅ reaction checks use the current thread
+    # Remove old entry for this ticket if thread changed
+    old_ts = None
+    for ts, j in list(jobs.items()):
+        if j.get("ticket") == ticket:
+            old_ts = ts
+            break
+    if old_ts and old_ts != thread_ts:
+        del jobs[old_ts]
+
+    jobs[thread_ts] = {"ticket": ticket, "thread_ts": thread_ts, "status": "in_progress"}
+
+    print(f"  PID {proc.pid}, log: {log_path}")
+
+
+def resume_claude(state, feedback_text):
+    """Resume a Claude session with user feedback."""
+    ticket = state["ticket"]
+    session_id = state["session_id"]
+    work_dir = state.get("work_dir", "")
+    thread_ts = state["thread_ts"]
+    model = state.get("model", "sonnet")
+
+    if not work_dir or not os.path.isdir(work_dir):
+        slack_reply(
+            DM_CHANNEL, thread_ts,
+            f":warning: Can't resume — worktree not found at `{work_dir}`"
+        )
+        return
+
+    status_resp = slack_reply(
+        DM_CHANNEL, thread_ts,
+        f":arrows_counterclockwise: Resuming work on {ticket}..."
+    )
+    status_ts = status_resp.get("ts", "")
+
+    prompt = (
+        f"The user reviewed your changes and has this feedback:\n\n"
+        f"{feedback_text}\n\n"
+        f"Apply the requested changes. Commit your changes when done.\n"
+        f"Update REVIEW.md in the git repo root with what changed in this pass.\n"
+        f"Do NOT run a soft reset — the wrapper handles that.\n"
+        f"Do NOT push or create an MR."
+    )
+
+    cmd = [
+        "claude", "-p",
+        "--model", model,
+        "--dangerously-skip-permissions",
+        "--resume", session_id,
+        prompt,
+    ]
+
+    # Update state
+    state["status"] = "in_progress"
+    state["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+    save_job(state)
+
+    log_path = STATE_DIR / f"{ticket}.resume.log"
+    log_file = open(log_path, "w")
+
+    # Export env vars for slack-ask
+    env = os.environ.copy()
+    env["SLACK_DM_CHANNEL_ID"] = DM_CHANNEL
+    env["SLACK_THREAD_TS"] = thread_ts
+
+    proc = subprocess.Popen(
+        cmd,
+        cwd=work_dir,
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+        env=env,
+        start_new_session=True,
+    )
+
+    running_procs[ticket] = {
+        "proc": proc,
+        "log_file": log_file,
+        "log_path": log_path,
+        "log_offset": 0,
+        "thread_ts": thread_ts,
+        "status_ts": status_ts,
+        "last_stage": ":arrows_counterclockwise: resuming...",
+        "last_activity_update": 0,
+        "last_files_snapshot": "",
+        "start_time": time.time(),
+        "ticket": ticket,
+    }
+    print(f"  Resuming {ticket} (PID {proc.pid})")
+
+
+# Map log lines to human-readable stages for the Slack status message
+STAGE_PATTERNS = [
+    # ticket-solve stages
+    ("Fetching ticket from Jira", ":mag: fetching ticket..."),
+    ("Creating worktree", ":file_folder: creating worktree..."),
+    ("Installing dependencies", ":package: installing dependencies..."),
+    ("Mock mode", ":test_tube: creating mock changes..."),
+    ("Running Claude", ":brain: Claude is implementing..."),
+    ("Soft resetting", ":arrows_counterclockwise: preparing diff..."),
+    ("Ready for review", ":heavy_check_mark: done — ready for review"),
+    ("Warning: No staged changes", ":warning: done — no changes produced"),
+    ("Claude exited with code", ":x: Claude failed"),
+    # publish stages
+    ("yarn install", ":package: installing dependencies..."),
+    ("pre-push checks", ":test_tube: running checks..."),
+    ("Pushing branch", ":rocket: pushing..."),
+    ("Step 2/4", ":rocket: pushing branch..."),
+    ("Step 3/4", ":memo: creating MR..."),
+    ("Step 4/4", ":link: linking Jira..."),
+    ("Create Merge Request", ":memo: creating MR..."),
+    ("Push failed", ":x: push failed"),
+    ("merge_requests", ":heavy_check_mark: MR created"),
+]
+
+
+def refresh_diff(state):
+    """Regenerate diff.html from current staged changes and notify."""
+    ticket = state["ticket"]
+    summary = state.get("summary", "")
+    work_dir = state.get("work_dir", "")
+    worktree = state.get("worktree", "")
+    thread_ts = state["thread_ts"]
+
+    if not work_dir or not os.path.isdir(work_dir):
+        slack_reply(DM_CHANNEL, thread_ts,
+                    f":warning: Worktree not found at `{work_dir}`")
+        return
+
+    diff_html = os.path.join(worktree, "diff.html") if worktree else os.path.join(work_dir, "..", "diff.html")
+
+    # Stage all changes and regenerate diff
+    result = subprocess.run(
+        f'git add -A && git diff --cached | diff2html -i stdin -s side -o stdout --title "{ticket}: {summary}" > {json.dumps(diff_html)}',
+        cwd=work_dir, shell=True, capture_output=True, text=True,
+    )
+
+    if result.returncode == 0 and os.path.exists(diff_html):
+        url = diff_url(worktree) if worktree else diff_html
+        slack_reply(DM_CHANNEL, thread_ts,
+                    f":arrows_counterclockwise: <{url}|Diff refreshed>")
+    else:
+        slack_reply(DM_CHANNEL, thread_ts,
+                    f":warning: Failed to regenerate diff\n```\n{result.stderr[:500]}\n```")
+
+
+
+def _post_action_prompt(state, thread_ts, text):
+    """Post a message that the user can react ✅ on to trigger an action.
+    Records the message ts so we only check THIS message for reactions."""
+    resp = slack_reply(DM_CHANNEL, thread_ts, text)
+    if resp and resp.get("ok"):
+        state["action_prompt_ts"] = resp["ts"]
+    save_job(state)
+    if thread_ts in jobs:
+        jobs[thread_ts] = state
+
+
+def publish_ticket(state, force_push=False):
+    """Commit staged changes and run publish-changes."""
+    ticket = state["ticket"]
+    summary = state.get("summary", "")
+    work_dir = state.get("work_dir", "")
+    thread_ts = state["thread_ts"]
+
+    if not work_dir or not os.path.isdir(work_dir):
+        slack_reply(
+            DM_CHANNEL, thread_ts,
+            f":warning: Can't publish — worktree not found at `{work_dir}`"
+        )
+        return
+
+    # Reuse the action prompt message for publish status updates
+    publish_status_ts = state.get("action_prompt_ts", "")
+    if publish_status_ts:
+        slack_update(DM_CHANNEL, publish_status_ts,
+                     f":rocket: *{ticket}* — publishing...")
+    else:
+        resp = slack_reply(DM_CHANNEL, thread_ts, f":rocket: *{ticket}* — publishing...")
+        publish_status_ts = resp.get("ts", "") if resp and resp.get("ok") else ""
+
+    commit_msg = f"{ticket}: {summary}"
+    publish = SCRIPT_DIR / "publish-changes"
+
+    install = 'test -f node_modules/.yarn-state.yml || yarn install; test -f src/styles/css/tailwind.css || yarn tailwind-build;'
+    mr_title = f"{ticket} {summary}"
+    force_flag = " --force-push" if force_push else ""
+    cmd = f'{install} git commit -m {json.dumps(commit_msg)} && {publish} --branch "$(git rev-parse --abbrev-ref HEAD)" --target main --no-draft-prompt --title {json.dumps(mr_title)} --include-ticket-description{force_flag}'
+
+    print(f"  Publishing {ticket}: {commit_msg}")
+
+    log_path = STATE_DIR / f"{ticket}.publish.log"
+    log_file = open(log_path, "w")
+
+    proc = subprocess.Popen(
+        ["bash", "-c", cmd],
+        cwd=work_dir,
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+
+    state["status"] = "publishing"
+    state["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+    save_job(state)
+
+    running_procs[ticket] = {
+        "proc": proc,
+        "log_file": log_file,
+        "log_path": log_path,
+        "log_offset": 0,
+        "thread_ts": thread_ts,
+        "status_ts": publish_status_ts,
+        "last_stage": "",
+        "start_time": time.time(),
+        "ticket": ticket,
+        "is_publish": True,
+    }
+    print(f"  Publish PID {proc.pid}, log: {log_path}")
+
+
+def check_running_procs():
+    """Check for completed subprocesses, tail logs, update Slack status."""
+    for ticket, info in list(running_procs.items()):
+        proc = info["proc"]
+        log_path = info["log_path"]
+
+        # ── Tail log → print new lines + detect stage changes ──
+        try:
+            if log_path.exists():
+                content = log_path.read_text()
+                new_content = content[info["log_offset"]:]
+                if new_content:
+                    info["log_offset"] = len(content)
+                    for line in new_content.splitlines():
+                        # Strip ANSI codes for clean terminal output
+                        clean = re.sub(r"\x1b\[[0-9;]*m", "", line).strip()
+                        if clean:
+                            print(f"  [{ticket}] {clean}")
+
+                        # Check for stage transitions
+                        for pattern, stage_text in STAGE_PATTERNS:
+                            if pattern in clean and stage_text != info["last_stage"]:
+                                info["last_stage"] = stage_text
+                                if info["status_ts"]:
+                                    slack_update(
+                                        DM_CHANNEL,
+                                        info["status_ts"],
+                                        f"*{ticket}* — {stage_text}",
+                                    )
+        except Exception:
+            pass
+
+        # ── Poll worktree for activity while Claude is running ──
+        if info["last_stage"].startswith(":brain:") and info["status_ts"]:
+            now = time.time()
+            # Update every 15 seconds
+            if now - info["last_activity_update"] >= 15:
+                info["last_activity_update"] = now
+                ticket = info["ticket"]
+
+                # Load state to get work_dir
+                state_path = STATE_DIR / f"{ticket}.json"
+                work_dir = ""
+                if state_path.exists():
+                    try:
+                        st = json.loads(state_path.read_text())
+                        work_dir = st.get("work_dir", "")
+                    except (json.JSONDecodeError, KeyError):
+                        pass
+
+                if work_dir and os.path.isdir(work_dir):
+                    try:
+                        # Check for uncommitted changes
+                        result = subprocess.run(
+                            ["git", "diff", "--name-only"],
+                            cwd=work_dir, capture_output=True, text=True, timeout=5,
+                        )
+                        files = [f.split("/")[-1] for f in result.stdout.strip().splitlines() if f]
+                        result2 = subprocess.run(
+                            ["git", "diff", "--cached", "--name-only"],
+                            cwd=work_dir, capture_output=True, text=True, timeout=5,
+                        )
+                        files += [f.split("/")[-1] for f in result2.stdout.strip().splitlines() if f]
+
+                        # Check for new commits since merge-base
+                        result3 = subprocess.run(
+                            ["git", "log", "--oneline", "--format=%s", "origin/main..HEAD"],
+                            cwd=work_dir, capture_output=True, text=True, timeout=5,
+                        )
+                        commits = [c for c in result3.stdout.strip().splitlines() if c]
+
+                        files = list(dict.fromkeys(files))
+
+                        # Build activity description
+                        parts = []
+                        if commits:
+                            parts.append(f"{len(commits)} commit{'s' if len(commits) != 1 else ''}")
+                        if files:
+                            file_str = ", ".join(files[:4])
+                            if len(files) > 4:
+                                file_str += f" +{len(files) - 4}"
+                            parts.append(f"editing {file_str}")
+
+                        if parts:
+                            activity = " · ".join(parts)
+                        else:
+                            activity = "exploring codebase..."
+
+                        # Always update with current elapsed time
+                        elapsed = int(now - info.get("start_time", now))
+                        mins = elapsed // 60
+                        time_str = f"{mins}m{elapsed % 60:02d}s" if mins > 0 else f"{elapsed}s"
+                        slack_update(
+                            DM_CHANNEL, info["status_ts"],
+                            f"*{ticket}* — :brain: implementing ({time_str})\n_{activity}_",
+                        )
+                    except Exception:
+                        pass
+
+        # ── Check if process finished ──
+        if proc.poll() is not None:
+            info["log_file"].close()
+            exit_code = proc.returncode
+            is_publish = info.get("is_publish", False)
+            print(f"  {ticket} {'publish' if is_publish else 'solve'} finished (exit {exit_code})")
+
+            # Handle publish completion
+            if is_publish:
+                state_path = STATE_DIR / f"{ticket}.json"
+                if state_path.exists():
+                    state = json.loads(state_path.read_text())
+                    if exit_code == 0:
+                        state["status"] = "published"
+                        save_job(state)
+                        # Try to extract MR URL from log
+                        mr_url = ""
+                        if log_path.exists():
+                            for line in log_path.read_text().splitlines():
+                                if "merge_requests" in line or "/-/merge_requests/" in line:
+                                    url_match = re.search(r"https://\S+merge_requests/\d+", line)
+                                    if url_match:
+                                        mr_url = url_match.group(0)
+                                        break
+                        # Update the existing message
+                        msg = f":heavy_check_mark: Published!"
+                        if mr_url:
+                            msg += f" {mr_url}"
+                        if info["status_ts"]:
+                            slack_update(DM_CHANNEL, info["status_ts"], msg)
+                        else:
+                            slack_reply(DM_CHANNEL, info["thread_ts"], msg)
+
+                    else:
+                        # Check if it was a push rejection (non-fast-forward)
+                        log_text = log_path.read_text() if log_path.exists() else ""
+                        is_push_rejection = "non-fast-forward" in log_text or "tip of your current branch is behind" in log_text
+
+                        if is_push_rejection:
+                            state["status"] = "needs_force_push"
+                            _post_action_prompt(state, info["thread_ts"],
+                                ":warning: Push rejected — remote branch has diverged. React :white_check_mark: to force-push.")
+                        else:
+                            state["status"] = "publish_failed"
+                            tail = ""
+                            if log_path.exists():
+                                lines = log_text.splitlines()
+                                tail = "\n".join(
+                                    re.sub(r"\x1b\[[0-9;]*m", "", l)
+                                    for l in lines[-10:]
+                                )
+                            _post_action_prompt(state, info["thread_ts"],
+                                f":x: Publish failed (exit {exit_code}). React :white_check_mark: to retry.\n```\n{tail}\n```")
+                    if info["thread_ts"] in jobs:
+                        jobs[info["thread_ts"]] = state
+                del running_procs[ticket]
+                continue
+
+            # Final status update
+            if info["status_ts"]:
+                if exit_code == 0:
+                    slack_update(
+                        DM_CHANNEL, info["status_ts"],
+                        f"*{ticket}* — :heavy_check_mark: done",
+                    )
+                else:
+                    slack_update(
+                        DM_CHANNEL, info["status_ts"],
+                        f"*{ticket}* — :x: failed (exit {exit_code})",
+                    )
+
+            del running_procs[ticket]
+
+            # Reload state from disk, but ensure thread_ts matches current thread
+            current_thread_ts = info["thread_ts"]
+            state_path = STATE_DIR / f"{ticket}.json"
+            state = None
+            if state_path.exists():
+                try:
+                    state = json.loads(state_path.read_text())
+                except (json.JSONDecodeError, KeyError):
+                    pass
+
+            if state is None:
+                state = {"ticket": ticket, "status": "failed"}
+
+            # Always use the current thread (not whatever's in the state file from a previous run)
+            state["thread_ts"] = current_thread_ts
+            if exit_code == 0 and state.get("status") == "in_progress":
+                state["status"] = "done"
+            elif exit_code != 0 and state.get("status") not in ("failed", "checks_failed"):
+                state["status"] = "failed"
+
+            state_path.write_text(json.dumps(state, indent=2))
+            jobs[current_thread_ts] = state
+
+            # Post an action prompt for the user
+            thread_ts = current_thread_ts
+            if state.get("status") == "done":
+                # Build a rich prompt with diff link + summary from state
+                worktree = state.get("worktree", "")
+                work_dir = state.get("work_dir", "")
+
+                # Soft reset to merge-base (same as ticket-solve does)
+                if work_dir and os.path.isdir(work_dir):
+                    try:
+                        merge_base = subprocess.run(
+                            ["git", "merge-base", "HEAD", "origin/main"],
+                            cwd=work_dir, capture_output=True, text=True, timeout=10,
+                        )
+                        if merge_base.returncode == 0 and merge_base.stdout.strip():
+                            subprocess.run(
+                                ["git", "reset", "--soft", merge_base.stdout.strip()],
+                                cwd=work_dir, capture_output=True, timeout=10,
+                            )
+                        # Unstage non-deliverable files
+                        if worktree:
+                            for f in ["REVIEW.md", ".claude-output.log", "diff.html"]:
+                                subprocess.run(
+                                    ["git", "rm", "--cached", "-f", f],
+                                    cwd=worktree, capture_output=True, timeout=5,
+                                )
+                    except Exception:
+                        pass
+                prompt_lines = []
+
+                # Regenerate diff.html from current staged changes
+                if work_dir and os.path.isdir(work_dir):
+                    try:
+                        diff_result = subprocess.run(
+                            ["git", "diff", "--cached"],
+                            cwd=work_dir, capture_output=True, timeout=30,
+                        )
+                        if diff_result.stdout:
+                            diff_html_path = os.path.join(worktree, "diff.html")
+                            d2h = subprocess.run(
+                                ["diff2html", "-i", "stdin", "-s", "side", "-o", "stdout",
+                                 "--title", f"{ticket}: {state.get('summary', '')}"],
+                                input=diff_result.stdout, capture_output=True, timeout=30,
+                            )
+                            if d2h.returncode == 0 and d2h.stdout:
+                                with open(diff_html_path, "wb") as f:
+                                    f.write(d2h.stdout)
+                    except Exception:
+                        pass
+
+                # Diff link
+                if worktree:
+                    wt_basename = os.path.basename(worktree)
+                    diff_path = os.path.join(worktree, "diff.html")
+                    if os.path.exists(diff_path):
+                        prompt_lines.append(f":mag: <{diff_url(worktree)}|View diff>")
+
+                # cd command
+                if work_dir:
+                    prompt_lines.append(f"`cd {work_dir}`")
+
+                # Claude's summary (check resume log first, then main log)
+                summary_line = ""
+                for log_candidate in [log_path, Path(os.path.join(worktree, ".claude-output.log")) if worktree else None]:
+                    if log_candidate and log_candidate.exists():
+                        for line in log_candidate.read_text().splitlines():
+                            if line.startswith("SUMMARY:"):
+                                summary_line = line[8:].strip()
+                                break
+                    if summary_line:
+                        break
+                if summary_line:
+                    prompt_lines.append("")
+                    prompt_lines.append(summary_line)
+
+                prompt_lines.append("")
+                prompt_lines.append("_Reply with feedback for another pass. React :white_check_mark: to publish._")
+                _post_action_prompt(state, thread_ts, "\n".join(prompt_lines))
+            elif state.get("status") == "failed":
+                reason = ""
+                if log_path.exists():
+                    for line in log_path.read_text().splitlines():
+                        clean = re.sub(r"\x1b\[[0-9;]*m", "", line).strip()
+                        if any(p in clean for p in [
+                            "already exists", "has work on it", "not found",
+                            "yarn install failed", "Failed to", "Claude exited",
+                        ]):
+                            reason = clean
+                            break
+                msg = f":x: *{ticket}* failed"
+                if reason:
+                    msg += f": {reason}"
+                msg += "\n_React :white_check_mark: to delete the existing worktree, branch, and remote branch, then re-run._"
+                _post_action_prompt(state, thread_ts, msg)
+            elif exit_code != 0:
+                print(f"  WARNING: {ticket} failed with no state file")
+
+
+# ── Main loop ──
+
+print(f"ticket-bot running{'  (MOCK MODE)' if MOCK_MODE else ''}")
+print(f"  DM channel: {DM_CHANNEL}")
+print(f"  Bot user:   {BOT_USER_ID}")
+print(f"  Watching:   {USER_ID}")
+print(f"  Project:    {PROJECT_ROOT}")
+print(f"  State dir:  {STATE_DIR}")
+print()
+
+# Load existing jobs
+jobs = load_jobs()
+if jobs:
+    done_count = sum(1 for j in jobs.values() if j.get("status") == "done")
+    print(f"  Loaded {len(jobs)} jobs ({done_count} done, watching for feedback)")
+    for _ts, _j in jobs.items():
+        print(f"    {_j.get('ticket','?')} status={_j.get('status','?')} thread={_ts}")
+    print()
+
+# Clean up stale state from previous sessions
+(STATE_DIR / ".pending_clear").unlink(missing_ok=True)
+
+# Send startup greeting
+HELP_TEXT = "\n".join([
+    ":robot_face: *ticket-bot is online*",
+    "`UB-1234` — start a ticket  |  `help` — full usage  |  `status` — list jobs",
+])
+
+HELP_FULL = "\n".join([
+    "*Usage:*",
+    ">`UB-1234` — create worktree, run Claude, DM when done",
+    ">`UB-1234 <slack-url> extra context` — include thread + instructions",
+    "",
+    "*After completion:*",
+    ">Reply with feedback → Claude resumes",
+    ">Reply `refresh` → re-stage + regenerate diff",
+    ">React :white_check_mark: → commit + publish MR",
+])
+
+_welcome_resp = slack_post(
+    "chat.postMessage",
+    channel=DM_CHANNEL,
+    text=HELP_TEXT,
+    mrkdwn=True,
+)
+
+# Track last seen message — use the welcome message's Slack timestamp
+# to avoid clock skew between local time and Slack's servers
+last_ts_file = STATE_DIR / ".last_dm_ts"
+last_ts = _welcome_resp.get("ts", str(time.time())) if _welcome_resp.get("ok") else str(time.time())
+print(f"  Listening from ts: {last_ts}")
+
+try:
+    while True:
+        try:
+            # ── Poll for new DMs ──
+            result = slack_get(
+                "conversations.history",
+                channel=DM_CHANNEL,
+                oldest=last_ts,
+                limit=10,
+            )
+
+            if not result.get("ok"):
+                print(f"  Poll error: {result.get('error')}")
+
+            messages = result.get("messages", [])
+            for msg in reversed(messages):  # oldest first
+                ts = msg.get("ts", "")
+                user = msg.get("user", "")
+                text = msg.get("text", "")
+                msg_thread_ts = msg.get("thread_ts")
+
+                # Skip bot's own messages
+                if user == BOT_USER_ID:
+                    last_ts = ts
+                    continue
+
+                # Skip thread replies (handled below)
+                if msg_thread_ts and msg_thread_ts != ts:
+                    last_ts = ts
+                    continue
+
+                # Check for ticket ID in top-level message
+                ticket_match = TICKET_RE.search(text)
+                if ticket_match:
+                    ticket = ticket_match.group(1).upper()
+                    slack_urls = [
+                        m.group(1) for m in SLACK_URL_RE.finditer(text)
+                    ]
+
+                    # Everything else is extra context
+                    extra = text
+                    extra = TICKET_RE.sub("", extra)
+                    extra = SLACK_URL_RE.sub("", extra)
+                    extra = re.sub(r"[<>]", "", extra).strip()
+
+                    print(f"New request: {ticket}{' (mock)' if MOCK_MODE else ''}")
+                    start_ticket_solve(
+                        ticket,
+                        thread_ts=ts,
+                        slack_urls=slack_urls if slack_urls else None,
+                        extra_context=extra if extra else None,
+                        mock=MOCK_MODE,
+                    )
+                elif text.strip().lower() == "help":
+                    slack_post(
+                        "chat.postMessage",
+                        channel=DM_CHANNEL,
+                        text=HELP_FULL,
+                        mrkdwn=True,
+                    )
+                elif text.strip().lower() == "status":
+                    # Reload jobs from disk
+                    jobs = load_jobs()
+                    lines = [":clipboard: *Active jobs:*"]
+                    any_jobs = False
+                    for _ts, j in sorted(
+                        jobs.items(),
+                        key=lambda x: x[1].get("updated_at", ""),
+                        reverse=True,
+                    )[:10]:
+                        t = j.get("ticket", "?")
+                        s = j.get("status", "?")
+                        summary = j.get("summary", "")[:50]
+                        emoji = {
+                            "in_progress": ":hourglass_flowing_sand:",
+                            "done": ":heavy_check_mark:",
+                            "done_empty": ":warning:",
+                            "failed": ":x:",
+                        }.get(s, ":grey_question:")
+                        wt = j.get("work_dir", "")
+                        lines.append(f">{emoji} *{t}* ({s}) {summary}")
+                        if wt:
+                            lines.append(f">  `{wt}`")
+                        any_jobs = True
+                    if not any_jobs:
+                        lines.append(">No jobs yet.")
+                    # Running procs
+                    if running_procs:
+                        lines.append("")
+                        lines.append(f"_Running processes: {len(running_procs)}_")
+                    slack_post(
+                        "chat.postMessage",
+                        channel=DM_CHANNEL,
+                        text="\n".join(lines),
+                        mrkdwn=True,
+                    )
+
+                elif text.strip().lower() == "clear":
+                    if running_procs:
+                        slack_post("chat.postMessage", channel=DM_CHANNEL,
+                                   text=f":warning: Can't clear while {len(running_procs)} job(s) are running.",
+                                   mrkdwn=True)
+                        last_ts = ts
+                        continue
+                    # Count bot messages first
+                    total = 0
+                    has_more = True
+                    cursor = None
+                    while has_more:
+                        params = {"channel": DM_CHANNEL, "limit": 100}
+                        if cursor:
+                            params["cursor"] = cursor
+                        history = slack_get("conversations.history", **params)
+                        for m in history.get("messages", []):
+                            if m.get("user") == BOT_USER_ID or m.get("bot_id"):
+                                total += 1
+                            if m.get("reply_count", 0) > 0:
+                                replies = slack_get(
+                                    "conversations.replies",
+                                    channel=DM_CHANNEL, ts=m["ts"], limit=100,
+                                )
+                                for r in replies.get("messages", []):
+                                    if (r.get("user") == BOT_USER_ID or r.get("bot_id")) and r["ts"] != m["ts"]:
+                                        total += 1
+                        cursor = history.get("response_metadata", {}).get("next_cursor")
+                        has_more = bool(cursor)
+
+                    if total == 0:
+                        slack_post("chat.postMessage", channel=DM_CHANNEL,
+                                   text="Nothing to clear.", mrkdwn=True)
+                    else:
+                        resp = slack_post("chat.postMessage", channel=DM_CHANNEL,
+                                   text=f"Found {total} bot messages. React :white_check_mark: to delete them all.",
+                                   mrkdwn=True)
+                        confirm_ts = resp.get("ts", "") if resp and resp.get("ok") else ""
+                        if confirm_ts:
+                            STATE_DIR.joinpath(".pending_clear").write_text(
+                                json.dumps({"msg_ts": confirm_ts, "expires": time.time() + 120}))
+
+                last_ts = ts
+
+            last_ts_file.write_text(last_ts)
+
+            # ── Check for thread replies on completed jobs ──
+            for thread_ts, state in list(jobs.items()):
+                if state.get("status") != "done":
+                    continue
+
+                last_checked = state.get("last_checked_ts", state.get("updated_at_ts", thread_ts))
+
+                try:
+                    replies = slack_get(
+                        "conversations.replies",
+                        channel=DM_CHANNEL,
+                        ts=thread_ts,
+                        oldest=last_checked,
+                        limit=5,
+                    )
+
+                    for reply in replies.get("messages", []):
+                        reply_ts = reply.get("ts", "")
+                        reply_user = reply.get("user", "")
+                        reply_text = reply.get("text", "")
+
+                        # Skip bot messages and already-seen messages
+                        if reply_user == BOT_USER_ID or reply.get("bot_id") or reply_ts <= last_checked:
+                            continue
+
+                        # Handle refresh command — regenerate diff without Claude
+                        if reply_text.strip().lower() == "refresh":
+                            print(f"  Refreshing diff for {state['ticket']}")
+                            refresh_diff(state)
+                        else:
+                            print(f"Feedback on {state['ticket']}: {reply_text[:60]}...")
+                            resume_claude(state, reply_text)
+
+                        state["last_checked_ts"] = reply_ts
+                        save_job(state)
+                        break  # One reply at a time
+
+                except Exception as e:
+                    # Don't crash on thread check failures
+                    pass
+
+            # ── Check for pending clear confirmation ──
+            pending_file = STATE_DIR / ".pending_clear"
+            if pending_file.exists():
+                try:
+                    pending = json.loads(pending_file.read_text())
+                    if time.time() > pending["expires"]:
+                        pending_file.unlink()
+                    else:
+                        r = slack_get("reactions.get", channel=DM_CHANNEL,
+                                      timestamp=pending["msg_ts"], full=True)
+                        if r.get("ok"):
+                            for rx in r.get("message", {}).get("reactions", []):
+                                if rx.get("name") == "white_check_mark" and USER_ID in rx.get("users", []):
+                                    pending_file.unlink()
+                                    print("  Clearing bot messages...")
+                                    deleted = 0
+                                    has_more = True
+                                    cursor = None
+                                    while has_more:
+                                        params = {"channel": DM_CHANNEL, "limit": 100}
+                                        if cursor:
+                                            params["cursor"] = cursor
+                                        hist = slack_get("conversations.history", **params)
+                                        for m2 in hist.get("messages", []):
+                                            if m2.get("reply_count", 0) > 0:
+                                                reps = slack_get(
+                                                    "conversations.replies",
+                                                    channel=DM_CHANNEL, ts=m2["ts"], limit=100,
+                                                )
+                                                for rr in reps.get("messages", []):
+                                                    if (rr.get("user") == BOT_USER_ID or rr.get("bot_id")) and rr["ts"] != m2["ts"]:
+                                                        slack_post("chat.delete", channel=DM_CHANNEL, ts=rr["ts"])
+                                                        deleted += 1
+                                            if m2.get("user") == BOT_USER_ID or m2.get("bot_id"):
+                                                slack_post("chat.delete", channel=DM_CHANNEL, ts=m2["ts"])
+                                                deleted += 1
+                                        cursor = hist.get("response_metadata", {}).get("next_cursor")
+                                        has_more = bool(cursor)
+                                    print(f"  Cleared {deleted} messages")
+                                    break
+                except (json.JSONDecodeError, KeyError):
+                    pending_file.unlink(missing_ok=True)
+
+            # ── Check for ✅ reactions on action prompts ──
+            # Only checks the SPECIFIC message we posted as a prompt.
+            # No thread scanning, no timestamp dedup needed.
+            for thread_ts, state in list(jobs.items()):
+                prompt_ts = state.get("action_prompt_ts")
+                if not prompt_ts:
+                    continue
+
+                ticket = state.get("ticket", "")
+                if ticket in running_procs:
+                    continue
+
+                try:
+                    r = slack_get("reactions.get",
+                                  channel=DM_CHANNEL,
+                                  timestamp=prompt_ts,
+                                  full=True)
+                    if not r.get("ok"):
+                        continue
+
+                    has_checkmark = False
+                    for reaction in r.get("message", {}).get("reactions", []):
+                        if reaction.get("name") == "white_check_mark" and USER_ID in reaction.get("users", []):
+                            has_checkmark = True
+                            break
+
+                    if not has_checkmark:
+                        continue
+
+                    # Clear the prompt so we don't act on it again
+                    state.pop("action_prompt_ts", None)
+                    save_job(state)
+
+                    status = state.get("status")
+                    if status == "done":
+                        print(f"  ✅ on {ticket} — publishing")
+                        publish_ticket(state)
+                        state["status"] = "publishing"
+                    elif status == "publish_failed":
+                        print(f"  ✅ on {ticket} — retrying publish")
+                        publish_ticket(state)
+                        state["status"] = "publishing"
+                    elif status == "needs_force_push":
+                        print(f"  ✅ on {ticket} — force-push approved")
+                        publish_ticket(state, force_push=True)
+                        state["status"] = "publishing"
+                    elif status in ("failed", "checks_failed", "done_empty"):
+                        print(f"  ✅ on {ticket} — retrying (force)")
+                        start_ticket_solve(ticket, thread_ts, mock=MOCK_MODE, force=True)
+
+                    jobs[thread_ts] = state
+                except Exception:
+                    pass
+
+            # ── Check running subprocesses ──
+            check_running_procs()
+
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:
+            print(f"Error: {e}")
+
+        try:
+            time.sleep(POLL_INTERVAL)
+        except KeyboardInterrupt:
+            raise
+
+except KeyboardInterrupt:
+    print("\nShutting down...")
+    last_ts_file.write_text(last_ts)
+
+    # Kill all child process groups
+    for ticket, info in running_procs.items():
+        proc = info["proc"]
+        if proc.poll() is None:
+            print(f"  Killing {ticket} (PID {proc.pid})...")
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                pass
+        info["log_file"].close()
+
+    # Wait briefly for cleanup
+    for ticket, info in running_procs.items():
+        try:
+            info["proc"].wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(os.getpgid(info["proc"].pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+
+    print("Done.")

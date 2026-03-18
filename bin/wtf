@@ -1,0 +1,279 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CANONICAL="$HOME/work/repos/ul"
+
+# Files to seed on creation
+FILES=(
+  .env
+)
+
+# Get JSON output for parsing
+JSON_OUTPUT=$(wt list --format json)
+
+# Get current branch name
+CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+
+# Function to get last checkout time for a branch
+get_checkout_time() {
+  local branch="$1"
+  
+  # Get from reflog - look for checkout to this branch
+  # Pattern: "checkout: moving from X to BRANCH"
+  git reflog -n 5000 --date=relative 2>/dev/null | \
+    grep -E "checkout: moving from .* to $branch\$" | \
+    head -1 | \
+    sed -E 's/^[a-f0-9]+ HEAD@\{([^}]+)\}:.*/\1/' || echo "never"
+}
+
+# Function to format worktree info nicely
+# Append branch name at end for easy extraction in preview
+format_worktree_line() {
+  local branch="$1"
+  local is_current="$2"
+  local path="$3"
+  local commit_msg="$4"
+  local commit_time="$5"
+  local status_info="$6"
+  local checkout_time="$7"
+  
+  # Truncate branch name if needed
+  local branch_display="$branch"
+  if [ ${#branch_display} -gt 25 ]; then
+    branch_display="${branch_display:0:22}..."
+  fi
+  
+  # Truncate commit message
+  local msg_display="$commit_msg"
+  if [ ${#msg_display} -gt 40 ]; then
+    msg_display="${msg_display:0:37}..."
+  fi
+  
+  # Truncate checkout and commit time strings to fit their columns
+  local checkout_display="checked: $checkout_time"
+  if [ ${#checkout_display} -gt 20 ]; then
+    checkout_display="${checkout_display:0:17}..."
+  fi
+  
+  local commit_display="committed: $commit_time"
+  if [ ${#commit_display} -gt 30 ]; then
+    commit_display="${commit_display:0:27}..."
+  fi
+  
+  # Truncate status info if needed
+  local status_display="$status_info"
+  if [ ${#status_display} -gt 30 ]; then
+    status_display="${status_display:0:27}..."
+  fi
+  
+  # Format based on whether it's current
+  # Append branch name at end with a delimiter for easy extraction
+  if [ "$is_current" = "true" ]; then
+    # Highlight current worktree - bright purple like rr.sh
+    printf "\033[38;5;141m@ %-25s\033[0m │ \033[38;5;109m%-40s\033[0m │ \033[2;37m%-20s\033[0m │ \033[2;37m%-30s\033[0m │ %-30s │BRANCH:%s\n" \
+      "$branch_display" "$msg_display" "$checkout_display" "$commit_display" "$status_display" "$branch"
+  else
+    # Normal formatting with 2-space indent for alignment
+    printf "  \033[38;5;250m%-25s\033[0m │ \033[38;5;109m%-40s\033[0m │ \033[2;37m%-20s\033[0m │ \033[2;37m%-30s\033[0m │ %-30s │BRANCH:%s\n" \
+      "$branch_display" "$msg_display" "$checkout_display" "$commit_display" "$status_display" "$branch"
+  fi
+}
+
+# Preview function to show details about selected worktree
+preview_worktree() {
+  local selected_line="$1"
+  
+  # Extract branch name from the end of the line (after │BRANCH:)
+  # Match BRANCH: followed by non-whitespace, non-pipe characters, then stop at pipe or end of line
+  local branch=$(echo "$selected_line" | sed -n 's/.*BRANCH:\([^|[:space:]]*\).*/\1/p')
+  
+  # Fallback: if BRANCH: marker not found, try extracting from first field
+  if [[ -z "$branch" ]]; then
+    branch=$(echo "$selected_line" | sed 's/\x1b\[[0-9;]*m//g' | cut -d'│' -f1 | sed 's/^[@ ]*//' | sed 's/[[:space:]]*$//' | sed "s/['\"]//g")
+  fi
+  
+  # Remove any quotes that might have been included
+  branch=$(echo "$branch" | sed "s/['\"]//g" | sed 's/^[[:space:]]*//' | sed 's/[[:space:]]*$//')
+  
+  if [[ "$branch" == "+ create new worktree" ]] || [[ -z "$branch" ]]; then
+    echo "Create a new worktree and branch"
+    return
+  fi
+  
+  # Get the worktree path from JSON
+  # Use the main repo to get fresh JSON to avoid issues with exported variable
+  local wt_path
+  wt_path=$(cd "$CANONICAL" && wt list --format json | jq -r --arg branch "$branch" '.[] | select(.branch == $branch) | .path')
+  
+  # Convert relative paths to absolute if needed
+  if [[ "$wt_path" != /* ]] && [[ -n "$wt_path" ]]; then
+    # If it's a relative path, make it relative to CANONICAL's parent
+    local canonical_parent=$(dirname "$CANONICAL")
+    wt_path="$canonical_parent/$wt_path"
+  fi
+  
+  # Show git status for this specific worktree
+  if [[ -n "$wt_path" ]] && [[ -d "$wt_path" ]]; then
+    echo "Branch: $branch"
+    echo "Path: $wt_path"
+    echo ""
+    # Use git status from the worktree directory with colors
+    # Worktrees share the same .git directory, so we can cd to the worktree and run git status
+    local status_output
+    status_output=$(cd "$wt_path" && git -c color.status=always status --short 2>&1)
+    local exit_code=$?
+    
+    if [[ $exit_code -eq 0 ]] && [[ -n "$status_output" ]]; then
+      echo "$status_output" | head -20
+    elif [[ $exit_code -ne 0 ]]; then
+      echo -e "\033[2mError getting status\033[0m"
+      echo "$status_output" | head -5
+    else
+      echo -e "\033[2mNo changes\033[0m"
+    fi
+  else
+    echo "Branch: $branch"
+    echo "Path: (not found: $wt_path)"
+  fi
+}
+
+export -f preview_worktree
+export JSON_OUTPUT
+export CANONICAL
+
+# Format worktrees with nice output - output directly to avoid ANSI code issues
+# Sort by checkout time (most recent first), similar to rr.sh
+format_worktrees() {
+  # Process each worktree and get checkout timestamp for sorting
+  echo "$JSON_OUTPUT" | jq -r '.[] | "\(.branch)|\(.is_current)|\(.path)|\(.commit.message)|\(.commit.timestamp)|\(.statusline)"' | \
+  while IFS='|' read -r branch is_current path commit_msg commit_ts statusline; do
+    # Get relative commit time using git log from the worktree path
+    if [ -d "$path" ]; then
+      commit_time=$(cd "$path" && git log -1 --format="%cr" 2>/dev/null || echo "unknown")
+    else
+      commit_time="unknown"
+    fi
+    
+    # Get checkout time from reflog (use main repo)
+    checkout_time=$(cd "$CANONICAL" && get_checkout_time "$branch")
+    
+    # Get timestamp for sorting
+    if [[ "$is_current" == "true" ]]; then
+      # Current worktree always first - use very large timestamp
+      sort_key="9999999999"
+    elif [[ "$checkout_time" != "never" ]]; then
+      # Get the actual unix timestamp from reflog
+      sort_key=$(cd "$CANONICAL" && git reflog -n 5000 --date=unix 2>/dev/null | \
+        grep -E "checkout: moving from .* to $branch\$" | \
+        head -1 | \
+        sed -E 's/^[a-f0-9]+ HEAD@\{([0-9]+)\}:.*/\1/')
+      
+      # If we couldn't get timestamp, use 0
+      if [[ -z "$sort_key" ]] || [[ ! "$sort_key" =~ ^[0-9]+$ ]]; then
+        sort_key="0"
+      fi
+    else
+      # Never checked out - sort to bottom
+      sort_key="0"
+    fi
+    
+    # Clean up statusline - remove branch name and ANSI codes, keep only status symbols and diff info
+    # The statusline format is: "branch  symbols  diff  ahead/behind"
+    # Remove ANSI codes first
+    status_clean=$(echo "$statusline" | sed 's/\x1b\[[0-9;]*m//g')
+    # Remove branch name explicitly - match the branch name at the start followed by spaces
+    # Escape special regex characters in branch name
+    branch_escaped=$(printf '%s\n' "$branch" | sed 's/[[\.*^$()+?{|]/\\&/g')
+    status_clean=$(echo "$status_clean" | sed -E "s/^${branch_escaped}[[:space:]]+//" | sed 's/^[[:space:]]*//')
+    
+    # If status_clean is empty or just whitespace, show a dash
+    if [[ -z "$status_clean" ]] || [[ "$status_clean" =~ ^[[:space:]]+$ ]]; then
+      status_clean="-"
+    fi
+    
+    # Output with sort key
+    printf "%s|%s|%s|%s|%s|%s|%s|%s\n" \
+      "$sort_key" "$branch" "$is_current" "$path" "$commit_msg" "$commit_time" "$status_clean" "$checkout_time"
+  done | \
+  # Sort by timestamp (descending - most recent first)
+  sort -t'|' -k1,1rn | \
+  # Format the output
+  while IFS='|' read -r sort_key branch is_current path commit_msg commit_time status_clean checkout_time; do
+    format_worktree_line "$branch" "$is_current" "$path" "$commit_msg" "$commit_time" "$status_clean" "$checkout_time"
+  done
+}
+
+# Show the formatted list in fzf
+# Use --print-query to get what user typed if nothing selected
+CHOICE_OUTPUT=$(
+  {
+    format_worktrees
+  } | fzf \
+    --ansi \
+    --prompt="worktree > " \
+    --preview='bash -c "preview_worktree \"{}\""' \
+    --preview-window=up:10:wrap \
+    --header='Branch │ Commit Message │ Checkout Time      │ Commit Time              │ Status
+Ctrl+A: create new | Type name to create' \
+    --delimiter='│' \
+    --nth=1 \
+    --with-nth=1,2,3,4,5 \
+    --bind 'ctrl-a:execute(echo "CREATE_NEW")+abort' \
+    --print-query \
+    --height=100%
+)
+
+# Parse fzf output - first line is query (what user typed), second is selection
+QUERY=$(echo "$CHOICE_OUTPUT" | head -1)
+CHOICE=$(echo "$CHOICE_OUTPUT" | tail -1)
+
+# If user pressed Ctrl+N or typed something that doesn't match, create new
+if [[ "$CHOICE" == "CREATE_NEW" ]] || ([[ -n "$QUERY" ]] && [[ -z "$CHOICE" ]] && [[ "$QUERY" != "" ]]); then
+  # Use query as default name if provided
+  if [[ "$CHOICE" == "CREATE_NEW" ]]; then
+    NAME=""
+  else
+    NAME="$QUERY"
+  fi
+  
+  # Prompt for name if not provided
+  if [[ -z "$NAME" ]]; then
+    read -p "New worktree name: " NAME
+  fi
+  
+  [ -n "$NAME" ] || exit 1
+
+  # Use create-wt script which handles file copying properly
+  "$HOME/bin/dev-workflow-tools/bin/create-wt" "$NAME"
+  exit $?
+fi
+
+# If nothing selected, exit
+[ -n "$CHOICE" ] || exit 0
+
+# Extract branch name from the selected line
+BRANCH_NAME=""
+# Extract branch name from BRANCH: marker at end of line
+# Match BRANCH: followed by non-whitespace, non-pipe characters
+BRANCH_NAME=$(echo "$CHOICE" | sed -n 's/.*BRANCH:\([^|[:space:]]*\).*/\1/p')
+
+# Remove any quotes that might have been included
+BRANCH_NAME=$(echo "$BRANCH_NAME" | sed "s/['\"]//g" | sed 's/^[[:space:]]*//' | sed 's/[[:space:]]*$//')
+
+# Fallback: extract from first field if marker not found
+if [[ -z "$BRANCH_NAME" ]]; then
+  BRANCH_NAME=$(echo "$CHOICE" | sed 's/\x1b\[[0-9;]*m//g' | cut -d'│' -f1 | sed 's/^[@ ]*//' | sed 's/[[:space:]]*$//' | sed "s/['\"]//g")
+  
+  # If truncated (ends with ...), find the full branch name
+  if echo "$BRANCH_NAME" | grep -q '\.\.\.$'; then
+    truncated=$(echo "$BRANCH_NAME" | sed 's/\.\.\.$//' | sed 's/^[[:space:]]*//' | sed 's/[[:space:]]*$//')
+    BRANCH_NAME=$(echo "$JSON_OUTPUT" | jq -r '.[].branch' | grep "^${truncated}" | head -1)
+  fi
+fi
+
+# --- Switch existing worktree ---
+# Execute wt switch and capture the output
+wt switch "$BRANCH_NAME"
+
+# The wt switch command should handle the directory change via shell integration
+# If it doesn't work, the user needs to source this script or use the wt command directly

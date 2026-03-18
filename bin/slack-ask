@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+# Ask the user a question via Slack DM thread and block until they reply.
+# Called by Claude during headless ticket-solve runs.
+#
+# Usage: slack-ask "Should I handle the empty state?"
+# Returns: The user's reply text on stdout
+#
+# Required env vars (set by ticket-solve):
+#   SLACK_DM_CHANNEL_ID      - DM channel ID
+#   SLACK_THREAD_TS          - Thread to post in
+#   TICKET_CREATOR_BOT_TOKEN - Bot token
+#   SLACK_NOTIFY_USER_ID     - User ID (to distinguish from bot messages)
+#
+# Timeout: 30 minutes (override with SLACK_ASK_TIMEOUT_SECONDS)
+
+set -euo pipefail
+
+QUESTION="$*"
+TIMEOUT="${SLACK_ASK_TIMEOUT_SECONDS:-1800}"
+POLL_INTERVAL=5
+
+if [ -z "$QUESTION" ]; then
+    echo "Usage: slack-ask <question>" >&2
+    exit 1
+fi
+
+if [ -z "${SLACK_DM_CHANNEL_ID:-}" ] || [ -z "${SLACK_THREAD_TS:-}" ] || [ -z "${TICKET_CREATOR_BOT_TOKEN:-}" ]; then
+    echo "Slack not configured, proceeding without answer" >&2
+    echo "(no response — Slack not configured)"
+    exit 0
+fi
+
+# Post the question
+RESPONSE=$(curl -sf -X POST "https://slack.com/api/chat.postMessage" \
+    -H "Authorization: Bearer ${TICKET_CREATOR_BOT_TOKEN}" \
+    -H "Content-Type: application/json; charset=utf-8" \
+    -d "$(jq -n \
+        --arg channel "$SLACK_DM_CHANNEL_ID" \
+        --arg thread_ts "$SLACK_THREAD_TS" \
+        --arg text ":thinking_face: *Question:* ${QUESTION}" \
+        '{channel: $channel, thread_ts: $thread_ts, text: $text, mrkdwn: true}')" 2>/dev/null) || {
+    echo "Failed to post question to Slack" >&2
+    echo "(no response — failed to post)"
+    exit 0
+}
+
+QUESTION_TS=$(echo "$RESPONSE" | jq -r '.ts // empty')
+if [ -z "$QUESTION_TS" ]; then
+    echo "Failed to post question to Slack" >&2
+    echo "(no response — failed to post)"
+    exit 0
+fi
+
+echo "Posted question to Slack, waiting for reply (timeout: ${TIMEOUT}s)..." >&2
+
+# Poll for reply
+ELAPSED=0
+while [ $ELAPSED -lt $TIMEOUT ]; do
+    sleep $POLL_INTERVAL
+    ELAPSED=$((ELAPSED + POLL_INTERVAL))
+
+    # Get thread replies newer than our question
+    REPLIES=$(curl -sf -G "https://slack.com/api/conversations.replies" \
+        -H "Authorization: Bearer ${TICKET_CREATOR_BOT_TOKEN}" \
+        --data-urlencode "channel=${SLACK_DM_CHANNEL_ID}" \
+        --data-urlencode "ts=${SLACK_THREAD_TS}" \
+        --data-urlencode "oldest=${QUESTION_TS}" 2>/dev/null) || continue
+
+    # Find first reply from the user (not the bot) after our question
+    REPLY_TEXT=$(echo "$REPLIES" | jq -r \
+        --arg qts "$QUESTION_TS" \
+        --arg uid "${SLACK_NOTIFY_USER_ID:-}" \
+        '[.messages[] | select(.ts > $qts and .user == $uid)] | first | .text // empty')
+
+    if [ -n "$REPLY_TEXT" ]; then
+        echo "Got reply" >&2
+        echo "$REPLY_TEXT"
+        exit 0
+    fi
+done
+
+echo "Timed out waiting for reply (${TIMEOUT}s)" >&2
+
+# Post timeout notice
+curl -sf -X POST "https://slack.com/api/chat.postMessage" \
+    -H "Authorization: Bearer ${TICKET_CREATOR_BOT_TOKEN}" \
+    -H "Content-Type: application/json; charset=utf-8" \
+    -d "$(jq -n \
+        --arg channel "$SLACK_DM_CHANNEL_ID" \
+        --arg thread_ts "$SLACK_THREAD_TS" \
+        --arg text ":hourglass: No reply received, proceeding with best judgment" \
+        '{channel: $channel, thread_ts: $thread_ts, text: $text, mrkdwn: true}')" >/dev/null 2>&1 || true
+
+echo "(no response — timed out after ${TIMEOUT}s)"
