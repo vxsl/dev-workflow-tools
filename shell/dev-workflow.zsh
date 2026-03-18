@@ -91,9 +91,48 @@ function gcm() {
 # Core workflow commands for day-to-day development
 
 # Branch Management
-alias r="$DEV_WORKFLOW_TOOLS_DIR/bin/rr.sh"  # Interactive branch switcher with Jira integration
-alias gc="git for-each-ref --sort=-committerdate refs/heads/ --format='%(align:left,40)%(refname:short)%(end)%(committerdate:relative)' | fzf --preview 'git log -p main..{1} --color=always' | cut -c1-40 | xargs git switch"
+alias w="wt select"  # Interactive worktree switcher
+# alias cw="source create-wt"
 alias gcb="git checkout -b"                   # Create and checkout new branch
+alias gc="git for-each-ref --sort=-committerdate refs/heads/ --format='%(align:left,40)%(refname:short)%(end)%(committerdate:relative)' | fzf --preview 'git log -p main..{1} --color=always' | cut -c1-40 | xargs git switch"
+
+# Interactive branch/worktree switcher with Jira integration
+r() {
+    local output
+    output=$("$DEV_WORKFLOW_TOOLS_DIR/bin/rr.sh" "$@" 2>&1)
+    local exit_code=$?
+
+    # Extract directives
+    local target_dir=$(echo "$output" | grep "RR_CD:" | head -1 | sed 's/.*RR_CD://' | tr -d '\r\n')
+    local target_branch=$(echo "$output" | grep "RR_SWITCH:" | head -1 | sed 's/.*RR_SWITCH://' | tr -d '\r\n')
+
+    # Print all output except directive lines
+    echo "$output" | grep -v "RR_CD:" | grep -v "RR_SWITCH:"
+
+    # Handle CD directive first
+    if [ -n "$target_dir" ]; then
+        if [ -d "$target_dir" ]; then
+            cd "$target_dir"
+            echo ""
+            echo "→ Switched to: $target_dir"
+            # Optionally open/focus Cursor at the new worktree (acts like GitLens worktree switch)
+            if [ "${RR_CURSOR_SWITCH:-false}" = "true" ] && command -v cursor >/dev/null 2>&1; then
+                cursor "$target_dir" >/dev/null 2>&1 &
+            fi
+        else
+            echo "Error: Invalid directory: $target_dir" >&2
+            return 1
+        fi
+    fi
+
+    # Handle SWITCH directive after CD
+    if [ -n "$target_branch" ]; then
+        echo "→ Switching to branch: $target_branch"
+        git switch "$target_branch"
+    fi
+
+    return $exit_code
+}
 
 # Commit Operations
 alias wip="git commit -m \"wip --no-verify\" --no-verify"  # Quick WIP commit (no hooks)
@@ -101,9 +140,11 @@ alias gca="git commit --amend --no-edit"      # Amend last commit without editin
 alias reword="git commit --amend"             # Amend commit message
 
 # Reset Operations
+alias rhom="git fetch --all && git reset --hard origin/main"      # Hard reset to origin/main
 alias rho="git reset --hard origin/@{u}"      # Hard reset to upstream
 alias gr="git reset --hard @{u}"              # Hard reset to upstream (short)
 alias gru="git reset --hard @{u}"             # Hard reset to upstream (alt)
+alias gfgru="git fetch --all && git reset --hard @{u}"
 alias so="git reset --soft HEAD~1; git reset; s"    # Soft reset + unstage
 alias soft="git reset --soft HEAD~1; git reset; s"  # Soft reset + unstage (verbose)
 
@@ -142,6 +183,15 @@ alias gds="git-branch-status"                 # Branch status (if available)
 # Jira + GitLab Integration Scripts
 alias os="oneshot"                        # One-shot commit workflow with Jira integration
 
+# misc 
+alias c="claude"
+
+# ============================================================================
+# Worktree Prompt Integration
+# ============================================================================
+# For p10k users: source ~/bin/dev-workflow-tools/shell/p10k-worktree.zsh
+# AFTER .p10k.zsh in your .zshrc for automatic worktree indicator
+
 # ============================================================================
 # Configuration
 # ============================================================================
@@ -163,6 +213,79 @@ elif [[ -f "$DEV_WORKFLOW_TOOLS_DIR/../.env" ]]; then
 fi
 
 # ============================================================================
+# Worktree Navigation
+# ============================================================================
+
+# cw - jump to subdirectory within current git worktree
+# Usage: cw [subdir]
+# Example: cw client/web
+# If no subdir provided, goes to git root
+cw() {
+    local git_root subdir target_dir
+
+    git_root=$(git rev-parse --show-toplevel 2>/dev/null)
+    if [ -z "$git_root" ]; then
+        echo "✗ Not in a git repository" >&2
+        return 1
+    fi
+
+    if [ -n "$1" ]; then
+        subdir="$1"
+        target_dir="$git_root/$subdir"
+
+        if [ ! -d "$target_dir" ]; then
+            echo "✗ Directory '$subdir' does not exist in git root" >&2
+            return 1
+        fi
+
+        cd "$target_dir"
+    else
+        cd "$git_root"
+    fi
+}
+
+# Completion for cw - suggest directories in git root
+_cw_completion() {
+    local git_root
+
+    git_root=$(git rev-parse --show-toplevel 2>/dev/null)
+    if [ -z "$git_root" ]; then
+        return
+    fi
+
+    # Find directories relative to git root
+    local -a dirs
+    dirs=("${(@f)$(cd "$git_root" && find . -maxdepth 3 -type d -not -path '*/.*' 2>/dev/null | sed 's|^\./||' | sort)}")
+
+    _describe 'directory' dirs
+}
+
+compdef _cw_completion cw
+
+# ============================================================================
 # Completion
 # ============================================================================
 # Add completion for our custom commands (if needed in future)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

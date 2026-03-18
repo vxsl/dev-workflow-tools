@@ -1346,6 +1346,12 @@ switch_to_branch_interactive() {
     read
 }
 
+# Handle --fetch-only: refresh cache without opening UI
+if [ "$1" = "--fetch-only" ]; then
+    get_all_tickets > /dev/null
+    exit $?
+fi
+
 # Handle --generate-list for fzf reload
 if [ "$1" = "--generate-list" ]; then
     generate_ticket_list "$2" "$3"

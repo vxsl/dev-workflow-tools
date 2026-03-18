@@ -344,7 +344,7 @@ cat > "$tmpdir/description" << EOFDESC
 ${initial_desc}
 EOFDESC
 
-$EDITOR "$tmpdir/description"
+$EDITOR "$tmpdir/description" < /dev/tty > /dev/tty
 desc_text=$(grep -v '^#' "$tmpdir/description")
 desc_preview=$(printf '%s' "$desc_text" | head -c 50)
 

@@ -8,6 +8,11 @@ if [ -f "$SCRIPT_DIR/../.env" ]; then
     source "$SCRIPT_DIR/../.env"
 fi
 
+# Source extracted core functions
+if [ -f "$SCRIPT_DIR/../lib/rr-core.sh" ]; then
+    source "$SCRIPT_DIR/../lib/rr-core.sh"
+fi
+
 # Configuration
 REFLOG_COUNT=50
 DISPLAY_COUNT=10
@@ -772,6 +777,139 @@ done
 CACHE_FILE="$CACHE_DIR/branch_list_${REFLOG_COUNT}.cache"
 REFLOG_CACHE="$CACHE_DIR/reflog_${REFLOG_COUNT}.cache"
 
+# Phase 1 instant data: worktrees + top reflog branches, pre-sorted, no buffering.
+# Outputs TSV rows in the same format as generate_worktree_data/generate_branch_data.
+# This bypasses the sort buffer so fzf gets data immediately.
+generate_instant_data() {
+    local claimed_file="${1:-}"
+    local _instant_rows=""
+    local _now
+    _now=$(date +%s)
+
+    local _current_branch
+    _current_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+
+    # --- Step 1: Worktrees (ZERO git subprocess forks — all from preloaded data) ---
+    # We skip dirty checks, commit info, and mismatch detection here.
+    # Phase 2 (generate_worktree_data) provides full data; but since dedup means
+    # Phase 1 rows "win", these rows will show with minimal info until the user
+    # scrolls or the display refreshes. This tradeoff gives us <50ms for 72 worktrees
+    # instead of ~1300ms.
+    declare -A _seen_wt_paths=()
+    for _wt_branch in "${!WORKTREE_MAP[@]}"; do
+        local _wt_path="${WORKTREE_MAP[$_wt_branch]}"
+        [ "$_wt_path" = "$GIT_ROOT" ] && continue
+
+        # Dedup by worktree path (WORKTREE_MAP may have both eponymous and actual branch keys)
+        [ -n "${_seen_wt_paths[$_wt_path]+x}" ] && continue
+        _seen_wt_paths["$_wt_path"]=1
+
+        # Get eponymous branch inline (no subprocess — bash builtins only)
+        local _wt_basename="${_wt_path##*/}"
+        local _epo_branch
+        if [[ "$_wt_basename" =~ \.([^.]+)$ ]]; then
+            _epo_branch="${BASH_REMATCH[1]}"
+        else
+            _epo_branch="$_wt_basename"
+        fi
+
+        [ "$_epo_branch" = "$_current_branch" ] && continue
+
+        # Compute timestamp inline (no subprocess — bash builtins + one stat)
+        local _ts=0
+        if [ "$PWD" = "$_wt_path" ] || [[ "$PWD" == "$_wt_path/"* ]]; then
+            _ts=$_now
+        else
+            local _nav_ts="${WORKTREE_NAV_TIMES[$_wt_path]:-0}"
+            [ "$_nav_ts" -gt "$_ts" ] && _ts=$_nav_ts
+            # HEAD mtime — single stat call, no git subprocess
+            local _head_file=""
+            if [ -f "$_wt_path/.git" ]; then
+                # Worktree .git file points to gitdir; read it with bash builtins
+                local _gitline
+                IFS= read -r _gitline < "$_wt_path/.git"
+                _head_file="${_gitline#gitdir: }/HEAD"
+            elif [ -d "$_wt_path/.git" ]; then
+                _head_file="$_wt_path/.git/HEAD"
+            fi
+            if [ -n "$_head_file" ] && [ -f "$_head_file" ]; then
+                local _hm
+                _hm=$(stat -c %Y "$_head_file" 2>/dev/null || stat -f %m "$_head_file" 2>/dev/null)
+                [ -n "$_hm" ] && [ "$_hm" -gt "$_ts" ] && _ts=$_hm
+            fi
+        fi
+
+        # Skip worktrees with no meaningful timestamp — let Phase 2 handle them
+        # with full data (dirty status, commit info, etc.)
+        [ "$_ts" -eq 0 ] && continue
+
+        # JIRA lookup (O(1), no subprocess)
+        local _ticket=""
+        [[ "$_epo_branch" =~ (${JIRA_PROJECT}-[0-9]+) ]] && _ticket="${BASH_REMATCH[1]^^}"
+        local _title="${JIRA_TITLE_CACHE[$_ticket]:-<EMPTY>}"
+        local _jira_status="${JIRA_STATUS_CACHE[$_ticket]:-<EMPTY>}"
+        local _jira_assignee="${JIRA_ASSIGNEE_CACHE[$_ticket]:-<UNASSIGNED>}"
+
+        # Truncate inline (no subprocess)
+        local _truncated="$_epo_branch"
+        if (( ${#_truncated} > BRANCH_MAX_LENGTH )); then
+            _truncated="${_truncated:0:$((BRANCH_MAX_LENGTH-3))}..."
+        fi
+
+        # IMPORTANT: Use " " (space) instead of "" for empty fields.
+        # IFS=$'\t' read collapses consecutive tabs, so truly empty fields
+        # cause all subsequent fields to shift. A single space preserves
+        # the field position while displaying as blank.
+        printf -v _row "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s" \
+            "$_truncated" "$_title" "$_jira_status" " " \
+            "checked:$_ts" " " \
+            "$_epo_branch" "$_jira_assignee" "WT" "$_wt_path" " "
+
+        _instant_rows+="${_ts}"$'\t'"${_row}"$'\n'
+
+        [ -n "$claimed_file" ] && echo "$_epo_branch" >> "$claimed_file"
+    done
+
+    # --- Step 2: Top-N reflog branches ---
+    # One git-reflog subprocess + one git-log per branch (only ~20 branches max)
+    local _reflog_git_dir=""
+    local _common_dir
+    _common_dir=$(git rev-parse --git-common-dir 2>/dev/null)
+    [[ -n "$_common_dir" && "$_common_dir" != ".git" ]] && _reflog_git_dir="--git-dir=$_common_dir"
+
+    while IFS=$'\t' read -r _rbranch _rtime; do
+        [ -z "$_rbranch" ] && continue
+        [ -n "${WORKTREE_MAP[$_rbranch]+x}" ] && continue
+        [ -z "${VALID_BRANCH_REFS[$_rbranch]+x}" ] && continue
+        [ "$_rbranch" = "$_current_branch" ] && continue
+
+        local _ticket=""
+        [[ "$_rbranch" =~ (${JIRA_PROJECT}-[0-9]+) ]] && _ticket="${BASH_REMATCH[1]^^}"
+        local _title="${JIRA_TITLE_CACHE[$_ticket]:-<EMPTY>}"
+        local _jira_status="${JIRA_STATUS_CACHE[$_ticket]:-<EMPTY>}"
+        local _jira_assignee="${JIRA_ASSIGNEE_CACHE[$_ticket]:-<UNASSIGNED>}"
+
+        local _last_commit="" _author=""
+        IFS='|' read -r _last_commit _author <<< "$(git log -1 --pretty=format:'%cr|%an' "refs/heads/$_rbranch" 2>/dev/null)"
+        _author="${_author:0:15}"
+
+        local _truncated="$_rbranch"
+        if (( ${#_truncated} > BRANCH_MAX_LENGTH )); then
+            _truncated="${_truncated:0:$((BRANCH_MAX_LENGTH-3))}..."
+        fi
+
+        printf -v _row "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s" \
+            "$_truncated" "$_title" "$_jira_status" "$_author" \
+            "checked:$_rtime" "committed: ${_last_commit:-unknown}" \
+            "$_rbranch" "$_jira_assignee" "" "" ""
+
+        _instant_rows+="${_rtime}"$'\t'"${_row}"$'\n'
+    done < <(parse_reflog_branches "$_reflog_git_dir" 200 | head -n 20)
+
+    # Sort by timestamp descending and strip the sort prefix
+    [ -n "$_instant_rows" ] && printf '%s' "$_instant_rows" | sort -t$'\t' -k1,1nr | cut -f2-
+}
+
 # Generate TSV rows for all non-main worktrees instantly (no reflog parsing needed).
 # Outputs rows for the eponymous branch of each worktree; if a different branch is
 # currently checked out, the wt_indicator is set to "WT_MISMATCH:<actual_branch>".
@@ -1290,9 +1428,8 @@ generate_branch_data() {
     # This prevents ctrl-r from seeing a truncated cache and reporting false "new branches".
     mv "${temp_cache_file}.streaming.$$" "$temp_cache_file" 2>/dev/null || true
 
-    # Write hot cache with top N rows for instant display on next run (stale-while-revalidate)
-    local hot_cache_file="$CACHE_DIR/hot_${count}.cache"
-    head -n "${RR_HOT_CACHE_N:-25}" "$temp_cache_file" > "$hot_cache_file" 2>/dev/null || true
+    # Hot cache removed — replaced by generate_instant_data() which computes fresh
+    # data on every run instead of serving stale previous-run data.
 
     # Cache the branch state (not HEAD, so switching branches doesn't invalidate)
     git for-each-ref --format='%(refname) %(objectname)' refs/heads/ | sort | sha256sum | cut -d' ' -f1 > "$temp_reflog_cache"
@@ -2020,6 +2157,20 @@ else
     build_worktree_map
 fi
 
+# Pre-load access log into associative array (eliminates grep|tail|cut per worktree)
+declare -A WORKTREE_NAV_TIMES=()
+if [ -f "$WORKTREE_ACCESS_LOG" ]; then
+    while IFS=$'\t' read -r _nav_ts _nav_wt_path; do
+        [ -n "$_nav_ts" ] && [ -n "$_nav_wt_path" ] && WORKTREE_NAV_TIMES["$_nav_wt_path"]="$_nav_ts"
+    done < "$WORKTREE_ACCESS_LOG"
+fi
+
+# Pre-load valid branch refs (eliminates git show-ref per branch)
+declare -A VALID_BRANCH_REFS=()
+while IFS= read -r _ref; do
+    VALID_BRANCH_REFS["$_ref"]=1
+done < <(git for-each-ref --format='%(refname:short)' refs/heads/)
+
 # Show stage 4 progress before the (potentially slow) branch data generation
 if [ "$GENERATE_MORE_MODE" != true ]; then
     update_loading_progress 4
@@ -2306,32 +2457,18 @@ mkfifo "$_data_fifo"
     # Output header as first line
     echo "$header_text"
 
-        # Stream branch data (and branchless tickets after) through the display formatter.
-        # generate_worktree_data runs first for instant worktree rows; generate_branch_data
-        # skips those branches. generate_branchless_ticket_data appends unstarted tickets.
+        # Two-phase data loading:
+        # Phase 1 (generate_instant_data): worktrees + top reflog branches, pre-sorted,
+        #   streamed directly — fzf gets data immediately (<100ms).
+        # Phase 2: full pipeline through sort buffer — dedup handles overlap with Phase 1.
         _wt_claimed_file=$(mktemp)
         {
-            # Hot micro-cache: output top N rows from previous run immediately, bypassing
-            # the sort buffer below. This lets fzf show recent branches before data loads.
-            # The format loop deduplicates so these rows won't appear twice.
-            # Skip the hot cache when the access log has been updated since the hot cache
-            # was written — stale hot cache would show wrong sort order for recently
-            # accessed worktrees (the hot cache positions "win" via dedup).
-            _hot_cache="$CACHE_DIR/hot_${REFLOG_COUNT}.cache"
-            if [[ -f "$_hot_cache" ]]; then
-                _hot_ok=true
-                if [[ -f "$WORKTREE_ACCESS_LOG" ]]; then
-                    _hot_mtime=$(stat -c %Y "$_hot_cache" 2>/dev/null || stat -f %m "$_hot_cache" 2>/dev/null)
-                    _log_mtime=$(stat -c %Y "$WORKTREE_ACCESS_LOG" 2>/dev/null || stat -f %m "$WORKTREE_ACCESS_LOG" 2>/dev/null)
-                    if [[ -n "$_log_mtime" ]] && [[ -n "$_hot_mtime" ]] && [[ "$_log_mtime" -gt "$_hot_mtime" ]]; then
-                        _hot_ok=false
-                    fi
-                fi
-                [[ "$_hot_ok" = true ]] && cat "$_hot_cache"
+            # Phase 1: Instant display — bypasses sort buffer
+            if [ "${RR_DISABLE_INSTANT:-false}" != "true" ]; then
+                generate_instant_data "$_wt_claimed_file"
             fi
 
-            # Worktrees and regular branches are sorted together by checkout/access time.
-            # Branchless tickets and remote-only branches are appended after.
+            # Phase 2: Full data — through sort buffer (dedup catches duplicates)
             {
                 generate_worktree_data "$_wt_claimed_file"
                 generate_branch_data "$REFLOG_COUNT" "$_wt_claimed_file"
@@ -2354,7 +2491,7 @@ mkfifo "$_data_fifo"
         _jira_me_lower="${JIRA_ME,,}"
         _format_now_sec=$(date +%s)
         while IFS=$'\t' read -r branch title status author time_info commit_info full_branch assignee wt_indicator wt_path wt_status; do
-            # Dedup: hot cache rows appear first; skip when the sort pipeline re-emits them
+            # Dedup: Phase 1 (instant) rows arrive first; skip when Phase 2 re-emits them
             if [[ -n "${_seen_branches[$full_branch]+x}" ]]; then continue; fi
             _seen_branches["$full_branch"]=1
 
