@@ -12,10 +12,10 @@ fi
 REFLOG_COUNT=50
 DISPLAY_COUNT=10
 SORT_BY_COMMIT=false
-SEARCH_ORIGIN=false
 JIRA_DOMAIN="${JIRA_DOMAIN}"
 JIRA_PROJECT="${JIRA_PROJECT}"
 JIRA_ME="${JIRA_ME:-}"  # Your JIRA username - used to highlight your assigned branches
+RR_REMOTE_MAX_AGE_DAYS="${RR_REMOTE_MAX_AGE_DAYS:-90}"  # Max age of remote-only branches to show (0 = no limit)
 
 # Validate required environment variables
 if [ -z "$JIRA_DOMAIN" ] || [ -z "$JIRA_PROJECT" ]; then
@@ -39,9 +39,9 @@ fi
 
 # Cache directory
 CACHE_DIR="$HOME/.cache/rr"
-STATE_FILE="$CACHE_DIR/current_mode"
 WORKTREE_ACCESS_LOG="$CACHE_DIR/worktree_access.log"
 JIRA_ASSIGNED_CACHE="$HOME/.jira_assigned_cache"
+JIRA_ACTIVE_CACHE="$HOME/.jira_active_cache"
 
 # Pane management configuration - parse RR_PANE_N_* variables
 RR_PANE_MGMT_ENABLED="${RR_PANE_MGMT_ENABLED:-false}"
@@ -373,7 +373,7 @@ copy_worktree_files() {
         local src="$src_root/$file"
         local dst="$dst_root/$file"
         if [ -e "$src" ] && [ ! -e "$dst" ]; then
-            if [ -n "$WORKTREE_COPY_EXCLUDE" ]; then
+            if [ -n "$WORKTREE_COPY_EXCLUDE" ] && [ -d "$src" ]; then
                 local exclude_args=""
                 for pattern in $WORKTREE_COPY_EXCLUDE; do
                     exclude_args="$exclude_args --exclude=$pattern"
@@ -468,14 +468,21 @@ switch_pane_to_branch() {
     local pane_num="$1"
     local branch="$2"
 
+    # Strip REMOTE: prefix if present
+    local is_remote=false
+    if [[ "$branch" == REMOTE:* ]]; then
+        branch="${branch#REMOTE:}"
+        is_remote=true
+    fi
+
     # Get pane configuration
     local pane_id="${PANE_IDS[$pane_num]}"
     local pane_dir="${PANE_DIRS[$pane_num]}"
     local pane_cmd="${PANE_COMMANDS[$pane_num]}"
     local pane_label="${PANE_LABELS[$pane_num]}"
 
-    # Find worktree path
-    local wt_path=$(git worktree list --porcelain | grep -B2 "^branch refs/heads/$branch$" | grep "^worktree " | cut -d' ' -f2)
+    # Find worktree path (use pre-built map instead of slow git call)
+    local wt_path=$(get_worktree_path "$branch")
 
     if [ -z "$wt_path" ]; then
         # No worktree - offer to create one
@@ -490,6 +497,14 @@ switch_pane_to_branch() {
         local choice=$(printf '%s\n%s\n' "$opt1" "$opt2" | fzf --ansi --height=5 --reverse --header="Switch $pane_label pane to '$branch'?" --header-first 2>/dev/tty)
 
         if echo "$choice" | grep -q "Create worktree"; then
+            # Create local tracking branch first if this is a remote-only branch
+            if [ "$is_remote" = true ] && ! git show-ref --verify --quiet "refs/heads/$branch"; then
+                echo "Creating local branch '$branch' tracking 'origin/$branch'..." >&2
+                git branch "$branch" "origin/$branch" 2>&1 || {
+                    echo "✗ Failed to create local tracking branch" >&2
+                    return 1
+                }
+            fi
             # Create worktree
             echo "Creating worktree for '$branch'..." >&2
             if create_worktree "$branch"; then
@@ -640,10 +655,8 @@ show_help() {
     echo ""
     echo -e "\033[1;36mSEARCH & VIEW\033[0m"
     echo -e "  \033[32mType\033[0m         Filter by name/status/author"
-    echo -e "  \033[32mCtrl-O\033[0m       Toggle LOCAL ↔ ORIGIN mode"
     echo -e "  \033[32mCtrl-L\033[0m       Load more branches"
     echo -e "  \033[32mCtrl-R\033[0m       Refresh (shows summary for ~2.5s, auto-clears)"
-    echo -e "  \033[32mCtrl-P\033[0m       Toggle preview (diff/commits)"
     echo ""
     echo -e "\033[1;36mWORKTREE MANAGEMENT\033[0m"
     echo -e "  \033[33mF2\033[0m           Create worktree for branch"
@@ -668,7 +681,7 @@ show_help() {
 
     echo -e "\033[1;36mVISUAL INDICATORS\033[0m"
     echo -e "  \033[38;5;141m★\033[0m Your branch   \033[38;5;244m·\033[0m Variant   \033[38;5;220m⊙\033[0m   Worktree (clean)   \033[38;5;214m⊙ !\033[0m Worktree (dirty)"
-    echo -e "  \033[38;5;71m+\033[0m Unstarted ticket (no branch yet)"
+    echo -e "  \033[38;5;71m+\033[0m Unstarted ticket (no branch yet)   \033[38;5;67m↑\033[0m Remote-only branch (no local checkout)"
     if [ "$RR_PANE_MGMT_ENABLED" = "true" ] && [ "$PANE_COUNT" -gt 0 ]; then
         echo -n "  "
         for i in "${!PANE_IDS[@]}"; do
@@ -691,12 +704,13 @@ show_help() {
 # Parse command line arguments
 FORCE_REFRESH=false
 GENERATE_MORE_MODE=false
+FULL_HEIGHT=false
 while [[ "$#" -gt 0 ]]; do
     case $1 in
         -c|--commit-sort) SORT_BY_COMMIT=true ;;
         -n|--number) REFLOG_COUNT="$2"; shift ;;
         -r|--refresh) FORCE_REFRESH=true ;;
-        -o|--origin) SEARCH_ORIGIN=true ;;
+        -f|--full) FULL_HEIGHT=true ;;
         -m|--me) JIRA_ME="$2"; shift ;;
         --show-help) show_help; exit 0 ;;
         --reload-refresh)
@@ -710,20 +724,12 @@ while [[ "$#" -gt 0 ]]; do
 
             # Delete all caches to force full refresh
             rm -f ~/.jira_cache ~/.jira_status_cache ~/.jira_assignee_cache
-            rm -f "$JIRA_ASSIGNED_CACHE"
+            rm -f "$JIRA_ASSIGNED_CACHE" "$JIRA_ACTIVE_CACHE"
             rm -f "$CACHE_DIR"/branch_list_*.cache "$CACHE_DIR"/reflog_*.cache
 
             FORCE_REFRESH=true
             GENERATE_MORE_MODE=true
             SHOW_REFRESH_SUMMARY=true
-
-            # Read current mode from state file
-            current_mode=$(cat "$STATE_FILE" 2>/dev/null || echo "local")
-            if [ "$current_mode" = "origin" ]; then
-                SEARCH_ORIGIN=true
-            else
-                SEARCH_ORIGIN=false
-            fi
 
             # Export temp dir for use in summary
             export REFRESH_TEMP_DIR="$TEMP_DIR"
@@ -731,13 +737,6 @@ while [[ "$#" -gt 0 ]]; do
         --reload-normal)
             # Just output normal data (for clearing refresh summary)
             GENERATE_MORE_MODE=true
-            # Read current mode from state file
-            current_mode=$(cat "$STATE_FILE" 2>/dev/null || echo "local")
-            if [ "$current_mode" = "origin" ]; then
-                SEARCH_ORIGIN=true
-            else
-                SEARCH_ORIGIN=false
-            fi
             ;;
         --generate-more) 
             # Special mode for fzf reload - increase reflog count to fetch more branches
@@ -749,39 +748,6 @@ while [[ "$#" -gt 0 ]]; do
             
             # Double the reflog count to fetch more branches
             REFLOG_COUNT=$((CURRENT_COUNT * 2))
-            
-            # Check current mode from state file
-            current_mode=$(cat ~/.cache/rr/current_mode 2>/dev/null || echo "local")
-            if [ "$current_mode" = "origin" ]; then
-                SEARCH_ORIGIN=true
-            else
-                SEARCH_ORIGIN=false
-            fi
-            
-            GENERATE_MORE_MODE=true
-            ;;
-        --toggle-origin)
-            # Toggle between origin and local mode
-            shift
-            DISPLAY_COUNT="$1"
-
-            if [ -z "$DISPLAY_COUNT" ]; then
-                DISPLAY_COUNT=10
-            fi
-
-            # Read current mode from state file
-            current_mode=$(cat "$STATE_FILE" 2>/dev/null || echo "local")
-
-            # Toggle based on current mode
-            if [ "$current_mode" = "origin" ]; then
-                SEARCH_ORIGIN=false
-                echo "local" > "$STATE_FILE"
-                echo "# Switched to local reflog mode" >&2
-            else
-                SEARCH_ORIGIN=true
-                echo "origin" > "$STATE_FILE"
-                echo "# Switched to origin branches mode" >&2
-            fi
             GENERATE_MORE_MODE=true
             ;;
         --process-action)
@@ -790,26 +756,21 @@ while [[ "$#" -gt 0 ]]; do
             ACTION_STRING="$1"
             PROCESS_ACTION_MODE=true
             ;;
-        *) echo "Unknown parameter: $1"; 
-           echo "Usage: $0 [-c|--commit-sort] [-n|--number LINES] [-r|--refresh] [-o|--origin] [-m|--me NAME]"
+        *) echo "Unknown parameter: $1";
+           echo "Usage: $0 [-c|--commit-sort] [-n|--number LINES] [-r|--refresh] [-m|--me NAME]"
            echo "  -c, --commit-sort    Sort by commit date instead of checkout time"
            echo "  -n, --number LINES   Number of reflog entries to process (default: 50)"
            echo "  -r, --refresh        Force refresh cache"
-           echo "  -o, --origin         Search remote origin branches instead of reflog"
+           echo "  -f, --full           Use full terminal height"
            echo "  -m, --me NAME        Your JIRA display name to highlight your assigned tickets"
            exit 1 ;;
     esac
     shift
 done
 
-# Set cache files based on final REFLOG_COUNT value and search mode
-if [ "$SEARCH_ORIGIN" = true ]; then
-    CACHE_FILE="$CACHE_DIR/branch_list_${REFLOG_COUNT}_origin.cache"
-    REFLOG_CACHE="$CACHE_DIR/reflog_${REFLOG_COUNT}_origin.cache"
-else
-    CACHE_FILE="$CACHE_DIR/branch_list_${REFLOG_COUNT}.cache"
-    REFLOG_CACHE="$CACHE_DIR/reflog_${REFLOG_COUNT}.cache"
-fi
+# Set cache files based on final REFLOG_COUNT value
+CACHE_FILE="$CACHE_DIR/branch_list_${REFLOG_COUNT}.cache"
+REFLOG_CACHE="$CACHE_DIR/reflog_${REFLOG_COUNT}.cache"
 
 # Generate TSV rows for all non-main worktrees instantly (no reflog parsing needed).
 # Outputs rows for the eponymous branch of each worktree; if a different branch is
@@ -937,13 +898,8 @@ generate_branch_data() {
         done < "$claimed_file"
     fi
 
-    if [ "$SEARCH_ORIGIN" = true ]; then
-        temp_cache_file="$CACHE_DIR/branch_list_${count}_origin.cache"
-        temp_reflog_cache="$CACHE_DIR/reflog_${count}_origin.cache"
-    else
-        temp_cache_file="$CACHE_DIR/branch_list_${count}.cache"
-        temp_reflog_cache="$CACHE_DIR/reflog_${count}.cache"
-    fi
+    temp_cache_file="$CACHE_DIR/branch_list_${count}.cache"
+    temp_reflog_cache="$CACHE_DIR/reflog_${count}.cache"
     
     # Check if we have valid cache for this count
     if [[ "$FORCE_REFRESH" == false ]] && [[ -f "$temp_cache_file" ]] && [[ -s "$temp_cache_file" ]] && [[ -f "$temp_reflog_cache" ]]; then
@@ -989,11 +945,7 @@ generate_branch_data() {
         # Smart check: only invalidate if branches changed
         # Get list of all branch refs with their commit hashes
         local current_branches_hash
-        if [ "$SEARCH_ORIGIN" = true ]; then
-            current_branches_hash=$(git for-each-ref --format='%(refname) %(objectname)' refs/remotes/origin/ | sort | sha256sum | cut -d' ' -f1)
-        else
-            current_branches_hash=$(git for-each-ref --format='%(refname) %(objectname)' refs/heads/ | sort | sha256sum | cut -d' ' -f1)
-        fi
+        current_branches_hash=$(git for-each-ref --format='%(refname) %(objectname)' refs/heads/ | sort | sha256sum | cut -d' ' -f1)
 
         local cached_branches_hash
         cached_branches_hash=$(cat "$temp_reflog_cache" 2>/dev/null)
@@ -1070,20 +1022,7 @@ generate_branch_data() {
     fi
     
     # Generate fresh data
-    if [ "$SEARCH_ORIGIN" = true ]; then
-        # Search remote origin branches - get all available first
-        all_branches=$(git for-each-ref --sort='-committerdate' refs/remotes/origin/ \
-            --format='%(refname:short)%09%(committerdate:unix)%09%(committerdate:relative)' |
-            sed 's/^origin\///' |
-            grep -v '^HEAD')
-        # Only limit if we're not in generate-more mode or if we have fewer branches than requested
-        total_available=$(echo "$all_branches" | wc -l)
-        if [ "$total_available" -le "$count" ]; then
-            branch_list="$all_branches"
-        else
-            branch_list=$(echo "$all_branches" | head -n "$count")
-        fi
-    elif [ "$SORT_BY_COMMIT" = true ]; then
+    if [ "$SORT_BY_COMMIT" = true ]; then
         branch_list=$(git for-each-ref --sort='-committerdate' refs/heads/ \
             --format='%(refname:short)%09%(committerdate:unix)%09%(committerdate:relative)' | head -n "$count")
     else
@@ -1164,18 +1103,13 @@ generate_branch_data() {
     # First pass: collect all tickets to fetch JIRA data in batch
     declare -A tickets_to_fetch
     while read -r branch rest; do
-        local ref_path
-        if [ "$SEARCH_ORIGIN" = true ]; then
-            ref_path="refs/remotes/origin/$branch"
-        else
-            ref_path="refs/heads/$branch"
-        fi
-        
+        local ref_path="refs/heads/$branch"
+
         # Skip entries that aren't actual branches
         if ! git show-ref --verify --quiet "$ref_path"; then
             continue
         fi
-        
+
         # Extract JIRA ticket
         ticket=$(echo "$branch" | grep -oi "${JIRA_PROJECT}-[0-9]\+" | tr '[:lower:]' '[:upper:]')
         if [ -n "$ticket" ]; then
@@ -1184,6 +1118,7 @@ generate_branch_data() {
     done <<< "$branch_list"
     
     # Batch fetch JIRA data for all tickets that aren't cached
+    local _fetch_pids=()
     for ticket in "${!tickets_to_fetch[@]}"; do
         # Check if already cached
         if ! grep -q "^$ticket:" ~/.jira_cache 2>/dev/null || \
@@ -1191,24 +1126,32 @@ generate_branch_data() {
            ! grep -q "^$ticket:" ~/.jira_assignee_cache 2>/dev/null; then
             # Fetch in background to parallelize
             (
-                response=$(curl -s -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
+                response=$(curl -s --max-time 8 -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
                     "https://${JIRA_DOMAIN}/rest/api/2/issue/${ticket}" \
                     -H "Content-Type: application/json" 2>/dev/null)
-                
+
                 if [ $? -eq 0 ] && [ -n "$response" ]; then
                     title=$(echo "$response" | jq -r '.fields.summary // empty' 2>/dev/null)
                     status=$(echo "$response" | jq -r '.fields.status.name // empty' 2>/dev/null)
                     assignee=$(echo "$response" | jq -r '.fields.assignee.displayName // empty' 2>/dev/null)
-                    
+
                     [ -n "$title" ] && echo "$ticket:$title" >> ~/.jira_cache
                     [ -n "$status" ] && echo "$ticket:$status" >> ~/.jira_status_cache
                     [ -n "$assignee" ] && echo "$ticket:$assignee" >> ~/.jira_assignee_cache
                 fi
             ) &
+            _fetch_pids+=($!)
         fi
     done
-    # Wait for all background JIRA fetches to complete
-    wait
+    # Wait for JIRA fetches, but kill stragglers after 3s so selecting a branch is never
+    # held up by in-flight network requests.
+    if [ ${#_fetch_pids[@]} -gt 0 ]; then
+        ( sleep 3 && kill "${_fetch_pids[@]}" 2>/dev/null ) &
+        local _killer_pid=$!
+        wait "${_fetch_pids[@]}" 2>/dev/null
+        kill "$_killer_pid" 2>/dev/null
+        wait "$_killer_pid" 2>/dev/null
+    fi
 
     # Reload caches to pick up newly fetched data
     load_jira_caches
@@ -1257,12 +1200,7 @@ generate_branch_data() {
         # Skip branches claimed by generate_worktree_data
         [ -n "${_wt_claimed[$branch]+x}" ] && continue
 
-        local ref_path
-        if [ "$SEARCH_ORIGIN" = true ]; then
-            ref_path="refs/remotes/origin/$branch"
-        else
-            ref_path="refs/heads/$branch"
-        fi
+        local ref_path="refs/heads/$branch"
 
         # Skip entries that aren't actual branches
         if ! git show-ref --verify --quiet "$ref_path"; then
@@ -1337,12 +1275,7 @@ generate_branch_data() {
         else
             wt_indicator=""
             # Use main repo reflog time for non-worktree branches
-            # Store timestamp for conversion at display time
-            if [ "$SEARCH_ORIGIN" = true ]; then
-                time_info="updated:$unix_time"
-            else
-                time_info="checked:$unix_time"
-            fi
+            time_info="checked:$unix_time"
         fi
 
         truncated_branch=$(truncate "$branch" $BRANCH_MAX_LENGTH)
@@ -1357,12 +1290,12 @@ generate_branch_data() {
     # This prevents ctrl-r from seeing a truncated cache and reporting false "new branches".
     mv "${temp_cache_file}.streaming.$$" "$temp_cache_file" 2>/dev/null || true
 
+    # Write hot cache with top N rows for instant display on next run (stale-while-revalidate)
+    local hot_cache_file="$CACHE_DIR/hot_${count}.cache"
+    head -n "${RR_HOT_CACHE_N:-25}" "$temp_cache_file" > "$hot_cache_file" 2>/dev/null || true
+
     # Cache the branch state (not HEAD, so switching branches doesn't invalidate)
-    if [ "$SEARCH_ORIGIN" = true ]; then
-        git for-each-ref --format='%(refname) %(objectname)' refs/remotes/origin/ | sort | sha256sum | cut -d' ' -f1 > "$temp_reflog_cache"
-    else
-        git for-each-ref --format='%(refname) %(objectname)' refs/heads/ | sort | sha256sum | cut -d' ' -f1 > "$temp_reflog_cache"
-    fi
+    git for-each-ref --format='%(refname) %(objectname)' refs/heads/ | sort | sha256sum | cut -d' ' -f1 > "$temp_reflog_cache"
 }
 
 # Check if jq is installed
@@ -1468,7 +1401,7 @@ fetch_assigned_jira_tickets() {
     # Fetch from JIRA using JQL (v3 API with POST)
     local jql="assignee = currentUser() AND status NOT IN (Done, Closed) AND project = ${JIRA_PROJECT} ORDER BY updated DESC"
     local response
-    response=$(curl -s -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
+    response=$(curl -s --max-time 10 -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
         -X POST \
         "https://${JIRA_DOMAIN}/rest/api/3/search/jql" \
         -H "Content-Type: application/json" \
@@ -1510,7 +1443,77 @@ fetch_assigned_jira_tickets() {
     echo "$converted" | tee "$JIRA_ASSIGNED_CACHE"
 }
 
-# Generate TSV rows for JIRA tickets that don't have an associated local branch
+# Fetch all active tickets in the project updated within 6 months (with 5-min TTL cache)
+# Returns TSV: TICKET\tTITLE\tSTATUS\tASSIGNEE\tUNIX_TIMESTAMP
+fetch_all_active_jira_tickets() {
+    local cache_ttl=300  # 5 minutes
+
+    # Need JIRA credentials to fetch
+    if [ -z "$JIRA_EMAIL" ] || [ -z "$JIRA_API_TOKEN" ]; then
+        [ -f "$JIRA_ACTIVE_CACHE" ] && cat "$JIRA_ACTIVE_CACHE"
+        return
+    fi
+
+    # Check if cache is fresh (skip if FORCE_REFRESH)
+    if [ "${FORCE_REFRESH:-false}" != "true" ] && [ -f "$JIRA_ACTIVE_CACHE" ]; then
+        local cache_mtime
+        cache_mtime=$(stat -c %Y "$JIRA_ACTIVE_CACHE" 2>/dev/null || stat -f %m "$JIRA_ACTIVE_CACHE" 2>/dev/null)
+        if [ -n "$cache_mtime" ]; then
+            local cache_age=$(( $(date +%s) - cache_mtime ))
+            if [ "$cache_age" -lt "$cache_ttl" ]; then
+                cat "$JIRA_ACTIVE_CACHE"
+                return
+            fi
+        fi
+    fi
+
+    # Fetch from JIRA using JQL (v3 API with POST)
+    local jql="project = ${JIRA_PROJECT} AND status NOT IN (Done, Closed) AND updated >= \"-180d\" ORDER BY updated DESC"
+    local response
+    response=$(curl -s --max-time 10 -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
+        -X POST \
+        "https://${JIRA_DOMAIN}/rest/api/3/search/jql" \
+        -H "Content-Type: application/json" \
+        -H "Accept: application/json" \
+        -d "{\"jql\":\"${jql}\",\"maxResults\":200,\"fields\":[\"summary\",\"status\",\"assignee\",\"updated\"]}" \
+        2>/dev/null)
+
+    if [ -z "$response" ]; then
+        [ -f "$JIRA_ACTIVE_CACHE" ] && cat "$JIRA_ACTIVE_CACHE"
+        return
+    fi
+
+    # Parse response into TSV rows
+    local raw
+    raw=$(echo "$response" | jq -r '.issues[]? | (.key) + "\t" + ((.fields.summary // "") | gsub("[\n\r\t]"; " ")) + "\t" + (.fields.status.name // "") + "\t" + (.fields.assignee.displayName // "") + "\t" + (.fields.updated // "")' 2>/dev/null)
+
+    if [ -z "$raw" ]; then
+        [ -f "$JIRA_ACTIVE_CACHE" ] && cat "$JIRA_ACTIVE_CACHE"
+        return
+    fi
+
+    # Convert ISO timestamps to Unix timestamps
+    local converted=""
+    while IFS=$'\t' read -r key title status assignee updated; do
+        [ -z "$key" ] && continue
+        local ts
+        ts=$(date -d "$updated" +%s 2>/dev/null)
+        [ -z "$ts" ] && ts=$(date +%s)
+        local status_val="${status:-<EMPTY>}"
+        local assignee_val="${assignee:-<UNASSIGNED>}"
+        local line="${key}"$'\t'"${title}"$'\t'"${status_val}"$'\t'"${assignee_val}"$'\t'"${ts}"
+        if [ -z "$converted" ]; then
+            converted="$line"
+        else
+            converted="${converted}"$'\n'"$line"
+        fi
+    done <<< "$raw"
+
+    echo "$converted" | tee "$JIRA_ACTIVE_CACHE"
+}
+
+# Generate TSV rows for JIRA tickets that don't have an associated local branch.
+# Assigned-to-me tickets appear first, then all other active tickets below.
 generate_branchless_ticket_data() {
     local existing_data="$1"
 
@@ -1523,31 +1526,42 @@ generate_branchless_ticket_data() {
         existing_tickets=$(git branch 2>/dev/null | sed 's/^[* ]*//' | grep -oi "${JIRA_PROJECT}-[0-9]\+" | tr '[:lower:]' '[:upper:]' | sort -u)
     fi
 
-    # Fetch assigned tickets
-    local assigned
+    # Fetch assigned tickets and all active tickets
+    local assigned all_active
     assigned=$(fetch_assigned_jira_tickets)
-    [ -z "$assigned" ] && return
+    all_active=$(fetch_all_active_jira_tickets)
 
-    local branchless=""
-    while IFS=$'\t' read -r ticket title status assignee updated_ts; do
-        [ -z "$ticket" ] && continue
+    [ -z "$assigned" ] && [ -z "$all_active" ] && return
 
-        # Only process valid JIRA ticket IDs (skip garbage rows from parsing errors)
-        [[ ! "$ticket" =~ ^${JIRA_PROJECT}-[0-9]+$ ]] && continue
+    # Build set of assigned ticket IDs for dedup
+    local assigned_ids=""
+    if [ -n "$assigned" ]; then
+        assigned_ids=$(echo "$assigned" | cut -f1 | sort -u)
+    fi
 
-        # Convert placeholders back to empty strings for display logic
-        [ "$status" = "<EMPTY>" ] && status=""
-        [ "$assignee" = "<UNASSIGNED>" ] && assignee=""
+    # Helper to emit a branchless row
+    _emit_branchless_row() {
+        local ticket="$1" title="$2" status="$3" assignee="$4" updated_ts="$5"
+
+        [ -z "$ticket" ] && return
+        [[ ! "$ticket" =~ ^${JIRA_PROJECT}-[0-9]+$ ]] && return
 
         # Skip if this ticket already has a branch
-        if echo "$existing_tickets" | grep -qx "$ticket"; then
-            continue
-        fi
+        echo "$existing_tickets" | grep -qx "$ticket" && return
 
         # Update in-memory caches so worktree creation can use them
-        [ -z "${JIRA_TITLE_CACHE[$ticket]}" ] && JIRA_TITLE_CACHE["$ticket"]="$title"
-        [ -z "${JIRA_STATUS_CACHE[$ticket]}" ] && JIRA_STATUS_CACHE["$ticket"]="$status"
-        [ -z "${JIRA_ASSIGNEE_CACHE[$ticket]}" ] && JIRA_ASSIGNEE_CACHE["$ticket"]="$assignee"
+        if [ -z "${JIRA_TITLE_CACHE[$ticket]}" ]; then
+            JIRA_TITLE_CACHE["$ticket"]="$title"
+            [ -n "$title" ] && echo "$ticket:$title" >> ~/.jira_cache
+        fi
+        if [ -z "${JIRA_STATUS_CACHE[$ticket]}" ]; then
+            JIRA_STATUS_CACHE["$ticket"]="$status"
+            [ -n "$status" ] && echo "$ticket:$status" >> ~/.jira_status_cache
+        fi
+        if [ -z "${JIRA_ASSIGNEE_CACHE[$ticket]}" ]; then
+            JIRA_ASSIGNEE_CACHE["$ticket"]="$assignee"
+            [ -n "$assignee" ] && echo "$ticket:$assignee" >> ~/.jira_assignee_cache
+        fi
 
         local truncated_ticket
         truncated_ticket=$(truncate "$ticket" $BRANCH_MAX_LENGTH)
@@ -1556,20 +1570,88 @@ generate_branchless_ticket_data() {
         [ -z "$author_display" ] && author_display="<UNASSIGNED>"
         local assignee_display="${assignee:-<UNASSIGNED>}"
         local status_display="${status:-<EMPTY>}"
-        local row
-        row=$(printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s" \
+
+        printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
             "$truncated_ticket" "$title" "$status_display" "$author_display" \
             "updated:$updated_ts" "<NO BRANCH>" \
-            "TICKET:$ticket" "$assignee_display" "" "" "")
+            "TICKET:$ticket" "$assignee_display" "" "" ""
+    }
 
-        if [ -z "$branchless" ]; then
-            branchless="$row"
-        else
-            branchless="${branchless}"$'\n'"$row"
-        fi
-    done <<< "$assigned"
+    # Section 1: assigned-to-me tickets without branches
+    if [ -n "$assigned" ]; then
+        while IFS=$'\t' read -r ticket title status assignee updated_ts; do
+            [ "$status" = "<EMPTY>" ] && status=""
+            [ "$assignee" = "<UNASSIGNED>" ] && assignee=""
+            _emit_branchless_row "$ticket" "$title" "$status" "$assignee" "$updated_ts"
+        done <<< "$assigned"
+    fi
 
-    echo "$branchless"
+    # Section 2: all other active tickets without branches (not in assigned set)
+    if [ -n "$all_active" ]; then
+        while IFS=$'\t' read -r ticket title status assignee updated_ts; do
+            [ "$status" = "<EMPTY>" ] && status=""
+            [ "$assignee" = "<UNASSIGNED>" ] && assignee=""
+
+            # Skip if already shown in assigned section
+            echo "$assigned_ids" | grep -qx "$ticket" && continue
+
+            _emit_branchless_row "$ticket" "$title" "$status" "$assignee" "$updated_ts"
+        done <<< "$all_active"
+    fi
+}
+
+# Generate TSV rows for branches that exist on origin but not locally.
+# These appear at the bottom of the list as a "remote discovery" section.
+# Uses only in-memory JIRA cache (no blocking fetches).
+generate_remote_only_data() {
+    # One bulk call for local branch names (for dedup via awk)
+    local local_branches
+    local_branches=$(git for-each-ref --format='%(refname:short)' refs/heads/ 2>/dev/null)
+
+    # Compute cutoff timestamp (0 means no limit)
+    local cutoff_ts=0
+    if [ "${RR_REMOTE_MAX_AGE_DAYS:-0}" -gt 0 ] 2>/dev/null; then
+        cutoff_ts=$(( $(date +%s) - RR_REMOTE_MAX_AGE_DAYS * 86400 ))
+    fi
+
+    # One bulk call for all remote branches with full info.
+    # awk filters out branches that exist locally and are older than the age limit —
+    # no per-branch git calls. Output is streamed directly via printf so SIGPIPE
+    # propagates immediately when fzf exits.
+    git for-each-ref --sort='-committerdate' refs/remotes/origin/ \
+        --format='%(refname:short)%09%(committerdate:unix)%09%(committername)%09%(committerdate:relative)' 2>/dev/null |
+    sed 's/^origin\///' |
+    grep -v '^HEAD' |
+    awk -v local_branches="$local_branches" -v cutoff="$cutoff_ts" '
+        BEGIN {
+            n = split(local_branches, arr, "\n")
+            for (i = 1; i <= n; i++) local_set[arr[i]] = 1
+        }
+        {
+            if (local_set[$1]) next
+            if (cutoff > 0 && $2 < cutoff) next
+            print
+        }
+    ' |
+    while IFS=$'\t' read -r branch unix_time author rel_time; do
+        [ -z "$branch" ] && continue
+        author="${author:0:15}"
+
+        local ticket
+        ticket=$(echo "$branch" | grep -oi "${JIRA_PROJECT}-[0-9]\+" | tr '[:lower:]' '[:upper:]')
+        local jira_title jira_status jira_assignee
+        jira_title=$(get_jira_title "$ticket")
+        jira_status=$(get_jira_status "$ticket")
+        jira_assignee=$(get_jira_assignee "$ticket")
+
+        local truncated_branch
+        truncated_branch=$(truncate "$branch" $BRANCH_MAX_LENGTH)
+
+        printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+            "$truncated_branch" "${jira_title:-<EMPTY>}" "${jira_status:-<EMPTY>}" "$author" \
+            "updated:$unix_time" "committed: $rel_time" \
+            "REMOTE:$branch" "${jira_assignee:-<UNASSIGNED>}" "" "" ""
+    done
 }
 
 # Function to format status with color/emoji - returns padded colored string
@@ -1633,9 +1715,18 @@ format_status() {
     echo -e "\033[${color}m${icon} ${truncated_text}${padding}\033[0m"
 }
 
+# Cache format version — bump this whenever the TSV field layout changes.
+# On mismatch, all branch_list / reflog caches are deleted and regenerated.
+CACHE_FORMAT_VERSION="v3"
+
 # Cache management functions
 ensure_cache_dir() {
     mkdir -p "$CACHE_DIR"
+    local ver_file="$CACHE_DIR/.cache_format_version"
+    if [ "$(cat "$ver_file" 2>/dev/null)" != "$CACHE_FORMAT_VERSION" ]; then
+        rm -f "$CACHE_DIR"/branch_list_*.cache "$CACHE_DIR"/reflog_*.cache
+        echo "$CACHE_FORMAT_VERSION" > "$ver_file"
+    fi
 }
 
 
@@ -1774,8 +1865,7 @@ format_current_branch_as_row() {
     # Format assignee
     local display_assignee="$(printf "%-${ASSIGNEE_MAX_LENGTH}s" "${jira_assignee:-}")"
 
-    # Time info - show "checked out" instead of timestamp
-    local time_info="$(printf "%-26s" "◀ current")"
+    local time_info="$(printf "%-26s" "")"
 
     # Style as "current branch" marker: gray bg + bold, but warm amber tones
     # instead of the cool purple/blue used by real rows — clearly distinct at a glance
@@ -1785,18 +1875,17 @@ format_current_branch_as_row() {
     local warm_tan=$'\033[38;5;137m'   # slightly more muted tan for assignee
     local dim_gray=$'\033[2;37m'       # dim gray for time/commit (same as real rows)
 
-    local display_branch="${bg}${bold}${amber}★ $(printf "%-${branch_width}s" "$current_branch")${wt_display}"
+    local branch_display
+    branch_display=$(truncate "$current_branch" $branch_width)
+    local display_branch="${bg}${bold}${amber}★ $(printf "%-${branch_width}s" "$branch_display")${wt_display}"
 
     # Print row with gray background and amber palette
-    echo -e "${display_branch}${bg} │ ${bg}${bold}${amber}$(printf "%-${TITLE_MAX_LENGTH}s" "$display_title")${bg} │ ${bg}${display_status}${bg} │ ${bg}${bold}${warm_tan}$(printf "%-${ASSIGNEE_MAX_LENGTH}s" "$display_assignee")${bg} │ ${bg}${bold}${dim_gray}${time_info}${bg} │ ${bg}${bold}${dim_gray}${commit_info}"$'\033[0m'
+    echo -e "${display_branch}${bg} │ ${bg}${bold}${amber}$(printf "%-${TITLE_MAX_LENGTH}s" "$display_title")${bg} │ ${bg}${display_status}${bg} │ ${bg}${bold}${warm_tan}$(printf "%-${ASSIGNEE_MAX_LENGTH}s" "$display_assignee")${bg} │ ${bg}${bold}${dim_gray}${time_info}${bg} │ ${bg}${bold}${dim_gray}${commit_info}${bg} │"$'\033[0m'
 }
 
 # Function to show help page
 # Function to generate dynamic header text with colors
 get_header_text() {
-    # Show current state first
-    get_current_state
-
     # Build pane status display if pane management is enabled
     local pane_status=""
     if [ "$RR_PANE_MGMT_ENABLED" = "true" ] && [ "$PANE_COUNT" -gt 0 ]; then
@@ -1817,7 +1906,7 @@ get_header_text() {
     fi
 
     # Build keybinding help text (compact - press ? for full help)
-    local base_keys="?: help │ C-O: toggle │ C-R: refresh"
+    local base_keys="?: help │ C-R: refresh"
     local pane_keys=""
 
     # Add pane management keys if enabled (these are the most important)
@@ -1832,15 +1921,7 @@ get_header_text() {
 
     local keys_display="${base_keys}${pane_keys}"
 
-    # Check current mode from state file or variable
-    local current_mode=$(cat "$STATE_FILE" 2>/dev/null || echo "local")
-    if [ "$SEARCH_ORIGIN" = true ] || [ "$current_mode" = "origin" ]; then
-        # Mellow purple for origin mode
-        echo -e "╰─ \033[1;38;5;141m🌐 ORIGIN MODE\033[0m ${pane_status}\033[2m│ ${keys_display}\033[0m"
-    else
-        # Mellow blue for local mode
-        echo -e "╰─ \033[1;38;5;109m📁 LOCAL MODE\033[0m  ${pane_status}\033[2m│ ${keys_display}\033[0m"
-    fi
+    echo -e "╰─ \033[1;38;5;109m📁 rr\033[0m  ${pane_status}\033[2m│ ${keys_display}\033[0m"
 
     # Show current branch as final line (formatted row matching column structure)
     format_current_branch_as_row
@@ -1921,13 +2002,6 @@ update_branch_progress() {
 # Initialize cache (must happen before loading UI for GENERATE_MORE_MODE check)
 ensure_cache_dir
 
-# Save current mode to state file for toggle functionality
-if [ "$SEARCH_ORIGIN" = true ]; then
-    echo "origin" > "$STATE_FILE"
-else
-    echo "local" > "$STATE_FILE"
-fi
-
 # Show initial loading UI and run initialization stages with progress
 if [ "$GENERATE_MORE_MODE" != true ]; then
     { printf '\n\n\n\n'; tput cuu 4; tput sc; } > /dev/tty 2>&1
@@ -1955,6 +2029,13 @@ fi
 if [ "$PROCESS_ACTION_MODE" = true ]; then
     if [[ "$ACTION_STRING" =~ ^SET_ALL_PANES: ]]; then
         branch=$(echo "$ACTION_STRING" | sed 's/^SET_ALL_PANES://' | tr -d '\n\r' | sed "s/^[[:space:]'\"]*//;s/[[:space:]'\"]*$//")
+        # Strip REMOTE: prefix and create local tracking branch if needed
+        if [[ "$branch" == REMOTE:* ]]; then
+            branch="${branch#REMOTE:}"
+            if ! git show-ref --verify --quiet "refs/heads/$branch"; then
+                git branch "$branch" "origin/$branch" >/dev/null 2>&1
+            fi
+        fi
 
         if [ "$RR_PANE_MGMT_ENABLED" != "true" ] || [ "$PANE_COUNT" -eq 0 ]; then
             notify-send "Pane management not enabled" &
@@ -1985,9 +2066,15 @@ if [ "$GENERATE_MORE_MODE" = true ]; then
     _wt_data=$(generate_worktree_data "$_wt_claimed_file")
     processed_data=$(generate_branch_data "$REFLOG_COUNT" "$_wt_claimed_file")
     rm -f "$_wt_claimed_file"
+    # Merge-sort worktree data and branch data by access timestamp (field 5)
+    # so the combined list has correct sort order across both sources.
     if [ -n "$_wt_data" ]; then
         if [ -n "$processed_data" ]; then
-            processed_data="${_wt_data}"$'\n'"${processed_data}"
+            processed_data=$(printf '%s\n%s' "$_wt_data" "$processed_data" | awk -F'\t' '{
+                ts = 0; n = split($5, a, ":")
+                if (n >= 2 && a[n] ~ /^[0-9]+$/) ts = a[n]
+                print ts "\t" $0
+            }' | sort -t$'\t' -k1,1nr | cut -f2-)
         else
             processed_data="$_wt_data"
         fi
@@ -2002,6 +2089,16 @@ if [ "$GENERATE_MORE_MODE" = true ]; then
             else
                 processed_data="$branchless_data"
             fi
+        fi
+    fi
+
+    # Append remote-only branches (exist on origin but not locally)
+    remote_data=$(generate_remote_only_data)
+    if [ -n "$remote_data" ]; then
+        if [ -n "$processed_data" ]; then
+            processed_data="${processed_data}"$'\n'"${remote_data}"
+        else
+            processed_data="$remote_data"
         fi
     fi
 
@@ -2155,12 +2252,19 @@ if [ "$GENERATE_MORE_MODE" = true ]; then
         # Truncate branch to correct width (handles pre-truncated branches with "...")
         branch_display=$(truncate "$branch" $branch_width)
 
-        # Detect branchless tickets (TICKET: prefix in full_branch)
+        # Detect row type from full_branch prefix
         is_branchless=false
+        is_remote=false
         [[ "$full_branch" == TICKET:* ]] && is_branchless=true
+        [[ "$full_branch" == REMOTE:* ]] && is_remote=true
 
         display_branch=""
-        if [ "$is_branchless" = true ]; then
+        if [ "$is_remote" = true ]; then
+            # Remote-only branch - dim steel blue with ↑ prefix
+            display_branch=$(printf "\033[38;5;67m↑ \033[38;5;67m%-${branch_width}s\033[0m" "$branch_display")
+            printf "%s │ \033[38;5;67m%s\033[0m │ %s │ \033[38;5;244m%s\033[0m │ \033[2;37m%-26s\033[0m │ \033[2;37m%-${COMMIT_MAX_LENGTH}s\033[0m │ %s │ %s\n" \
+                "$display_branch" "$title_column" "$display_status" "$display_assignee" "$time_info" "$commit_info" "$full_branch" "$title"
+        elif [ "$is_branchless" = true ]; then
             # Branchless ticket - use + prefix with green color
             display_branch=$(printf "\033[38;5;71m+ \033[38;5;71m%-${branch_width}s\033[0m" "$branch_display")
             printf "%s │ \033[38;5;71m%s\033[0m │ %s │ \033[38;5;244m%s\033[0m │ \033[2;37m%-26s\033[0m │ \033[38;5;241m%-${COMMIT_MAX_LENGTH}s\033[0m │ %s │ %s\n" \
@@ -2193,54 +2297,114 @@ fi
 { tput rc; printf '\033[J'; } > /dev/tty 2>&1
 header_text=$(get_header_text)
 
-selected_line=$(
-    {
-        # Output header as first line
-        echo "$header_text"
+# Use a FIFO to decouple the data+format pipeline from fzf.
+# $() will return as soon as fzf exits — it won't wait for JIRA fetches or sort buffers.
+_data_fifo=$(mktemp -u)
+mkfifo "$_data_fifo"
+
+{
+    # Output header as first line
+    echo "$header_text"
 
         # Stream branch data (and branchless tickets after) through the display formatter.
         # generate_worktree_data runs first for instant worktree rows; generate_branch_data
         # skips those branches. generate_branchless_ticket_data appends unstarted tickets.
         _wt_claimed_file=$(mktemp)
         {
-            generate_worktree_data "$_wt_claimed_file"
-            generate_branch_data "$REFLOG_COUNT" "$_wt_claimed_file"
+            # Hot micro-cache: output top N rows from previous run immediately, bypassing
+            # the sort buffer below. This lets fzf show recent branches before data loads.
+            # The format loop deduplicates so these rows won't appear twice.
+            # Skip the hot cache when the access log has been updated since the hot cache
+            # was written — stale hot cache would show wrong sort order for recently
+            # accessed worktrees (the hot cache positions "win" via dedup).
+            _hot_cache="$CACHE_DIR/hot_${REFLOG_COUNT}.cache"
+            if [[ -f "$_hot_cache" ]]; then
+                _hot_ok=true
+                if [[ -f "$WORKTREE_ACCESS_LOG" ]]; then
+                    _hot_mtime=$(stat -c %Y "$_hot_cache" 2>/dev/null || stat -f %m "$_hot_cache" 2>/dev/null)
+                    _log_mtime=$(stat -c %Y "$WORKTREE_ACCESS_LOG" 2>/dev/null || stat -f %m "$WORKTREE_ACCESS_LOG" 2>/dev/null)
+                    if [[ -n "$_log_mtime" ]] && [[ -n "$_hot_mtime" ]] && [[ "$_log_mtime" -gt "$_hot_mtime" ]]; then
+                        _hot_ok=false
+                    fi
+                fi
+                [[ "$_hot_ok" = true ]] && cat "$_hot_cache"
+            fi
+
+            # Worktrees and regular branches are sorted together by checkout/access time.
+            # Branchless tickets and remote-only branches are appended after.
+            {
+                generate_worktree_data "$_wt_claimed_file"
+                generate_branch_data "$REFLOG_COUNT" "$_wt_claimed_file"
+            } | awk -F'\t' '{
+                ts = 0; n = split($5, a, ":")
+                if (n >= 2 && a[n] ~ /^[0-9]+$/) ts = a[n]
+                print ts "\t" $0
+            }' | sort -t$'\t' -k1,1nr | cut -f2-
             if [ -n "$JIRA_EMAIL" ] && [ -n "$JIRA_API_TOKEN" ]; then
                 generate_branchless_ticket_data ""
             fi
+            generate_remote_only_data
             rm -f "$_wt_claimed_file"
         } |
         # Use │ as delimiter with proper column spacing
+        {
+        declare -A _seen_branches=()
+        # Hoist loop-invariants outside: saves 1 git call + 1 tr call per row
+        _current_branch_name=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+        _jira_me_lower="${JIRA_ME,,}"
+        _format_now_sec=$(date +%s)
         while IFS=$'\t' read -r branch title status author time_info commit_info full_branch assignee wt_indicator wt_path wt_status; do
-            # Convert timestamp to human-readable format
-            time_info=$(convert_timestamp_to_relative "$time_info")
+            # Dedup: hot cache rows appear first; skip when the sort pipeline re-emits them
+            if [[ -n "${_seen_branches[$full_branch]+x}" ]]; then continue; fi
+            _seen_branches["$full_branch"]=1
 
-            # Ensure title field is exactly TITLE_MAX_LENGTH characters
+            # Skip the current branch early (avoids all formatting work below)
+            if [ "$branch" = "$_current_branch_name" ]; then continue; fi
+
+            # Convert timestamp to human-readable format (inline, no subshell)
+            if [[ "$time_info" =~ ^(checked|updated):([0-9]+)$ ]]; then
+                _ts_prefix="${BASH_REMATCH[1]}"
+                _ts_diff=$(( _format_now_sec - BASH_REMATCH[2] ))
+                if   (( _ts_diff < 60 ));      then _ts_rel="seconds ago"
+                elif (( _ts_diff < 3600 ));    then _ts_m=$((_ts_diff/60));   ((_ts_m==1)) && _ts_rel="1 minute ago"  || _ts_rel="$_ts_m minutes ago"
+                elif (( _ts_diff < 86400 ));   then _ts_h=$((_ts_diff/3600)); ((_ts_h==1)) && _ts_rel="1 hour ago"    || _ts_rel="$_ts_h hours ago"
+                elif (( _ts_diff < 2592000 )); then _ts_d=$((_ts_diff/86400)); ((_ts_d==1)) && _ts_rel="1 day ago"    || _ts_rel="$_ts_d days ago"
+                else                                _ts_mo=$((_ts_diff/2592000)); ((_ts_mo==1)) && _ts_rel="1 month ago" || _ts_rel="$_ts_mo months ago"
+                fi
+                time_info="${_ts_prefix}: ${_ts_rel}"
+            fi
+
+            # Ensure title field is exactly TITLE_MAX_LENGTH characters (no subshell)
             if [ -z "$title" ] || [ "$title" = " " ] || [ "$title" = "<EMPTY>" ]; then
-                display_title="$(printf "%-${TITLE_MAX_LENGTH}s" "")"
+                printf -v display_title "%-${TITLE_MAX_LENGTH}s" ""
             else
-                # Truncate if needed (adds ... for long titles), then pad to exact width
-                truncated_title=$(truncate "$title" $TITLE_MAX_LENGTH)
-                display_title="$(printf "%-${TITLE_MAX_LENGTH}s" "$truncated_title")"
+                # Truncate if needed (inline, no subshell), then pad to exact width
+                if (( ${#title} > TITLE_MAX_LENGTH )); then
+                    printf -v display_title "%-${TITLE_MAX_LENGTH}s" "${title:0:$((TITLE_MAX_LENGTH-3))}..."
+                else
+                    printf -v display_title "%-${TITLE_MAX_LENGTH}s" "$title"
+                fi
             fi
             # Format status with color
             if [ -z "$status" ] || [ "$status" = "<EMPTY>" ]; then
-                display_status="$(printf "%-${STATUS_MAX_LENGTH}s" "")"
+                printf -v display_status "%-${STATUS_MAX_LENGTH}s" ""
             else
                 display_status="$(format_status "$status")"
             fi
-            # Ensure assignee field is exactly 15 characters
+            # Ensure assignee field is exactly 15 characters (no subshell)
             if [ -z "$assignee" ] || [ "$assignee" = "<UNASSIGNED>" ]; then
-                display_assignee="$(printf "%-15s" "")"
+                printf -v display_assignee "%-15s" ""
             else
-                display_assignee="$(printf "%-15s" "$assignee")"
+                printf -v display_assignee "%-15s" "$assignee"
             fi
-            # Check if assigned to me AND branch is authoritative (exact ticket match)
-            assignee_lower=$(echo "$assignee" | tr '[:upper:]' '[:lower:]')
-            jira_me_lower=$(echo "$JIRA_ME" | tr '[:upper:]' '[:lower:]')
-            # Extract ticket from branch name and check if branch IS the ticket (not a variant like -wip, -good)
-            ticket_from_branch=$(echo "$branch" | grep -oi "${JIRA_PROJECT}-[0-9]\+" | tr '[:lower:]' '[:upper:]' | head -1)
-            branch_upper=$(echo "$branch" | tr '[:lower:]' '[:upper:]')
+            # Check if assigned to me AND branch is authoritative (bash builtins, no fork)
+            assignee_lower="${assignee,,}"
+            # Extract ticket from branch name using bash regex (no grep/tr/head pipeline)
+            ticket_from_branch=""
+            if [[ "$branch" =~ (${JIRA_PROJECT}-[0-9]+) ]]; then
+                ticket_from_branch="${BASH_REMATCH[1]^^}"
+            fi
+            branch_upper="${branch^^}"
             is_authoritative=false
             [ "$branch_upper" = "$ticket_from_branch" ] && is_authoritative=true
             
@@ -2280,26 +2444,31 @@ selected_line=$(
                 branch_width=$((BRANCH_MAX_LENGTH - 2 - wt_visual_width))
             fi
 
-            # Skip the current branch - you're already on it
-            current_branch_name=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
-            if [ "$branch" = "$current_branch_name" ]; then
-                continue
+            # Truncate branch to correct width (inline, no subshell)
+            if (( ${#branch} > branch_width )); then
+                branch_display="${branch:0:$((branch_width-3))}..."
+            else
+                branch_display="$branch"
             fi
 
-            # Truncate branch to correct width (handles pre-truncated branches with "...")
-            branch_display=$(truncate "$branch" $branch_width)
-
-            # Detect branchless tickets (TICKET: prefix in full_branch)
+            # Detect row type from full_branch prefix
             is_branchless=false
+            is_remote=false
             [[ "$full_branch" == TICKET:* ]] && is_branchless=true
+            [[ "$full_branch" == REMOTE:* ]] && is_remote=true
 
             display_branch=""
-            if [ "$is_branchless" = true ]; then
+            if [ "$is_remote" = true ]; then
+                # Remote-only branch - dim steel blue with ↑ prefix
+                display_branch=$(printf "\033[38;5;67m↑ \033[38;5;67m%-${branch_width}s\033[0m" "$branch_display")
+                printf "%s │ \033[38;5;67m%s\033[0m │ %s │ \033[38;5;244m%s\033[0m │ \033[2;37m%-26s\033[0m │ \033[2;37m%-${COMMIT_MAX_LENGTH}s\033[0m │ %s │ %s\n" \
+                    "$display_branch" "$display_title" "$display_status" "$display_assignee" "$time_info" "$commit_info" "$full_branch" "$title"
+            elif [ "$is_branchless" = true ]; then
                 # Branchless ticket - use + prefix with green color
                 display_branch=$(printf "\033[38;5;71m+ \033[38;5;71m%-${branch_width}s\033[0m" "$branch_display")
                 printf "%s │ \033[38;5;71m%s\033[0m │ %s │ \033[38;5;244m%s\033[0m │ \033[2;37m%-26s\033[0m │ \033[38;5;241m%-${COMMIT_MAX_LENGTH}s\033[0m │ %s │ %s\n" \
                     "$display_branch" "$display_title" "$display_status" "$display_assignee" "$time_info" "no branch" "$full_branch" "$title"
-            elif [ -n "$JIRA_ME" ] && [ "$assignee_lower" = "$jira_me_lower" ]; then
+            elif [ -n "$JIRA_ME" ] && [ "$assignee_lower" = "$_jira_me_lower" ]; then
                 if [ "$is_authoritative" = true ]; then
                     # Authoritative branch assigned to me - full star, bright purple
                     display_branch=$(printf "\033[38;5;141m★ %-${branch_width}s\033[0m%s" "$branch_display" "$wt_display")
@@ -2318,7 +2487,12 @@ selected_line=$(
                     "$display_branch" "$display_title" "$display_status" "$display_assignee" "$time_info" "$commit_info" "$full_branch" "$title"
             fi
         done
-    } |
+        }
+} > "$_data_fifo" 2>/dev/null &
+_gen_pid=$!
+
+# fzf reads from the FIFO — $() returns the instant fzf exits, without waiting for generators
+selected_line=$(
     {
         # Build dynamic pane keybindings
         pane_bindings=""
@@ -2326,7 +2500,7 @@ selected_line=$(
             for i in "${!PANE_KEYS[@]}"; do
                 key="${PANE_KEYS[$i]}"
                 if [ -n "$key" ]; then
-                    pane_bindings="$pane_bindings --bind '${key}:execute-silent($SCRIPT_PATH --process-action \"SET_PANE_${i}:{7}\" &)'"
+                    pane_bindings="$pane_bindings --bind '${key}:execute-silent($SCRIPT_PATH --process-action \"SET_PANE_${i}:{7}\" </dev/null >/dev/null 2>/dev/null &)'"
                 fi
             done
             # alt-enter: switch branch (accept) + switch ALL panes synchronously (with visible output)
@@ -2334,11 +2508,11 @@ selected_line=$(
         fi
 
         eval "fzf --ansi \
+            --no-sort \
             --reverse \
-            --height=$((DISPLAY_COUNT + 3)) \
+            --height=$($FULL_HEIGHT && echo "100%" || echo $((DISPLAY_COUNT + 7))) \
             --bind 'ctrl-d:half-page-down,ctrl-u:half-page-up' \
             --bind \"ctrl-l:reload($0 --generate-more $REFLOG_COUNT${JIRA_ME:+ -m \\\"$JIRA_ME\\\"})\" \
-            --bind \"ctrl-o:reload($0 --toggle-origin $DISPLAY_COUNT${JIRA_ME:+ -m \\\"$JIRA_ME\\\"})\" \
             --bind \"ctrl-r:reload($0 --reload-refresh${JIRA_ME:+ -m \\\"$JIRA_ME\\\"})\" \
             --bind \"f9:reload($0 --reload-normal${JIRA_ME:+ -m \\\"$JIRA_ME\\\"})\" \
             --bind \"?:execute($SCRIPT_PATH --show-help)\" \
@@ -2346,16 +2520,21 @@ selected_line=$(
             --bind 'f2:execute-silent(echo \"CREATE_WT:{7}\" > ~/.cache/rr/action)+abort' \
             --bind 'f3:execute-silent(echo \"CREATE_NEW_WT:\" > ~/.cache/rr/action)+abort' \
             $pane_bindings \
-            --bind 'f6:execute-silent($SCRIPT_PATH --process-action \"SET_ALL_PANES:{7}\" &)' \
+            --bind 'f6:execute-silent($SCRIPT_PATH --process-action \"SET_ALL_PANES:{7}\" </dev/null >/dev/null 2>/dev/null &)' \
             --bind 'f7:execute-silent(echo \"SET_ALL_PANES_CURRENT:\" > ~/.cache/rr/action)+abort' \
             --bind 'f8:execute-silent(echo \"REMOVE_WT:{7}\" > ~/.cache/rr/action)+abort' \
             --delimiter='│' \
             --with-nth=1,2,3,4,5,6 \
             --nth=1,2,3,4,8 \
             --tiebreak=begin,length,index \
-            --header-lines=3"
-    }
-)
+            --header-lines=2 \
+            --preview '$SCRIPT_DIR/rr-preview.sh {}' \
+            --preview-window='bottom:4:nohidden:wrap:border-top'"
+    } < "$_data_fifo")
+
+# Kill the background data pipeline and clean up — do it in the background so
+# navigation is not held up waiting for JIRA fetches or sort buffers to die.
+{ kill "$_gen_pid" 2>/dev/null; wait "$_gen_pid" 2>/dev/null; rm -f "$_data_fifo"; } >/dev/null 2>/dev/null &
 
 # Check if user requested a worktree action via keybinding
 ACTION_FILE="$CACHE_DIR/action"
@@ -2367,6 +2546,18 @@ if [ -f "$ACTION_FILE" ]; then
     if [[ "$action_line" =~ ^CREATE_WT: ]]; then
         # Extract branch name - it's now the clean full branch name from field 7
         branch=$(echo "$action_line" | sed 's/^CREATE_WT://' | tr -d '\n\r' | sed "s/^[[:space:]'\"]*//;s/[[:space:]'\"]*$//")
+
+        # Handle remote-only branch - ensure local tracking branch exists first
+        if [[ "$branch" == REMOTE:* ]]; then
+            branch="${branch#REMOTE:}"
+            if ! git show-ref --verify --quiet "refs/heads/$branch"; then
+                echo "Creating local branch '$branch' tracking 'origin/$branch'..." >&2
+                git branch "$branch" "origin/$branch" 2>&1 || {
+                    echo "✗ Failed to create local tracking branch" >&2
+                    exit 1
+                }
+            fi
+        fi
 
         # Handle branchless ticket - create new branch from main then worktree
         if [[ "$branch" == TICKET:* ]]; then
@@ -2664,6 +2855,18 @@ if [ -f "$ACTION_FILE" ]; then
         # Switch all panes to selected branch
         branch=$(echo "$action_line" | sed "s/^SET_ALL_PANES://" | tr -d '\n\r' | sed "s/^[[:space:]'\"]*//;s/[[:space:]'\"]*$//")
 
+        # Strip REMOTE: prefix and create local tracking branch if needed
+        if [[ "$branch" == REMOTE:* ]]; then
+            branch="${branch#REMOTE:}"
+            if ! git show-ref --verify --quiet "refs/heads/$branch"; then
+                echo "Creating local branch '$branch' tracking 'origin/$branch'..." >&2
+                git branch "$branch" "origin/$branch" 2>&1 || {
+                    echo "✗ Failed to create local tracking branch" >&2
+                    exit 1
+                }
+            fi
+        fi
+
         # Check if pane management is enabled
         if [ "$RR_PANE_MGMT_ENABLED" != "true" ] || [ "$PANE_COUNT" -eq 0 ]; then
             echo "✗ Pane management is not enabled in .env" >&2
@@ -2674,6 +2877,23 @@ if [ -f "$ACTION_FILE" ]; then
         if [ -n "$branch" ]; then
             echo "Switching ALL panes to branch: $branch" >&2
             echo "" >&2
+
+            # If no worktree exists yet, create it once before looping panes
+            wt_check=$(git worktree list --porcelain | grep -B2 "^branch refs/heads/$branch$" | grep "^worktree " | cut -d' ' -f2)
+            if [ -z "$wt_check" ]; then
+                opt1="● Create worktree for '$branch' and switch all panes"
+                opt2="○ Cancel"
+                choice=$(printf '%s\n%s\n' "$opt1" "$opt2" | fzf --ansi --height=5 --reverse --header="No worktree for '$branch' — create one?" --header-first 2>/dev/tty)
+                if echo "$choice" | grep -q "Create worktree"; then
+                    echo "Creating worktree for '$branch'..." >&2
+                    if ! create_worktree "$branch"; then
+                        echo "✗ Failed to create worktree" >&2
+                        exit 1
+                    fi
+                else
+                    exit 0
+                fi
+            fi
 
             success_count=0
             fail_count=0
@@ -2801,20 +3021,20 @@ if [ -f "$ACTION_FILE" ]; then
     fi
 fi
 
-# Extract the full branch name from field 1 (stripping formatting)
+# Extract the full branch name from field 7 (hidden in fzf display but always present)
+is_remote_selection=false
 if [ -n "$selected_line" ]; then
-    # Field 7 contains the full untruncated branch name (hidden in fzf display but always present)
-    # This avoids issues where truncated branch names in field 1 cause "invalid reference" errors
     field7=$(echo "$selected_line" | cut -d'│' -f7 | tr -d '\n\r' | sed "s/^[[:space:]'\"]*//;s/[[:space:]'\"]*$//")
 
-    # Check if this is a branchless ticket (field 7 starts with "TICKET:")
     if [[ "$field7" == TICKET:* ]]; then
         branch="${field7#TICKET:}"
         # Write CREATE_WT action to action file and process it
         mkdir -p "$CACHE_DIR"
         echo "CREATE_WT:TICKET:$branch" > "$CACHE_DIR/action"
-        # Re-exec to process the action
         exec "$0"
+    elif [[ "$field7" == REMOTE:* ]]; then
+        branch="${field7#REMOTE:}"
+        is_remote_selection=true
     else
         branch="$field7"
     fi
@@ -2822,9 +3042,6 @@ fi
 
 # Only switch if a branch was selected
 if [ -n "$branch" ]; then
-    # Rebuild worktree map in case it changed
-    build_worktree_map
-
     # Check if branch has a worktree
     wt_path=$(get_worktree_path "$branch")
 
@@ -2870,16 +3087,10 @@ if [ -n "$branch" ]; then
         # Otherwise, if in a worktree trying to switch to a different branch, ask what to do
         if [ "$is_in_worktree" = true ] && [ "$branch" = "$expected_branch" ]; then
             # Switching to expected branch - allow without prompting (fixes worktree)
-            current_mode=$(cat "$STATE_FILE" 2>/dev/null || echo "local")
-            if [ "$current_mode" = "origin" ]; then
-                if git show-ref --verify --quiet "refs/heads/$branch"; then
-                    smart_git_switch "$branch"
-                    [ $? -eq 2 ] && exit 0  # If RR_CD was output, exit
-                else
-                    echo "Creating local branch '$branch' tracking 'origin/$branch'..." >&2
-                    smart_git_switch "$branch" "-c" "origin/$branch"
-                    [ $? -eq 2 ] && exit 0  # If RR_CD was output, exit
-                fi
+            if [ "$is_remote_selection" = true ] && ! git show-ref --verify --quiet "refs/heads/$branch"; then
+                echo "Creating local branch '$branch' tracking 'origin/$branch'..." >&2
+                smart_git_switch "$branch" "-c" "origin/$branch"
+                [ $? -eq 2 ] && exit 0  # If RR_CD was output, exit
             else
                 smart_git_switch "$branch"
                 [ $? -eq 2 ] && exit 0  # If RR_CD was output, exit
@@ -2897,14 +3108,25 @@ if [ -n "$branch" ]; then
             main_repo_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
             cd "$current_pwd" 2>/dev/null
 
+            # 'main' always goes directly to main repo without prompting
+            if [ "$branch" = "main" ] || [ "$branch" = "master" ]; then
+                choice_num="2"
+            else
             # Build options with smart styling
             wt_basename=$(basename "$current_wt_path")
 
             # Option 1: Create new worktree (recommended - bright green)
             opt1=$(echo -e "\033[38;5;114m● Create new worktree for '$branch' and go there\033[0m")
 
-            # Option 2: Go to main repo (conditional based on cleanliness)
-            if [ "$main_repo_clean" = true ]; then
+            # Option 2: Go to main repo (conditional based on cleanliness and current branch)
+            if [ "$main_repo_branch" = "$branch" ]; then
+                # Already on target branch - can always navigate there regardless of dirty state
+                if [ "$main_repo_clean" = true ]; then
+                    opt2=$(echo -e "○ Go to main repo \033[2m(already on '$branch')\033[0m")
+                else
+                    opt2=$(echo -e "○ Go to main repo \033[2m(already on '$branch', has uncommitted changes)\033[0m")
+                fi
+            elif [ "$main_repo_clean" = true ]; then
                 opt2=$(echo -e "○ Go to main repo and switch to '$branch' \033[2m(currently on '$main_repo_branch')\033[0m")
             else
                 opt2=$(echo -e "\033[2m○ Go to main repo and switch to '$branch' \033[38;5;167m✗ can't switch - main repo has uncommitted changes\033[0m")
@@ -2925,6 +3147,7 @@ if [ -n "$branch" ]; then
             else
                 choice_num=""
             fi
+            fi  # end non-main branch prompt
 
             case "$choice_num" in
                 1)
@@ -2958,33 +3181,29 @@ if [ -n "$branch" ]; then
                     fi
                     ;;
                 2)
-                    # Go to main repo and switch there
-                    if [ "$main_repo_clean" = false ]; then
-                        echo ""
-                        echo "✗ Cannot switch: The main repo (at $GIT_ROOT) has uncommitted changes" >&2
-                        echo ""
-                        echo "  Fix: Go to the main repo and commit or stash first:" >&2
-                        echo "       cd $GIT_ROOT" >&2
-                        echo "       git add . && git commit -m 'wip'  # or: git stash" >&2
-                        echo ""
-                        exit 1
+                    # Go to main repo and switch there (if needed)
+                    if [ "$main_repo_branch" != "$branch" ]; then
+                        if [ "$main_repo_clean" = false ]; then
+                            echo ""
+                            echo "✗ Cannot switch: The main repo (at $GIT_ROOT) has uncommitted changes" >&2
+                            echo ""
+                            echo "  Fix: Go to the main repo and commit or stash first:" >&2
+                            echo "       cd $GIT_ROOT" >&2
+                            echo "       git add . && git commit -m 'wip'  # or: git stash" >&2
+                            echo ""
+                            exit 1
+                        fi
+                        echo "RR_SWITCH:$branch" >&2
                     fi
-                    echo "RR_CD:$GIT_ROOT" >&2
-                    echo "RR_SWITCH:$branch" >&2
+                    echo "RR_CD:$GIT_ROOT"
                     exit 0
                     ;;
                 3)
                     # Switch current worktree (original behavior)
-                    current_mode=$(cat "$STATE_FILE" 2>/dev/null || echo "local")
-                    if [ "$current_mode" = "origin" ]; then
-                        if git show-ref --verify --quiet "refs/heads/$branch"; then
-                            smart_git_switch "$branch"
-                            [ $? -eq 2 ] && exit 0  # If RR_CD was output, exit
-                        else
-                            echo "Creating local branch '$branch' tracking 'origin/$branch'..." >&2
-                            smart_git_switch "$branch" "-c" "origin/$branch"
-                            [ $? -eq 2 ] && exit 0  # If RR_CD was output, exit
-                        fi
+                    if [ "$is_remote_selection" = true ] && ! git show-ref --verify --quiet "refs/heads/$branch"; then
+                        echo "Creating local branch '$branch' tracking 'origin/$branch'..." >&2
+                        smart_git_switch "$branch" "-c" "origin/$branch"
+                        [ $? -eq 2 ] && exit 0  # If RR_CD was output, exit
                     else
                         smart_git_switch "$branch"
                         [ $? -eq 2 ] && exit 0  # If RR_CD was output, exit
@@ -3001,22 +3220,12 @@ if [ -n "$branch" ]; then
             esac
         else
             # In main repo or other cases - proceed with normal switch
-            current_mode=$(cat "$STATE_FILE" 2>/dev/null || echo "local")
-
-            if [ "$current_mode" = "origin" ]; then
-                # In origin mode - handle remote branches
-                if git show-ref --verify --quiet "refs/heads/$branch"; then
-                    # Local branch exists, just switch to it
-                    smart_git_switch "$branch"
-                    [ $? -eq 2 ] && exit 0  # If RR_CD was output, exit
-                else
-                    # Local branch doesn't exist, create it tracking the remote
-                    echo "Creating local branch '$branch' tracking 'origin/$branch'..." >&2
-                    smart_git_switch "$branch" "-c" "origin/$branch"
-                    [ $? -eq 2 ] && exit 0  # If RR_CD was output, exit
-                fi
+            if [ "$is_remote_selection" = true ] && ! git show-ref --verify --quiet "refs/heads/$branch"; then
+                # Remote-only branch - create local tracking branch
+                echo "Creating local branch '$branch' tracking 'origin/$branch'..." >&2
+                smart_git_switch "$branch" "-c" "origin/$branch"
+                [ $? -eq 2 ] && exit 0  # If RR_CD was output, exit
             else
-                # In local mode - normal switch
                 smart_git_switch "$branch"
                 [ $? -eq 2 ] && exit 0  # If RR_CD was output, exit
             fi
