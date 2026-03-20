@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Create a GitLab Merge Request with optional Jira integration
-# Compatible with bash and zsh
 #
 # Usage:
 #   publish-changes                           Interactive MR creation from current branch
 #   publish-changes PROJ-1234                 Create MR and link to Jira ticket
+#   publish-changes PROJ-1234 PROJ-5678       Link MR to multiple Jira tickets
 #   publish-changes --branch feature/foo      Create MR for specific branch
 #   publish-changes --target main             Pre-select target branch
 #   publish-changes --draft                   Create as draft MR
@@ -38,26 +38,40 @@
 
 set -e
 
-# Load shell compatibility layer
+# Detect if running interactively (has a controlling terminal)
+is_interactive() { [ -c /dev/tty ] 2>/dev/null && [ -t 2 ]; }
+
+# Safe read from tty — returns empty string when non-interactive
+read_tty() {
+    if is_interactive; then
+        read "$@" < /dev/tty
+    else
+        # Set the variable to empty
+        local _varname="${@: -1}"
+        eval "$_varname=''"
+    fi
+}
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-source "$SCRIPT_DIR/../lib/shell-compat.sh"
+source "$SCRIPT_DIR/../lib/ticket-selection.sh"
 
 # Load environment from parent directory
 if [ -f "$SCRIPT_DIR/../.env" ]; then
     source "$SCRIPT_DIR/../.env"
 fi
+source "$SCRIPT_DIR/../lib/env-validate.sh"
 
 # Configuration
 JIRA_DOMAIN="${JIRA_DOMAIN}"
 JIRA_PROJECT="${JIRA_PROJECT}"
 CACHE_DIR="$HOME/.cache/jira-fzf"
+TICKETS_CACHE="$CACHE_DIR/tickets.json"
 
-# Validate required environment variables (only if Jira integration is used)
-# Note: publish-changes can work without Jira if --no-jira flag is used
 MR_CACHE_FILE="$CACHE_DIR/mr_cache.json"
 
 # Arguments
 TICKET_KEY=""
+EXTRA_TICKET_KEYS=()
 SOURCE_BRANCH=""
 TARGET_BRANCH=""
 IS_DRAFT=""
@@ -65,8 +79,11 @@ NO_JIRA=false
 SKIP_PUSH=false
 OUTPUT_URL=false
 NO_DRAFT_PROMPT=false
+FORCE_PUSH=false
 INCLUDE_TICKET_DESCRIPTION=false
 TICKET_DESCRIPTION=""
+MR_TITLE_OVERRIDE=""
+MR_DESCRIPTION_OVERRIDE=""
 
 # Colors
 RED='\033[38;5;167m'
@@ -110,6 +127,10 @@ while [[ "$#" -gt 0 ]]; do
             NO_DRAFT_PROMPT=true
             shift
             ;;
+        --force-push)
+            FORCE_PUSH=true
+            shift
+            ;;
         --include-ticket-description)
             INCLUDE_TICKET_DESCRIPTION=true
             shift
@@ -118,16 +139,26 @@ while [[ "$#" -gt 0 ]]; do
             TICKET_DESCRIPTION="$2"
             shift 2
             ;;
+        --title)
+            MR_TITLE_OVERRIDE="$2"
+            shift 2
+            ;;
+        --description)
+            MR_DESCRIPTION_OVERRIDE="$2"
+            shift 2
+            ;;
         --help|-h)
             head -35 "$0" | tail -33
             exit 0
             ;;
         *)
             # Check if it looks like a Jira ticket
-            if [[ "$1" =~ ^${JIRA_PROJECT}-[0-9]+$ ]]; then
-                TICKET_KEY="$1"
-            elif [[ "$1" =~ ^[A-Z]+-[0-9]+$ ]]; then
-                TICKET_KEY="$1"
+            if [[ "$1" =~ ^${JIRA_PROJECT}-[0-9]+$ ]] || [[ "$1" =~ ^[A-Z]+-[0-9]+$ ]]; then
+                if [ -z "$TICKET_KEY" ]; then
+                    TICKET_KEY="$1"
+                else
+                    EXTRA_TICKET_KEYS+=("$1")
+                fi
             else
                 echo "Unknown argument: $1" >&2
                 exit 1
@@ -136,6 +167,17 @@ while [[ "$#" -gt 0 ]]; do
             ;;
     esac
 done
+
+# Validate env vars (Jira creds not required if --no-jira)
+require_env JIRA_DOMAIN JIRA_PROJECT
+if [ "$NO_JIRA" != "true" ]; then
+    warn_env "Jira integration" JIRA_EMAIL JIRA_API_TOKEN
+fi
+
+if [ -n "$ENV_WARNINGS" ]; then
+    echo -e "\033[38;5;208m${ENV_WARNINGS}\033[0m" >&2
+    echo "" >&2
+fi
 
 # Find fzf
 if [ -x "$HOME/.zsh/fzf/bin/fzf" ]; then
@@ -154,6 +196,14 @@ export FZF_DEFAULT_OPTS="${FZF_DEFAULT_OPTS} --bind 'ctrl-d:half-page-down,ctrl-
 if ! command -v glab &> /dev/null; then
     echo -e "${RED}Error: glab CLI not found${RESET}" >&2
     echo -e "${DIM}Install: https://gitlab.com/gitlab-org/cli${RESET}" >&2
+    exit 1
+fi
+
+# Verify glab is authenticated
+if ! glab auth status >/dev/null 2>&1; then
+    echo -e "${RED}Error: glab is not authenticated${RESET}" >&2
+    echo -e "${DIM}Run: glab auth login${RESET}" >&2
+    echo -e "${DIM}Token needs scopes: api, write_repository${RESET}" >&2
     exit 1
 fi
 
@@ -331,15 +381,20 @@ update_jira_ticket() {
         local domain_count=$(echo "$domains" | wc -l)
         
         if [ "$domain_count" -gt 1 ]; then
-            # Multiple domains - show fzf menu
-            echo -e "  ${CYAN}Select QA domain:${RESET}" >&2
-            qa_branch_domain=$(echo "$domains" | $FZF \
-                --prompt="  QA Domain > " \
-                --height=10 \
-                --reverse \
-                --border=rounded \
-                --header="Select QA branch domain")
-            
+            if is_interactive; then
+                # Multiple domains - show fzf menu
+                echo -e "  ${CYAN}Select QA domain:${RESET}" >&2
+                qa_branch_domain=$(echo "$domains" | $FZF \
+                    --prompt="  QA Domain > " \
+                    --height=10 \
+                    --reverse \
+                    --border=rounded \
+                    --header="Select QA branch domain")
+            else
+                # Non-interactive — use first domain
+                qa_branch_domain=$(echo "$domains" | head -1)
+            fi
+
             if [ -z "$qa_branch_domain" ]; then
                 echo -e "  ${YELLOW}⚠${RESET} QA Branch: No domain selected" >&2
             else
@@ -384,7 +439,7 @@ update_jira_ticket() {
         fi
     fi
     
-    # 3. Status transition (skip for draft MRs)
+    # 3. Status transition and assignee (skip for draft MRs)
     if [ -n "$is_draft" ]; then
         echo -e "  ${DIM}─${RESET} Status: ${DIM}${current_status} (draft MR, not moving to review)${RESET}" >&2
     else
@@ -392,7 +447,7 @@ update_jira_ticket() {
             "https://${JIRA_DOMAIN}/rest/api/3/issue/${key}/transitions" 2>/dev/null)
         local mr_transition_id=$(echo "$transitions" | jq -r '[.transitions[] | select(.name | test("MR|[Mm]erge|[Rr]eview"; "i"))][0].id // empty' 2>/dev/null)
         local mr_transition_name=$(echo "$transitions" | jq -r '[.transitions[] | select(.name | test("MR|[Mm]erge|[Rr]eview"; "i"))][0].name // empty' 2>/dev/null)
-        
+
         if echo "$current_status" | grep -qi "MR\|merge\|review"; then
             echo -e "  ${DIM}─${RESET} Status: ${DIM}${current_status} (already in review)${RESET}" >&2
         elif [ -n "$mr_transition_id" ]; then
@@ -403,6 +458,21 @@ update_jira_ticket() {
                 -d "{\"transition\": {\"id\": \"$mr_transition_id\"}}" 2>/dev/null)
             if [ -z "$transition_result" ]; then
                 echo -e "  ${GREEN}✓${RESET} Status: ${current_status} → ${mr_transition_name}" >&2
+
+                # Auto-assign ticket to current user when moving to MR
+                local current_user_id=$(curl -s --max-time 10 -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
+                    "https://${JIRA_DOMAIN}/rest/api/3/myself" 2>/dev/null | jq -r '.accountId // empty')
+
+                if [ -n "$current_user_id" ]; then
+                    local assign_result=$(curl -s --max-time 10 -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
+                        -X PUT \
+                        "https://${JIRA_DOMAIN}/rest/api/3/issue/${key}" \
+                        -H "Content-Type: application/json" \
+                        -d "{\"fields\": {\"assignee\": {\"accountId\": \"$current_user_id\"}}}" 2>/dev/null)
+                    if [ -z "$assign_result" ]; then
+                        echo -e "  ${GREEN}✓${RESET} Assignee: Assigned to you" >&2
+                    fi
+                fi
             else
                 echo -e "  ${RED}✗${RESET} Status: Could not transition" >&2
             fi
@@ -416,7 +486,7 @@ update_jira_ticket() {
 detect_ticket_from_branch() {
     local branch="$1"
     if [[ "$branch" =~ (${JIRA_PROJECT}-[0-9]+) ]]; then
-        echo "$(shell_get_match 1)"
+        echo "${BASH_REMATCH[1]}"
     fi
 }
 
@@ -479,6 +549,11 @@ if [ -n "$TICKET_KEY" ] && [ "$NO_JIRA" != "true" ]; then
         echo -e "  ${CYAN}Ticket:${RESET} ${TICKET_KEY}" >&2
         echo -e "  ${CYAN}Title:${RESET}  ${summary}" >&2
     fi
+
+    # Prompt for additional tickets (skipped if extras already provided via CLI)
+    if [ "${#EXTRA_TICKET_KEYS[@]}" -eq 0 ]; then
+        prompt_additional_tickets EXTRA_TICKET_KEYS
+    fi
 fi
 
 echo "" >&2
@@ -496,16 +571,25 @@ if [ "$SKIP_PUSH" != "true" ]; then
     git push -u origin "$selected_branch" 2>&1 | tee "$push_tmp" | while read -r line; do
         echo -e "  ${DIM}${line}${RESET}" >&2
     done
-    push_exit_code=$(shell_get_pipe_status 0)
+    push_exit_code="${PIPESTATUS[0]}"
 
-    if [ $push_exit_code -eq 0 ]; then
+    if [ "$push_exit_code" -eq 0 ]; then
         echo -e "  ${GREEN}✓${RESET} Push successful" >&2
     elif grep -q "non-fast-forward\|fetch first\|tip of your current branch is behind" "$push_tmp"; then
         echo -e "  ${RED}✗${RESET} Push rejected (remote has changes not in local branch)" >&2
-        echo "" >&2
-        printf "  ${YELLOW}Force push to overwrite remote?${RESET} ${DIM}(y/N)${RESET} " >&2
-        read -n 1 force_choice < /dev/tty
-        echo "" >&2
+        force_choice=""
+        if [ "$FORCE_PUSH" = "true" ]; then
+            force_choice="y"
+            echo -e "  ${DIM}Force pushing (--force-push flag)${RESET}" >&2
+        elif is_interactive; then
+            echo "" >&2
+            printf "  ${YELLOW}Force push to overwrite remote?${RESET} ${DIM}(y/N)${RESET} " >&2
+            read_tty -n 1 force_choice
+            echo "" >&2
+        else
+            echo -e "  ${RED}✗${RESET} Push cancelled (use --force-push to overwrite)" >&2
+            exit 1
+        fi
         if [[ "$force_choice" =~ ^[Yy]$ ]]; then
             echo -e "  ${DIM}Running: git push -u origin ${selected_branch} --force-with-lease${RESET}" >&2
             git push -u origin "$selected_branch" --force-with-lease 2>&1 | while read -r line; do
@@ -590,7 +674,7 @@ if [ -z "$IS_DRAFT" ] && [ "$NO_DRAFT_PROMPT" != "true" ]; then
     echo -e "${CYAN}┃${RESET} ${BLUE}Step 4/5:${RESET} Create as draft? ${DIM}(y/N)${RESET}                       ${CYAN}┃${RESET}" >&2
     echo -e "${CYAN}┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛${RESET}" >&2
     printf "  ${DIM}Draft MRs cannot be merged until marked ready.${RESET} " >&2
-    read -n 1 draft_choice < /dev/tty
+    read_tty -n 1 draft_choice
     echo "" >&2
     if [[ "$draft_choice" =~ ^[Yy]$ ]]; then
         IS_DRAFT="--draft"
@@ -607,10 +691,24 @@ echo -e "${CYAN}┃${RESET} ${BLUE}Step 5/5:${RESET} Creating Merge Request     
 echo -e "${CYAN}┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛${RESET}" >&2
 
 # Set MR title based on whether we have a ticket
-if [ -n "$TICKET_KEY" ] && [ "$NO_JIRA" != "true" ] && [ -n "$summary" ]; then
+if [ -n "$MR_TITLE_OVERRIDE" ]; then
+    mr_title="$MR_TITLE_OVERRIDE"
+    mr_description="$MR_DESCRIPTION_OVERRIDE"
+elif [ -n "$TICKET_KEY" ] && [ "$NO_JIRA" != "true" ] && [ -n "$summary" ]; then
     mr_title="$TICKET_KEY $summary"
+    for _extra in "${EXTRA_TICKET_KEYS[@]}"; do
+        _extra_summary=$(get_ticket_summary "$_extra")
+        if [ -n "$_extra_summary" ]; then
+            mr_title+=" | $_extra $_extra_summary"
+        else
+            mr_title+=" | $_extra"
+        fi
+    done
     mr_description="Closes $TICKET_KEY"
-    
+    for _extra in "${EXTRA_TICKET_KEYS[@]}"; do
+        mr_description+=$'\nCloses '"$_extra"
+    done
+
     # Include ticket description if requested
     if [ "$INCLUDE_TICKET_DESCRIPTION" = true ]; then
         # Use passed description if available, otherwise fetch from Jira
@@ -695,27 +793,36 @@ else
             # Cache MR info (only for ticket entries)
             if [ -n "$TICKET_KEY" ]; then
                 save_mr_to_cache "$TICKET_KEY" "$mr_url" "$selected_branch"
+                for _extra in "${EXTRA_TICKET_KEYS[@]}"; do
+                    save_mr_to_cache "$_extra" "$mr_url" "$selected_branch"
+                done
             fi
-            
+
             # Copy to clipboard (skip if --output-url to avoid blocking)
             if [ "$OUTPUT_URL" != "true" ]; then
                 if copy_to_clipboard "$mr_url"; then
                     echo -e "  ${DIM}(URL copied to clipboard)${RESET}" >&2
                 fi
             fi
-            
+
             # Update Jira ticket if we have one
             if [ -n "$TICKET_KEY" ] && [ "$NO_JIRA" != "true" ]; then
                 update_jira_ticket "$TICKET_KEY" "$mr_url" "$selected_branch" "$IS_DRAFT"
-                
+                for _extra in "${EXTRA_TICKET_KEYS[@]}"; do
+                    update_jira_ticket "$_extra" "$mr_url" "$selected_branch" "$IS_DRAFT"
+                done
+
                 # Open both MR and Jira (skip if --output-url to avoid blocking)
                 if [ "$OUTPUT_URL" != "true" ]; then
                     echo "" >&2
                     echo -e "  ${DIM}Opening in browser...${RESET}" >&2
-                    jira_url="https://${JIRA_DOMAIN}/browse/${TICKET_KEY}"
                     open_url "${mr_url}/diffs"
                     sleep 0.3
-                    open_url "$jira_url"
+                    open_url "https://${JIRA_DOMAIN}/browse/${TICKET_KEY}"
+                    for _extra in "${EXTRA_TICKET_KEYS[@]}"; do
+                        sleep 0.3
+                        open_url "https://${JIRA_DOMAIN}/browse/${_extra}"
+                    done
                 fi
             else
                 # Just open MR (skip if --output-url to avoid blocking)
@@ -741,8 +848,11 @@ else
             
             if [ -n "$TICKET_KEY" ]; then
                 save_mr_to_cache "$TICKET_KEY" "$mr_url" "$selected_branch"
+                for _extra in "${EXTRA_TICKET_KEYS[@]}"; do
+                    save_mr_to_cache "$_extra" "$mr_url" "$selected_branch"
+                done
             fi
-            
+
             # Skip clipboard and browser if --output-url to avoid blocking
             if [ "$OUTPUT_URL" != "true" ]; then
                 if copy_to_clipboard "$mr_url"; then
