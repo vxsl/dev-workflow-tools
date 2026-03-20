@@ -17,7 +17,7 @@
 #   jira-fzf --labels "front-end,bug"    Set default labels for new tickets
 #   
 # Keybindings:
-#   <CR> maximize preview  <C-y> copy  <C-o> open  <C-t> new  <C-s> sort  <C-r> refresh
+#   <CR> maximize preview  <C-y> copy  <C-o> open  <C-t> new  <C-s> sort  <C-r> refresh  <C-f> search Jira
 #   <C-g> create MR  <C-c> checkout  <C-n>/<C-p> nav  <C-d>/<C-u> page  q/esc close preview
 
 # Load environment variables
@@ -26,6 +26,7 @@ source "$SCRIPT_DIR/../lib/fzf-helpers"
 if [ -f "$SCRIPT_DIR/../.env" ]; then
     source "$SCRIPT_DIR/../.env"
 fi
+source "$SCRIPT_DIR/../lib/env-validate.sh"
 
 # Function to get or set the project directory for git operations
 get_project_dir() {
@@ -118,11 +119,7 @@ JIRA_DOMAIN="${JIRA_DOMAIN}"
 JIRA_PROJECT="${JIRA_PROJECT}"
 CACHE_DIR="$HOME/.cache/jira-fzf"
 
-# Validate required environment variables
-if [ -z "$JIRA_DOMAIN" ] || [ -z "$JIRA_PROJECT" ]; then
-    echo "Error: JIRA_DOMAIN and JIRA_PROJECT must be set in .env or environment" >&2
-    exit 1
-fi
+require_env JIRA_DOMAIN JIRA_PROJECT JIRA_EMAIL JIRA_API_TOKEN
 MR_CACHE_FILE="$CACHE_DIR/mr_cache.json"
 
 # Initialize MR cache if it doesn't exist
@@ -228,12 +225,6 @@ for tool in jq curl; do
     fi
 done
 
-# Check Jira credentials
-if [ -z "$JIRA_EMAIL" ] || [ -z "$JIRA_API_TOKEN" ]; then
-    echo "Error: JIRA_EMAIL and JIRA_API_TOKEN must be set in $SCRIPT_DIR/.env"
-    exit 1
-fi
-
 # Function to call Jira API (v3)
 jira_api() {
     local endpoint="$1"
@@ -280,10 +271,12 @@ get_current_user() {
 get_all_tickets() {
     local force_refresh="$1"
     
-    # Check cache validity
+    # Check cache validity (must exist, be fresh, AND have issues)
     if [ "$force_refresh" != "true" ] && [ -f "$TICKETS_CACHE" ]; then
         local cache_age=$(($(date +%s) - $(stat -c %Y "$TICKETS_CACHE" 2>/dev/null || echo 0)))
-        if [ $cache_age -lt $CACHE_TTL ]; then
+        local issue_count
+        issue_count=$(jq -r '.issues | length' "$TICKETS_CACHE" 2>/dev/null || echo 0)
+        if [ $cache_age -lt $CACHE_TTL ] && [ "$issue_count" -gt 0 ] 2>/dev/null; then
             cat "$TICKETS_CACHE"
             return
         fi
@@ -296,7 +289,7 @@ get_all_tickets() {
     fi
     
     # Fetch fresh data with pagination - API limits to 100 per page
-    local jql="project=${JIRA_PROJECT} ORDER BY ${sort_order}"
+    local jql="project=${JIRA_PROJECT} AND issuetype != Epic ORDER BY ${sort_order}"
     local jql_encoded=$(echo "$jql" | jq -sRr @uri)
     local all_issues="[]"
     local next_page_token=""
@@ -309,7 +302,7 @@ get_all_tickets() {
             url="${url}&nextPageToken=${next_page_token}"
         fi
         
-        local response=$(curl -s -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" "$url")
+        local response=$(curl -s --max-time 15 -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" "$url")
         
         if [ $? -ne 0 ] || ! echo "$response" | jq -e '.issues' >/dev/null 2>&1; then
             if [ $page -eq 0 ]; then
@@ -474,7 +467,7 @@ search_tickets_by_query() {
     fi
     
     # Build JQL for text search
-    local jql="project=${JIRA_PROJECT} AND text ~ \"${query}*\" ORDER BY updated DESC"
+    local jql="project=${JIRA_PROJECT} AND issuetype != Epic AND text ~ \"${query}*\" ORDER BY updated DESC"
     local jql_encoded=$(echo "$jql" | jq -sRr @uri)
     
     # Fetch search results (limit to 50 to keep it fast)
@@ -682,19 +675,62 @@ copy_ticket_dialog() {
         local copy_options="Ticket Key ($key)
 URL ($url)
 Markdown Link ([$key]($url))"
-        
+
         if [ -n "$summary" ]; then
             copy_options="${copy_options}
 Key + Summary ($key: $summary)
 Markdown Link with Summary ([$key: $summary]($url))"
         fi
-        
-        local choice=$(echo "$copy_options" | $FZF \
+
+        copy_options="${copy_options}
+MR Markdown Link (fetches MR URL)"
+
+        # Write options to a temp file; background job appends QA branch when ready
+        local copy_opts_file=$(mktemp /tmp/jira-copy-opts-XXXXXX)
+        echo "$copy_options" > "$copy_opts_file"
+
+        # Background: fetch QA branch URL and append to options file
+        if [ -n "${JIRA_QA_BRANCH_DOMAIN:-}" ]; then
+            (
+                local qa_field_id="${JIRA_QA_BRANCH_FIELD:-}"
+                local tmpfile="/tmp/jira-preview-${key}.json"
+
+                # Auto-detect field ID if not configured
+                if [ -z "$qa_field_id" ]; then
+                    local editmeta
+                    editmeta=$(curl -s --max-time 5 -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
+                        "https://${JIRA_DOMAIN}/rest/api/3/issue/${key}/editmeta" 2>/dev/null)
+                    qa_field_id=$(echo "$editmeta" | jq -r '.fields | to_entries[] | select(.value.name | test("[Qq][Aa].*[Bb]ranch|[Bb]ranch.*[Qq][Aa]"; "i")) | .key' 2>/dev/null | head -1)
+                fi
+
+                [ -z "$qa_field_id" ] && exit 0
+
+                # Get value from preview cache or API
+                local qa_url=""
+                if [ -f "$tmpfile" ]; then
+                    qa_url=$(jq -r ".fields.${qa_field_id} // empty" "$tmpfile" 2>/dev/null)
+                fi
+                if [ -z "$qa_url" ]; then
+                    qa_url=$(curl -s --max-time 5 -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
+                        "https://${JIRA_DOMAIN}/rest/api/3/issue/${key}?fields=${qa_field_id}" 2>/dev/null | \
+                        jq -r ".fields.${qa_field_id} // empty" 2>/dev/null)
+                fi
+
+                if [ -n "$qa_url" ]; then
+                    echo "QA Branch URL (${qa_url})" >> "$copy_opts_file"
+                fi
+            ) &
+        fi
+
+        local choice=$(cat "$copy_opts_file" | $FZF \
             --prompt="  📋 Copy Format > " \
-            --height=12 \
+            --height=15 \
             --reverse \
             --border=rounded \
-            --header="Select format to copy")
+            --header="Select format to copy" \
+            --bind "change:reload:cat $copy_opts_file" \
+            --bind "focus:reload:cat $copy_opts_file")
+        rm -f "$copy_opts_file"
         
         if [ -n "$choice" ]; then
             local to_copy=""
@@ -713,6 +749,19 @@ Markdown Link with Summary ([$key: $summary]($url))"
                     ;;
                 "Key + Summary"*)
                     to_copy="$key: $summary"
+                    ;;
+                "MR Markdown Link"*)
+                    fetch_mr_url_for_ticket "$key"
+                    if [ -n "$_FETCHED_MR_URL" ]; then
+                        if [ -n "$summary" ]; then
+                            to_copy="[$key: $summary]($_FETCHED_MR_URL)"
+                        else
+                            to_copy="[$key]($_FETCHED_MR_URL)"
+                        fi
+                    fi
+                    ;;
+                "QA Branch URL"*)
+                    to_copy=$(echo "$choice" | sed 's/^QA Branch URL (\(.*\))$/\1/')
                     ;;
             esac
             
@@ -879,18 +928,56 @@ open_ticket() {
         local url_to_open=""
         
         # Show options dialog immediately - MR lookup happens lazily when needed
-        local options="Jira ticket
+        local open_opts_file=$(mktemp /tmp/jira-open-opts-XXXXXX)
+        cat > "$open_opts_file" <<'OPTS'
+Jira ticket
 MR
 MR (diff)
 MR (pipelines)
 MR (latest pipeline)
-Both (MR + Jira ticket)"
-        local choice=$(echo "$options" | $FZF \
+Both (MR + Jira ticket)
+OPTS
+
+        # Background: fetch QA branch URL and append to options file
+        if [ -n "${JIRA_QA_BRANCH_DOMAIN:-}" ]; then
+            (
+                local qa_field_id="${JIRA_QA_BRANCH_FIELD:-}"
+                local tmpfile="/tmp/jira-preview-${key}.json"
+
+                if [ -z "$qa_field_id" ]; then
+                    local editmeta
+                    editmeta=$(curl -s --max-time 5 -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
+                        "https://${JIRA_DOMAIN}/rest/api/3/issue/${key}/editmeta" 2>/dev/null)
+                    qa_field_id=$(echo "$editmeta" | jq -r '.fields | to_entries[] | select(.value.name | test("[Qq][Aa].*[Bb]ranch|[Bb]ranch.*[Qq][Aa]"; "i")) | .key' 2>/dev/null | head -1)
+                fi
+
+                [ -z "$qa_field_id" ] && exit 0
+
+                local qa_url=""
+                if [ -f "$tmpfile" ]; then
+                    qa_url=$(jq -r ".fields.${qa_field_id} // empty" "$tmpfile" 2>/dev/null)
+                fi
+                if [ -z "$qa_url" ]; then
+                    qa_url=$(curl -s --max-time 5 -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
+                        "https://${JIRA_DOMAIN}/rest/api/3/issue/${key}?fields=${qa_field_id}" 2>/dev/null | \
+                        jq -r ".fields.${qa_field_id} // empty" 2>/dev/null)
+                fi
+
+                if [ -n "$qa_url" ]; then
+                    echo "QA Branch (${qa_url})" >> "$open_opts_file"
+                fi
+            ) &
+        fi
+
+        local choice=$(cat "$open_opts_file" | $FZF \
             --prompt="  🔗 Open > " \
-            --height=11 \
+            --height=15 \
             --reverse \
             --border=rounded \
-            --header="$key - Choose what to open")
+            --header="$key - Choose what to open" \
+            --bind "change:reload:cat $open_opts_file" \
+            --bind "focus:reload:cat $open_opts_file")
+        rm -f "$open_opts_file"
         
         case "$choice" in
             "MR (diff)")
@@ -1013,6 +1100,16 @@ Both (MR + Jira ticket)"
                 ;;
             "Jira ticket")
                 url_to_open="$jira_url"
+                ;;
+            "QA Branch"*)
+                local qa_url=$(echo "$choice" | sed 's/^QA Branch (\(.*\))$/\1/')
+                if [ -n "${JIRA_QA_BRANCH_OPEN_CMD:-}" ]; then
+                    ( set -- "$qa_url"; eval "$JIRA_QA_BRANCH_OPEN_CMD" )
+                else
+                    open_url "$qa_url"
+                fi
+                echo "✓ Opened QA branch: $qa_url" >&2
+                return
                 ;;
             "Both (MR + Jira ticket)")
                 if fetch_mr_url_for_ticket "$key"; then
@@ -1346,6 +1443,12 @@ switch_to_branch_interactive() {
     read
 }
 
+# Handle --fetch-only: refresh cache without opening UI
+if [ "$1" = "--fetch-only" ]; then
+    get_all_tickets > /dev/null
+    exit $?
+fi
+
 # Handle --generate-list for fzf reload
 if [ "$1" = "--generate-list" ]; then
     generate_ticket_list "$2" "$3"
@@ -1370,6 +1473,49 @@ fi
 if [ "$1" = "--open-ticket" ]; then
     shift
     open_ticket "$@"
+    exit 0
+fi
+
+# Handle --open-qa-branch for fzf execute
+if [ "$1" = "--open-qa-branch" ]; then
+    shift
+    line="$1"
+    key=$(echo "$line" | sed 's/\x1b\[[0-9;]*m//g' | awk '{print $2}')
+    if ! [[ "$key" =~ ^${JIRA_PROJECT}-[0-9]+$ ]]; then
+        key=$(echo "$line" | sed 's/\x1b\[[0-9;]*m//g' | awk '{print $1}')
+    fi
+    if [[ "$key" =~ ^${JIRA_PROJECT}-[0-9]+$ ]] && [ -n "${JIRA_QA_BRANCH_DOMAIN:-}" ]; then
+        qa_field_id="${JIRA_QA_BRANCH_FIELD:-}"
+        if [ -z "$qa_field_id" ]; then
+            editmeta=$(curl -s --max-time 5 -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
+                "https://${JIRA_DOMAIN}/rest/api/3/issue/${key}/editmeta" 2>/dev/null)
+            qa_field_id=$(echo "$editmeta" | jq -r '.fields | to_entries[] | select(.value.name | test("[Qq][Aa].*[Bb]ranch|[Bb]ranch.*[Qq][Aa]"; "i")) | .key' 2>/dev/null | head -1)
+        fi
+        if [ -n "$qa_field_id" ]; then
+            tmpfile="/tmp/jira-preview-${key}.json"
+            qa_url=""
+            if [ -f "$tmpfile" ]; then
+                qa_url=$(jq -r ".fields.${qa_field_id} // empty" "$tmpfile" 2>/dev/null)
+            fi
+            if [ -z "$qa_url" ]; then
+                qa_url=$(curl -s --max-time 5 -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
+                    "https://${JIRA_DOMAIN}/rest/api/3/issue/${key}?fields=${qa_field_id}" 2>/dev/null | \
+                    jq -r ".fields.${qa_field_id} // empty" 2>/dev/null)
+            fi
+            if [ -n "$qa_url" ]; then
+                if [ -n "${JIRA_QA_BRANCH_OPEN_CMD:-}" ]; then
+                    ( set -- "$qa_url"; eval "$JIRA_QA_BRANCH_OPEN_CMD" )
+                else
+                    open_url "$qa_url"
+                fi
+                echo "✓ Opened QA branch: $qa_url" >&2
+            else
+                echo "No QA branch URL found for $key" >&2
+            fi
+        else
+            echo "QA branch field not found" >&2
+        fi
+    fi
     exit 0
 fi
 
@@ -1738,9 +1884,10 @@ export JIRA_FZF_DEFAULT_LABELS="$DEFAULT_LABELS"
     --bind 'ctrl-k:preview-up' \
     --bind "ctrl-r:reload($0 --generate-list true {q})" \
     --bind "ctrl-s:execute($0 --sort-menu < /dev/tty > /dev/tty 2>&1)+reload($0 --generate-list true)" \
-    --bind "change:reload:sleep 0.3; $0 --generate-list false {q}" \
+    --bind "ctrl-f:reload($0 --generate-list false {q})" \
     --bind "ctrl-t:execute($0 --create-ticket {q} < /dev/tty > /dev/tty 2>&1)+reload($0 --generate-list false)" \
     --bind "ctrl-o:execute($0 --open-ticket {} < /dev/tty > /dev/tty 2>&1)" \
+    --bind "ctrl-q:execute-silent($0 --open-qa-branch {})" \
     --bind "enter:transform:[ ! -f $CACHE_DIR/maximized ] && echo 'execute-silent(touch $CACHE_DIR/maximized)+change-preview-window(down:95%)+refresh-preview' || echo 'ignore'" \
     --bind "esc:transform:[ -f $CACHE_DIR/maximized ] && echo 'execute-silent(rm -f $CACHE_DIR/maximized)+change-preview-window(down:40%)+refresh-preview' || echo 'ignore'" \
     --bind "q:transform:[ -f $CACHE_DIR/maximized ] && echo 'execute-silent(rm -f $CACHE_DIR/maximized)+change-preview-window(down:40%)+refresh-preview' || echo 'ignore'" \
