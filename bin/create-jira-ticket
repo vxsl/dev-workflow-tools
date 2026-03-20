@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 # Shared Jira ticket creation script
-# Compatible with bash and zsh
 # Used by jira-fzf, oneshot, and other tools
 #
 # Usage:
@@ -16,9 +15,7 @@
 
 set -e
 
-# Load shell compatibility layer
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-source "$SCRIPT_DIR/../lib/shell-compat.sh"
 
 # Load environment variables
 if [ -f "$SCRIPT_DIR/../.env" ]; then
@@ -26,17 +23,14 @@ if [ -f "$SCRIPT_DIR/../.env" ]; then
     source "$SCRIPT_DIR/../.env"
     set +a
 fi
+source "$SCRIPT_DIR/../lib/env-validate.sh"
 
 # Configuration
 JIRA_DOMAIN="${JIRA_DOMAIN}"
 JIRA_PROJECT="${JIRA_PROJECT}"
 CACHE_DIR="$HOME/.cache/jira-fzf"
 
-# Validate required environment variables
-if [ -z "$JIRA_DOMAIN" ] || [ -z "$JIRA_PROJECT" ]; then
-    echo "Error: JIRA_DOMAIN and JIRA_PROJECT must be set in .env or environment" >&2
-    exit 1
-fi
+require_env JIRA_DOMAIN JIRA_PROJECT JIRA_EMAIL JIRA_API_TOKEN
 DRY_RUN=false
 DEFAULT_LABELS="front-end"
 OUTPUT_FILE=""
@@ -90,12 +84,6 @@ for tool in jq curl; do
         exit 1
     fi
 done
-
-# Check Jira credentials
-if [ -z "$JIRA_EMAIL" ] || [ -z "$JIRA_API_TOKEN" ]; then
-    echo "Error: JIRA_EMAIL and JIRA_API_TOKEN must be set in $SCRIPT_DIR/.env" >&2
-    exit 1
-fi
 
 # Function to call Jira API (v3)
 jira_api() {
@@ -216,16 +204,11 @@ printf "\033[38;5;109m┏━━━━━━━━━━━━━━━━━━�
 printf "\033[38;5;109m┃\033[0m \033[38;5;81mStep 1/8:\033[0m Enter ticket summary                         \033[38;5;109m┃\033[0m\n" >&2
 printf "\033[38;5;109m┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\033[0m\n" >&2
 echo -n "  ✏️  " >&2
-# Cross-shell compatible read with pre-filled value
+# Read summary with pre-filled value for editing
 if [ -n "$INITIAL_SUMMARY" ]; then
-    summary="$INITIAL_SUMMARY"
-    if [ "$SHELL_TYPE" = "bash" ]; then
-read -e -i "$INITIAL_SUMMARY" summary
-    else
-        vared summary
-    fi
+    read -e -i "$INITIAL_SUMMARY" summary < /dev/tty
 else
-    read summary
+    read summary < /dev/tty
 fi
 summary=$(echo "$summary" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
 
@@ -344,7 +327,7 @@ cat > "$tmpdir/description" << EOFDESC
 ${initial_desc}
 EOFDESC
 
-$EDITOR "$tmpdir/description"
+$EDITOR "$tmpdir/description" < /dev/tty > /dev/tty
 desc_text=$(grep -v '^#' "$tmpdir/description")
 desc_preview=$(printf '%s' "$desc_text" | head -c 50)
 
