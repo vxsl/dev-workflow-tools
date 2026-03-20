@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
 # One-shot change: commit staged changes to a new branch and create MR
-# Compatible with bash and zsh
 #
 # Usage:
 #   oneshot                              Interactive ticket selection (or create new)
-#   oneshot PROJ-1234                    Use existing ticket
+#   oneshot PROJ-1234                    Use existing ticket (prompts for additional tickets)
 #   oneshot "Ticket title here"          Create new ticket with given title
-#   oneshot https://slack.com/...        Create ticket + link to Slack thread
+#   oneshot https://slack.com/.../p...    Create ticket + link to Slack thread
+#   oneshot https://slack.com/.../       Create ticket + post to Slack channel
+#   oneshot --hotfix                     Hotfix mode: skip ticket, branch as hotfix/<slug>
+#   oneshot --hotfix "description"       Hotfix with description (skips prompt)
+#   oneshot --hotfix https://slack...    Hotfix + post MR link to Slack thread/channel
 #   oneshot --dry-run                    Show what would be done
 #   oneshot --base origin/main           Explicitly set base branch (default: origin/main)
 #   oneshot --include-ticket-description Include ticket description in MR description
@@ -22,7 +25,7 @@
 #      - Supports multiple commits interactively
 #      - Re-runs pre-push checks before publishing
 #   5. Run publish-changes to create MR
-#   6. (If Slack URL) Post ticket link back to thread
+#   6. (If Slack URL) Post ticket link back to thread/channel
 #
 # Resumability:
 #   - State is saved after ticket creation
@@ -31,9 +34,8 @@
 
 set -e
 
-# Load shell compatibility layer
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-source "$SCRIPT_DIR/../lib/shell-compat.sh"
+source "$SCRIPT_DIR/../lib/ticket-selection.sh"
 
 # Load environment variables
 if [ -f "$SCRIPT_DIR/../.env" ]; then
@@ -41,6 +43,7 @@ if [ -f "$SCRIPT_DIR/../.env" ]; then
     source "$SCRIPT_DIR/../.env"
     set +a
 fi
+source "$SCRIPT_DIR/../lib/env-validate.sh"
 
 # Configuration
 JIRA_DOMAIN="${JIRA_DOMAIN}"
@@ -48,11 +51,6 @@ JIRA_PROJECT="${JIRA_PROJECT}"
 CACHE_DIR="$HOME/.cache/jira-fzf"
 STATE_DIR="$HOME/.cache/oneshot-state"
 
-# Validate required environment variables
-if [ -z "$JIRA_DOMAIN" ] || [ -z "$JIRA_PROJECT" ]; then
-    echo "Error: JIRA_DOMAIN and JIRA_PROJECT must be set in .env or environment" >&2
-    exit 1
-fi
 TICKETS_CACHE="$CACHE_DIR/tickets.json"
 mkdir -p "$STATE_DIR"
 DRY_RUN=false
@@ -62,6 +60,11 @@ SLACK_CHANNEL=""
 SLACK_THREAD_TS=""
 INCLUDE_TICKET_DESCRIPTION=false
 NEW_TICKET_TITLE=""
+HOTFIX_MODE=false
+HOTFIX_DESCRIPTION=""
+PREEXISTING_COMMITS=false
+PREEXISTING_COMMITS_BRANCH=""
+REBASED=false
 
 # Colors
 RED='\033[38;5;167m'
@@ -89,18 +92,31 @@ while [[ "$#" -gt 0 ]]; do
             INCLUDE_TICKET_DESCRIPTION=true
             shift
             ;;
+        --hotfix)
+            HOTFIX_MODE=true
+            shift
+            ;;
         --help|-h)
             head -20 "$0" | tail -19
             exit 0
             ;;
         *)
-            # Check if it's a Slack URL
+            # Check if it's a Slack thread URL (/archives/CHANNEL/pTIMESTAMP)
             if [[ "$1" =~ ^https://.*slack\.com/archives/([A-Z0-9]+)/p([0-9]+) ]]; then
                 SLACK_URL="$1"
-                SLACK_CHANNEL=$(shell_get_match 1)
+                SLACK_CHANNEL=${BASH_REMATCH[1]}
                 # Convert p1234567890123456 to 1234567890.123456 format
-                raw_ts=$(shell_get_match 2)
+                raw_ts=${BASH_REMATCH[2]}
                 SLACK_THREAD_TS="${raw_ts:0:10}.${raw_ts:10}"
+            # Check if it's a Slack channel URL (/archives/CHANNEL or /client/WORKSPACE/CHANNEL)
+            elif [[ "$1" =~ ^https://.*slack\.com/archives/([A-Z0-9]+)/?$ ]]; then
+                SLACK_URL="$1"
+                SLACK_CHANNEL=${BASH_REMATCH[1]}
+                SLACK_THREAD_TS=""
+            elif [[ "$1" =~ ^https://.*slack\.com/client/[A-Z0-9]+/([A-Z0-9]+) ]]; then
+                SLACK_URL="$1"
+                SLACK_CHANNEL=${BASH_REMATCH[1]}
+                SLACK_THREAD_TS=""
             # Check if it looks like a Jira ticket
             elif [[ "$1" =~ ^${JIRA_PROJECT}-[0-9]+$ ]]; then
                 TICKET_KEY="$1"
@@ -134,9 +150,72 @@ if ! git rev-parse --git-dir >/dev/null 2>&1; then
     exit 1
 fi
 
+# Validate env vars: JIRA_DOMAIN/PROJECT always needed, API creds needed unless hotfix
+require_env JIRA_DOMAIN JIRA_PROJECT
+if [ "$HOTFIX_MODE" != "true" ]; then
+    require_env JIRA_EMAIL JIRA_API_TOKEN
+fi
+
+# Kick off ticket cache refresh in background immediately
+"$SCRIPT_DIR/jira-fzf" --fetch-only >/dev/null &
+TICKET_FETCH_PID=$!
+
 # ============================================================================
 # Functions
 # ============================================================================
+
+# Prompt: create Jira ticket or hotfix? Returns "ticket" or "hotfix".
+prompt_ticket_or_hotfix() {
+    echo -e "  ${CYAN}Create ticket or hotfix?${RESET}" >&2
+    echo -e "    ${DIM}1) Create Jira ticket${RESET}" >&2
+    echo -e "    ${DIM}2) Hotfix (no ticket)${RESET}" >&2
+    local _choice
+    read -p "  > " -n 1 -r _choice < /dev/tty
+    echo "" >&2
+    echo "" >&2
+    if [[ $_choice =~ ^[2]$ ]]; then
+        echo "hotfix"
+    else
+        echo "ticket"
+    fi
+}
+
+# Convert a string to a URL-safe slug (lowercase, hyphens)
+slugify() {
+    echo "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g; s/-\+/-/g; s/^-\|-$//g'
+}
+
+# Set up hotfix state (shared between --hotfix flag and interactive HOTFIX selection)
+handle_hotfix_setup() {
+    HOTFIX_MODE=true
+    echo -e "  ${CYAN}Hotfix mode: No Jira ticket required${RESET}" >&2
+    echo "" >&2
+
+    # Use NEW_TICKET_TITLE as description if provided via positional arg
+    if [ -z "$HOTFIX_DESCRIPTION" ] && [ -n "$NEW_TICKET_TITLE" ]; then
+        HOTFIX_DESCRIPTION="$NEW_TICKET_TITLE"
+    fi
+
+    if [ -z "$HOTFIX_DESCRIPTION" ]; then
+        echo -e "  ${CYAN}Enter hotfix description:${RESET}" >&2
+        read -p "  > " -r HOTFIX_DESCRIPTION < /dev/tty
+        echo "" >&2
+    fi
+
+    if [ -z "$HOTFIX_DESCRIPTION" ]; then
+        echo -e "  ${RED}✗ Hotfix description required${RESET}" >&2
+        exit 1
+    fi
+
+    TICKET_KEY=""
+    summary="$HOTFIX_DESCRIPTION"
+    branch_name="hotfix/$(slugify "$HOTFIX_DESCRIPTION")"
+    commit_message="$HOTFIX_DESCRIPTION"
+    ticket_description=""
+
+    echo -e "  ${GREEN}✓${RESET} Hotfix: ${CYAN}${HOTFIX_DESCRIPTION}${RESET}" >&2
+    echo -e "  ${DIM}Branch: ${branch_name}${RESET}" >&2
+}
 
 # Call Jira API
 jira_api() {
@@ -173,13 +252,6 @@ get_current_user_id() {
         return 1
     fi
     jira_api "myself" 2>/dev/null | jq -r '.accountId // empty' 2>/dev/null
-}
-
-# Get cached tickets for fzf selection
-get_cached_tickets() {
-    if [ -f "$TICKETS_CACHE" ]; then
-        jq -r '.issues[] | .key + "\t" + .fields.summary' "$TICKETS_CACHE" 2>/dev/null
-    fi
 }
 
 # Get cache key for current staged changes
@@ -253,7 +325,9 @@ run_prepush_checks() {
     fi
     
     # Get git hooks path (could be custom via core.hooksPath)
-    local hooks_path=$(git config core.hooksPath || echo ".git/hooks")
+    # In a worktree, .git is a file; hooks live in the common git dir
+    local hooks_path
+    hooks_path=$(git config core.hooksPath 2>/dev/null) || hooks_path="$(git rev-parse --git-common-dir)/hooks"
     local pre_push_hook="${hooks_path}/pre-push"
     
     local result=0
@@ -271,7 +345,7 @@ run_prepush_checks() {
         # Skip protected branch check since we're creating a new branch anyway
         local exit_code=0
         echo "refs/heads/${current_branch} ${current_sha} refs/heads/main 0000000000000000000000000000000000000000" | SKIP_PROTECTED_BRANCH_CHECK=true "$pre_push_hook" 2>&1 >&2
-        exit_code=$(shell_get_pipe_status 1)
+        exit_code="${PIPESTATUS[1]}"
         
         if [ $exit_code -eq 0 ]; then
             echo -e "  ${GREEN}✓${RESET} Pre-push hook passed" >&2
@@ -376,22 +450,38 @@ post_to_slack() {
             ;;
         mr)
             local mr_num=$(echo "$url" | grep -oE '[0-9]+$')
-            text=$':gitlab: MR: <'"${url}|!${mr_num}"$'> :shipit:'
+            local author_first=$(git config user.name 2>/dev/null | cut -d' ' -f1)
+            local author="${author_first:-Someone}"
+            if [ -n "$thread_ts" ]; then
+                text=":gitlab: ${author} posted an MR related to this thread: <${url}|!${mr_num} — ${title}>"
+            else
+                text=":gitlab: ${author} posted an MR: <${url}|!${mr_num} — ${title}>"
+            fi
             ;;
         *)
             text="$url"
             ;;
     esac
     
+    local payload
+    if [ -n "$thread_ts" ]; then
+        payload=$(jq -n \
+            --arg channel "$channel" \
+            --arg thread_ts "$thread_ts" \
+            --arg text "$text" \
+            '{channel: $channel, thread_ts: $thread_ts, text: $text, unfurl_links: true, mrkdwn: true}')
+    else
+        payload=$(jq -n \
+            --arg channel "$channel" \
+            --arg text "$text" \
+            '{channel: $channel, text: $text, unfurl_links: true, mrkdwn: true}')
+    fi
+
     local response
     response=$(curl -s -X POST "https://slack.com/api/chat.postMessage" \
         -H "Authorization: Bearer ${TICKET_CREATOR_BOT_TOKEN}" \
         -H "Content-Type: application/json" \
-        -d "$(jq -n \
-            --arg channel "$channel" \
-            --arg thread_ts "$thread_ts" \
-            --arg text "$text" \
-            '{channel: $channel, thread_ts: $thread_ts, text: $text, unfurl_links: true, mrkdwn: true}')")
+        -d "$payload")
     
     if echo "$response" | jq -e '.ok == true' >/dev/null 2>&1; then
         return 0
@@ -453,57 +543,6 @@ clear_state() {
     rm -f "$state_file"
 }
 
-# Select ticket interactively (or create new)
-select_ticket_or_slack() {
-    echo -e "${CYAN}┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓${RESET}" >&2
-    echo -e "${CYAN}┃${RESET} ${BLUE}Select ticket${RESET} or create new                            ${CYAN}┃${RESET}" >&2
-    echo -e "${CYAN}┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛${RESET}" >&2
-    
-    local selection
-    selection=$( { echo -e "NEW\t✨ Create new ticket"; get_cached_tickets; } | $FZF \
-        --prompt="  🎫 Ticket > " \
-        --height=20 \
-        --reverse \
-        --border=rounded \
-        --delimiter='\t' \
-        --with-nth=1,2 \
-        --preview='key=$(echo {} | cut -f1); if [ "$key" = "NEW" ]; then echo "Create a new Jira ticket"; else curl -s -u "'"${JIRA_EMAIL}:${JIRA_API_TOKEN}"'" "https://'"${JIRA_DOMAIN}"'/rest/api/3/issue/${key}?fields=summary,status,assignee" 2>/dev/null | jq -r "\"Status: \" + .fields.status.name + \"\nAssignee: \" + (.fields.assignee.displayName // \"Unassigned\") + \"\n\n\" + .fields.summary" 2>/dev/null || echo "Loading..."; fi' \
-        --preview-window=right:40%:wrap \
-        --header="Enter: select │ Type ticket title or paste Slack URL" \
-        --print-query)
-    
-    # Check what user entered
-    local query=$(echo "$selection" | head -1)
-    local selected=$(echo "$selection" | tail -1)
-    
-    # Check if it's a Slack URL
-    if [[ "$query" =~ ^https://.*slack\.com/archives/([A-Z0-9]+)/p([0-9]+) ]]; then
-        echo "SLACK:$query"
-        return 0
-    fi
-    
-    # Check if user selected "Create new ticket"
-    if [[ "$selected" =~ ^NEW ]]; then
-        echo "NEW"
-        return 0
-    fi
-    
-    # If selected differs from query, user selected an item from the list
-    if [ -n "$selected" ] && [ "$selected" != "$query" ]; then
-        echo "$selected" | cut -f1
-    # If selected equals query or is empty, no item was selected - check what was typed
-    elif [[ "$query" =~ ^${JIRA_PROJECT}-[0-9]+$ ]]; then
-        echo "$query"
-    elif [[ "$query" =~ ^[0-9]+$ ]]; then
-        echo "${JIRA_PROJECT}-$query"
-    elif [ -n "$query" ]; then
-        # Treat non-empty query as ticket title (when no items matched)
-        echo "TITLE:$query"
-    else
-        echo ""
-    fi
-}
-
 # ============================================================================
 # Main flow
 # ============================================================================
@@ -527,18 +566,22 @@ if [ -n "$saved_state" ]; then
     saved_timestamp=$(echo "$saved_state" | jq -r '.timestamp')
     
     echo -e "${YELLOW}⚠ Found incomplete oneshot from ${saved_timestamp}${RESET}" >&2
-    echo -e "  ${CYAN}Ticket:${RESET} ${saved_ticket}" >&2
+    if [ "$saved_ticket" = "HOTFIX" ]; then
+        echo -e "  ${CYAN}Type:${RESET}   Hotfix" >&2
+    else
+        echo -e "  ${CYAN}Ticket:${RESET} ${saved_ticket}" >&2
+    fi
     echo -e "  ${CYAN}Branch:${RESET} ${saved_branch}" >&2
     if [ -n "$saved_summary" ]; then
         echo -e "  ${CYAN}Summary:${RESET} ${DIM}${saved_summary}${RESET}" >&2
     fi
     echo "" >&2
-    echo -e "  ${CYAN}Resume from saved state?${RESET} ${DIM}(y/n)${RESET}" >&2
-    shell_read_prompt "  > " resume_response "-k 1"
+    echo -e "  ${CYAN}Resume from saved state?${RESET} ${DIM}(Y/n)${RESET}" >&2
+    read -p "  > " -n 1 -r resume_response < /dev/tty
     echo "" >&2
     echo "" >&2
-    
-    if [[ $resume_response =~ ^[Yy]$ ]]; then
+
+    if [[ ! $resume_response =~ ^[Nn]$ ]]; then
         # Load state variables
         TICKET_KEY="$saved_ticket"
         summary="$saved_summary"
@@ -548,11 +591,19 @@ if [ -n "$saved_state" ]; then
         SLACK_CHANNEL=$(echo "$saved_state" | jq -r '.slack_channel // empty')
         SLACK_THREAD_TS=$(echo "$saved_state" | jq -r '.slack_thread_ts // empty')
         
-        # Set commit_message for Slack post
-        if [ -n "$summary" ]; then
-            commit_message="$TICKET_KEY: $summary"
+        # Detect hotfix resume
+        if [ "$TICKET_KEY" = "HOTFIX" ]; then
+            HOTFIX_MODE=true
+            TICKET_KEY=""
+            HOTFIX_DESCRIPTION="$summary"
+            commit_message="$summary"
         else
-            commit_message="$TICKET_KEY"
+            # Set commit_message for Slack post
+            if [ -n "$summary" ]; then
+                commit_message="$TICKET_KEY: $summary"
+            else
+                commit_message="$TICKET_KEY"
+            fi
         fi
         
         # Skip to Step 3
@@ -564,17 +615,29 @@ if [ -n "$saved_state" ]; then
         # Verify we're on the correct branch
         current_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
         if [ "$current_branch" != "$branch_name" ]; then
-            echo -e "  ${YELLOW}⚠ Currently on ${current_branch}, switching to ${branch_name}${RESET}" >&2
-            if [ "$DRY_RUN" != true ]; then
-                if ! git checkout "$branch_name" 2>&1 | while read -r line; do echo -e "    ${DIM}${line}${RESET}" >&2; done; then
-                    echo -e "  ${RED}✗ Failed to checkout branch${RESET}" >&2
-                    exit 1
+            if git show-ref --verify --quiet "refs/heads/$branch_name"; then
+                # Branch exists locally, just check it out
+                echo -e "  ${YELLOW}⚠ Currently on ${current_branch}, switching to ${branch_name}${RESET}" >&2
+                if [ "$DRY_RUN" != true ]; then
+                    checkout_out=$(git checkout "$branch_name" 2>&1)
+                    checkout_exit=$?
+                    echo "$checkout_out" | while read -r line; do echo -e "    ${DIM}${line}${RESET}" >&2; done
+                    if [ $checkout_exit -ne 0 ]; then
+                        echo -e "  ${RED}✗ Failed to checkout branch${RESET}" >&2
+                        exit 1
+                    fi
                 fi
+            else
+                # Branch doesn't exist yet (previous run failed before creating it)
+                echo -e "  ${YELLOW}⚠ Branch ${branch_name} not found locally — will create it${RESET}" >&2
+                SKIP_TO_COMMIT_LOOP=false
             fi
         fi
-        
-        # Jump to commit loop (skip steps 1-2)
-        SKIP_TO_COMMIT_LOOP
+
+        # Jump to commit loop (skip steps 1-2) only if branch is ready
+        if [ "${SKIP_TO_COMMIT_LOOP:-true}" != false ]; then
+            SKIP_TO_COMMIT_LOOP=true
+        fi
     else
         clear_state
         echo -e "  ${DIM}Cleared saved state, starting fresh${RESET}" >&2
@@ -585,32 +648,53 @@ fi
 # Step 1: Check for staged changes
 if [ "${SKIP_TO_COMMIT_LOOP:-false}" != true ]; then
     echo -e "${CYAN}┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓${RESET}" >&2
-    echo -e "${CYAN}┃${RESET} ${BLUE}Step 1/4:${RESET} Checking staged changes                       ${CYAN}┃${RESET}" >&2
+    echo -e "${CYAN}┃${RESET} ${BLUE}Step 1/4:${RESET} Checking changes                              ${CYAN}┃${RESET}" >&2
     echo -e "${CYAN}┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛${RESET}" >&2
 
     staged_files=$(git diff --cached --name-only)
     staged_count=$(echo "$staged_files" | grep -c . || true)
 
-    if [ "$staged_count" -eq 0 ]; then
+    # Check for commits not yet pushed to any origin ref
+    ahead_count=$(git rev-list HEAD --not --remotes=origin --count 2>/dev/null || echo 0)
+
+    if [ "$staged_count" -eq 0 ] && [ "$ahead_count" -eq 0 ]; then
         echo -e "  ${RED}✗ No staged changes${RESET}" >&2
         echo -e "  ${DIM}Stage changes first: git add <files>${RESET}" >&2
         exit 1
     fi
 
-    echo -e "  ${GREEN}✓${RESET} ${staged_count} file(s) staged:" >&2
-    echo "$staged_files" | head -5 | while read -r file; do
-        echo -e "    ${DIM}${file}${RESET}" >&2
-    done
-    if [ "$staged_count" -gt 5 ]; then
-        echo -e "    ${DIM}... and $((staged_count - 5)) more${RESET}" >&2
+    if [ "$ahead_count" -gt 0 ]; then
+        PREEXISTING_COMMITS=true
+        PREEXISTING_COMMITS_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+        if [ "$staged_count" -eq 0 ]; then
+            echo -e "  ${YELLOW}⚠ No staged changes, but found ${ahead_count} unpublished commit(s):${RESET}" >&2
+        else
+            echo -e "  ${YELLOW}⚠ Found ${ahead_count} existing unpublished commit(s):${RESET}" >&2
+        fi
+        git rev-list HEAD --not --remotes=origin --oneline 2>/dev/null | while read -r line; do
+            echo -e "    ${DIM}${line}${RESET}" >&2
+        done
+        echo "" >&2
+        echo -e "  ${GREEN}✓${RESET} Will move these commits to a new branch" >&2
+        echo "" >&2
     fi
-    echo "" >&2
 
-    # Step 1.5: Run pre-push checks
-    if [ "$DRY_RUN" != true ]; then
+    if [ "$staged_count" -gt 0 ]; then
+        echo -e "  ${GREEN}✓${RESET} ${staged_count} file(s) staged:" >&2
+        echo "$staged_files" | head -5 | while read -r file; do
+            echo -e "    ${DIM}${file}${RESET}" >&2
+        done
+        if [ "$staged_count" -gt 5 ]; then
+            echo -e "    ${DIM}... and $((staged_count - 5)) more${RESET}" >&2
+        fi
+        echo "" >&2
+    fi
+
+    # Step 1.5: Run pre-push checks (only when there are staged changes to validate)
+    if [ "$staged_count" -gt 0 ] && [ "$DRY_RUN" != true ]; then
         # Determine repository root
         repo_root=$(git rev-parse --show-toplevel)
-        
+
         if ! run_prepush_checks "$repo_root"; then
             exit 1
         fi
@@ -623,58 +707,72 @@ echo -e "${CYAN}┏━━━━━━━━━━━━━━━━━━━━�
 echo -e "${CYAN}┃${RESET} ${BLUE}Step 2/4:${RESET} Select Jira ticket                            ${CYAN}┃${RESET}" >&2
 echo -e "${CYAN}┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛${RESET}" >&2
 
+# Handle hotfix mode (from --hotfix flag) — takes priority over ticket/Slack flows
+if [ "$HOTFIX_MODE" = true ]; then
+    handle_hotfix_setup
+
 # Handle Slack URL from argument
-if [ -n "$SLACK_URL" ]; then
-    echo -e "  ${CYAN}Slack thread:${RESET} ${DIM}${SLACK_URL}${RESET}" >&2
-    
+elif [ -n "$SLACK_URL" ]; then
+    if [ -n "$SLACK_THREAD_TS" ]; then
+        echo -e "  ${CYAN}Slack thread:${RESET} ${DIM}${SLACK_URL}${RESET}" >&2
+    else
+        echo -e "  ${CYAN}Slack channel:${RESET} ${DIM}${SLACK_URL}${RESET}" >&2
+    fi
+
     # Verify bot can post to the channel
     if [ "$DRY_RUN" != true ] && [ -n "$TICKET_CREATOR_BOT_TOKEN" ]; then
         if ! verify_slack_channel_access "$SLACK_CHANNEL"; then
             exit 1
         fi
     fi
-    
+
     echo "" >&2
-    
-    # Build flags for create-jira-ticket
-    flags=()
-    if [ "$DRY_RUN" = true ]; then
-        flags+=(--dry-run)
-    fi
-    
-    if [ -n "$SLACK_URL" ]; then
-        flags+=(--slack-url "$SLACK_URL")
-    fi
-    
-    # Call the shared create-jira-ticket script
-    # Use temp file to capture JSON output
-    result_file=$(mktemp)
-    trap "rm -f '$result_file'" EXIT
-    
-    if ! "$SCRIPT_DIR/create-jira-ticket" "${flags[@]}" --output-file "$result_file"; then
-        echo -e "  ${RED}✗ Failed to create ticket${RESET}" >&2
+
+    if [ "$(prompt_ticket_or_hotfix)" = "hotfix" ]; then
+        handle_hotfix_setup
+    else
+        # Build flags for create-jira-ticket
+        flags=()
+        if [ "$DRY_RUN" = true ]; then
+            flags+=(--dry-run)
+        fi
+
+        if [ -n "$SLACK_URL" ]; then
+            flags+=(--slack-url "$SLACK_URL")
+        fi
+
+        # Call the shared create-jira-ticket script
+        # Use temp file to capture JSON output
+        result_file=$(mktemp)
+        trap "rm -f '$result_file'" EXIT
+
+        if ! "$SCRIPT_DIR/create-jira-ticket" "${flags[@]}" --output-file "$result_file"; then
+            echo -e "  ${RED}✗ Failed to create ticket${RESET}" >&2
+            rm -f "$result_file"
+            exit 1
+        fi
+        echo "" >&2
+        echo -e "  ${DIM}Processing ticket information...${RESET}" >&2
+        TICKET_KEY=$(jq -r '.key' < "$result_file")
+        summary=$(jq -r '.summary' < "$result_file")
+        ticket_description=$(jq -r '.description // empty' < "$result_file")
         rm -f "$result_file"
-        exit 1
-    fi
-    echo "" >&2
-    echo -e "  ${DIM}Processing ticket information...${RESET}" >&2
-    TICKET_KEY=$(jq -r '.key' < "$result_file")
-    summary=$(jq -r '.summary' < "$result_file")
-    ticket_description=$(jq -r '.description // empty' < "$result_file")
-    rm -f "$result_file"
-    
-    if [ -z "$TICKET_KEY" ] || ! [[ "$TICKET_KEY" =~ ^${JIRA_PROJECT}-[0-9]+$ ]]; then
-        echo -e "  ${RED}✗ Failed to create ticket${RESET}" >&2
-        exit 1
-    fi
-    
-    # Post to Slack if we have a thread
-    if [ -n "$SLACK_URL" ] && [ "$DRY_RUN" != true ]; then
-        echo -e "  ${DIM}Posting to Slack thread...${RESET}" >&2
-        
-        jira_url="https://${JIRA_DOMAIN}/browse/${TICKET_KEY}"
-        if post_to_slack "$SLACK_CHANNEL" "$SLACK_THREAD_TS" "ticket" "$jira_url" "${TICKET_KEY}: ${summary}"; then
-            echo -e "  ${GREEN}✓${RESET} Posted ticket link to Slack" >&2
+
+        if [ -z "$TICKET_KEY" ] || ! [[ "$TICKET_KEY" =~ ^${JIRA_PROJECT}-[0-9]+$ ]]; then
+            echo -e "  ${RED}✗ Failed to create ticket${RESET}" >&2
+            exit 1
+        fi
+
+        # Post to Slack if we have a URL
+        if [ -n "$SLACK_URL" ] && [ "$DRY_RUN" != true ]; then
+            slack_target="channel"
+            [ -n "$SLACK_THREAD_TS" ] && slack_target="thread"
+            echo -e "  ${DIM}Posting to Slack ${slack_target}...${RESET}" >&2
+
+            jira_url="https://${JIRA_DOMAIN}/browse/${TICKET_KEY}"
+            if post_to_slack "$SLACK_CHANNEL" "$SLACK_THREAD_TS" "ticket" "$jira_url" "${TICKET_KEY}: ${summary}"; then
+                echo -e "  ${GREEN}✓${RESET} Posted ticket link to Slack ${slack_target}" >&2
+            fi
         fi
     fi
 
@@ -726,9 +824,13 @@ elif [ -n "$NEW_TICKET_TITLE" ]; then
 # Interactive selection
 else
     selection=$(select_ticket_or_slack)
-    
+
+    # Check if user selected hotfix
+    if [ "$selection" = "HOTFIX" ]; then
+        handle_hotfix_setup
+
     # Check if user wants to create a new ticket
-    if [ "$selection" = "NEW" ]; then
+    elif [ "$selection" = "NEW" ]; then
         echo -e "  ${CYAN}Creating new ticket${RESET}" >&2
         echo "" >&2
         
@@ -794,17 +896,27 @@ else
         fi
     # Check if user entered a Slack URL
     elif [[ "$selection" =~ ^SLACK:(.+)$ ]]; then
-        SLACK_URL=$(shell_get_match 1)
+        SLACK_URL=${BASH_REMATCH[1]}
         
-        # Parse Slack URL
+        # Parse Slack URL (thread or channel)
         if [[ "$SLACK_URL" =~ ^https://.*slack\.com/archives/([A-Z0-9]+)/p([0-9]+) ]]; then
-            SLACK_CHANNEL=$(shell_get_match 1)
-            raw_ts=$(shell_get_match 2)
+            SLACK_CHANNEL=${BASH_REMATCH[1]}
+            raw_ts=${BASH_REMATCH[2]}
             SLACK_THREAD_TS="${raw_ts:0:10}.${raw_ts:10}"
+        elif [[ "$SLACK_URL" =~ ^https://.*slack\.com/archives/([A-Z0-9]+)/?$ ]]; then
+            SLACK_CHANNEL=${BASH_REMATCH[1]}
+            SLACK_THREAD_TS=""
+        elif [[ "$SLACK_URL" =~ ^https://.*slack\.com/client/[A-Z0-9]+/([A-Z0-9]+) ]]; then
+            SLACK_CHANNEL=${BASH_REMATCH[1]}
+            SLACK_THREAD_TS=""
         fi
-        
+
         echo "" >&2
-        echo -e "  ${CYAN}Slack thread:${RESET} ${DIM}${SLACK_URL}${RESET}" >&2
+        if [ -n "$SLACK_THREAD_TS" ]; then
+            echo -e "  ${CYAN}Slack thread:${RESET} ${DIM}${SLACK_URL}${RESET}" >&2
+        else
+            echo -e "  ${CYAN}Slack channel:${RESET} ${DIM}${SLACK_URL}${RESET}" >&2
+        fi
         
         # Verify bot can post to the channel
         if [ "$DRY_RUN" != true ] && [ -n "$TICKET_CREATOR_BOT_TOKEN" ]; then
@@ -814,42 +926,48 @@ else
         fi
         
         echo "" >&2
-        
-        # Build flags for create-jira-ticket
-        flags=()
-        if [ "$DRY_RUN" = true ]; then
-            flags+=(--dry-run)
-        fi
-        
-        # Call the shared create-jira-ticket script with Slack URL
-        # Use temp file to capture JSON output
-        result_file=$(mktemp)
-        trap "rm -f '$result_file'" EXIT
-        
-        if ! "$SCRIPT_DIR/create-jira-ticket" "${flags[@]}" --slack-url "$SLACK_URL" --output-file "$result_file"; then
-            echo -e "  ${RED}✗ Failed to create ticket${RESET}" >&2
+
+        if [ "$(prompt_ticket_or_hotfix)" = "hotfix" ]; then
+            handle_hotfix_setup
+        else
+            # Build flags for create-jira-ticket
+            flags=()
+            if [ "$DRY_RUN" = true ]; then
+                flags+=(--dry-run)
+            fi
+
+            # Call the shared create-jira-ticket script with Slack URL
+            # Use temp file to capture JSON output
+            result_file=$(mktemp)
+            trap "rm -f '$result_file'" EXIT
+
+            if ! "$SCRIPT_DIR/create-jira-ticket" "${flags[@]}" --slack-url "$SLACK_URL" --output-file "$result_file"; then
+                echo -e "  ${RED}✗ Failed to create ticket${RESET}" >&2
+                rm -f "$result_file"
+                exit 1
+            fi
+            echo "" >&2
+            echo -e "  ${DIM}Processing ticket information...${RESET}" >&2
+            TICKET_KEY=$(jq -r '.key' < "$result_file")
+            summary=$(jq -r '.summary' < "$result_file")
+            ticket_description=$(jq -r '.description // empty' < "$result_file")
             rm -f "$result_file"
-            exit 1
-        fi
-        echo "" >&2
-        echo -e "  ${DIM}Processing ticket information...${RESET}" >&2
-        TICKET_KEY=$(jq -r '.key' < "$result_file")
-        summary=$(jq -r '.summary' < "$result_file")
-        ticket_description=$(jq -r '.description // empty' < "$result_file")
-        rm -f "$result_file"
-        
-        if [ -z "$TICKET_KEY" ] || ! [[ "$TICKET_KEY" =~ ^${JIRA_PROJECT}-[0-9]+$ ]]; then
-            echo -e "  ${RED}✗ Failed to create ticket${RESET}" >&2
-            exit 1
-        fi
-        
-        # Post to Slack
-        if [ "$DRY_RUN" != true ]; then
-            echo -e "  ${DIM}Posting to Slack thread...${RESET}" >&2
-            
-            jira_url="https://${JIRA_DOMAIN}/browse/${TICKET_KEY}"
-            if post_to_slack "$SLACK_CHANNEL" "$SLACK_THREAD_TS" "ticket" "$jira_url" "${TICKET_KEY}: ${summary}"; then
-                echo -e "  ${GREEN}✓${RESET} Posted ticket link to Slack" >&2
+
+            if [ -z "$TICKET_KEY" ] || ! [[ "$TICKET_KEY" =~ ^${JIRA_PROJECT}-[0-9]+$ ]]; then
+                echo -e "  ${RED}✗ Failed to create ticket${RESET}" >&2
+                exit 1
+            fi
+
+            # Post to Slack
+            if [ "$DRY_RUN" != true ]; then
+                slack_target="channel"
+                [ -n "$SLACK_THREAD_TS" ] && slack_target="thread"
+                echo -e "  ${DIM}Posting to Slack ${slack_target}...${RESET}" >&2
+
+                jira_url="https://${JIRA_DOMAIN}/browse/${TICKET_KEY}"
+                if post_to_slack "$SLACK_CHANNEL" "$SLACK_THREAD_TS" "ticket" "$jira_url" "${TICKET_KEY}: ${summary}"; then
+                    echo -e "  ${GREEN}✓${RESET} Posted ticket link to Slack ${slack_target}" >&2
+                fi
             fi
         fi
     else
@@ -879,7 +997,11 @@ fi
     
     # Save state after ticket is created successfully
     if [ "$DRY_RUN" != true ]; then
-        save_state "$TICKET_KEY" "$summary" "$TICKET_KEY" "$BASE_BRANCH" "$SLACK_URL" "$SLACK_CHANNEL" "$SLACK_THREAD_TS"
+        if [ "$HOTFIX_MODE" = true ]; then
+            save_state "HOTFIX" "$summary" "$branch_name" "$BASE_BRANCH" "$SLACK_URL" "$SLACK_CHANNEL" "$SLACK_THREAD_TS"
+        else
+            save_state "$TICKET_KEY" "$summary" "$TICKET_KEY" "$BASE_BRANCH" "$SLACK_URL" "$SLACK_CHANNEL" "$SLACK_THREAD_TS"
+        fi
         echo -e "  ${DIM}Saved progress (resumable if script fails)${RESET}" >&2
     fi
 fi  # End of SKIP_TO_COMMIT_LOOP check
@@ -895,15 +1017,15 @@ if [ "${SKIP_TO_COMMIT_LOOP:-false}" != true ]; then
     # Check if user is on a non-main branch and if BASE_BRANCH wasn't explicitly set
     current_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
     if [ "$BASE_BRANCH" = "origin/main" ] && [ "$current_branch" != "main" ] && [ "$current_branch" != "master" ]; then
-        # Try to get the remote tracking branch
-        remote_tracking=$(git rev-parse --abbrev-ref --symbolic-full-name @{u} 2>/dev/null)
+        # Try to get the remote tracking branch (|| true prevents set -e from killing script when no upstream)
+        remote_tracking=$(git rev-parse --abbrev-ref --symbolic-full-name @{u} 2>/dev/null) || true
         
         if [ -n "$remote_tracking" ]; then
             echo -e "  ${YELLOW}⚠ You're currently on branch: ${current_branch} (tracking ${remote_tracking})${RESET}" >&2
             echo -e "  ${CYAN}Base new branch off of:${RESET}" >&2
             echo -e "    ${DIM}1) Current branch (${remote_tracking})${RESET}" >&2
             echo -e "    ${DIM}2) origin/main${RESET}" >&2
-            shell_read_prompt "  > " base_choice "-k 1"
+            read -p "  > " -n 1 -r base_choice < /dev/tty
             echo "" >&2
             
             if [[ $base_choice =~ ^[1]$ ]]; then
@@ -917,7 +1039,7 @@ if [ "${SKIP_TO_COMMIT_LOOP:-false}" != true ]; then
             echo -e "  ${CYAN}Base new branch off of:${RESET}" >&2
             echo -e "    ${DIM}1) Current branch (${current_branch})${RESET}" >&2
             echo -e "    ${DIM}2) origin/main${RESET}" >&2
-            shell_read_prompt "  > " base_choice "-k 1"
+            read -p "  > " -n 1 -r base_choice < /dev/tty
             echo "" >&2
             
             if [[ $base_choice =~ ^[1]$ ]]; then
@@ -930,31 +1052,323 @@ if [ "${SKIP_TO_COMMIT_LOOP:-false}" != true ]; then
         echo "" >&2
     fi
 
-    branch_name="$TICKET_KEY"
-    if [ -n "$summary" ]; then
-        commit_message="$TICKET_KEY: $summary"
+    if [ "$HOTFIX_MODE" = true ]; then
+        # branch_name and commit_message already set in handle_hotfix_setup
+        : # no-op
     else
-        commit_message="$TICKET_KEY"
+        branch_name="$TICKET_KEY"
+        if [ -n "$summary" ]; then
+            commit_message="$TICKET_KEY: $summary"
+        else
+            commit_message="$TICKET_KEY"
+        fi
     fi
+
+    # ── Worktree-aware branch creation ──────────────────────────────
+    # If we're running inside a worktree that belongs to a different ticket,
+    # we must NOT checkout a different branch (that would hijack the worktree).
+    # Instead, create a new worktree for the new branch.
+    WORKTREE_HANDLED=false
+
+    if [ "$DRY_RUN" != true ]; then
+        _oneshot_git_dir=$(git rev-parse --git-dir 2>/dev/null)
+        if [[ "$_oneshot_git_dir" == *"/worktrees/"* ]]; then
+            _wt_current_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+            if [ "$branch_name" != "$_wt_current_branch" ]; then
+                echo -e "  ${CYAN}Inside worktree for ${_wt_current_branch} — creating new worktree for ${branch_name}${RESET}" >&2
+                echo "" >&2
+
+                # Preexisting commits in a foreign worktree is too complex to handle
+                if [ "$PREEXISTING_COMMITS" = true ]; then
+                    echo -e "  ${RED}✗ Cannot move unpublished commits across worktrees${RESET}" >&2
+                    echo -e "  ${DIM}Push your commits on ${_wt_current_branch} first, then run oneshot again${RESET}" >&2
+                    exit 1
+                fi
+
+                # Get main repo root and current worktree root
+                _main_root=$(git worktree list --porcelain | grep -m1 '^worktree ' | cut -d' ' -f2)
+                _repo_name=$(basename "$_main_root")
+                _current_wt_root=$(git rev-parse --show-toplevel)
+
+                # Save staged changes as a patch
+                _wt_staged_patch=$(mktemp)
+                git diff --cached > "$_wt_staged_patch"
+
+                # Save unstaged changes
+                _wt_unstaged_patch=""
+                if ! git diff-files --quiet; then
+                    _wt_unstaged_patch=$(mktemp)
+                    git diff > "$_wt_unstaged_patch"
+                fi
+
+                # Clean working tree so original worktree returns to proper state
+                git reset HEAD --quiet 2>/dev/null
+                git checkout -- . 2>/dev/null
+
+                # Fetch remote if needed
+                if [[ "$BASE_BRANCH" =~ ^origin/ ]]; then
+                    _remote_branch="${BASE_BRANCH#origin/}"
+                    echo -e "  ${DIM}$ git fetch origin ${_remote_branch}${RESET}" >&2
+                    git fetch origin "$_remote_branch" 2>&1 | while read -r line; do echo -e "    ${DIM}${line}${RESET}" >&2; done
+                fi
+
+                # Build worktree path (same convention as rr.sh)
+                _wt_path="$_main_root/../$_repo_name.$branch_name"
+
+                # Create worktree with the new branch
+                if git show-ref --verify --quiet "refs/heads/$branch_name"; then
+                    # Branch already exists — just create worktree for it
+                    echo -e "  ${DIM}$ git worktree add ${_wt_path} ${branch_name}${RESET}" >&2
+                    _wt_add_output=$(git worktree add "$_wt_path" "$branch_name" 2>&1)
+                else
+                    echo -e "  ${DIM}$ git worktree add -b ${branch_name} ${_wt_path} ${BASE_BRANCH}${RESET}" >&2
+                    _wt_add_output=$(git worktree add -b "$branch_name" "$_wt_path" "$BASE_BRANCH" 2>&1)
+                fi
+                _wt_add_exit=$?
+                if [ -n "$_wt_add_output" ]; then
+                    echo "$_wt_add_output" | while read -r line; do echo -e "    ${DIM}${line}${RESET}" >&2; done
+                fi
+                if [ $_wt_add_exit -ne 0 ]; then
+                    echo -e "  ${RED}✗ Failed to create worktree${RESET}" >&2
+                    # Restore staged changes in original worktree
+                    if [ -s "$_wt_staged_patch" ]; then
+                        git apply --index "$_wt_staged_patch" 2>/dev/null
+                    fi
+                    if [ -n "$_wt_unstaged_patch" ] && [ -s "$_wt_unstaged_patch" ]; then
+                        git apply "$_wt_unstaged_patch" 2>/dev/null
+                    fi
+                    rm -f "$_wt_staged_patch" "$_wt_unstaged_patch"
+                    exit 1
+                fi
+
+                # Copy common files from current worktree to new one
+                for _f in .env .cursor .vscode; do
+                    if [ -e "$_current_wt_root/$_f" ]; then
+                        cp -r "$_current_wt_root/$_f" "$_wt_path/$_f" 2>/dev/null
+                    fi
+                done
+
+                # Switch to the new worktree
+                cd "$_wt_path" || { echo -e "  ${RED}✗ Failed to cd into new worktree${RESET}" >&2; exit 1; }
+
+                # Apply staged changes in the new worktree
+                if [ -s "$_wt_staged_patch" ]; then
+                    _apply_output=$(git apply --index "$_wt_staged_patch" 2>&1)
+                    _apply_exit=$?
+                    if [ -n "$_apply_output" ]; then
+                        echo "$_apply_output" | while read -r line; do echo -e "    ${DIM}${line}${RESET}" >&2; done
+                    fi
+                    if [ $_apply_exit -ne 0 ]; then
+                        echo -e "  ${RED}✗ Staged changes don't apply cleanly to ${BASE_BRANCH}${RESET}" >&2
+                        echo -e "  ${DIM}Your changes may conflict with ${BASE_BRANCH}. Try rebasing first.${RESET}" >&2
+                        echo -e "  ${DIM}Patch saved at: ${_wt_staged_patch}${RESET}" >&2
+                        [ -n "$_wt_unstaged_patch" ] && rm -f "$_wt_unstaged_patch"
+                        exit 1
+                    fi
+                fi
+                rm -f "$_wt_staged_patch"
+
+                # Restore unstaged changes if any
+                if [ -n "$_wt_unstaged_patch" ] && [ -s "$_wt_unstaged_patch" ]; then
+                    if ! git apply "$_wt_unstaged_patch" 2>/dev/null; then
+                        echo -e "  ${YELLOW}⚠ Could not restore unstaged changes in new worktree${RESET}" >&2
+                        echo -e "  ${DIM}Patch saved at: ${_wt_unstaged_patch}${RESET}" >&2
+                    else
+                        rm -f "$_wt_unstaged_patch"
+                    fi
+                elif [ -n "$_wt_unstaged_patch" ]; then
+                    rm -f "$_wt_unstaged_patch"
+                fi
+
+                # Re-save state with new worktree path
+                if [ "$HOTFIX_MODE" = true ]; then
+                    save_state "HOTFIX" "$summary" "$branch_name" "$BASE_BRANCH" "$SLACK_URL" "$SLACK_CHANNEL" "$SLACK_THREAD_TS"
+                else
+                    save_state "$TICKET_KEY" "$summary" "$TICKET_KEY" "$BASE_BRANCH" "$SLACK_URL" "$SLACK_CHANNEL" "$SLACK_THREAD_TS"
+                fi
+
+                echo -e "  ${GREEN}✓${RESET} Worktree: ${_wt_path}" >&2
+                echo -e "  ${GREEN}✓${RESET} Branch: ${branch_name}" >&2
+                WORKTREE_HANDLED=true
+            fi
+        fi
+    fi
+
+    if [ "$WORKTREE_HANDLED" != true ]; then
+
+    # Stash unstaged changes before checkout so they don't block switching branches
+    checkout_stashed=false
+    if [ "$DRY_RUN" != true ] && ! git diff-files --quiet; then
+        echo -e "  ${DIM}Stashing unstaged changes for checkout...${RESET}" >&2
+        git stash push --keep-index --quiet -m "oneshot: temporary stash for branch checkout"
+        checkout_stashed=true
+    fi
+
+    # Helper: run git command, show output, and check exit code correctly despite pipe
+    run_git_checkout() {
+        local git_output
+        git_output=$(eval "$@" 2>&1)
+        local git_exit=$?
+        echo "$git_output" | while read -r line; do echo -e "    ${DIM}${line}${RESET}" >&2; done
+        return $git_exit
+    }
 
     # Check if branch already exists
     if git show-ref --verify --quiet "refs/heads/$branch_name"; then
         echo -e "  ${YELLOW}⚠ Branch ${branch_name} already exists${RESET}" >&2
         echo -e "  ${DIM}Switching to existing branch...${RESET}" >&2
-        
+
         if [ "$DRY_RUN" = true ]; then
             echo -e "  ${DIM}[DRY RUN] Would run: git checkout ${branch_name}${RESET}" >&2
         else
-            # Checkout existing branch - staged changes will come along automatically
             echo -e "  ${DIM}$ git checkout ${branch_name}${RESET}" >&2
-            if ! git checkout "$branch_name" 2>&1 | while read -r line; do echo -e "    ${DIM}${line}${RESET}" >&2; done; then
+            if ! run_git_checkout git checkout "$branch_name"; then
                 echo -e "  ${RED}✗ Failed to checkout branch${RESET}" >&2
+                [ "$checkout_stashed" = true ] && git stash pop --quiet
                 exit 1
+            fi
+        fi
+    elif [ "$PREEXISTING_COMMITS" = true ]; then
+        # Determine if commits need to be transplanted to a different base
+        unpublished_commits=$(git rev-list HEAD --not --remotes=origin --reverse)
+        oldest_unpublished=$(echo "$unpublished_commits" | head -1)
+        commits_base=$(git rev-parse "${oldest_unpublished}^" 2>/dev/null || echo "")
+        base_head=$(git rev-parse "$BASE_BRANCH" 2>/dev/null || echo "")
+
+        if [ -n "$commits_base" ] && [ -n "$base_head" ] && [ "$commits_base" != "$base_head" ]; then
+            # Transplant: cherry-pick unpublished commits onto BASE_BRANCH
+            transplant_count=$(echo "$unpublished_commits" | wc -w)
+            echo -e "  ${DIM}Cherry-picking ${transplant_count} unpublished commit(s) onto ${BASE_BRANCH}...${RESET}" >&2
+
+            if [ "$DRY_RUN" = true ]; then
+                echo -e "  ${DIM}[DRY RUN] Would cherry-pick ${transplant_count} commit(s) onto ${BASE_BRANCH}${RESET}" >&2
+            else
+                # Recover unstaged changes from stash before transplant
+                # (stash pop on a different base would do a bad 3-way merge)
+                transplant_unstaged_patch=""
+                if [ "$checkout_stashed" = true ]; then
+                    git stash pop --quiet
+                    checkout_stashed=false
+                    transplant_unstaged_patch=$(mktemp)
+                    git diff > "$transplant_unstaged_patch"
+                fi
+
+                # Save staged changes if any (they sit on top of the commits)
+                transplant_staged_patch=""
+                if [ -n "$(git diff --cached --name-only)" ]; then
+                    transplant_staged_patch=$(mktemp)
+                    git diff --cached > "$transplant_staged_patch"
+                fi
+
+                # Clean working tree so checkout succeeds
+                git reset --hard HEAD --quiet
+
+                # Fetch if base is a remote branch
+                if [[ "$BASE_BRANCH" =~ ^origin/ ]]; then
+                    remote_branch="${BASE_BRANCH#origin/}"
+                    echo -e "  ${DIM}$ git fetch origin ${remote_branch}${RESET}" >&2
+                    git fetch origin "$remote_branch" 2>&1 | while read -r line; do echo -e "    ${DIM}${line}${RESET}" >&2; done
+                fi
+
+                echo -e "  ${DIM}$ git checkout -b ${branch_name} ${BASE_BRANCH}${RESET}" >&2
+                if ! run_git_checkout git checkout -b "$branch_name" "$BASE_BRANCH"; then
+                    echo -e "  ${RED}✗ Failed to create branch${RESET}" >&2
+                    [ -n "$transplant_staged_patch" ] && rm -f "$transplant_staged_patch"
+                    [ "$checkout_stashed" = true ] && git stash pop --quiet
+                    exit 1
+                fi
+
+                # Cherry-pick unpublished commits onto the new base
+                echo -e "  ${DIM}$ git cherry-pick (${transplant_count} commit(s))${RESET}" >&2
+                cherry_pick_output=$(git cherry-pick $unpublished_commits 2>&1)
+                cherry_pick_exit=$?
+                if [ -n "$cherry_pick_output" ]; then
+                    echo "$cherry_pick_output" | while read -r line; do echo -e "    ${DIM}${line}${RESET}" >&2; done
+                fi
+                if [ $cherry_pick_exit -ne 0 ]; then
+                    echo -e "  ${RED}✗ Cherry-pick failed — conflicts with ${BASE_BRANCH}${RESET}" >&2
+                    echo -e "  ${DIM}Resolve conflicts, then run 'oneshot' to resume${RESET}" >&2
+                    [ -n "$transplant_staged_patch" ] && rm -f "$transplant_staged_patch"
+                    [ "$checkout_stashed" = true ] && git stash pop --quiet 2>/dev/null
+                    exit 1
+                fi
+
+                REBASED=true
+
+                # Re-apply staged changes if any
+                if [ -n "$transplant_staged_patch" ] && [ -s "$transplant_staged_patch" ]; then
+                    apply_output=$(git apply --index "$transplant_staged_patch" 2>&1)
+                    apply_exit=$?
+                    if [ -n "$apply_output" ]; then
+                        echo "$apply_output" | while read -r line; do echo -e "    ${DIM}${line}${RESET}" >&2; done
+                    fi
+                    if [ $apply_exit -ne 0 ]; then
+                        echo -e "  ${RED}✗ Could not re-apply staged changes after cherry-pick${RESET}" >&2
+                        echo -e "  ${DIM}Patch saved at: ${transplant_staged_patch}${RESET}" >&2
+                        [ "$checkout_stashed" = true ] && git stash pop --quiet 2>/dev/null
+                        exit 1
+                    fi
+                    rm -f "$transplant_staged_patch"
+                fi
+
+                # Restore unstaged changes if any
+                if [ -n "$transplant_unstaged_patch" ] && [ -s "$transplant_unstaged_patch" ]; then
+                    if ! git apply "$transplant_unstaged_patch" 2>/dev/null; then
+                        echo -e "  ${YELLOW}⚠ Could not restore unstaged changes on new base${RESET}" >&2
+                        echo -e "  ${DIM}Patch saved at: ${transplant_unstaged_patch}${RESET}" >&2
+                    else
+                        rm -f "$transplant_unstaged_patch"
+                    fi
+                elif [ -n "$transplant_unstaged_patch" ]; then
+                    rm -f "$transplant_unstaged_patch"
+                fi
+
+                # Reset original branch to where it was before the unpublished commits
+                echo -e "  ${DIM}$ git branch -f ${PREEXISTING_COMMITS_BRANCH} ${commits_base:0:12}${RESET}" >&2
+                branch_reset_output=$(git branch -f "$PREEXISTING_COMMITS_BRANCH" "$commits_base" 2>&1)
+                branch_reset_exit=$?
+                if [ -n "$branch_reset_output" ]; then
+                    echo "$branch_reset_output" | while read -r line; do echo -e "    ${DIM}${line}${RESET}" >&2; done
+                fi
+                if [ $branch_reset_exit -ne 0 ]; then
+                    echo -e "  ${YELLOW}⚠ Could not reset ${PREEXISTING_COMMITS_BRANCH} (continuing anyway)${RESET}" >&2
+                else
+                    echo -e "  ${DIM}Reset ${PREEXISTING_COMMITS_BRANCH} → ${commits_base:0:12}${RESET}" >&2
+                fi
+            fi
+        else
+            # Same base: just create branch at current HEAD (existing behavior)
+            echo -e "  ${DIM}Creating branch at current HEAD (carrying unpublished commits)...${RESET}" >&2
+
+            if [ "$DRY_RUN" = true ]; then
+                echo -e "  ${DIM}[DRY RUN] Would run: git checkout -b ${branch_name}${RESET}" >&2
+                echo -e "  ${DIM}[DRY RUN] Would run: git branch -f ${PREEXISTING_COMMITS_BRANCH} ${commits_base:0:12}${RESET}" >&2
+            else
+                echo -e "  ${DIM}$ git checkout -b ${branch_name}${RESET}" >&2
+                if ! run_git_checkout git checkout -b "$branch_name"; then
+                    echo -e "  ${RED}✗ Failed to create branch${RESET}" >&2
+                    [ "$checkout_stashed" = true ] && git stash pop --quiet
+                    exit 1
+                fi
+                # Reset the original branch to before the unpublished commits
+                if [ -n "$commits_base" ]; then
+                    echo -e "  ${DIM}$ git branch -f ${PREEXISTING_COMMITS_BRANCH} ${commits_base:0:12}${RESET}" >&2
+                    branch_reset_output=$(git branch -f "$PREEXISTING_COMMITS_BRANCH" "$commits_base" 2>&1)
+                    branch_reset_exit=$?
+                    if [ -n "$branch_reset_output" ]; then
+                        echo "$branch_reset_output" | while read -r line; do echo -e "    ${DIM}${line}${RESET}" >&2; done
+                    fi
+                    if [ $branch_reset_exit -ne 0 ]; then
+                        echo -e "  ${YELLOW}⚠ Could not reset ${PREEXISTING_COMMITS_BRANCH} (continuing anyway)${RESET}" >&2
+                    else
+                        echo -e "  ${DIM}Reset ${PREEXISTING_COMMITS_BRANCH} → ${commits_base:0:12}${RESET}" >&2
+                    fi
+                fi
             fi
         fi
     else
         echo -e "  ${DIM}Creating branch: ${branch_name} from ${BASE_BRANCH}${RESET}" >&2
-        
+
         if [ "$DRY_RUN" = true ]; then
             echo -e "  ${DIM}[DRY RUN] Would run: git fetch origin${RESET}" >&2
             echo -e "  ${DIM}[DRY RUN] Would run: git checkout -b ${branch_name} ${BASE_BRANCH}${RESET}" >&2
@@ -965,17 +1379,96 @@ if [ "${SKIP_TO_COMMIT_LOOP:-false}" != true ]; then
                 echo -e "  ${DIM}$ git fetch origin ${remote_branch}${RESET}" >&2
                 git fetch origin "$remote_branch" 2>&1 | while read -r line; do echo -e "    ${DIM}${line}${RESET}" >&2; done
             fi
-            
-            # Create branch from base - staged changes will come along automatically
-            echo -e "  ${DIM}$ git checkout -b ${branch_name} ${BASE_BRANCH}${RESET}" >&2
-            if ! git checkout -b "$branch_name" "$BASE_BRANCH" 2>&1 | while read -r line; do echo -e "    ${DIM}${line}${RESET}" >&2; done; then
-                echo -e "  ${RED}✗ Failed to create branch${RESET}" >&2
-                exit 1
+
+            # Check if we're switching to a different base than current HEAD
+            base_head=$(git rev-parse "$BASE_BRANCH" 2>/dev/null || echo "")
+            current_head=$(git rev-parse HEAD 2>/dev/null)
+
+            if [ "$current_head" != "$base_head" ] && [ -n "$base_head" ]; then
+                # Transplant: save staged changes, clean checkout, re-apply
+                # Without this, staged content (relative to feature branch) would
+                # include unintended diffs when committed against origin/main
+                echo -e "  ${DIM}Transplanting staged changes to ${BASE_BRANCH}...${RESET}" >&2
+
+                # Recover unstaged changes from stash before transplant
+                # (stash pop on a different base would do a bad 3-way merge)
+                transplant_unstaged_patch=""
+                if [ "$checkout_stashed" = true ]; then
+                    git stash pop --quiet
+                    checkout_stashed=false
+                    transplant_unstaged_patch=$(mktemp)
+                    git diff > "$transplant_unstaged_patch"
+                fi
+
+                transplant_staged_patch=$(mktemp)
+                git diff --cached > "$transplant_staged_patch"
+
+                # Clean working tree so checkout to a different base succeeds
+                git reset --hard HEAD --quiet
+
+                echo -e "  ${DIM}$ git checkout -b ${branch_name} ${BASE_BRANCH}${RESET}" >&2
+                if ! run_git_checkout git checkout -b "$branch_name" "$BASE_BRANCH"; then
+                    echo -e "  ${RED}✗ Failed to create branch${RESET}" >&2
+                    rm -f "$transplant_staged_patch"
+                    [ -n "$transplant_unstaged_patch" ] && rm -f "$transplant_unstaged_patch"
+                    exit 1
+                fi
+
+                # Re-apply staged changes on the new base
+                if [ -s "$transplant_staged_patch" ]; then
+                    apply_output=$(git apply --index "$transplant_staged_patch" 2>&1)
+                    apply_exit=$?
+                    if [ -n "$apply_output" ]; then
+                        echo "$apply_output" | while read -r line; do echo -e "    ${DIM}${line}${RESET}" >&2; done
+                    fi
+                    if [ $apply_exit -ne 0 ]; then
+                        echo -e "  ${RED}✗ Staged changes don't apply cleanly to ${BASE_BRANCH}${RESET}" >&2
+                        echo -e "  ${DIM}Your changes may conflict with ${BASE_BRANCH}. Try rebasing first.${RESET}" >&2
+                        echo -e "  ${DIM}Patch saved at: ${transplant_staged_patch}${RESET}" >&2
+                        [ -n "$transplant_unstaged_patch" ] && rm -f "$transplant_unstaged_patch"
+                        exit 1
+                    fi
+                fi
+                rm -f "$transplant_staged_patch"
+
+                REBASED=true
+
+                # Restore unstaged changes if any
+                if [ -n "$transplant_unstaged_patch" ] && [ -s "$transplant_unstaged_patch" ]; then
+                    if ! git apply "$transplant_unstaged_patch" 2>/dev/null; then
+                        echo -e "  ${YELLOW}⚠ Could not restore unstaged changes on new base${RESET}" >&2
+                        echo -e "  ${DIM}Patch saved at: ${transplant_unstaged_patch}${RESET}" >&2
+                    else
+                        rm -f "$transplant_unstaged_patch"
+                    fi
+                elif [ -n "$transplant_unstaged_patch" ]; then
+                    rm -f "$transplant_unstaged_patch"
+                fi
+            else
+                echo -e "  ${DIM}$ git checkout -b ${branch_name} ${BASE_BRANCH}${RESET}" >&2
+                if ! run_git_checkout git checkout -b "$branch_name" "$BASE_BRANCH"; then
+                    echo -e "  ${RED}✗ Failed to create branch${RESET}" >&2
+                    [ "$checkout_stashed" = true ] && git stash pop --quiet
+                    exit 1
+                fi
             fi
         fi
     fi
 
-    echo -e "  ${GREEN}✓${RESET} Branch: ${branch_name}" >&2
+    # Restore unstaged changes now that we're on the right branch
+    if [ "$checkout_stashed" = true ]; then
+        echo -e "  ${DIM}Restoring unstaged changes...${RESET}" >&2
+        if ! git stash pop --quiet 2>/dev/null; then
+            echo -e "  ${YELLOW}⚠ Could not restore unstaged changes cleanly${RESET}" >&2
+            echo -e "  ${DIM}Your unstaged changes are in the stash (git stash list)${RESET}" >&2
+        fi
+    fi
+
+    fi  # End of WORKTREE_HANDLED check
+
+    if [ "$WORKTREE_HANDLED" != true ]; then
+        echo -e "  ${GREEN}✓${RESET} Branch: ${branch_name}" >&2
+    fi
 
     # Verify we're actually on the new branch
     if [ "$DRY_RUN" != true ]; then
@@ -985,12 +1478,14 @@ if [ "${SKIP_TO_COMMIT_LOOP:-false}" != true ]; then
             exit 1
         fi
         
-        # Verify we have staged changes to commit
-        staged_files_check=$(git diff --cached --name-only)
-        if [ -z "$staged_files_check" ]; then
-            echo -e "  ${RED}✗ No staged changes found after branch creation${RESET}" >&2
-            echo -e "  ${DIM}This might indicate an issue with git stash pop${RESET}" >&2
-            exit 1
+        # Verify we have staged changes to commit (skip if we're moving preexisting commits)
+        if [ "$PREEXISTING_COMMITS" != true ]; then
+            staged_files_check=$(git diff --cached --name-only)
+            if [ -z "$staged_files_check" ]; then
+                echo -e "  ${RED}✗ No staged changes found after branch creation${RESET}" >&2
+                echo -e "  ${DIM}This might indicate an issue with git stash pop${RESET}" >&2
+                exit 1
+            fi
         fi
     fi
 
@@ -999,29 +1494,40 @@ fi  # End of branch creation (SKIP_TO_COMMIT_LOOP check)
 
 # Prompt for first commit message
 if [ "${SKIP_TO_COMMIT_LOOP:-false}" != true ]; then
-    # Set commit message for new workflow
-    commit_message="$TICKET_KEY"
-    if [ -n "$summary" ]; then
-        commit_message="$TICKET_KEY: $summary"
-    fi
-    
-    echo -e "  ${CYAN}Commit message:${RESET}" >&2
-    echo -e "  ${DIM}Default: \"${commit_message}\"${RESET}" >&2
-    echo -e "  ${DIM}(Press Enter to use default, or type custom message)${RESET}" >&2
-    shell_read_prompt "  > " user_message
-
-    if [ -z "$user_message" ]; then
-        current_commit_message="$commit_message"  # Use ticket summary
+    # If we only have preexisting commits (nothing new staged), skip the commit prompt/loop
+    if [ "$PREEXISTING_COMMITS" = true ] && [ "$staged_count" -eq 0 ]; then
+        SKIP_COMMIT_LOOP=true
+        extra_commits_made=true  # Ensure pre-push runs before publish
     else
-        # Auto-prefix with ticket key if not present
-        if [[ ! "$user_message" =~ ^${TICKET_KEY}: ]]; then
-            current_commit_message="$TICKET_KEY: $user_message"
+        # Set commit message for new workflow
+        if [ "$HOTFIX_MODE" = true ]; then
+            commit_message="$summary"
         else
-            current_commit_message="$user_message"
+            commit_message="$TICKET_KEY"
+            if [ -n "$summary" ]; then
+                commit_message="$TICKET_KEY: $summary"
+            fi
         fi
-    fi
 
-    echo "" >&2
+        echo -e "  ${CYAN}Commit message:${RESET}" >&2
+        echo -e "  ${DIM}Default: \"${commit_message}\"${RESET}" >&2
+        echo -e "  ${DIM}(Press Enter to use default, or type custom message)${RESET}" >&2
+        read -p "  > " -r user_message < /dev/tty
+
+        if [ -z "$user_message" ]; then
+            current_commit_message="$commit_message"  # Use default
+        else
+            if [ "$HOTFIX_MODE" = true ]; then
+                current_commit_message="$user_message"
+            elif [[ ! "$user_message" =~ ^${TICKET_KEY}: ]]; then
+                current_commit_message="$TICKET_KEY: $user_message"
+            else
+                current_commit_message="$user_message"
+            fi
+        fi
+
+        echo "" >&2
+    fi
 else
     # Resuming - check if there are staged changes for a first commit
     staged_files_check=$(git diff --cached --name-only)
@@ -1033,20 +1539,26 @@ else
         # When resuming with commits, we need to re-run prepush
         extra_commits_made=true
         # Has staged changes, prompt for commit message
-        commit_message="$TICKET_KEY"
-        if [ -n "$summary" ]; then
-            commit_message="$TICKET_KEY: $summary"
+        if [ "$HOTFIX_MODE" = true ]; then
+            commit_message="$summary"
+        else
+            commit_message="$TICKET_KEY"
+            if [ -n "$summary" ]; then
+                commit_message="$TICKET_KEY: $summary"
+            fi
         fi
-        
+
         echo -e "  ${CYAN}Commit message for staged changes:${RESET}" >&2
         echo -e "  ${DIM}Default: \"${commit_message}\"${RESET}" >&2
         echo -e "  ${DIM}(Press Enter to use default, or type custom message)${RESET}" >&2
-        shell_read_prompt "  > " user_message
+        read -p "  > " -r user_message < /dev/tty
 
         if [ -z "$user_message" ]; then
             current_commit_message="$commit_message"
         else
-            if [[ ! "$user_message" =~ ^${TICKET_KEY}: ]]; then
+            if [ "$HOTFIX_MODE" = true ]; then
+                current_commit_message="$user_message"
+            elif [[ ! "$user_message" =~ ^${TICKET_KEY}: ]]; then
                 current_commit_message="$TICKET_KEY: $user_message"
             else
                 current_commit_message="$user_message"
@@ -1103,8 +1615,8 @@ if [ "${SKIP_COMMIT_LOOP:-false}" != true ]; then
     
     # Ask if user wants to make another commit
     echo "" >&2
-    echo -e "  ${CYAN}Make another commit?${RESET} ${DIM}(y/n)${RESET}" >&2
-    shell_read_prompt "  > " make_another "-k 1"
+    echo -e "  ${CYAN}Make another commit?${RESET} ${DIM}(y/N)${RESET}" >&2
+    read -p "  > " -n 1 -r make_another < /dev/tty
     echo "" >&2
     
     if [[ ! $make_another =~ ^[Yy]$ ]]; then
@@ -1114,7 +1626,7 @@ if [ "${SKIP_COMMIT_LOOP:-false}" != true ]; then
     echo "" >&2
     echo -e "  ${CYAN}Stage your changes, then press Enter to continue${RESET}" >&2
     echo -e "  ${DIM}(In another terminal: git add <files>)${RESET}" >&2
-    shell_read_prompt "  > Press Enter when ready..." dummy
+    read -p "  > Press Enter when ready..." < /dev/tty
     echo "" >&2
     
     # Check for newly staged changes
@@ -1136,14 +1648,26 @@ if [ "${SKIP_COMMIT_LOOP:-false}" != true ]; then
     echo "" >&2
     
     # Get commit message for this commit
-    echo -e "  ${CYAN}Enter commit message:${RESET}" >&2
-    echo -e "  ${DIM}(Leave empty to use: ${TICKET_KEY}: <message>)${RESET}" >&2
-    shell_read_prompt "  > " user_message
-    
-    if [ -z "$user_message" ]; then
+    if [ "$HOTFIX_MODE" = true ]; then
+        echo -e "  ${CYAN}Enter commit message:${RESET}" >&2
+    else
+        echo -e "  ${CYAN}Enter commit message:${RESET}" >&2
+        echo -e "  ${DIM}(Leave empty to use: ${TICKET_KEY}: <message>)${RESET}" >&2
+    fi
+    read -p "  > " -r user_message < /dev/tty
+
+    if [ "$HOTFIX_MODE" = true ]; then
+        if [ -z "$user_message" ]; then
+            echo -e "  ${CYAN}Short description:${RESET}" >&2
+            read -p "  > " -r short_desc < /dev/tty
+            current_commit_message="${short_desc:-additional changes}"
+        else
+            current_commit_message="$user_message"
+        fi
+    elif [ -z "$user_message" ]; then
         # Ask for short description
         echo -e "  ${CYAN}Short description:${RESET}" >&2
-        shell_read_prompt "  > " short_desc
+        read -p "  > " -r short_desc < /dev/tty
         if [ -n "$short_desc" ]; then
             current_commit_message="$TICKET_KEY: $short_desc"
         else
@@ -1168,9 +1692,9 @@ fi  # End of commit loop
 echo "" >&2
 
 # Step 3.5: Run pre-push checks again before publishing
-# This ensures any additional commits made in the loop are validated
-# Only run if extra commits were added after the initial validation
-if [ "$DRY_RUN" != true ] && [ "${extra_commits_made:-false}" = true ]; then
+# This ensures any additional commits or rebased code is validated
+# Runs if extra commits were added after initial validation, or if code was rebased onto a different base
+if [ "$DRY_RUN" != true ] && { [ "${extra_commits_made:-false}" = true ] || [ "${REBASED:-false}" = true ]; }; then
     repo_root=$(git rev-parse --show-toplevel)
     
     echo -e "${CYAN}┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓${RESET}" >&2
@@ -1191,8 +1715,8 @@ fi
 
 echo "" >&2
 
-# Step 4: Ask about including ticket description in MR
-if [ -n "$TICKET_KEY" ] && [ "$INCLUDE_TICKET_DESCRIPTION" != "true" ] && [ "$DRY_RUN" != "true" ]; then
+# Step 4: Ask about including ticket description in MR (only if description is not empty)
+if [ -n "$TICKET_KEY" ] && [ "$INCLUDE_TICKET_DESCRIPTION" != "true" ] && [ "$DRY_RUN" != "true" ] && [ -n "$ticket_description" ]; then
     echo -e "${CYAN}┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓${RESET}" >&2
     echo -e "${CYAN}┃${RESET} ${BLUE}Step 4/5:${RESET} Include ticket description in MR? ${DIM}(y/N)${RESET}       ${CYAN}┃${RESET}" >&2
     echo -e "${CYAN}┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛${RESET}" >&2
@@ -1217,11 +1741,19 @@ echo -e "${CYAN}┗━━━━━━━━━━━━━━━━━━━━�
 target_branch="${BASE_BRANCH#origin/}"
 
 if [ "$DRY_RUN" = true ]; then
-    include_desc_flag=""
-    [ "$INCLUDE_TICKET_DESCRIPTION" = true ] && include_desc_flag="--include-ticket-description "
-    echo -e "  ${DIM}[DRY RUN] Would run: SKIP_PRE_PUSH_CHECKS=true publish-changes --branch ${branch_name} --target ${target_branch} ${include_desc_flag}${TICKET_KEY}${RESET}" >&2
+    if [ "$HOTFIX_MODE" = true ]; then
+        echo -e "  ${DIM}[DRY RUN] Would run: SKIP_PRE_PUSH_CHECKS=true publish-changes --branch ${branch_name} --target ${target_branch} --no-jira --title \"${summary}\"${RESET}" >&2
+    else
+        include_desc_flag=""
+        [ "$INCLUDE_TICKET_DESCRIPTION" = true ] && include_desc_flag="--include-ticket-description "
+        echo -e "  ${DIM}[DRY RUN] Would run: SKIP_PRE_PUSH_CHECKS=true publish-changes --branch ${branch_name} --target ${target_branch} ${include_desc_flag}${TICKET_KEY}${RESET}" >&2
+    fi
     if [ -n "$SLACK_URL" ]; then
-        echo -e "  ${DIM}[DRY RUN] Would post MR link to Slack thread${RESET}" >&2
+        if [ -n "$SLACK_THREAD_TS" ]; then
+            echo -e "  ${DIM}[DRY RUN] Would post MR link to Slack thread${RESET}" >&2
+        else
+            echo -e "  ${DIM}[DRY RUN] Would post MR link to Slack channel${RESET}" >&2
+        fi
     fi
     echo "" >&2
     echo -e "${GREEN}=== Dry run complete ===${RESET}" >&2
@@ -1229,20 +1761,69 @@ else
     # Run publish-changes and capture the MR URL from stdout
     # Skip pre-push checks since we already ran them earlier
     publish_args=(--branch "$branch_name" --target "$target_branch" --output-url --no-draft-prompt)
-    if [ "$INCLUDE_TICKET_DESCRIPTION" = true ]; then
-        publish_args+=(--include-ticket-description)
-        if [ -n "$ticket_description" ]; then
-            publish_args+=(--ticket-description "$ticket_description")
+    if [ "$HOTFIX_MODE" = true ]; then
+        publish_args+=(--no-jira --title "$summary")
+        if [ -n "$SLACK_URL" ]; then
+            publish_args+=(--description "Slack: $SLACK_URL")
         fi
+    else
+        if [ "$INCLUDE_TICKET_DESCRIPTION" = true ]; then
+            publish_args+=(--include-ticket-description)
+            if [ -n "$ticket_description" ]; then
+                publish_args+=(--ticket-description "$ticket_description")
+            fi
+        fi
+        publish_args+=("$TICKET_KEY")
     fi
-    publish_args+=("$TICKET_KEY")
-    mr_url=$(SKIP_PRE_PUSH_CHECKS=true "$SCRIPT_DIR/publish-changes" "${publish_args[@]}")
-    
-    # Post MR link to Slack if we have a thread
+    mr_url=$(SKIP_PRE_PUSH_CHECKS=true "$SCRIPT_DIR/publish-changes" "${publish_args[@]}") || {
+        echo -e "${RED}  ✗ publish-changes failed${RESET}" >&2
+        echo -e "  ${DIM}State saved — fix the issue and run 'oneshot' to resume${RESET}" >&2
+        exit 1
+    }
+
+    # Post MR link to Slack if we have a URL
     if [ -n "$SLACK_URL" ] && [ -n "$mr_url" ]; then
-        echo -e "  ${DIM}Posting MR link to Slack thread...${RESET}" >&2
+        slack_target="channel"
+        [ -n "$SLACK_THREAD_TS" ] && slack_target="thread"
+        echo -e "  ${DIM}Posting MR link to Slack ${slack_target}...${RESET}" >&2
         if post_to_slack "$SLACK_CHANNEL" "$SLACK_THREAD_TS" "mr" "$mr_url" "$commit_message"; then
-            echo -e "  ${GREEN}✓${RESET} Posted MR link to Slack" >&2
+            echo -e "  ${GREEN}✓${RESET} Posted MR link to Slack ${slack_target}" >&2
+        fi
+    elif [ "$HOTFIX_MODE" = true ] && [ -n "$mr_url" ] && [ -z "$SLACK_URL" ]; then
+        # Offer to post to a Slack thread/channel for hotfixes without an initial Slack URL
+        echo "" >&2
+        echo -e "  ${CYAN}Post MR link to Slack?${RESET} ${DIM}(y/N)${RESET}" >&2
+        read -p "  > " -n 1 -r post_slack_choice < /dev/tty
+        echo "" >&2
+        if [[ $post_slack_choice =~ ^[Yy]$ ]]; then
+            echo -e "  ${CYAN}Paste Slack URL (thread or channel):${RESET}" >&2
+            read -p "  > " -r hotfix_slack_url < /dev/tty
+            hotfix_channel="" hotfix_thread_ts=""
+            if [[ "$hotfix_slack_url" =~ ^https://.*slack\.com/archives/([A-Z0-9]+)/p([0-9]+) ]]; then
+                hotfix_channel=${BASH_REMATCH[1]}
+                raw_ts=${BASH_REMATCH[2]}
+                hotfix_thread_ts="${raw_ts:0:10}.${raw_ts:10}"
+            elif [[ "$hotfix_slack_url" =~ ^https://.*slack\.com/archives/([A-Z0-9]+)/?$ ]]; then
+                hotfix_channel=${BASH_REMATCH[1]}
+                hotfix_thread_ts=""
+            elif [[ "$hotfix_slack_url" =~ ^https://.*slack\.com/client/[A-Z0-9]+/([A-Z0-9]+) ]]; then
+                hotfix_channel=${BASH_REMATCH[1]}
+                hotfix_thread_ts=""
+            fi
+            if [ -n "$hotfix_channel" ]; then
+                echo "" >&2
+                # Update MR description with Slack reference
+                if glab mr update "$branch_name" --description "Slack: $hotfix_slack_url" >/dev/null 2>&1; then
+                    echo -e "  ${GREEN}✓${RESET} Added Slack reference to MR description" >&2
+                fi
+                if [ -n "$TICKET_CREATOR_BOT_TOKEN" ] && ! verify_slack_channel_access "$hotfix_channel"; then
+                    echo -e "  ${YELLOW}⚠ Skipping Slack post${RESET}" >&2
+                elif post_to_slack "$hotfix_channel" "$hotfix_thread_ts" "mr" "$mr_url" "$commit_message"; then
+                    echo -e "  ${GREEN}✓${RESET} Posted MR link to Slack" >&2
+                fi
+            else
+                echo -e "  ${YELLOW}⚠ Invalid Slack URL, skipping${RESET}" >&2
+            fi
         fi
     fi
     
