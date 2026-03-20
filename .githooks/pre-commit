@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+BATS="$REPO_ROOT/test/bats/bin/bats"
+
+if [ ! -x "$BATS" ]; then
+  echo "[pre-commit] bats not found, skipping tests" >&2
+  exit 0
+fi
+
+echo "[pre-commit] Running bats tests..."
+"$BATS" "$REPO_ROOT/test/"
