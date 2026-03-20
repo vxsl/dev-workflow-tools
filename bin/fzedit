@@ -53,14 +53,14 @@ generate_list() {
         
         # Preferred directories with preferred extensions
         for dir in "${PREFERRED_DIRS[@]}"; do
-            [ -d "$dir" ] && fd . "$dir" --type f --follow --hidden "${EXCLUDE_DIRS[@]}" "${PREFERRED_EXTS[@]}"
+            [ -d "$dir" ] && fd . "$dir" --type f --follow --hidden --no-ignore-vcs "${EXCLUDE_DIRS[@]}" "${PREFERRED_EXTS[@]}"
         done
-        
+
         # All preferred extensions in home
-        fd . ~/ --type f --follow --hidden "${EXCLUDE_DIRS[@]}" "${PREFERRED_EXTS[@]}"
-        
+        fd . ~/ --type f --follow --hidden --no-ignore-vcs "${EXCLUDE_DIRS[@]}" "${PREFERRED_EXTS[@]}"
+
         # Everything else (lower priority)
-        fd . ~/ --type f --follow --hidden "${EXCLUDE_DIRS[@]}"
+        fd . ~/ --type f --follow --hidden --no-ignore-vcs "${EXCLUDE_DIRS[@]}"
     } | awk '!seen[$0]++' | awk -v home="$HOME" '{
         # Replace home directory with ~
         path = $0
