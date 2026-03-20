@@ -20,7 +20,10 @@ source ~/bin/dev-workflow-tools/shell/dev-workflow.zsh
 ### Dependencies
 
 Required: `git`, `fzf`, `jq`, `curl`, `glab`
-Optional: `xclip`, `bat`, `eza`, `fd`, `wmctrl`
+Optional:
+- `tmux` (for pane management + auto-clear refresh summary)
+- `xdotool` (Linux X11 only - for auto-clear refresh summary outside tmux)
+- `xclip`, `bat`, `eza`, `fd`, `wmctrl`
 
 ## Configuration
 
@@ -31,8 +34,8 @@ JIRA_PROJECT="<PROJ|DEV|ENG>"
 JIRA_EMAIL="your-email@company.com"
 JIRA_API_TOKEN="your-api-token"
 
-# Optional
-JIRA_ME="Your Name"
+# Optional - your JIRA username (for branch highlighting in rr)
+JIRA_ME="your-jira-username"
 TICKET_CREATOR_BOT_TOKEN="xoxb-..."
 FZF_PERSIST_MODE=1  # For xmonad scratchpads/tmux popups
 
@@ -42,6 +45,21 @@ JIRA_QA_BRANCH_DOMAIN="qa.example.com"    # Single domain or comma/space-separat
 ```
 
 Get Jira API token: https://id.atlassian.com/manage-profile/security/api-tokens
+
+#### Required Jira API Token Scopes
+
+When creating your API token, select these granular scopes:
+
+| Scope | Used for |
+|---|---|
+| `read:jira-work` | Searching/reading issues, projects, statuses, priorities |
+| `write:jira-work` | Creating issues, adding comments, transitioning statuses, updating fields |
+| `read:jira-user` | Reading current user info (`/myself` endpoint) |
+| `read:board:jira-software` | Fetching boards for sprint assignment (`create-jira-ticket`) |
+| `read:sprint:jira-software` | Fetching active sprints (`create-jira-ticket`) |
+| `write:sprint:jira-software` | Adding issues to sprints (`create-jira-ticket`) |
+
+> **Note:** If classic scopes are available, `read:jira-work` + `write:jira-work` + `read:jira-user` cover everything except Agile board/sprint features.
 
 ### Slack Bot Token
 
@@ -80,6 +98,35 @@ JIRA_QA_BRANCH_DOMAIN="qa.example.com"
 ### FZF Persist Mode
 
 By default, fzf tools exit after selection (normal CLI behavior). Set `FZF_PERSIST_MODE=1` if using xmonad scratchpads or tmux popups to keep the interface open after actions.
+
+### Worktree Customization
+
+Automatically customize new worktrees when created via `create-wt` or rr's F2/F3 keybindings.
+
+**Exclude Build Artifacts** (skip copying large directories):
+```bash
+# Skip Rust's target/ directory (can be hundreds of MB)
+WORKTREE_COPY_EXCLUDE="target/"
+
+# Multiple patterns
+WORKTREE_COPY_EXCLUDE="target/ build/ dist/ *.log"
+```
+
+**VS Code Settings** (simple JSON merge):
+```bash
+# Disable Rust analyzer in all new worktrees
+VSCODE_WORKSPACE_SETTINGS='{"rust-analyzer.enable": false}'
+
+# Multiple settings
+VSCODE_WORKSPACE_SETTINGS='{"rust-analyzer.enable": false, "editor.formatOnSave": true}'
+```
+
+**Post-Worktree Hook** (arbitrary customization):
+```bash
+POST_WORKTREE_HOOK="/home/username/bin/my-worktree-setup.sh"
+```
+
+See [WORKTREE_CUSTOMIZATION.md](WORKTREE_CUSTOMIZATION.md) for detailed examples and use cases.
 
 ## Tools
 
@@ -124,7 +171,69 @@ r -o        # Remote branches
 r -r        # Refresh cache
 ```
 
-**Keys:** `^l` load more | `^o` toggle local/remote
+**Keys:** `^l` load more | `^o` toggle local/remote | `^r` refresh (shows summary for 2.5s, auto-clears) | `F2` new worktree | `F3` new branch+wt | `F8` delete wt
+
+**Refresh Auto-Clear:**
+The refresh summary automatically clears after 2.5 seconds when using:
+- **tmux** - Works in any tmux session
+- **macOS** - Uses built-in `osascript` (no extra install needed)
+- **Linux X11** - Requires `xdotool` package
+
+If auto-clear is unavailable, the summary will show installation instructions or indicate it will persist.
+
+**Display Columns:**
+1. **Branch** - Branch name with indicators
+2. **Title** - JIRA ticket summary
+3. **Status** - JIRA ticket status
+4. **Assignee** - JIRA ticket assignee
+5. **Checked** - When you last checked out this branch/worktree
+6. **Committed** - When the last commit was made
+
+**Branch Emphasis** (requires `JIRA_ME` in `.env`):
+- **★ Bright purple** - Your authoritative branch (exact ticket: `UB-6493`)
+- **· Dimmed purple** - Your variant branch (ticket + suffix: `UB-6493-wip`)
+- **Gray (no symbol)** - Other branches (not assigned to you)
+
+**Visual Indicators:**
+- `⚡` Worktree exists
+- `⌘` Worktree status (green=clean, orange=dirty)
+
+#### Tmux Pane Management (Optional)
+
+You can configure `rr` to manage specific tmux panes (e.g., dev server, tsc-watch) across worktrees. When enabled, you can switch which worktree is active for each pane with a single keystroke.
+
+**Configuration in `.env`:**
+```bash
+# Enable pane management
+RR_PANE_MGMT_ENABLED=true
+
+# Dev server pane (format: session:window.pane)
+RR_DEV_SERVER_PANE="tmuxa-1:0.1"
+RR_DEV_SERVER_COMMAND="yarn install && yarn run-p tailwind dev"
+
+# TypeScript watch pane (optional)
+RR_TSC_WATCH_PANE="tmuxa-1:0.2"
+RR_TSC_WATCH_COMMAND="yarn tsc-watch"
+```
+
+**Usage:**
+1. In `rr`, select a worktree with an existing worktree (marked with ⚡⌘)
+2. Press `F4` to set it as the dev server target
+3. Press `F5` to set it as the tsc-watch target
+4. The script will automatically:
+   - Kill the current process in the pane (Ctrl-C)
+   - cd to the selected worktree
+   - Run the configured command
+
+**Visual Indicators:**
+- `▶` (green) - This worktree is running the dev server
+- `⏩` (cyan) - This worktree is running tsc-watch
+
+**Finding your pane IDs:**
+```bash
+# List all tmux panes with their IDs
+tmux list-panes -a -F "#{session_name}:#{window_index}.#{pane_index} - #{pane_title}"
+```
 
 ### `fzedit`
 Interactive file finder/editor.
