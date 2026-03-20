@@ -1,15 +1,16 @@
 #!/bin/sh
 # Shell Compatibility Module
-# Provides 3 helper functions to make the dev-workflow-tools cross-compatibile for both bash and zsh
+# Provides helper functions that abstract bash/zsh differences.
 #
-# This library provides wrapper functions to handle differences between
-# bash and zsh, allowing scripts to work in both shells without modification.
+# NOTE: Most bin/ scripts use #!/usr/bin/env bash and always run under bash,
+# so they do NOT need this library. Only source this from scripts that must
+# genuinely run under both bash and zsh (e.g., scripts sourced from .zshrc).
 #
 # Usage:
 #   source "$SCRIPT_DIR/../lib/shell-compat.sh"
 #
 # Functions:
-#   shell_get_match INDEX          - Get regex capture group from last match
+#   shell_get_match INDEX          - Get regex capture group from last [[ =~ ]] match
 #   shell_get_pipe_status INDEX    - Get exit status from pipeline command
 #   shell_read_prompt PROMPT VAR [OPTS] - Read user input with prompt
 
