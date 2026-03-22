@@ -34,7 +34,7 @@
 
 set -e
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$(type -P "$0" || echo "$0")")")" && pwd)"
 source "$SCRIPT_DIR/../lib/ticket-selection.sh"
 
 # Load environment variables

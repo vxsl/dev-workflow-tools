@@ -15,7 +15,7 @@
 
 set -e
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$(type -P "$0" || echo "$0")")")" && pwd)"
 
 # Load environment variables
 if [ -f "$SCRIPT_DIR/../.env" ]; then

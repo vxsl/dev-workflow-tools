@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # Load environment variables
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$(type -P "$0" || echo "$0")")")" && pwd)"
 SCRIPT_PATH="$(readlink -f "$0")"
 AUTO_CLEAR_SCRIPT="$SCRIPT_DIR/rr-auto-clear.sh"
 if [ -f "$SCRIPT_DIR/../.env" ]; then
