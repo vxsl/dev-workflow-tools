@@ -1,0 +1,130 @@
+#!/usr/bin/env bash
+# create-wt: Create a branch + worktree for a ticket
+# Usage: create-wt <TICKET-ID>
+# Outputs the worktree path on stdout on success.
+
+set -euo pipefail
+
+TICKET="${1:?Usage: create-wt <TICKET-ID>}"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$(type -P "$0" || echo "$0")")")" && pwd)"
+
+if [ -f "$SCRIPT_DIR/../.env" ]; then
+    set -a; source "$SCRIPT_DIR/../.env"; set +a
+fi
+
+GIT_ROOT=$(git rev-parse --show-toplevel)
+REPO_NAME=$(basename "$GIT_ROOT")
+JIRA_PROJECT="${JIRA_PROJECT:-UB}"
+
+declare -A JIRA_TITLE_CACHE=()
+
+load_jira_caches() {
+    if [ -f ~/.jira_cache ]; then
+        while IFS=: read -r ticket title; do
+            JIRA_TITLE_CACHE["$ticket"]="$title"
+        done < ~/.jira_cache
+    fi
+}
+
+get_jira_title() {
+    local ticket=$1
+    if [[ $ticket =~ ^[A-Z]+-[0-9]+$ ]]; then
+        echo "${JIRA_TITLE_CACHE[$ticket]:-}"
+    fi
+}
+
+sanitize_title_for_path() {
+    local title="$1"
+    local max_length="${2:-40}"
+    local sanitized
+    sanitized=$(echo "$title" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g' | sed 's/-\+/-/g' | sed 's/^-\+//g' | sed 's/-\+$//g')
+    if [ ${#sanitized} -gt "$max_length" ]; then
+        sanitized="${sanitized:0:$max_length}"
+        sanitized=$(echo "$sanitized" | sed 's/-\+$//g')
+    fi
+    echo "$sanitized"
+}
+
+copy_worktree_files() {
+    local src_root="$1"
+    local dst_root="$2"
+    local files_to_copy_str="${WT_FILES_TO_COPY:-client/web/.env client/web/ulweb/pkg client/web/.cursor client/web/.vscode}"
+    local copied_count=0
+    for file in $files_to_copy_str; do
+        local src="$src_root/$file"
+        local dst="$dst_root/$file"
+        if [ -e "$src" ] && [ ! -e "$dst" ]; then
+            if [ -d "$src" ] && [ -n "${WORKTREE_COPY_EXCLUDE:-}" ]; then
+                local exclude_args=""
+                for pattern in $WORKTREE_COPY_EXCLUDE; do
+                    exclude_args="$exclude_args --exclude=$pattern"
+                done
+                # shellcheck disable=SC2086
+                rsync -a $exclude_args "$src/" "$dst/" 2>/dev/null && ((copied_count++)) || true
+            else
+                cp -r "$src" "$dst" 2>/dev/null && ((copied_count++)) || true
+            fi
+        fi
+    done
+    [ $copied_count -gt 0 ] && echo "✓ Copied $copied_count file(s) to worktree" >&2 || true
+    if [ -n "${VSCODE_WORKSPACE_SETTINGS:-}" ]; then
+        local vscode_dir="$dst_root/client/web/.vscode"
+        local vscode_settings="$vscode_dir/settings.json"
+        mkdir -p "$vscode_dir"
+        echo "$VSCODE_WORKSPACE_SETTINGS" | python3 -c "
+import json, sys
+settings = json.load(sys.stdin)
+print(json.dumps(settings, indent=2))
+" 2>/dev/null > "$vscode_settings" && echo "✓ Created VS Code workspace settings" >&2 || true
+    fi
+    if [ -n "${POST_WORKTREE_HOOK:-}" ] && [ -x "$POST_WORKTREE_HOOK" ]; then
+        echo "Running post-worktree hook: $POST_WORKTREE_HOOK" >&2
+        "$POST_WORKTREE_HOOK" "$dst_root" >&2
+    fi
+}
+
+# Determine base branch
+default_branch="main"
+if ! git -C "$GIT_ROOT" show-ref --verify --quiet refs/heads/main; then
+    if git -C "$GIT_ROOT" show-ref --verify --quiet refs/heads/master; then
+        default_branch="master"
+    else
+        echo "✗ Cannot find main/master branch" >&2
+        exit 1
+    fi
+fi
+
+# Build worktree name
+load_jira_caches
+jira_title=$(get_jira_title "$TICKET")
+wt_name="$TICKET"
+if [ -n "$jira_title" ]; then
+    sanitized=$(sanitize_title_for_path "$jira_title" 40)
+    wt_name="$TICKET-$sanitized"
+fi
+wt_path="$GIT_ROOT/../$REPO_NAME.$wt_name"
+
+# Create worktree
+if git -C "$GIT_ROOT" show-ref --verify --quiet "refs/remotes/origin/$TICKET"; then
+    echo "Tracking existing remote branch origin/$TICKET..." >&2
+    echo "Creating worktree at $wt_path..." >&2
+    if git -C "$GIT_ROOT" worktree add --track -b "$TICKET" "$wt_path" "origin/$TICKET" 2>&1 >&2; then
+        echo "✓ Branch and worktree created successfully!" >&2
+        copy_worktree_files "$GIT_ROOT" "$wt_path"
+        echo "$wt_path"
+    else
+        echo "✗ Failed to create branch and worktree" >&2
+        exit 1
+    fi
+else
+    echo "Creating branch $TICKET from $default_branch..." >&2
+    echo "Creating worktree at $wt_path..." >&2
+    if git -C "$GIT_ROOT" worktree add -b "$TICKET" "$wt_path" "$default_branch" 2>&1 >&2; then
+        echo "✓ Branch and worktree created successfully!" >&2
+        copy_worktree_files "$GIT_ROOT" "$wt_path"
+        echo "$wt_path"
+    else
+        echo "✗ Failed to create branch and worktree" >&2
+        exit 1
+    fi
+fi
