@@ -23,10 +23,21 @@ JIRA_PROJECT="${JIRA_PROJECT}"
 JIRA_ME="${JIRA_ME:-}"  # Your JIRA username - used to highlight your assigned branches
 RR_REMOTE_MAX_AGE_DAYS="${RR_REMOTE_MAX_AGE_DAYS:-90}"  # Max age of remote-only branches to show (0 = no limit)
 
+# Auto-detect Jira from JIRA_REPO: enable only when running inside that repo
+if [ -n "${JIRA_REPO:-}" ]; then
+    _git_root=$(git rev-parse --show-toplevel 2>/dev/null)
+    if [ "$_git_root" = "$JIRA_REPO" ]; then
+        JIRA_ENABLED=true
+    else
+        JIRA_ENABLED=false
+    fi
+fi
+
 # Validate required environment variables
-require_env JIRA_DOMAIN JIRA_PROJECT
-# Warn about optional Jira API credentials (ticket info, assignee data)
-warn_env "Jira ticket details" JIRA_EMAIL JIRA_API_TOKEN
+if [ "${JIRA_ENABLED:-false}" = "true" ]; then
+    require_env JIRA_DOMAIN JIRA_PROJECT
+    warn_env "Jira ticket details" JIRA_EMAIL JIRA_API_TOKEN
+fi
 
 if [ -n "$ENV_WARNINGS" ]; then
     echo "" >&2
@@ -1386,15 +1397,11 @@ generate_branch_data() {
             head -n "$count"
         )
 
-        # If we got very few branches from reflog, supplement with all branches by commit date
-        local reflog_count=$(echo "$branch_list" | grep -c '^' || echo 0)
-        if [ "$reflog_count" -lt 3 ]; then
-            # Get all branches sorted by commit date and merge with reflog results
-            local all_branches=$(git for-each-ref --sort='-committerdate' refs/heads/ \
-                --format='%(refname:short)%09%(committerdate:unix)%09%(committerdate:relative)')
-            # Combine: reflog branches first (preserving order), then fill with commit-sorted branches
-            branch_list=$(echo -e "$branch_list\n$all_branches" | awk '!seen[$1]++ { print $0 }' | head -n "$count")
-        fi
+        # Always supplement with all local branches so none are invisible
+        local all_branches=$(git for-each-ref --sort='-committerdate' refs/heads/ \
+            --format='%(refname:short)%09%(committerdate:unix)%09%(committerdate:relative)')
+        # Combine: reflog branches first (preserving order), then fill with commit-sorted branches
+        branch_list=$(echo -e "$branch_list\n$all_branches" | awk '!seen[$1]++ { print $0 }')
 
         # Always ensure all worktree branches are included (important for branches in detached HEAD state during rebase)
         local worktree_branches=""
@@ -1505,7 +1512,7 @@ generate_branch_data() {
     fi
 
     # Reload caches to pick up newly fetched data
-    load_jira_caches
+    [ "${JIRA_ENABLED:-false}" = "true" ] && load_jira_caches
 
     # Pre-sort branch_list by final sort timestamp before streaming.
     # Worktree access times are already available in WORKTREE_ACCESS_LOG and WORKTREE_MAP,
@@ -2392,8 +2399,8 @@ if [ "$GENERATE_MORE_MODE" != true ]; then
     { printf '\n\n\n\n'; tput cuu 4; tput sc; } > /dev/tty 2>&1
     update_loading_progress 1
 
-    # Load JIRA caches
-    load_jira_caches
+    # Load JIRA caches (only when in the Jira repo)
+    [ "${JIRA_ENABLED:-false}" = "true" ] && load_jira_caches
     update_loading_progress 2
 
     # Build worktree map
@@ -2401,7 +2408,7 @@ if [ "$GENERATE_MORE_MODE" != true ]; then
     update_loading_progress 3
 else
     # For reload mode, just run silently
-    load_jira_caches
+    [ "${JIRA_ENABLED:-false}" = "true" ] && load_jira_caches
     build_worktree_map
 fi
 
@@ -2480,7 +2487,7 @@ if [ "$GENERATE_MORE_MODE" = true ]; then
     fi
 
     # Append branchless JIRA tickets
-    if [ -n "$JIRA_EMAIL" ] && [ -n "$JIRA_API_TOKEN" ]; then
+    if [ "${JIRA_ENABLED:-false}" = "true" ] && [ -n "$JIRA_EMAIL" ] && [ -n "$JIRA_API_TOKEN" ]; then
         branchless_data=$(generate_branchless_ticket_data "$processed_data")
         if [ -n "$branchless_data" ]; then
             if [ -n "$processed_data" ]; then
@@ -2733,7 +2740,7 @@ mkfifo "$_data_fifo"
                 if (n >= 2 && a[n] ~ /^[0-9]+$/) ts = a[n]
                 print ts "\t" $0
             }' | sort -t$'\t' -k1,1nr | cut -f2-
-            if [ -n "$JIRA_EMAIL" ] && [ -n "$JIRA_API_TOKEN" ]; then
+            if [ "${JIRA_ENABLED:-false}" = "true" ] && [ -n "$JIRA_EMAIL" ] && [ -n "$JIRA_API_TOKEN" ]; then
                 generate_branchless_ticket_data ""
             fi
             generate_remote_only_data
