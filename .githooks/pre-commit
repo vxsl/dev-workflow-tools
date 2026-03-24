@@ -10,4 +10,5 @@ if [ ! -x "$BATS" ]; then
 fi
 
 echo "[pre-commit] Running bats tests..."
-"$BATS" "$REPO_ROOT/test/"
+env -u GIT_DIR -u GIT_INDEX_FILE -u GIT_WORK_TREE -u GIT_OBJECT_DIRECTORY \
+  "$BATS" "$REPO_ROOT/test/"

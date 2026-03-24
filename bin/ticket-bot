@@ -242,7 +242,7 @@ if "--test-dm" in sys.argv:
 
 
 # Patterns
-TICKET_RE = re.compile(r"([A-Z]{2,10}-\d+)", re.IGNORECASE)
+TICKET_RE = re.compile(r"([A-Z]{2,10}-\d+)")
 SLACK_URL_RE = re.compile(r"<?(https://\S+slack\.com/archives/\S+?)>?")
 JIRA_URL_RE = re.compile(r"<?(https://\S+atlassian\.net/\S+?)>?")
 
