@@ -575,6 +575,17 @@ if [ "$SKIP_PUSH" != "true" ]; then
 
     if [ "$push_exit_code" -eq 0 ]; then
         echo -e "  ${GREEN}✓${RESET} Push successful" >&2
+    elif grep -q "Autofix commits were added" "$push_tmp"; then
+        echo -e "  ${YELLOW}⚠${RESET} Pre-push hook added autofix commits — retrying push..." >&2
+        git push -u origin "$selected_branch" 2>&1 | while read -r line; do
+            echo -e "  ${DIM}${line}${RESET}" >&2
+        done
+        if [ ${PIPESTATUS[0]} -eq 0 ]; then
+            echo -e "  ${GREEN}✓${RESET} Push successful (after autofix)" >&2
+        else
+            echo -e "  ${RED}✗${RESET} Push failed" >&2
+            exit 1
+        fi
     elif grep -q "non-fast-forward\|fetch first\|tip of your current branch is behind" "$push_tmp"; then
         echo -e "  ${RED}✗${RESET} Push rejected (remote has changes not in local branch)" >&2
         force_choice=""
