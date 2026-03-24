@@ -490,9 +490,10 @@ if $MOCK; then
     # Create a dummy change in an existing file
     MOCK_FILE=$(set +o pipefail; git -C "$WORK_DIR" ls-files '*.ts' | head -1)
     if [ -n "$MOCK_FILE" ]; then
-        echo "// ticket-solve mock $(date -Iseconds)" >> "$WORK_DIR/$MOCK_FILE"
+        # var triggers eslint no-var autofix → gets rewritten to const
+        echo "var _ticketSolveMock = '$(date -Iseconds)'" >> "$WORK_DIR/$MOCK_FILE"
     else
-        echo "// ticket-solve mock $(date -Iseconds)" > "$WORK_DIR/mock-ticket-solve.ts"
+        echo "var _ticketSolveMock = '$(date -Iseconds)'" > "$WORK_DIR/mock-ticket-solve.ts"
         MOCK_FILE="mock-ticket-solve.ts"
     fi
     git -C "$WORK_DIR" add -A
