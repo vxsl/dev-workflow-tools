@@ -244,6 +244,7 @@ if "--test-dm" in sys.argv:
 # Patterns
 TICKET_RE = re.compile(r"([A-Z]{2,10}-\d+)", re.IGNORECASE)
 SLACK_URL_RE = re.compile(r"<?(https://\S+slack\.com/archives/\S+?)>?")
+JIRA_URL_RE = re.compile(r"<?(https://\S+atlassian\.net/\S+?)>?")
 
 
 # ── State management ──
@@ -965,6 +966,7 @@ try:
                     extra = text
                     extra = TICKET_RE.sub("", extra)
                     extra = SLACK_URL_RE.sub("", extra)
+                    extra = JIRA_URL_RE.sub("", extra)
                     extra = re.sub(r"[<>]", "", extra).strip()
 
                     print(f"New request: {ticket}{' (mock)' if MOCK_MODE else ''}")
