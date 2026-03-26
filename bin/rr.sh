@@ -23,10 +23,11 @@ JIRA_PROJECT="${JIRA_PROJECT}"
 JIRA_ME="${JIRA_ME:-}"  # Your JIRA username - used to highlight your assigned branches
 RR_REMOTE_MAX_AGE_DAYS="${RR_REMOTE_MAX_AGE_DAYS:-90}"  # Max age of remote-only branches to show (0 = no limit)
 
-# Auto-detect Jira from JIRA_REPO: enable only when running inside that repo
+# Auto-detect Jira from JIRA_REPO: enable when running inside that repo or any of its worktrees
 if [ -n "${JIRA_REPO:-}" ]; then
-    _git_root=$(git rev-parse --show-toplevel 2>/dev/null)
-    if [ "$_git_root" = "$JIRA_REPO" ]; then
+    _jira_common="$(git -C "$JIRA_REPO" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
+    _cur_common="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
+    if [ -n "$_jira_common" ] && [ "$_jira_common" = "$_cur_common" ]; then
         JIRA_ENABLED=true
     else
         JIRA_ENABLED=false
