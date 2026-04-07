@@ -241,6 +241,7 @@ except urllib.error.URLError as e:
     sys.exit(1)
 
 BOT_USER_ID = auth_resp.get("user_id", "")
+WORKSPACE_URL = auth_resp.get("url", "").rstrip("/")  # e.g. "https://urbanlogiq.slack.com"
 if not auth_resp.get("ok"):
     print(f"Error: auth.test failed: {auth_resp.get('error')}")
     print("Check that TICKET_CREATOR_BOT_TOKEN is a valid bot token (xoxb-...)")
@@ -1271,10 +1272,22 @@ def handle_message(channel, ts, user, text, thread_ts=None):
                     json.dumps({"msg_ts": confirm_ts, "channel": channel, "expires": time.time() + 120}))
 
     elif text.strip():
-        # Freeform text without a ticket ID or Slack URL — nudge the user
-        slack_reply(channel, ts,
-                    ":thinking_face: I need a *ticket ID* (e.g. `UB-1234`) or a *Slack thread link* to get started.\n"
-                    "You can also add instructions after the ticket/link.")
+        # If posted in a thread, use the thread as Slack context
+        parent_ts = thread_ts if (thread_ts and thread_ts != ts) else None
+        if parent_ts and WORKSPACE_URL:
+            thread_url = f"{WORKSPACE_URL}/archives/{channel}/p{parent_ts.replace('.', '')}"
+            print(f"New thread-context request: {thread_url} (channel={channel}){' (mock)' if MOCK_MODE else ''}: {text[:60]}...")
+            start_ticket_solve(
+                ticket=None, thread_ts=parent_ts, channel=channel,
+                slack_urls=[thread_url],
+                extra_context=text.strip(),
+                mock=MOCK_MODE, slack_context=True,
+            )
+        else:
+            # Top-level freeform text without a ticket ID or Slack URL — nudge the user
+            slack_reply(channel, ts,
+                        ":thinking_face: I need a *ticket ID* (e.g. `UB-1234`) or a *Slack thread link* to get started.\n"
+                        "You can also add instructions after the ticket/link.")
 
 
 def handle_reaction(channel, ts, user, reaction):
