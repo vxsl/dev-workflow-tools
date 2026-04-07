@@ -380,6 +380,7 @@ def start_ticket_solve(ticket, thread_ts, channel, slack_urls=None, extra_contex
 
     if slack_context:
         cmd.append("--slack-context")
+        cmd.extend(["--slug", dedup_key])
     elif ticket:
         cmd.insert(1, ticket)  # ticket as first positional arg
 
