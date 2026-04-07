@@ -71,10 +71,28 @@ Thread replies:
 State is saved to ~/.cache/ticket-solve/*.json
 Logs are at ~/.cache/ticket-solve/*.log
 
+Dependencies:
+  pip install -r requirements.txt   (or: pip install slack_sdk)
+
 Requires in .env:
   TICKET_CREATOR_BOT_TOKEN   Slack bot token (xoxb-...)
+  SLACK_APP_TOKEN             Slack app-level token (xapp-...)
   SLACK_NOTIFY_USER_ID       Your Slack user ID
   JIRA_EMAIL, JIRA_API_TOKEN, JIRA_DOMAIN
+
+Slack app setup:
+  1. Create a Slack app at https://api.slack.com/apps
+  2. Enable Socket Mode (Settings → Socket Mode → Enable)
+  3. Generate an App-Level Token with connections:write scope
+     → this is your SLACK_APP_TOKEN (starts with xapp-)
+  4. Add bot token scopes (OAuth & Permissions → Scopes → Bot Token Scopes):
+       chat:write, channels:history, channels:read,
+       groups:history, groups:read, im:history, reactions:read
+  5. Subscribe to bot events (Event Subscriptions → Subscribe to bot events):
+       message.channels, message.groups, message.im, reaction_added
+  6. Install the app to your workspace
+     → copy the Bot User OAuth Token as TICKET_CREATOR_BOT_TOKEN (starts with xoxb-)
+  7. Invite the bot to any channels you want it to listen in: /invite @botname
 """)
     sys.exit(0)
 
@@ -106,13 +124,31 @@ JIRA_PROJECT = os.environ.get("JIRA_PROJECT", "UB")
 JIRA_DOMAIN = os.environ.get("JIRA_DOMAIN", "")
 PROJECT_ROOT = os.environ.get("TICKET_BOT_PROJECT_ROOT", "")
 
-if not BOT_TOKEN or not USER_ID:
-    print("Error: TICKET_CREATOR_BOT_TOKEN and SLACK_NOTIFY_USER_ID required in .env")
-    sys.exit(1)
-
-if not APP_TOKEN:
-    print("Error: SLACK_APP_TOKEN required in .env (xapp-... token for Socket Mode)")
-    print("Enable Socket Mode in your Slack app settings and generate an App-Level Token")
+if not BOT_TOKEN or not USER_ID or not APP_TOKEN:
+    missing = []
+    if not BOT_TOKEN:
+        missing.append("TICKET_CREATOR_BOT_TOKEN")
+    if not APP_TOKEN:
+        missing.append("SLACK_APP_TOKEN")
+    if not USER_ID:
+        missing.append("SLACK_NOTIFY_USER_ID")
+    print(f"Missing from .env: {', '.join(missing)}")
+    print()
+    print("Slack app setup:")
+    print("  1. Create a Slack app at https://api.slack.com/apps")
+    print("  2. Enable Socket Mode (Settings → Socket Mode → Enable)")
+    print("  3. Generate an App-Level Token with connections:write scope")
+    print("     → save as SLACK_APP_TOKEN in .env (starts with xapp-)")
+    print("  4. Add bot token scopes (OAuth & Permissions → Bot Token Scopes):")
+    print("       chat:write, channels:history, channels:read,")
+    print("       groups:history, groups:read, im:history, reactions:read")
+    print("  5. Subscribe to bot events (Event Subscriptions → Subscribe to bot events):")
+    print("       message.channels, message.groups, message.im, reaction_added")
+    print("  6. Install the app to your workspace")
+    print("     → save Bot User OAuth Token as TICKET_CREATOR_BOT_TOKEN (starts with xoxb-)")
+    print("  7. Set SLACK_NOTIFY_USER_ID to your Slack user ID")
+    print("     (find it: click your profile → ⋯ → Copy member ID)")
+    print(f"\n  .env location: {ENV_FILE}")
     sys.exit(1)
 
 if not PROJECT_ROOT:
