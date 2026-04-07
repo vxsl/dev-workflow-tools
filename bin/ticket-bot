@@ -113,6 +113,40 @@ MOCK_MODE = "--mock" in sys.argv
 # ── Slack API helpers ──
 
 
+_rate_limit_until = 0  # epoch time to pause API calls until
+
+
+def _slack_request(method, req):
+    """Execute a Slack API request with rate-limit retry."""
+    global _rate_limit_until
+    now = time.time()
+    if now < _rate_limit_until:
+        wait = _rate_limit_until - now
+        print(f"  Rate limited, waiting {wait:.0f}s...")
+        time.sleep(wait)
+    try:
+        with urllib.request.urlopen(req) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        if e.code == 429:
+            retry_after = int(e.headers.get("Retry-After", 30))
+            _rate_limit_until = time.time() + retry_after
+            print(f"  Rate limited ({method}), waiting {retry_after}s...")
+            time.sleep(retry_after)
+            # Retry once
+            try:
+                with urllib.request.urlopen(req) as resp:
+                    return json.loads(resp.read())
+            except urllib.error.URLError as e2:
+                print(f"  Slack API error ({method}): {e2}")
+                return {"ok": False, "error": str(e2)}
+        print(f"  Slack API error ({method}): {e}")
+        return {"ok": False, "error": str(e)}
+    except urllib.error.URLError as e:
+        print(f"  Slack API error ({method}): {e}")
+        return {"ok": False, "error": str(e)}
+
+
 def slack_post(method, **kwargs):
     url = f"https://slack.com/api/{method}"
     data = json.dumps(kwargs).encode()
@@ -124,12 +158,7 @@ def slack_post(method, **kwargs):
             "Content-Type": "application/json; charset=utf-8",
         },
     )
-    try:
-        with urllib.request.urlopen(req) as resp:
-            return json.loads(resp.read())
-    except urllib.error.URLError as e:
-        print(f"  Slack API error ({method}): {e}")
-        return {"ok": False, "error": str(e)}
+    return _slack_request(method, req)
 
 
 def slack_get(method, **params):
@@ -139,12 +168,7 @@ def slack_get(method, **params):
     req = urllib.request.Request(
         url, headers={"Authorization": f"Bearer {BOT_TOKEN}"}
     )
-    try:
-        with urllib.request.urlopen(req) as resp:
-            return json.loads(resp.read())
-    except urllib.error.URLError as e:
-        print(f"  Slack API error ({method}): {e}")
-        return {"ok": False, "error": str(e)}
+    return _slack_request(method, req)
 
 
 def slack_reply(channel, thread_ts, text):
@@ -1014,7 +1038,9 @@ _welcome_resp = slack_post(
 _start_ts = _welcome_resp.get("ts", str(time.time())) if _welcome_resp.get("ok") else str(time.time())
 channel_last_ts = {ch: _start_ts for ch in bot_channels}
 CHANNEL_REFRESH_INTERVAL = 300  # re-discover channels every 5 min
+CHANNELS_PER_CYCLE = 3  # max non-DM channels to poll per cycle (rate limit friendly)
 _last_channel_refresh = time.time()
+_channel_poll_index = 0  # round-robin index for non-DM channels
 print(f"  Listening from ts: {_start_ts}")
 
 try:
@@ -1037,8 +1063,22 @@ try:
                         channel_last_ts.pop(ch, None)
                 bot_channels = new_channels
 
-            # ── Poll all channels for new messages ──
-            for poll_channel in list(bot_channels):
+            # ── Poll channels for new messages ──
+            # Always poll DM; round-robin through non-DM channels to stay under rate limits
+            non_dm_channels = sorted(ch for ch in bot_channels if not is_dm_channel(ch))
+            dm_channels = [ch for ch in bot_channels if is_dm_channel(ch)]
+            # Pick a slice of non-DM channels for this cycle
+            if non_dm_channels:
+                start = _channel_poll_index % len(non_dm_channels)
+                cycle_slice = non_dm_channels[start:start + CHANNELS_PER_CYCLE]
+                if len(cycle_slice) < CHANNELS_PER_CYCLE:
+                    cycle_slice += non_dm_channels[:CHANNELS_PER_CYCLE - len(cycle_slice)]
+                _channel_poll_index = (start + CHANNELS_PER_CYCLE) % len(non_dm_channels)
+            else:
+                cycle_slice = []
+            channels_this_cycle = dm_channels + cycle_slice
+
+            for poll_channel in channels_this_cycle:
                 last_ts = channel_last_ts.get(poll_channel, _start_ts)
                 result = slack_get(
                     "conversations.history",
