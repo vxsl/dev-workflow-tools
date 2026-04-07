@@ -4,12 +4,14 @@
 # Usage:
 #   ticket-solve UB-1234                         Solve ticket (fetches description from Jira)
 #   ticket-solve UB-1234 https://slack.com/...   Include Slack thread context
+#   ticket-solve https://slack.com/.../p123...   Solve from Slack thread (no Jira ticket)
 #   ticket-solve UB-1234 --context "extra info"  Pass additional context
 #   ticket-solve UB-1234 --dry-run               Show what would be done
 #   ticket-solve UB-1234 --model sonnet          Use a specific model (default: sonnet)
 #
 # When called by ticket-bot:
 #   ticket-solve UB-1234 --thread-ts 123.456 --dm-channel C0123 --session-id <uuid>
+#   ticket-solve --slack-context https://slack.com/... --thread-ts ... --dm-channel ... --session-id ...
 #
 # End state:
 #   - Worktree at ../repo.TICKET-slug/ with all changes soft-reset (staged, not committed)
@@ -56,6 +58,8 @@ SLACK_URLS=()
 THREAD_TS=""          # If set, reply in existing thread (from ticket-bot)
 DM_CHANNEL=""         # If set, use this DM channel (from ticket-bot)
 SESSION_ID=""         # If set, use this session ID (from ticket-bot)
+SLACK_CONTEXT=false   # If true, primary context is a Slack thread (no Jira ticket required)
+SLUG=""               # Branch slug for Slack-context mode (auto-generated if empty)
 
 # Parse args
 TICKET=""
@@ -93,6 +97,14 @@ while [[ $# -gt 0 ]]; do
             SESSION_ID="$2"
             shift 2
             ;;
+        --slack-context)
+            SLACK_CONTEXT=true
+            shift
+            ;;
+        --slug)
+            SLUG="$2"
+            shift 2
+            ;;
         https://*slack.com/archives/*)
             SLACK_URLS+=("$1")
             shift
@@ -108,15 +120,42 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [ -z "$TICKET" ]; then
-    echo -e "${RED}Usage: ticket-solve <TICKET-ID> [slack-urls...] [--context \"...\"] [--model MODEL]${RESET}"
+# If no ticket but we have Slack URLs, enable Slack-context mode
+if [ -z "$TICKET" ] && [ ${#SLACK_URLS[@]} -gt 0 ]; then
+    SLACK_CONTEXT=true
+fi
+
+if [ -z "$TICKET" ] && ! $SLACK_CONTEXT; then
+    echo -e "${RED}Usage: ticket-solve <TICKET-ID|slack-url> [slack-urls...] [--context \"...\"] [--model MODEL]${RESET}"
+    echo -e "${DIM}  Pass a Jira ticket ID or a Slack thread URL as the primary input.${RESET}"
     exit 1
 fi
 
-# Normalize ticket ID
-TICKET=$(echo "$TICKET" | tr '[:lower:]' '[:upper:]')
-if [[ "$TICKET" =~ ^[0-9]+$ ]]; then
-    TICKET="${JIRA_PROJECT:-UB}-${TICKET}"
+if $SLACK_CONTEXT && [ ${#SLACK_URLS[@]} -eq 0 ]; then
+    echo -e "${RED}--slack-context requires at least one Slack URL${RESET}"
+    exit 1
+fi
+
+# Generate a branch name for Slack-context mode
+if $SLACK_CONTEXT; then
+    if [ -z "$SLUG" ]; then
+        # Derive slug from the first Slack URL's channel + timestamp
+        first_url="${SLACK_URLS[0]}"
+        if [[ "$first_url" =~ /archives/([A-Z0-9]+)/p([0-9]+) ]]; then
+            SLUG="slack-${BASH_REMATCH[1]:(-4)}-${BASH_REMATCH[2]:0:10}"
+        else
+            SLUG="slack-$(date +%Y%m%d-%H%M%S)"
+        fi
+    fi
+    # Use SLUG as the branch/ticket identifier
+    TICKET="$SLUG"
+    TICKET_SUMMARY="Slack thread task"
+else
+    # Normalize ticket ID
+    TICKET=$(echo "$TICKET" | tr '[:lower:]' '[:upper:]')
+    if [[ "$TICKET" =~ ^[0-9]+$ ]]; then
+        TICKET="${JIRA_PROJECT:-UB}-${TICKET}"
+    fi
 fi
 
 # Generate session ID if not provided
@@ -124,9 +163,13 @@ if [ -z "$SESSION_ID" ]; then
     SESSION_ID=$(python3 -c "import uuid; print(uuid.uuid4())")
 fi
 
-require_env JIRA_DOMAIN JIRA_PROJECT JIRA_EMAIL JIRA_API_TOKEN
+if ! $SLACK_CONTEXT; then
+    require_env JIRA_DOMAIN JIRA_PROJECT JIRA_EMAIL JIRA_API_TOKEN
+fi
 
-echo -e "${CYAN}ticket-solve${RESET} ${GREEN}${TICKET}${RESET} ${DIM}(session: ${SESSION_ID:0:8}...)${RESET}"
+SLACK_LABEL=""
+$SLACK_CONTEXT && SLACK_LABEL=" ${DIM}(slack-context)${RESET}"
+echo -e "${CYAN}ticket-solve${RESET} ${GREEN}${TICKET}${RESET}${SLACK_LABEL} ${DIM}(session: ${SESSION_ID:0:8}...)${RESET}"
 echo ""
 
 # ── Fetch ticket description from Jira ──
@@ -199,11 +242,17 @@ EOF
     fi
 }
 
-echo -e "  ${DIM}Fetching ticket from Jira...${RESET}"
-TICKET_JSON=$(fetch_ticket "$TICKET") || exit 1
-TICKET_SUMMARY=$(echo "$TICKET_JSON" | jq -r '.fields.summary // "N/A"')
-TICKET_FORMATTED=$(format_ticket "$TICKET_JSON")
-echo -e "  ${GREEN}${TICKET}:${RESET} ${TICKET_SUMMARY}"
+TICKET_FORMATTED=""
+if $SLACK_CONTEXT; then
+    echo -e "  ${CYAN}Slack-context mode${RESET} — Claude will fetch thread via Slack MCP"
+    echo -e "  ${DIM}Slack URL(s): ${SLACK_URLS[*]}${RESET}"
+else
+    echo -e "  ${DIM}Fetching ticket from Jira...${RESET}"
+    TICKET_JSON=$(fetch_ticket "$TICKET") || exit 1
+    TICKET_SUMMARY=$(echo "$TICKET_JSON" | jq -r '.fields.summary // "N/A"')
+    TICKET_FORMATTED=$(format_ticket "$TICKET_JSON")
+    echo -e "  ${GREEN}${TICKET}:${RESET} ${TICKET_SUMMARY}"
+fi
 
 # ── Slack DM helper ──
 SLACK_DM_CHANNEL_ID="${DM_CHANNEL}"
@@ -266,18 +315,38 @@ GIT_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || {
 REPO_NAME=$(basename "$GIT_ROOT")
 
 # ── Build prompt ──
-PROMPT="I need you to implement this Jira ticket. Read the ticket carefully, explore the codebase, implement the changes, then prepare everything for my review.
+if $SLACK_CONTEXT; then
+    PROMPT="I need you to implement a task described in a Slack thread. Read the thread carefully, explore the codebase, implement the changes, then prepare everything for my review.
+
+## Slack Context
+
+**IMPORTANT: You must use the Slack MCP tools to fetch the thread content.** Use the slack search or read tools to fetch the conversation from the URL(s) below. If the Slack MCP is not connected or not authorized, print this exact line and stop:
+\`SLACK_MCP_AUTH_REQUIRED: Slack MCP is not authorized. Please run the Slack MCP authentication flow first.\`
+
+Fetch these Slack thread(s) for the task context:"
+
+    for url in "${SLACK_URLS[@]}"; do
+        PROMPT="${PROMPT}
+- ${url}"
+    done
+
+    PROMPT="${PROMPT}
+
+Read the full thread, understand the request, and implement the changes described. If the thread contains a bug report, fix the bug. If it contains a feature request, implement the feature. Use your best judgment to determine scope."
+else
+    PROMPT="I need you to implement this Jira ticket. Read the ticket carefully, explore the codebase, implement the changes, then prepare everything for my review.
 
 ${TICKET_FORMATTED}"
 
-# Add Slack context
-for url in "${SLACK_URLS[@]}"; do
-    PROMPT="${PROMPT}
+    # Add Slack context (supplementary, not primary)
+    for url in "${SLACK_URLS[@]}"; do
+        PROMPT="${PROMPT}
 
 ## Slack Thread
 
 Fetch this Slack thread for additional context: ${url}"
-done
+    done
+fi
 
 # Add extra context
 if [ -n "$EXTRA_CONTEXT" ]; then
@@ -432,12 +501,18 @@ echo -e "  ${GREEN}Worktree:${RESET} ${WORKTREE_PATH}"
 # ── Send starting DM (captures thread_ts if new thread) ──
 # Only send starting DM when running standalone (not from ticket-bot which has its own status message)
 if [ -z "$THREAD_TS" ]; then
-    slack_dm ":robot_face: Starting work on <https://${JIRA_DOMAIN}/browse/${TICKET}|${TICKET}>: ${TICKET_SUMMARY}" "true"
+    if $SLACK_CONTEXT; then
+        slack_dm ":robot_face: Starting work from Slack thread: ${SLACK_URLS[0]}" "true"
+    else
+        slack_dm ":robot_face: Starting work on <https://${JIRA_DOMAIN}/browse/${TICKET}|${TICKET}>: ${TICKET_SUMMARY}" "true"
+    fi
 fi
 
 # ── Save state ──
 save_state() {
     local status="$1"
+    local slack_urls_json
+    slack_urls_json=$(printf '%s\n' "${SLACK_URLS[@]}" | jq -R . | jq -s .)
     jq -n \
         --arg ticket "$TICKET" \
         --arg summary "$TICKET_SUMMARY" \
@@ -448,10 +523,13 @@ save_state() {
         --arg session_id "$SESSION_ID" \
         --arg model "$MODEL" \
         --arg status "$status" \
+        --argjson slack_context "$($SLACK_CONTEXT && echo true || echo false)" \
+        --argjson slack_urls "$slack_urls_json" \
         --arg updated_at "$(date -Iseconds)" \
         '{ticket: $ticket, summary: $summary, worktree: $worktree, work_dir: $work_dir,
           thread_ts: $thread_ts, dm_channel: $dm_channel, session_id: $session_id,
-          model: $model, status: $status, updated_at: $updated_at}' \
+          model: $model, status: $status, slack_context: $slack_context,
+          slack_urls: $slack_urls, updated_at: $updated_at}' \
         > "$STATE_DIR/${TICKET}.json"
 }
 
@@ -527,6 +605,15 @@ else
 
     EXIT_CODE=${PIPESTATUS[0]}
 
+    # Check if Claude reported Slack MCP auth failure
+    if grep -q "SLACK_MCP_AUTH_REQUIRED" "$WORKTREE_PATH/.claude-output.log" 2>/dev/null; then
+        echo ""
+        echo -e "${RED}Slack MCP is not authorized. Please authenticate the Slack MCP integration first.${RESET}"
+        save_state "slack_mcp_auth_required"
+        slack_dm ":warning: *Slack MCP not authorized* — cannot fetch Slack thread. Please authenticate the Slack MCP integration and retry."
+        exit 1
+    fi
+
     if [ $EXIT_CODE -ne 0 ]; then
         echo ""
         echo -e "${RED}Claude exited with code ${EXIT_CODE}${RESET}"
@@ -585,7 +672,11 @@ DIFF_URL="http://localhost:${DIFF_PORT}/${WORKTREE_BASENAME}/diff.html"
 
 # ── Send completion DM (only when running standalone, not from ticket-bot) ──
 if [ -n "$STAGED" ] && [ -z "$THREAD_TS" ]; then
-    DM_TEXT=":memo: <https://${JIRA_DOMAIN}/browse/${TICKET}|*${TICKET}*>: ${TICKET_SUMMARY}"
+    if $SLACK_CONTEXT; then
+        DM_TEXT=":memo: *${TICKET}* (from Slack thread)"
+    else
+        DM_TEXT=":memo: <https://${JIRA_DOMAIN}/browse/${TICKET}|*${TICKET}*>: ${TICKET_SUMMARY}"
+    fi
     DM_TEXT="${DM_TEXT}\n${CHANGED_FILES}"
     DM_TEXT="${DM_TEXT}\n"
     if [ -f "$DIFF_HTML" ]; then
