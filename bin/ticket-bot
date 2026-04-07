@@ -86,7 +86,7 @@ Slack app setup:
   3. Generate an App-Level Token with connections:write scope
      → this is your SLACK_APP_TOKEN (starts with xapp-)
   4. Add bot token scopes (OAuth & Permissions → Scopes → Bot Token Scopes):
-       chat:write, channels:history, channels:read,
+       chat:write, files:write, channels:history, channels:read,
        groups:history, groups:read, im:history, reactions:read
   5. Subscribe to bot events (Event Subscriptions → Subscribe to bot events):
        message.channels, message.groups, message.im, reaction_added
@@ -140,7 +140,7 @@ if not BOT_TOKEN or not USER_ID or not APP_TOKEN:
     print("  3. Generate an App-Level Token with connections:write scope")
     print("     → save as SLACK_APP_TOKEN in .env (starts with xapp-)")
     print("  4. Add bot token scopes (OAuth & Permissions → Bot Token Scopes):")
-    print("       chat:write, channels:history, channels:read,")
+    print("       chat:write, files:write, channels:history, channels:read,")
     print("       groups:history, groups:read, im:history, reactions:read")
     print("  5. Subscribe to bot events (Event Subscriptions → Subscribe to bot events):")
     print("       message.channels, message.groups, message.im, reaction_added")
@@ -279,6 +279,71 @@ def diff_url(worktree_path):
     """Get a clickable localhost URL for a worktree's diff.html."""
     rel = os.path.relpath(worktree_path, DIFF_SERVER_ROOT)
     return f"http://localhost:{DIFF_SERVER_PORT}/{rel}/diff.html"
+
+
+def upload_diff_to_slack(diff_path, channel, thread_ts, title=""):
+    """Upload diff.html to Slack so anyone in the channel can view it.
+    Returns the permalink URL on success, or empty string on failure."""
+    if not os.path.exists(diff_path):
+        return ""
+    try:
+        # Use files.upload_v2 (multipart form POST)
+        file_size = os.path.getsize(diff_path)
+        if file_size == 0:
+            return ""
+
+        # Step 1: Get upload URL
+        resp = slack_get("files.getUploadURLExternal",
+                         filename=os.path.basename(diff_path),
+                         length=file_size)
+        if not resp.get("ok"):
+            print(f"  Failed to get upload URL: {resp.get('error')}")
+            return ""
+
+        upload_url = resp["upload_url"]
+        file_id = resp["file_id"]
+
+        # Step 2: Upload file content
+        with open(diff_path, "rb") as f:
+            file_data = f.read()
+        req = urllib.request.Request(upload_url, data=file_data, method="POST")
+        req.add_header("Content-Type", "text/html")
+        urllib.request.urlopen(req)
+
+        # Step 3: Complete upload and share to channel/thread
+        payload = {
+            "files": [{"id": file_id, "title": title or "diff.html"}],
+            "channel_id": channel,
+            "thread_ts": thread_ts,
+        }
+        complete = slack_post("files.completeUploadExternal", **payload)
+        if not complete.get("ok"):
+            print(f"  Failed to complete upload: {complete.get('error')}")
+            return ""
+
+        # Extract permalink
+        for f in complete.get("files", []):
+            if f.get("permalink"):
+                return f["permalink"]
+        return ""
+    except Exception as e:
+        print(f"  Failed to upload diff: {e}")
+        return ""
+
+
+def share_diff(diff_path, worktree, channel, thread_ts, title=""):
+    """Share a diff — upload to Slack in channels, local link in DMs.
+    Returns the markdown line to include in messages."""
+    if is_dm_channel(channel):
+        # DM: local link (only the bot operator sees it)
+        return f":mag: <{diff_url(worktree)}|View diff>"
+
+    # Channel: upload so everyone can view
+    permalink = upload_diff_to_slack(diff_path, channel, thread_ts, title)
+    if permalink:
+        return f":mag: <{permalink}|View diff>"
+    # Fallback to local link with disclaimer
+    return f":mag: <{diff_url(worktree)}|View diff> _(local link — only available on bot host)_"
 
 
 # ── Test DM mode ──
@@ -604,9 +669,11 @@ def refresh_diff(state):
     )
 
     if result.returncode == 0 and os.path.exists(diff_html):
-        url = diff_url(worktree) if worktree else diff_html
+        diff_line = share_diff(diff_html, worktree, channel, thread_ts,
+                               title=f"{ticket}: {summary}")
+        # Replace the search emoji with refresh emoji
         slack_reply(channel, thread_ts,
-                    f":arrows_counterclockwise: <{url}|Diff refreshed>")
+                    diff_line.replace(":mag:", ":arrows_counterclockwise:"))
     else:
         slack_reply(channel, thread_ts,
                     f":warning: Failed to regenerate diff\n```\n{result.stderr[:500]}\n```")
@@ -949,10 +1016,11 @@ def check_running_procs():
 
                 # Diff link
                 if worktree:
-                    wt_basename = os.path.basename(worktree)
                     diff_path = os.path.join(worktree, "diff.html")
                     if os.path.exists(diff_path):
-                        prompt_lines.append(f":mag: <{diff_url(worktree)}|View diff>")
+                        diff_line = share_diff(diff_path, worktree, ch, current_thread_ts,
+                                               title=f"{ticket}: {state.get('summary', '')}")
+                        prompt_lines.append(diff_line)
 
                 # cd command
                 if work_dir:
