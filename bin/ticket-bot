@@ -306,7 +306,9 @@ def load_jobs():
 
 def save_job(state):
     """Save job state to disk."""
-    path = STATE_DIR / f"{state['ticket']}.json"
+    # Replace / with _ for filesystem safety (e.g. hotfix/foo → hotfix_foo.json)
+    safe_name = state["ticket"].replace("/", "_")
+    path = STATE_DIR / f"{safe_name}.json"
     path.write_text(json.dumps(state, indent=2))
 
 
@@ -825,18 +827,25 @@ def check_running_procs():
 
             del running_procs[ticket]
 
-            # Reload state from disk, but ensure thread_ts matches current thread
+            # Reload state from disk, but ensure thread_ts matches current thread.
+            # ticket-solve may have renamed the branch (e.g. slack-context → hotfix/...),
+            # so search all state files by thread_ts instead of assuming the filename.
             current_thread_ts = info["thread_ts"]
-            state_path = STATE_DIR / f"{ticket}.json"
             state = None
-            if state_path.exists():
+            state_path = None
+            for candidate in STATE_DIR.glob("*.json"):
                 try:
-                    state = json.loads(state_path.read_text())
+                    s = json.loads(candidate.read_text())
+                    if s.get("thread_ts") == current_thread_ts:
+                        state = s
+                        state_path = candidate
+                        break
                 except (json.JSONDecodeError, KeyError):
                     pass
 
             if state is None:
                 state = {"ticket": ticket, "status": "failed"}
+                state_path = STATE_DIR / f"{ticket}.json"
 
             # Always use the current thread/channel (not whatever's in the state file from a previous run)
             state["thread_ts"] = current_thread_ts

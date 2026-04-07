@@ -622,6 +622,35 @@ else
     fi
 fi
 
+# ── Rename branch for Slack-context mode (hotfix/<summary-slug>) ──
+if $SLACK_CONTEXT; then
+    CLAUDE_SUMMARY=$(grep -m1 '^SUMMARY:' "$WORKTREE_PATH/.claude-output.log" 2>/dev/null | sed 's/^SUMMARY: *//' || true)
+    if [ -n "$CLAUDE_SUMMARY" ]; then
+        TICKET_SUMMARY="$CLAUDE_SUMMARY"
+        # Slugify: lowercase, replace non-alnum with hyphens, trim, max 50 chars
+        HOTFIX_SLUG=$(echo "$CLAUDE_SUMMARY" | \
+            tr '[:upper:]' '[:lower:]' | \
+            sed 's/[^a-z0-9]/-/g' | \
+            sed 's/-\+/-/g' | sed 's/^-//; s/-$//' | \
+            cut -c1-50 | sed 's/-$//')
+        NEW_BRANCH="hotfix/${HOTFIX_SLUG}"
+        OLD_BRANCH="$TICKET"
+
+        echo -e "  ${DIM}Renaming branch: ${OLD_BRANCH} → ${NEW_BRANCH}${RESET}"
+        git -C "$WORKTREE_PATH" branch -m "$NEW_BRANCH" 2>/dev/null || true
+
+        # Update TICKET so state file and downstream references use the new name
+        TICKET="$NEW_BRANCH"
+
+        # Rename state file to match new branch name
+        OLD_STATE="$STATE_DIR/${OLD_BRANCH}.json"
+        NEW_STATE="$STATE_DIR/${NEW_BRANCH//\//_}.json"
+        if [ -f "$OLD_STATE" ]; then
+            mv "$OLD_STATE" "$NEW_STATE" 2>/dev/null || true
+        fi
+    fi
+fi
+
 # ── Soft reset to merge-base ──
 echo ""
 cd "$WORK_DIR"
