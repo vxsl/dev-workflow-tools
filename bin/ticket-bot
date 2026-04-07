@@ -434,10 +434,14 @@ def load_jobs():
     return jobs
 
 
+def _safe_filename(name):
+    """Replace / with _ for filesystem safety (e.g. hotfix/foo → hotfix_foo)."""
+    return name.replace("/", "_")
+
+
 def save_job(state):
     """Save job state to disk."""
-    # Replace / with _ for filesystem safety (e.g. hotfix/foo → hotfix_foo.json)
-    safe_name = state["ticket"].replace("/", "_")
+    safe_name = _safe_filename(state["ticket"])
     path = STATE_DIR / f"{safe_name}.json"
     path.write_text(json.dumps(state, indent=2))
 
@@ -541,7 +545,7 @@ def start_ticket_solve(ticket, thread_ts, channel, slack_urls=None, extra_contex
 
     print(f"  Starting: {' '.join(cmd[:5])}{'  (mock)' if mock else ''}{'  (force)' if force else ''}{'  (slack-context)' if slack_context else ''}...")
 
-    log_path = STATE_DIR / f"{dedup_key}.log"
+    log_path = STATE_DIR / f"{_safe_filename(dedup_key)}.log"
     log_file = open(log_path, "w")
 
     proc = subprocess.Popen(
@@ -627,7 +631,7 @@ def resume_claude(state, feedback_text):
     state["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
     save_job(state)
 
-    log_path = STATE_DIR / f"{ticket}.resume.log"
+    log_path = STATE_DIR / f"{_safe_filename(ticket)}.resume.log"
     log_file = open(log_path, "w")
 
     # Export env vars for slack-ask
@@ -769,7 +773,7 @@ def publish_ticket(state, force_push=False):
 
     print(f"  Publishing {ticket}: {commit_msg}")
 
-    log_path = STATE_DIR / f"{ticket}.publish.log"
+    log_path = STATE_DIR / f"{_safe_filename(ticket)}.publish.log"
     log_file = open(log_path, "w")
 
     proc = subprocess.Popen(
