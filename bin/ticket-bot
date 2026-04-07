@@ -1266,11 +1266,11 @@ def socket_event_handler(client: SocketModeClient, req: SocketModeRequest):
     # Always ack immediately
     client.send_socket_mode_response(SocketModeResponse(envelope_id=req.envelope_id))
 
-    print(f"  [socket] type={req.type} payload_type={req.payload.get('type', req.payload.get('event', {}).get('type', '?'))}")
-
     if req.type == "events_api":
         event = req.payload.get("event", {})
         event_type = event.get("type", "")
+        subtype = event.get("subtype", "")
+        print(f"  [event] {event_type}{f'/{subtype}' if subtype else ''} channel={event.get('channel', event.get('item', {}).get('channel', '?'))} user={event.get('user', '?')}")
 
         if event_type == "message":
             # Skip bot messages, message_changed, message_deleted, etc.
