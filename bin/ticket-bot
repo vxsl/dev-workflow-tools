@@ -339,11 +339,9 @@ def upload_diff_to_slack(diff_path, channel, thread_ts, title=""):
         req.add_header("Content-Type", "text/html")
         urllib.request.urlopen(req)
 
-        # Step 3: Complete upload and share to channel/thread
+        # Step 3: Complete upload (don't share to channel — avoids inline HTML preview)
         payload = {
             "files": [{"id": file_id, "title": title or "diff.html"}],
-            "channel_id": channel,
-            "thread_ts": thread_ts,
         }
         complete = slack_post("files.completeUploadExternal", **payload)
         if not complete.get("ok"):
@@ -370,7 +368,7 @@ def share_diff(diff_path, worktree, channel, thread_ts, title=""):
     # Channel: upload so everyone can view
     permalink = upload_diff_to_slack(diff_path, channel, thread_ts, title)
     if permalink:
-        return f":mag: <{permalink}|View diff>"
+        return f":mag: <{permalink}|View diff> _(download and open in browser)_"
     # Fallback to local link with disclaimer
     return f":mag: <{diff_url(worktree)}|View diff> _(local link — only available on bot host)_"
 
