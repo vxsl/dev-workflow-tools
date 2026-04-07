@@ -1174,6 +1174,11 @@ def handle_message(channel, ts, user, text, thread_ts=None):
                 STATE_DIR.joinpath(".pending_clear").write_text(
                     json.dumps({"msg_ts": confirm_ts, "channel": channel, "expires": time.time() + 120}))
 
+    else:
+        # Unrecognized command — nudge the user
+        slack_reply(channel, ts,
+                    "I didn't recognize that. Send a ticket ID (e.g. `UB-1234`), a Slack thread URL, or `help`.")
+
 
 def handle_reaction(channel, ts, user, reaction):
     """Handle a reaction_added event."""
