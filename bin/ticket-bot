@@ -28,6 +28,22 @@ import urllib.request
 import uuid
 from pathlib import Path
 
+try:
+    from slack_sdk.web import WebClient
+    from slack_sdk.socket_mode import SocketModeClient
+    from slack_sdk.socket_mode.request import SocketModeRequest
+    from slack_sdk.socket_mode.response import SocketModeResponse
+except ImportError:
+    print("Error: slack_sdk is required but not installed.")
+    print()
+    print("Install it with:")
+    req = Path(__file__).resolve().parent.parent / "requirements.txt"
+    if req.exists():
+        print(f"  pip install -r {req}")
+    else:
+        print("  pip install slack_sdk")
+    sys.exit(1)
+
 if "--help" in sys.argv or "-h" in sys.argv:
     print("""ticket-bot: Slack-driven ticket solver
 
@@ -944,11 +960,6 @@ def check_running_procs():
 
 
 # ── Socket Mode setup ──
-
-from slack_sdk.web import WebClient
-from slack_sdk.socket_mode import SocketModeClient
-from slack_sdk.socket_mode.request import SocketModeRequest
-from slack_sdk.socket_mode.response import SocketModeResponse
 
 sm_client = SocketModeClient(app_token=APP_TOKEN, web_client=WebClient(token=BOT_TOKEN))
 
