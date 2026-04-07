@@ -412,8 +412,8 @@ if "--test-dm" in sys.argv:
 
 # Patterns
 TICKET_RE = re.compile(r"([A-Z]{2,10}-\d+)")
-SLACK_URL_RE = re.compile(r"<?(https://\S+slack\.com/archives/\S+?)>?")
-JIRA_URL_RE = re.compile(r"<?(https://\S+atlassian\.net/\S+?)>?")
+SLACK_URL_RE = re.compile(r"<?(https://\S+slack\.com/archives/\S+)>?")
+JIRA_URL_RE = re.compile(r"<?(https://\S+atlassian\.net/\S+)>?")
 
 
 # ── State management ──
@@ -1271,13 +1271,10 @@ def handle_message(channel, ts, user, text, thread_ts=None):
                     json.dumps({"msg_ts": confirm_ts, "channel": channel, "expires": time.time() + 120}))
 
     elif text.strip():
-        # Freeform instructions — run in slack-context mode with text as context
-        print(f"New freeform request (channel={channel}){' (mock)' if MOCK_MODE else ''}: {text[:60]}...")
-        start_ticket_solve(
-            ticket=None, thread_ts=ts, channel=channel,
-            extra_context=text.strip(),
-            mock=MOCK_MODE, slack_context=True,
-        )
+        # Freeform text without a ticket ID or Slack URL — nudge the user
+        slack_reply(channel, ts,
+                    ":thinking_face: I need a *ticket ID* (e.g. `UB-1234`) or a *Slack thread link* to get started.\n"
+                    "You can also add instructions after the ticket/link.")
 
 
 def handle_reaction(channel, ts, user, reaction):
