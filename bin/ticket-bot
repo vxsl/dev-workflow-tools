@@ -1361,28 +1361,37 @@ def handle_reaction(channel, ts, user, reaction):
         save_job(state)
 
         status = state.get("status")
-        if status == "done":
-            print(f"  ✅ on {ticket} — publishing")
-            publish_ticket(state)
-            state["status"] = "publishing"
-        elif status == "publish_failed":
-            print(f"  ✅ on {ticket} — retrying publish")
-            publish_ticket(state)
-            state["status"] = "publishing"
-        elif status == "needs_force_push":
-            print(f"  ✅ on {ticket} — force-push approved")
-            publish_ticket(state, force_push=True)
-            state["status"] = "publishing"
-        elif status in ("failed", "checks_failed", "done_empty"):
-            print(f"  ✅ on {ticket} — retrying (force)")
-            is_slack_ctx = state.get("slack_context", False)
-            slack_urls_state = state.get("slack_urls", [])
-            start_ticket_solve(
-                ticket, thread_ts, channel=react_ch,
-                slack_urls=slack_urls_state if slack_urls_state else None,
-                mock=MOCK_MODE, force=True,
-                slack_context=is_slack_ctx,
-            )
+        try:
+            if status == "done":
+                print(f"  ✅ on {ticket} — publishing")
+                publish_ticket(state)
+                state["status"] = "publishing"
+            elif status == "publish_failed":
+                print(f"  ✅ on {ticket} — retrying publish")
+                publish_ticket(state)
+                state["status"] = "publishing"
+            elif status == "needs_force_push":
+                print(f"  ✅ on {ticket} — force-push approved")
+                publish_ticket(state, force_push=True)
+                state["status"] = "publishing"
+            elif status in ("failed", "checks_failed", "done_empty"):
+                print(f"  ✅ on {ticket} — retrying (force)")
+                is_slack_ctx = state.get("slack_context", False)
+                slack_urls_state = state.get("slack_urls", [])
+                start_ticket_solve(
+                    ticket, thread_ts, channel=react_ch,
+                    slack_urls=slack_urls_state if slack_urls_state else None,
+                    mock=MOCK_MODE, force=True,
+                    slack_context=is_slack_ctx,
+                )
+        except Exception as e:
+            print(f"  Error dispatching action for {ticket}: {e}")
+            state["status"] = "publish_failed" if status in ("done", "publish_failed", "needs_force_push") else "failed"
+            resp = slack_post("chat.postMessage", channel=react_ch, thread_ts=thread_ts,
+                              text=f":x: Action failed for *{ticket}*: `{e}`\nReact :white_check_mark: to retry.")
+            if resp and resp.get("ok"):
+                state["action_prompt_ts"] = resp["ts"]
+            save_job(state)
 
         jobs[thread_ts] = state
         break
