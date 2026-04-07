@@ -2,7 +2,8 @@
 """
 ticket-bot: Slack-driven ticket solver
 
-Polls your DM channel for messages and dispatches ticket-solve jobs.
+Polls DMs and any channels the bot is invited to for messages.
+In channels, the bot responds to @mentions only.
 
 Handles:
   - "UB-1234" → starts ticket-solve
@@ -29,14 +30,15 @@ from pathlib import Path
 if "--help" in sys.argv or "-h" in sys.argv:
     print("""ticket-bot: Slack-driven ticket solver
 
-Watches your Slack DMs and dispatches Claude to solve tickets.
+Watches Slack DMs and channels for messages, dispatches Claude to solve tickets.
+In channels, @mention the bot. In DMs, just send a message.
 
 Usage:
   ticket-bot              Start the bot (runs in foreground)
   ticket-bot --mock       Skip AI, use dummy changes (for testing the pipeline)
   ticket-bot --help       Show this help
 
-Slack commands (DM the bot):
+Slack commands (DM or @mention in a channel):
   UB-1234                           Start working on a ticket
   UB-1234 <slack-url>               Include Slack thread as context
   UB-1234 extra instructions here   Add context for Claude
@@ -171,6 +173,42 @@ BOT_USER_ID = auth_resp.get("user_id", "")
 
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 
+
+# ── Channel discovery ──
+
+
+def get_bot_channels():
+    """Return set of channel IDs the bot is a member of (includes DMs and channels)."""
+    channels = {DM_CHANNEL}
+    cursor = None
+    while True:
+        params = {"types": "public_channel,private_channel,im", "limit": 200}
+        if cursor:
+            params["cursor"] = cursor
+        resp = slack_get("users.conversations", **params)
+        if not resp.get("ok"):
+            print(f"  Warning: users.conversations failed: {resp.get('error')}")
+            break
+        for ch in resp.get("channels", []):
+            channels.add(ch["id"])
+        cursor = resp.get("response_metadata", {}).get("next_cursor")
+        if not cursor:
+            break
+    return channels
+
+
+def is_dm_channel(channel_id):
+    """Check if a channel is a DM (starts with D) vs a regular channel."""
+    return channel_id.startswith("D")
+
+
+def strip_bot_mention(text):
+    """Remove @bot mention from message text, return (stripped_text, was_mentioned)."""
+    mention = f"<@{BOT_USER_ID}>"
+    if mention in text:
+        return text.replace(mention, "").strip(), True
+    return text, False
+
 # ── File server for diff links ──
 import http.server
 import threading
@@ -297,7 +335,7 @@ def slack_update(channel, ts, text):
     )
 
 
-def start_ticket_solve(ticket, thread_ts, slack_urls=None, extra_context=None, mock=False, force=False, slack_context=False):
+def start_ticket_solve(ticket, thread_ts, channel, slack_urls=None, extra_context=None, mock=False, force=False, slack_context=False):
     """Start ticket-solve as a background process.
 
     If slack_context=True, ticket-solve runs in Slack-context mode (no Jira ticket required).
@@ -319,14 +357,14 @@ def start_ticket_solve(ticket, thread_ts, slack_urls=None, extra_context=None, m
 
     # Prevent duplicate runs
     if dedup_key in running_procs:
-        slack_reply(DM_CHANNEL, thread_ts,
+        slack_reply(channel, thread_ts,
                     f":warning: *{dedup_key}* is already running (PID {running_procs[dedup_key]['proc'].pid})")
         return
 
     # Post a status message that we'll update with progress
     label = f"*{ticket}*" if ticket and not slack_context else ":speech_balloon: Slack thread"
     resp = slack_reply(
-        DM_CHANNEL, thread_ts,
+        channel, thread_ts,
         f":hourglass_flowing_sand: {label} — setting up worktree..."
     )
     status_ts = resp.get("ts", "") if resp and resp.get("ok") else ""
@@ -336,7 +374,7 @@ def start_ticket_solve(ticket, thread_ts, slack_urls=None, extra_context=None, m
     cmd = [
         str(SCRIPT_DIR / "ticket-solve"),
         "--thread-ts", thread_ts,
-        "--dm-channel", DM_CHANNEL,
+        "--dm-channel", channel,
         "--session-id", session_id,
     ]
 
@@ -373,6 +411,7 @@ def start_ticket_solve(ticket, thread_ts, slack_urls=None, extra_context=None, m
         "log_path": log_path,
         "log_offset": 0,
         "thread_ts": thread_ts,
+        "channel": channel,
         "status_ts": status_ts,
         "last_stage": "",
         "last_activity_update": 0,
@@ -392,7 +431,7 @@ def start_ticket_solve(ticket, thread_ts, slack_urls=None, extra_context=None, m
     if old_ts and old_ts != thread_ts:
         del jobs[old_ts]
 
-    jobs[thread_ts] = {"ticket": dedup_key, "thread_ts": thread_ts, "status": "in_progress", "slack_context": slack_context}
+    jobs[thread_ts] = {"ticket": dedup_key, "thread_ts": thread_ts, "channel": channel, "status": "in_progress", "slack_context": slack_context}
 
     print(f"  PID {proc.pid}, log: {log_path}")
 
@@ -403,17 +442,18 @@ def resume_claude(state, feedback_text):
     session_id = state["session_id"]
     work_dir = state.get("work_dir", "")
     thread_ts = state["thread_ts"]
+    channel = state.get("channel", DM_CHANNEL)
     model = state.get("model", "sonnet")
 
     if not work_dir or not os.path.isdir(work_dir):
         slack_reply(
-            DM_CHANNEL, thread_ts,
+            channel, thread_ts,
             f":warning: Can't resume — worktree not found at `{work_dir}`"
         )
         return
 
     status_resp = slack_reply(
-        DM_CHANNEL, thread_ts,
+        channel, thread_ts,
         f":arrows_counterclockwise: Resuming work on {ticket}..."
     )
     status_ts = status_resp.get("ts", "")
@@ -445,7 +485,7 @@ def resume_claude(state, feedback_text):
 
     # Export env vars for slack-ask
     env = os.environ.copy()
-    env["SLACK_DM_CHANNEL_ID"] = DM_CHANNEL
+    env["SLACK_DM_CHANNEL_ID"] = channel
     env["SLACK_THREAD_TS"] = thread_ts
 
     proc = subprocess.Popen(
@@ -463,6 +503,7 @@ def resume_claude(state, feedback_text):
         "log_path": log_path,
         "log_offset": 0,
         "thread_ts": thread_ts,
+        "channel": channel,
         "status_ts": status_ts,
         "last_stage": ":arrows_counterclockwise: resuming...",
         "last_activity_update": 0,
@@ -505,9 +546,10 @@ def refresh_diff(state):
     work_dir = state.get("work_dir", "")
     worktree = state.get("worktree", "")
     thread_ts = state["thread_ts"]
+    channel = state.get("channel", DM_CHANNEL)
 
     if not work_dir or not os.path.isdir(work_dir):
-        slack_reply(DM_CHANNEL, thread_ts,
+        slack_reply(channel, thread_ts,
                     f":warning: Worktree not found at `{work_dir}`")
         return
 
@@ -521,10 +563,10 @@ def refresh_diff(state):
 
     if result.returncode == 0 and os.path.exists(diff_html):
         url = diff_url(worktree) if worktree else diff_html
-        slack_reply(DM_CHANNEL, thread_ts,
+        slack_reply(channel, thread_ts,
                     f":arrows_counterclockwise: <{url}|Diff refreshed>")
     else:
-        slack_reply(DM_CHANNEL, thread_ts,
+        slack_reply(channel, thread_ts,
                     f":warning: Failed to regenerate diff\n```\n{result.stderr[:500]}\n```")
 
 
@@ -532,7 +574,8 @@ def refresh_diff(state):
 def _post_action_prompt(state, thread_ts, text):
     """Post a message that the user can react ✅ on to trigger an action.
     Records the message ts so we only check THIS message for reactions."""
-    resp = slack_reply(DM_CHANNEL, thread_ts, text)
+    channel = state.get("channel", DM_CHANNEL)
+    resp = slack_reply(channel, thread_ts, text)
     if resp and resp.get("ok"):
         state["action_prompt_ts"] = resp["ts"]
     save_job(state)
@@ -546,10 +589,11 @@ def publish_ticket(state, force_push=False):
     summary = state.get("summary", "")
     work_dir = state.get("work_dir", "")
     thread_ts = state["thread_ts"]
+    channel = state.get("channel", DM_CHANNEL)
 
     if not work_dir or not os.path.isdir(work_dir):
         slack_reply(
-            DM_CHANNEL, thread_ts,
+            channel, thread_ts,
             f":warning: Can't publish — worktree not found at `{work_dir}`"
         )
         return
@@ -557,10 +601,10 @@ def publish_ticket(state, force_push=False):
     # Reuse the action prompt message for publish status updates
     publish_status_ts = state.get("action_prompt_ts", "")
     if publish_status_ts:
-        slack_update(DM_CHANNEL, publish_status_ts,
+        slack_update(channel, publish_status_ts,
                      f":rocket: *{ticket}* — publishing...")
     else:
-        resp = slack_reply(DM_CHANNEL, thread_ts, f":rocket: *{ticket}* — publishing...")
+        resp = slack_reply(channel, thread_ts, f":rocket: *{ticket}* — publishing...")
         publish_status_ts = resp.get("ts", "") if resp and resp.get("ok") else ""
 
     is_slack_context = state.get("slack_context", False)
@@ -597,6 +641,7 @@ def publish_ticket(state, force_push=False):
         "log_path": log_path,
         "log_offset": 0,
         "thread_ts": thread_ts,
+        "channel": channel,
         "status_ts": publish_status_ts,
         "last_stage": "",
         "start_time": time.time(),
@@ -611,6 +656,7 @@ def check_running_procs():
     for ticket, info in list(running_procs.items()):
         proc = info["proc"]
         log_path = info["log_path"]
+        ch = info.get("channel", DM_CHANNEL)
 
         # ── Tail log → print new lines + detect stage changes ──
         try:
@@ -631,7 +677,7 @@ def check_running_procs():
                                 info["last_stage"] = stage_text
                                 if info["status_ts"]:
                                     slack_update(
-                                        DM_CHANNEL,
+                                        ch,
                                         info["status_ts"],
                                         f"*{ticket}* — {stage_text}",
                                     )
@@ -699,7 +745,7 @@ def check_running_procs():
                         mins = elapsed // 60
                         time_str = f"{mins}m{elapsed % 60:02d}s" if mins > 0 else f"{elapsed}s"
                         slack_update(
-                            DM_CHANNEL, info["status_ts"],
+                            ch, info["status_ts"],
                             f"*{ticket}* — :brain: implementing ({time_str})\n_{activity}_",
                         )
                     except Exception:
@@ -734,9 +780,9 @@ def check_running_procs():
                         if mr_url:
                             msg += f" {mr_url}"
                         if info["status_ts"]:
-                            slack_update(DM_CHANNEL, info["status_ts"], msg)
+                            slack_update(ch, info["status_ts"], msg)
                         else:
-                            slack_reply(DM_CHANNEL, info["thread_ts"], msg)
+                            slack_reply(ch, info["thread_ts"], msg)
 
                     else:
                         # Check if it was a push rejection (non-fast-forward)
@@ -767,12 +813,12 @@ def check_running_procs():
             if info["status_ts"]:
                 if exit_code == 0:
                     slack_update(
-                        DM_CHANNEL, info["status_ts"],
+                        ch, info["status_ts"],
                         f"*{ticket}* — :heavy_check_mark: done",
                     )
                 else:
                     slack_update(
-                        DM_CHANNEL, info["status_ts"],
+                        ch, info["status_ts"],
                         f"*{ticket}* — :x: failed (exit {exit_code})",
                     )
 
@@ -791,8 +837,9 @@ def check_running_procs():
             if state is None:
                 state = {"ticket": ticket, "status": "failed"}
 
-            # Always use the current thread (not whatever's in the state file from a previous run)
+            # Always use the current thread/channel (not whatever's in the state file from a previous run)
             state["thread_ts"] = current_thread_ts
+            state["channel"] = ch
             if exit_code == 0 and state.get("status") == "in_progress":
                 state["status"] = "done"
             elif exit_code != 0 and state.get("status") not in ("failed", "checks_failed"):
@@ -901,12 +948,16 @@ def check_running_procs():
 
 # ── Main loop ──
 
+# Discover channels the bot is in
+bot_channels = get_bot_channels()
+
 print(f"ticket-bot running{'  (MOCK MODE)' if MOCK_MODE else ''}")
 print(f"  DM channel: {DM_CHANNEL}")
 print(f"  Bot user:   {BOT_USER_ID}")
 print(f"  Watching:   {USER_ID}")
 print(f"  Project:    {PROJECT_ROOT}")
 print(f"  State dir:  {STATE_DIR}")
+print(f"  Channels:   {len(bot_channels)} ({len(bot_channels) - 1} non-DM)")
 print()
 
 # Load existing jobs
@@ -921,15 +972,16 @@ if jobs:
 # Clean up stale state from previous sessions
 (STATE_DIR / ".pending_clear").unlink(missing_ok=True)
 
-# Send startup greeting
+# Send startup greeting (DM only)
 HELP_TEXT = "\n".join([
     ":robot_face: *ticket-bot is online*",
     "`UB-1234` or `<slack-url>` — start a task  |  `help` — full usage  |  `status` — list jobs",
+    f"_Listening in {len(bot_channels)} channel(s). @mention me in channels._",
 ])
 
 HELP_FULL = "\n".join([
-    "*Usage:*",
-    ">`UB-1234` — create worktree, run Claude, DM when done",
+    "*Usage* (DM me directly, or @mention me in a channel):",
+    ">`UB-1234` — create worktree, run Claude, notify when done",
     ">`UB-1234 <slack-url> extra context` — include thread + instructions",
     ">`<slack-url>` — solve from Slack thread (no Jira ticket needed)",
     ">`<slack-url> extra context` — Slack thread + extra instructions",
@@ -947,185 +999,223 @@ _welcome_resp = slack_post(
     mrkdwn=True,
 )
 
-# Track last seen message — use the welcome message's Slack timestamp
+# Track last seen message per channel — use the welcome message's Slack timestamp
 # to avoid clock skew between local time and Slack's servers
-last_ts_file = STATE_DIR / ".last_dm_ts"
-last_ts = _welcome_resp.get("ts", str(time.time())) if _welcome_resp.get("ok") else str(time.time())
-print(f"  Listening from ts: {last_ts}")
+_start_ts = _welcome_resp.get("ts", str(time.time())) if _welcome_resp.get("ok") else str(time.time())
+channel_last_ts = {ch: _start_ts for ch in bot_channels}
+CHANNEL_REFRESH_INTERVAL = 300  # re-discover channels every 5 min
+_last_channel_refresh = time.time()
+print(f"  Listening from ts: {_start_ts}")
 
 try:
     while True:
         try:
-            # ── Poll for new DMs ──
-            result = slack_get(
-                "conversations.history",
-                channel=DM_CHANNEL,
-                oldest=last_ts,
-                limit=10,
-            )
+            # ── Periodically refresh channel list ──
+            now = time.time()
+            if now - _last_channel_refresh >= CHANNEL_REFRESH_INTERVAL:
+                _last_channel_refresh = now
+                new_channels = get_bot_channels()
+                added = new_channels - bot_channels
+                removed = bot_channels - new_channels
+                if added:
+                    print(f"  New channels: {added}")
+                    for ch in added:
+                        channel_last_ts[ch] = str(time.time())
+                if removed:
+                    print(f"  Left channels: {removed}")
+                    for ch in removed:
+                        channel_last_ts.pop(ch, None)
+                bot_channels = new_channels
 
-            if not result.get("ok"):
-                print(f"  Poll error: {result.get('error')}")
+            # ── Poll all channels for new messages ──
+            for poll_channel in list(bot_channels):
+                last_ts = channel_last_ts.get(poll_channel, _start_ts)
+                result = slack_get(
+                    "conversations.history",
+                    channel=poll_channel,
+                    oldest=last_ts,
+                    limit=10,
+                )
 
-            messages = result.get("messages", [])
-            for msg in reversed(messages):  # oldest first
-                ts = msg.get("ts", "")
-                user = msg.get("user", "")
-                text = msg.get("text", "")
-                msg_thread_ts = msg.get("thread_ts")
-
-                # Skip bot's own messages
-                if user == BOT_USER_ID:
-                    last_ts = ts
-                    continue
-
-                # Skip thread replies (handled below)
-                if msg_thread_ts and msg_thread_ts != ts:
-                    last_ts = ts
-                    continue
-
-                # Check for ticket ID in top-level message
-                ticket_match = TICKET_RE.search(text)
-                slack_urls = [
-                    m.group(1) for m in SLACK_URL_RE.finditer(text)
-                ]
-
-                if ticket_match:
-                    ticket = ticket_match.group(1).upper()
-
-                    # Everything else is extra context
-                    extra = text
-                    extra = TICKET_RE.sub("", extra)
-                    extra = SLACK_URL_RE.sub("", extra)
-                    extra = JIRA_URL_RE.sub("", extra)
-                    extra = re.sub(r"[<>]", "", extra).strip()
-
-                    print(f"New request: {ticket}{' (mock)' if MOCK_MODE else ''}")
-                    start_ticket_solve(
-                        ticket,
-                        thread_ts=ts,
-                        slack_urls=slack_urls if slack_urls else None,
-                        extra_context=extra if extra else None,
-                        mock=MOCK_MODE,
-                    )
-
-                elif slack_urls:
-                    # Slack URL(s) without a ticket ID → Slack-context mode
-                    extra = text
-                    extra = SLACK_URL_RE.sub("", extra)
-                    extra = re.sub(r"[<>]", "", extra).strip()
-
-                    print(f"New Slack-context request: {slack_urls[0]}{' (mock)' if MOCK_MODE else ''}")
-                    start_ticket_solve(
-                        ticket=None,
-                        thread_ts=ts,
-                        slack_urls=slack_urls,
-                        extra_context=extra if extra else None,
-                        mock=MOCK_MODE,
-                        slack_context=True,
-                    )
-
-                elif text.strip().lower() == "help":
-                    slack_post(
-                        "chat.postMessage",
-                        channel=DM_CHANNEL,
-                        text=HELP_FULL,
-                        mrkdwn=True,
-                    )
-                elif text.strip().lower() == "status":
-                    # Reload jobs from disk
-                    jobs = load_jobs()
-                    lines = [":clipboard: *Active jobs:*"]
-                    any_jobs = False
-                    for _ts, j in sorted(
-                        jobs.items(),
-                        key=lambda x: x[1].get("updated_at", ""),
-                        reverse=True,
-                    )[:10]:
-                        t = j.get("ticket", "?")
-                        s = j.get("status", "?")
-                        summary = j.get("summary", "")[:50]
-                        emoji = {
-                            "in_progress": ":hourglass_flowing_sand:",
-                            "done": ":heavy_check_mark:",
-                            "done_empty": ":warning:",
-                            "failed": ":x:",
-                        }.get(s, ":grey_question:")
-                        wt = j.get("work_dir", "")
-                        lines.append(f">{emoji} *{t}* ({s}) {summary}")
-                        if wt:
-                            lines.append(f">  `{wt}`")
-                        any_jobs = True
-                    if not any_jobs:
-                        lines.append(">No jobs yet.")
-                    # Running procs
-                    if running_procs:
-                        lines.append("")
-                        lines.append(f"_Running processes: {len(running_procs)}_")
-                    slack_post(
-                        "chat.postMessage",
-                        channel=DM_CHANNEL,
-                        text="\n".join(lines),
-                        mrkdwn=True,
-                    )
-
-                elif text.strip().lower() == "clear":
-                    if running_procs:
-                        slack_post("chat.postMessage", channel=DM_CHANNEL,
-                                   text=f":warning: Can't clear while {len(running_procs)} job(s) are running.",
-                                   mrkdwn=True)
-                        last_ts = ts
-                        continue
-                    # Count bot messages first
-                    total = 0
-                    has_more = True
-                    cursor = None
-                    while has_more:
-                        params = {"channel": DM_CHANNEL, "limit": 100}
-                        if cursor:
-                            params["cursor"] = cursor
-                        history = slack_get("conversations.history", **params)
-                        for m in history.get("messages", []):
-                            if m.get("user") == BOT_USER_ID or m.get("bot_id"):
-                                total += 1
-                            if m.get("reply_count", 0) > 0:
-                                replies = slack_get(
-                                    "conversations.replies",
-                                    channel=DM_CHANNEL, ts=m["ts"], limit=100,
-                                )
-                                for r in replies.get("messages", []):
-                                    if (r.get("user") == BOT_USER_ID or r.get("bot_id")) and r["ts"] != m["ts"]:
-                                        total += 1
-                        cursor = history.get("response_metadata", {}).get("next_cursor")
-                        has_more = bool(cursor)
-
-                    if total == 0:
-                        slack_post("chat.postMessage", channel=DM_CHANNEL,
-                                   text="Nothing to clear.", mrkdwn=True)
+                if not result.get("ok"):
+                    err = result.get("error", "")
+                    if err in ("channel_not_found", "not_in_channel"):
+                        # Bot was removed from channel
+                        bot_channels.discard(poll_channel)
+                        channel_last_ts.pop(poll_channel, None)
+                        print(f"  Removed from channel {poll_channel}: {err}")
                     else:
-                        resp = slack_post("chat.postMessage", channel=DM_CHANNEL,
-                                   text=f"Found {total} bot messages. React :white_check_mark: to delete them all.",
-                                   mrkdwn=True)
-                        confirm_ts = resp.get("ts", "") if resp and resp.get("ok") else ""
-                        if confirm_ts:
-                            STATE_DIR.joinpath(".pending_clear").write_text(
-                                json.dumps({"msg_ts": confirm_ts, "expires": time.time() + 120}))
+                        print(f"  Poll error ({poll_channel}): {err}")
+                    continue
 
-                last_ts = ts
+                is_dm = is_dm_channel(poll_channel)
+                messages = result.get("messages", [])
+                for msg in reversed(messages):  # oldest first
+                    ts = msg.get("ts", "")
+                    user = msg.get("user", "")
+                    text = msg.get("text", "")
+                    msg_thread_ts = msg.get("thread_ts")
 
-            last_ts_file.write_text(last_ts)
+                    # Skip bot's own messages
+                    if user == BOT_USER_ID:
+                        channel_last_ts[poll_channel] = ts
+                        continue
+
+                    # Skip thread replies (handled below)
+                    if msg_thread_ts and msg_thread_ts != ts:
+                        channel_last_ts[poll_channel] = ts
+                        continue
+
+                    # In channels (non-DM), require @mention
+                    if not is_dm:
+                        text, was_mentioned = strip_bot_mention(text)
+                        if not was_mentioned:
+                            channel_last_ts[poll_channel] = ts
+                            continue
+
+                    # Check for ticket ID in top-level message
+                    ticket_match = TICKET_RE.search(text)
+                    slack_urls = [
+                        m.group(1) for m in SLACK_URL_RE.finditer(text)
+                    ]
+
+                    if ticket_match:
+                        ticket = ticket_match.group(1).upper()
+
+                        # Everything else is extra context
+                        extra = text
+                        extra = TICKET_RE.sub("", extra)
+                        extra = SLACK_URL_RE.sub("", extra)
+                        extra = JIRA_URL_RE.sub("", extra)
+                        extra = re.sub(r"[<>]", "", extra).strip()
+
+                        print(f"New request: {ticket} (channel={poll_channel}){' (mock)' if MOCK_MODE else ''}")
+                        start_ticket_solve(
+                            ticket,
+                            thread_ts=ts,
+                            channel=poll_channel,
+                            slack_urls=slack_urls if slack_urls else None,
+                            extra_context=extra if extra else None,
+                            mock=MOCK_MODE,
+                        )
+
+                    elif slack_urls:
+                        # Slack URL(s) without a ticket ID → Slack-context mode
+                        extra = text
+                        extra = SLACK_URL_RE.sub("", extra)
+                        extra = re.sub(r"[<>]", "", extra).strip()
+
+                        print(f"New Slack-context request: {slack_urls[0]} (channel={poll_channel}){' (mock)' if MOCK_MODE else ''}")
+                        start_ticket_solve(
+                            ticket=None,
+                            thread_ts=ts,
+                            channel=poll_channel,
+                            slack_urls=slack_urls,
+                            extra_context=extra if extra else None,
+                            mock=MOCK_MODE,
+                            slack_context=True,
+                        )
+
+                    elif text.strip().lower() == "help":
+                        slack_post(
+                            "chat.postMessage",
+                            channel=poll_channel,
+                            text=HELP_FULL,
+                            mrkdwn=True,
+                        )
+                    elif text.strip().lower() == "status":
+                        # Reload jobs from disk
+                        jobs = load_jobs()
+                        lines = [":clipboard: *Active jobs:*"]
+                        any_jobs = False
+                        for _ts, j in sorted(
+                            jobs.items(),
+                            key=lambda x: x[1].get("updated_at", ""),
+                            reverse=True,
+                        )[:10]:
+                            t = j.get("ticket", "?")
+                            s = j.get("status", "?")
+                            summary = j.get("summary", "")[:50]
+                            emoji = {
+                                "in_progress": ":hourglass_flowing_sand:",
+                                "done": ":heavy_check_mark:",
+                                "done_empty": ":warning:",
+                                "failed": ":x:",
+                            }.get(s, ":grey_question:")
+                            wt = j.get("work_dir", "")
+                            lines.append(f">{emoji} *{t}* ({s}) {summary}")
+                            if wt:
+                                lines.append(f">  `{wt}`")
+                            any_jobs = True
+                        if not any_jobs:
+                            lines.append(">No jobs yet.")
+                        # Running procs
+                        if running_procs:
+                            lines.append("")
+                            lines.append(f"_Running processes: {len(running_procs)}_")
+                        slack_post(
+                            "chat.postMessage",
+                            channel=poll_channel,
+                            text="\n".join(lines),
+                            mrkdwn=True,
+                        )
+
+                    elif text.strip().lower() == "clear":
+                        if running_procs:
+                            slack_post("chat.postMessage", channel=poll_channel,
+                                       text=f":warning: Can't clear while {len(running_procs)} job(s) are running.",
+                                       mrkdwn=True)
+                            channel_last_ts[poll_channel] = ts
+                            continue
+                        # Count bot messages first
+                        total = 0
+                        has_more = True
+                        cursor = None
+                        while has_more:
+                            params = {"channel": poll_channel, "limit": 100}
+                            if cursor:
+                                params["cursor"] = cursor
+                            history = slack_get("conversations.history", **params)
+                            for m in history.get("messages", []):
+                                if m.get("user") == BOT_USER_ID or m.get("bot_id"):
+                                    total += 1
+                                if m.get("reply_count", 0) > 0:
+                                    replies = slack_get(
+                                        "conversations.replies",
+                                        channel=poll_channel, ts=m["ts"], limit=100,
+                                    )
+                                    for r in replies.get("messages", []):
+                                        if (r.get("user") == BOT_USER_ID or r.get("bot_id")) and r["ts"] != m["ts"]:
+                                            total += 1
+                            cursor = history.get("response_metadata", {}).get("next_cursor")
+                            has_more = bool(cursor)
+
+                        if total == 0:
+                            slack_post("chat.postMessage", channel=poll_channel,
+                                       text="Nothing to clear.", mrkdwn=True)
+                        else:
+                            resp = slack_post("chat.postMessage", channel=poll_channel,
+                                       text=f"Found {total} bot messages. React :white_check_mark: to delete them all.",
+                                       mrkdwn=True)
+                            confirm_ts = resp.get("ts", "") if resp and resp.get("ok") else ""
+                            if confirm_ts:
+                                STATE_DIR.joinpath(".pending_clear").write_text(
+                                    json.dumps({"msg_ts": confirm_ts, "channel": poll_channel, "expires": time.time() + 120}))
+
+                    channel_last_ts[poll_channel] = ts
 
             # ── Check for thread replies on completed jobs ──
             for thread_ts, state in list(jobs.items()):
                 if state.get("status") != "done":
                     continue
 
+                job_ch = state.get("channel", DM_CHANNEL)
                 last_checked = state.get("last_checked_ts", state.get("updated_at_ts", thread_ts))
 
                 try:
                     replies = slack_get(
                         "conversations.replies",
-                        channel=DM_CHANNEL,
+                        channel=job_ch,
                         ts=thread_ts,
                         oldest=last_checked,
                         limit=5,
@@ -1164,7 +1254,8 @@ try:
                     if time.time() > pending["expires"]:
                         pending_file.unlink()
                     else:
-                        r = slack_get("reactions.get", channel=DM_CHANNEL,
+                        clear_ch = pending.get("channel", DM_CHANNEL)
+                        r = slack_get("reactions.get", channel=clear_ch,
                                       timestamp=pending["msg_ts"], full=True)
                         if r.get("ok"):
                             for rx in r.get("message", {}).get("reactions", []):
@@ -1175,7 +1266,7 @@ try:
                                     has_more = True
                                     cursor = None
                                     while has_more:
-                                        params = {"channel": DM_CHANNEL, "limit": 100}
+                                        params = {"channel": clear_ch, "limit": 100}
                                         if cursor:
                                             params["cursor"] = cursor
                                         hist = slack_get("conversations.history", **params)
@@ -1183,14 +1274,14 @@ try:
                                             if m2.get("reply_count", 0) > 0:
                                                 reps = slack_get(
                                                     "conversations.replies",
-                                                    channel=DM_CHANNEL, ts=m2["ts"], limit=100,
+                                                    channel=clear_ch, ts=m2["ts"], limit=100,
                                                 )
                                                 for rr in reps.get("messages", []):
                                                     if (rr.get("user") == BOT_USER_ID or rr.get("bot_id")) and rr["ts"] != m2["ts"]:
-                                                        slack_post("chat.delete", channel=DM_CHANNEL, ts=rr["ts"])
+                                                        slack_post("chat.delete", channel=clear_ch, ts=rr["ts"])
                                                         deleted += 1
                                             if m2.get("user") == BOT_USER_ID or m2.get("bot_id"):
-                                                slack_post("chat.delete", channel=DM_CHANNEL, ts=m2["ts"])
+                                                slack_post("chat.delete", channel=clear_ch, ts=m2["ts"])
                                                 deleted += 1
                                         cursor = hist.get("response_metadata", {}).get("next_cursor")
                                         has_more = bool(cursor)
@@ -1212,8 +1303,9 @@ try:
                     continue
 
                 try:
+                    react_ch = state.get("channel", DM_CHANNEL)
                     r = slack_get("reactions.get",
-                                  channel=DM_CHANNEL,
+                                  channel=react_ch,
                                   timestamp=prompt_ts,
                                   full=True)
                     if not r.get("ok"):
@@ -1251,6 +1343,7 @@ try:
                         slack_urls = state.get("slack_urls", [])
                         start_ticket_solve(
                             ticket, thread_ts,
+                            channel=react_ch,
                             slack_urls=slack_urls if slack_urls else None,
                             mock=MOCK_MODE, force=True,
                             slack_context=is_slack_ctx,
@@ -1275,7 +1368,6 @@ try:
 
 except KeyboardInterrupt:
     print("\nShutting down...")
-    last_ts_file.write_text(last_ts)
 
     # Kill all child process groups
     for ticket, info in running_procs.items():
