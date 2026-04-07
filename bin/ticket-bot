@@ -226,9 +226,37 @@ if not dm_resp.get("ok"):
 
 DM_CHANNEL = dm_resp["channel"]["id"]
 
-# Get bot's own user ID
-auth_resp = slack_get("auth.test")
+# Get bot's own user ID and check scopes
+_auth_req = urllib.request.Request(
+    "https://slack.com/api/auth.test",
+    headers={"Authorization": f"Bearer {BOT_TOKEN}", "Content-Type": "application/x-www-form-urlencoded"},
+    data=b"",
+)
+try:
+    with urllib.request.urlopen(_auth_req) as _auth_raw:
+        _granted_scopes = set(_auth_raw.headers.get("x-oauth-scopes", "").split(","))
+        auth_resp = json.loads(_auth_raw.read())
+except urllib.error.URLError as e:
+    print(f"Error connecting to Slack: {e}")
+    sys.exit(1)
+
 BOT_USER_ID = auth_resp.get("user_id", "")
+if not auth_resp.get("ok"):
+    print(f"Error: auth.test failed: {auth_resp.get('error')}")
+    print("Check that TICKET_CREATOR_BOT_TOKEN is a valid bot token (xoxb-...)")
+    sys.exit(1)
+
+REQUIRED_SCOPES = {
+    "chat:write", "files:write",
+    "channels:history", "channels:read",
+    "groups:history", "groups:read",
+    "im:history", "reactions:read",
+}
+_missing_scopes = REQUIRED_SCOPES - _granted_scopes
+if _missing_scopes:
+    print(f"Warning: bot token is missing scopes: {', '.join(sorted(_missing_scopes))}")
+    print("Add them in your Slack app → OAuth & Permissions → Bot Token Scopes, then reinstall.")
+    print("The bot will start, but some features may not work.\n")
 
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 
