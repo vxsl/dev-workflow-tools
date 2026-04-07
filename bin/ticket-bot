@@ -493,6 +493,17 @@ def start_ticket_solve(ticket, thread_ts, channel, slack_urls=None, extra_contex
                     f":warning: *{dedup_key}* is already running (PID {running_procs[dedup_key]['proc'].pid})")
         return
 
+    # Post an acknowledgment so the user can see what the bot understood
+    ack_parts = []
+    if ticket and not slack_context:
+        ack_parts.append(f":ticket: *{ticket}*")
+    if slack_urls:
+        ack_parts.append(f":link: {'  '.join(slack_urls)}")
+    if extra_context:
+        ack_parts.append(f":pencil: _{extra_context}_")
+    if ack_parts:
+        slack_reply(channel, thread_ts, "\n".join(ack_parts))
+
     # Post a status message that we'll update with progress
     label = f"*{ticket}*" if ticket and not slack_context else ":speech_balloon: Slack thread"
     resp = slack_reply(
