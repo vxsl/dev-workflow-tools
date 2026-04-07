@@ -1266,6 +1266,8 @@ def socket_event_handler(client: SocketModeClient, req: SocketModeRequest):
     # Always ack immediately
     client.send_socket_mode_response(SocketModeResponse(envelope_id=req.envelope_id))
 
+    print(f"  [socket] type={req.type} payload_type={req.payload.get('type', req.payload.get('event', {}).get('type', '?'))}")
+
     if req.type == "events_api":
         event = req.payload.get("event", {})
         event_type = event.get("type", "")
@@ -1328,9 +1330,16 @@ _proc_thread.start()
 # Send startup greeting to DM
 slack_post("chat.postMessage", channel=DM_CHANNEL, text=HELP_TEXT, mrkdwn=True)
 
+if "--debug" in sys.argv:
+    import logging
+    logging.basicConfig(level=logging.DEBUG)
+    print("  Debug logging enabled")
+
 print("  Connecting to Slack via Socket Mode...")
 sm_client.connect()
 print("  Connected! Listening for events...")
+print("  (If no events arrive, check that your Slack app has event subscriptions configured)")
+print("  (Required: message.channels, message.groups, message.im, reaction_added)")
 
 try:
     while True:
