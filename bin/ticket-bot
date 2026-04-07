@@ -394,6 +394,9 @@ def start_ticket_solve(ticket, thread_ts, channel, slack_urls=None, extra_contex
         f":hourglass_flowing_sand: {label} — setting up worktree..."
     )
     status_ts = resp.get("ts", "") if resp and resp.get("ok") else ""
+    if not resp or not resp.get("ok"):
+        print(f"  WARNING: initial status reply failed: {resp.get('error', 'unknown')}")
+        print(f"    channel={channel} thread_ts={thread_ts}")
 
     session_id = str(uuid.uuid4())
 
