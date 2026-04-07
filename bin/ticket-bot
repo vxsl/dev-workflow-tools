@@ -831,7 +831,7 @@ def check_running_procs():
                 ticket = info["ticket"]
 
                 # Load state to get work_dir
-                state_path = STATE_DIR / f"{ticket}.json"
+                state_path = STATE_DIR / f"{ticket.replace('/', '_')}.json"
                 work_dir = ""
                 if state_path.exists():
                     try:
@@ -898,7 +898,7 @@ def check_running_procs():
 
             # Handle publish completion
             if is_publish:
-                state_path = STATE_DIR / f"{ticket}.json"
+                state_path = STATE_DIR / f"{ticket.replace('/', '_')}.json"
                 if state_path.exists():
                     state = json.loads(state_path.read_text())
                     if exit_code == 0:
@@ -980,7 +980,7 @@ def check_running_procs():
 
             if state is None:
                 state = {"ticket": ticket, "status": "failed"}
-                state_path = STATE_DIR / f"{ticket}.json"
+                state_path = STATE_DIR / f"{ticket.replace('/', '_')}.json"
 
             # Always use the current thread/channel (not whatever's in the state file from a previous run)
             state["thread_ts"] = current_thread_ts

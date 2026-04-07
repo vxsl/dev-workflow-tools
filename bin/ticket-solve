@@ -530,7 +530,7 @@ save_state() {
           thread_ts: $thread_ts, dm_channel: $dm_channel, session_id: $session_id,
           model: $model, status: $status, slack_context: $slack_context,
           slack_urls: $slack_urls, updated_at: $updated_at}' \
-        > "$STATE_DIR/${TICKET}.json"
+        > "$STATE_DIR/${TICKET//\//_}.json"
 }
 
 save_state "in_progress"
