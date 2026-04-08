@@ -512,10 +512,11 @@ save_state() {
     local slack_url="$5"
     local slack_channel="$6"
     local slack_thread_ts="$7"
-    
+    local cherry_pick_commits="${8:-}"
+
     local repo_root=$(git rev-parse --show-toplevel)
     local state_file="${STATE_DIR}/$(echo "$repo_root" | sed 's|/|_|g').json"
-    
+
     jq -n \
         --arg ticket_key "$ticket_key" \
         --arg summary "$summary" \
@@ -524,6 +525,7 @@ save_state() {
         --arg slack_url "$slack_url" \
         --arg slack_channel "$slack_channel" \
         --arg slack_thread_ts "$slack_thread_ts" \
+        --arg cherry_pick_commits "$cherry_pick_commits" \
         '{
             ticket_key: $ticket_key,
             summary: $summary,
@@ -532,6 +534,7 @@ save_state() {
             slack_url: $slack_url,
             slack_channel: $slack_channel,
             slack_thread_ts: $slack_thread_ts,
+            cherry_pick_commits: $cherry_pick_commits,
             timestamp: now | todate
         }' > "$state_file"
 }
@@ -601,6 +604,7 @@ if [ -n "$saved_state" ]; then
         SLACK_URL=$(echo "$saved_state" | jq -r '.slack_url // empty')
         SLACK_CHANNEL=$(echo "$saved_state" | jq -r '.slack_channel // empty')
         SLACK_THREAD_TS=$(echo "$saved_state" | jq -r '.slack_thread_ts // empty')
+        CHERRY_PICK_COMMITS=$(echo "$saved_state" | jq -r '.cherry_pick_commits // empty')
         
         # Detect hotfix resume
         if [ "$TICKET_KEY" = "HOTFIX" ]; then
@@ -1108,10 +1112,18 @@ if [ "${SKIP_TO_COMMIT_LOOP:-false}" != true ]; then
                 echo -e "  ${CYAN}Inside worktree for ${_wt_current_branch} — creating new worktree for ${branch_name}${RESET}" >&2
                 echo "" >&2
 
-                # Preexisting commits in a foreign worktree is too complex to handle
+                # Preexisting commits in a foreign worktree: save SHAs for cherry-pick after push
                 if [ "$PREEXISTING_COMMITS" = true ]; then
-                    echo -e "  ${RED}✗ Cannot move unpublished commits across worktrees${RESET}" >&2
+                    _cherry_pick_shas=$(git rev-list HEAD --not --remotes=origin --reverse | tr '\n' ' ' | sed 's/ $//')
+                    echo -e "  ${YELLOW}⚠ Found unpublished commits that need to move to ${branch_name}${RESET}" >&2
                     echo -e "  ${DIM}Push your commits on ${_wt_current_branch} first, then run oneshot again${RESET}" >&2
+                    echo -e "  ${DIM}(Saved ${_cherry_pick_shas%% *}... for cherry-pick on resume)${RESET}" >&2
+                    # Re-save state with commit SHAs so resume can cherry-pick them
+                    if [ "$HOTFIX_MODE" = true ]; then
+                        save_state "HOTFIX" "$summary" "$branch_name" "$BASE_BRANCH" "$SLACK_URL" "$SLACK_CHANNEL" "$SLACK_THREAD_TS" "$_cherry_pick_shas"
+                    else
+                        save_state "$TICKET_KEY" "$summary" "$TICKET_KEY" "$BASE_BRANCH" "$SLACK_URL" "$SLACK_CHANNEL" "$SLACK_THREAD_TS" "$_cherry_pick_shas"
+                    fi
                     exit 1
                 fi
 
@@ -1219,6 +1231,25 @@ if [ "${SKIP_TO_COMMIT_LOOP:-false}" != true ]; then
 
                 echo -e "  ${GREEN}✓${RESET} Worktree: ${_wt_path}" >&2
                 echo -e "  ${GREEN}✓${RESET} Branch: ${branch_name}" >&2
+
+                # Cherry-pick commits saved from a previous "push first" interruption
+                if [ -n "${CHERRY_PICK_COMMITS:-}" ]; then
+                    _cherry_count=$(echo "$CHERRY_PICK_COMMITS" | wc -w)
+                    echo -e "  ${DIM}Cherry-picking ${_cherry_count} commit(s) from previous session...${RESET}" >&2
+                    # shellcheck disable=SC2086
+                    _cherry_output=$(git cherry-pick $CHERRY_PICK_COMMITS 2>&1)
+                    _cherry_exit=$?
+                    if [ -n "$_cherry_output" ]; then
+                        echo "$_cherry_output" | while read -r line; do echo -e "    ${DIM}${line}${RESET}" >&2; done
+                    fi
+                    if [ $_cherry_exit -ne 0 ]; then
+                        echo -e "  ${RED}✗ Cherry-pick failed — resolve conflicts, then run oneshot to resume${RESET}" >&2
+                        exit 1
+                    fi
+                    echo -e "  ${GREEN}✓${RESET} Cherry-picked ${_cherry_count} commit(s)" >&2
+                    CHERRY_PICKED=true
+                fi
+
                 WORKTREE_HANDLED=true
             fi
         fi
@@ -1508,8 +1539,8 @@ if [ "${SKIP_TO_COMMIT_LOOP:-false}" != true ]; then
             exit 1
         fi
         
-        # Verify we have staged changes to commit (skip if we're moving preexisting commits)
-        if [ "$PREEXISTING_COMMITS" != true ]; then
+        # Verify we have staged changes to commit (skip if we're moving preexisting/cherry-picked commits)
+        if [ "$PREEXISTING_COMMITS" != true ] && [ "${CHERRY_PICKED:-false}" != true ]; then
             staged_files_check=$(git diff --cached --name-only)
             if [ -z "$staged_files_check" ]; then
                 echo -e "  ${RED}✗ No staged changes found after branch creation${RESET}" >&2
@@ -1524,8 +1555,8 @@ fi  # End of branch creation (SKIP_TO_COMMIT_LOOP check)
 
 # Prompt for first commit message
 if [ "${SKIP_TO_COMMIT_LOOP:-false}" != true ]; then
-    # If we only have preexisting commits (nothing new staged), skip the commit prompt/loop
-    if [ "$PREEXISTING_COMMITS" = true ] && [ "$staged_count" -eq 0 ]; then
+    # If we only have preexisting/cherry-picked commits (nothing new staged), skip the commit prompt/loop
+    if { [ "$PREEXISTING_COMMITS" = true ] && [ "$staged_count" -eq 0 ]; } || [ "${CHERRY_PICKED:-false}" = true ]; then
         SKIP_COMMIT_LOOP=true
         extra_commits_made=true  # Ensure pre-push runs before publish
     else
