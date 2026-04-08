@@ -268,28 +268,28 @@ if [ "$issue_type" = "Bug" ]; then
     printf "\033[38;5;109m┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\033[0m\n" >&2
 
     # How was the bug found? (default: Discovered internally)
-    bug_found=$(get_custom_field_options "Bug" "customfield_10156" | $FZF --prompt="  🔍 How was the bug found? > " --height=10 --reverse --border=rounded --header="Press Enter for default (Discovered internally)")
+    bug_found=$(get_custom_field_options "Bug" "customfield_10156" | $FZF --prompt="  🔍 How was the bug found? > " --height=10 --reverse --border=rounded --header="Press Enter for default (Discovered internally)" || true)
     if [ -z "$bug_found" ]; then
         bug_found="Discovered internally  "
     fi
     printf "  \033[38;5;114m✓\033[0m Found: \033[0m%s\033[0m\n" "$bug_found" >&2
 
     # Does this bug affect sales demo? (default: No)
-    bug_demo=$(get_custom_field_options "Bug" "customfield_10165" | $FZF --prompt="  📊 Affects sales demo? > " --height=10 --reverse --border=rounded --header="Press Enter for default (No)")
+    bug_demo=$(get_custom_field_options "Bug" "customfield_10165" | $FZF --prompt="  📊 Affects sales demo? > " --height=10 --reverse --border=rounded --header="Press Enter for default (No)" || true)
     if [ -z "$bug_demo" ]; then
         bug_demo="No"
     fi
     printf "  \033[38;5;114m✓\033[0m Affects demo: \033[0m%s\033[0m\n" "$bug_demo" >&2
 
     # Which environment? (default: Production)
-    bug_env=$(get_custom_field_options "Bug" "customfield_10177" | $FZF --prompt="  🌐 Environment? > " --height=10 --reverse --border=rounded --header="Press Enter for default (Production)")
+    bug_env=$(get_custom_field_options "Bug" "customfield_10177" | $FZF --prompt="  🌐 Environment? > " --height=10 --reverse --border=rounded --header="Press Enter for default (Production)" || true)
     if [ -z "$bug_env" ]; then
         bug_env="Production (home.urbanlogiq.ca or home.urbanlogiq.us) "
     fi
     printf "  \033[38;5;114m✓\033[0m Environment: \033[0m%s\033[0m\n" "$bug_env" >&2
 
     # Which customers affected? (default: None, multi-select)
-    bug_customers=$(get_custom_field_options "Bug" "customfield_10170" | $FZF --prompt="  👥 Affected customers? > " --height=20 --reverse --border=rounded --multi --bind 'tab:toggle+down' --header="TAB=multi-select, Enter for default (None)")
+    bug_customers=$(get_custom_field_options "Bug" "customfield_10170" | $FZF --prompt="  👥 Affected customers? > " --height=20 --reverse --border=rounded --multi --bind 'tab:toggle+down' --header="TAB=multi-select, Enter for default (None)" || true)
     if [ -z "$bug_customers" ]; then
         bug_customers="None"
     fi
