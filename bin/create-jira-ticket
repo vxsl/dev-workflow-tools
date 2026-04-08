@@ -178,6 +178,18 @@ get_sprints() {
     fi
 }
 
+# Function to get allowed values for a custom field from createmeta
+# Usage: get_custom_field_options <issuetype_name> <field_id>
+get_custom_field_options() {
+    local issuetype_name="$1"
+    local field_id="$2"
+    local encoded_type=$(echo "$issuetype_name" | jq -sRr @uri)
+    local response=$(curl -s --max-time 10 -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
+        "https://${JIRA_DOMAIN}/rest/api/3/issue/createmeta?projectKeys=${JIRA_PROJECT}&issuetypeNames=${encoded_type}&expand=projects.issuetypes.fields" \
+        -H "Content-Type: application/json" 2>&1)
+    echo "$response" | jq -r ".projects[0].issuetypes[0].fields[\"${field_id}\"].allowedValues[]? | .value // .name // .id" 2>/dev/null
+}
+
 # ============================================================================
 # Main interactive ticket creation
 # ============================================================================
@@ -246,6 +258,58 @@ else
     fi
     printf "  \033[38;5;114m✓\033[0m Type: \033[0m%s\033[0m\n" "$issue_type" >&2
     echo "" >&2
+fi
+
+# Bug-specific required fields
+bug_fields=""
+if [ "$issue_type" = "Bug" ]; then
+    printf "\033[38;5;109m┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\033[0m\n" >&2
+    printf "\033[38;5;109m┃\033[0m \033[38;5;81mBug fields:\033[0m Required bug-specific information            \033[38;5;109m┃\033[0m\n" >&2
+    printf "\033[38;5;109m┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\033[0m\n" >&2
+
+    # How was the bug found? (default: Discovered internally)
+    bug_found=$(get_custom_field_options "Bug" "customfield_10156" | $FZF --prompt="  🔍 How was the bug found? > " --height=10 --reverse --border=rounded --header="Press Enter for default (Discovered internally)")
+    if [ -z "$bug_found" ]; then
+        bug_found="Discovered internally  "
+    fi
+    printf "  \033[38;5;114m✓\033[0m Found: \033[0m%s\033[0m\n" "$bug_found" >&2
+
+    # Does this bug affect sales demo? (default: No)
+    bug_demo=$(get_custom_field_options "Bug" "customfield_10165" | $FZF --prompt="  📊 Affects sales demo? > " --height=10 --reverse --border=rounded --header="Press Enter for default (No)")
+    if [ -z "$bug_demo" ]; then
+        bug_demo="No"
+    fi
+    printf "  \033[38;5;114m✓\033[0m Affects demo: \033[0m%s\033[0m\n" "$bug_demo" >&2
+
+    # Which environment? (default: Production)
+    bug_env=$(get_custom_field_options "Bug" "customfield_10177" | $FZF --prompt="  🌐 Environment? > " --height=10 --reverse --border=rounded --header="Press Enter for default (Production)")
+    if [ -z "$bug_env" ]; then
+        bug_env="Production (home.urbanlogiq.ca or home.urbanlogiq.us) "
+    fi
+    printf "  \033[38;5;114m✓\033[0m Environment: \033[0m%s\033[0m\n" "$bug_env" >&2
+
+    # Which customers affected? (default: None, multi-select)
+    bug_customers=$(get_custom_field_options "Bug" "customfield_10170" | $FZF --prompt="  👥 Affected customers? > " --height=20 --reverse --border=rounded --multi --bind 'tab:toggle+down' --header="TAB=multi-select, Enter for default (None)")
+    if [ -z "$bug_customers" ]; then
+        bug_customers="None"
+    fi
+    printf "  \033[38;5;114m✓\033[0m Customers: \033[0m%s\033[0m\n" "$(echo "$bug_customers" | tr '\n' ', ' | sed 's/,$//')" >&2
+
+    echo "" >&2
+
+    # Build JSON for bug custom fields (all are array type with {value: ...} objects)
+    bug_found_json=$(echo "$bug_found" | jq -R '[{value: .}]')
+    bug_demo_json=$(echo "$bug_demo" | jq -R '[{value: .}]')
+    bug_env_json=$(echo "$bug_env" | jq -R '[{value: .}]')
+    bug_customers_json=$(echo "$bug_customers" | jq -R . | jq -s 'map({value: .})')
+
+    bug_fields=$(cat <<EOFBUG
+    , "customfield_10156": $bug_found_json
+    , "customfield_10165": $bug_demo_json
+    , "customfield_10177": $bug_env_json
+    , "customfield_10170": $bug_customers_json
+EOFBUG
+    )
 fi
 
 # Step 3: Priority (default to Medium - first in list)
@@ -477,6 +541,7 @@ payload=$(cat <<EOFPAYLOAD
     $assignee_field
     $parent_field
     $labels_field
+    $bug_fields
   }
 }
 EOFPAYLOAD
