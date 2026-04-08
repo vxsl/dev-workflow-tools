@@ -759,11 +759,16 @@ def publish_ticket(state, force_push=False):
         publish_status_ts = resp.get("ts", "") if resp and resp.get("ok") else ""
 
     is_slack_context = state.get("slack_context", False)
-    commit_msg = f"{ticket}: {summary}"
     publish = SCRIPT_DIR / "publish-changes"
 
     install = 'test -f node_modules/.yarn-state.yml || yarn install; test -f src/styles/css/tailwind.css || yarn tailwind-build;'
-    mr_title = f"{ticket} {summary}"
+    if is_slack_context and summary:
+        # For slack-context, use just the summary as a meaningful English title
+        commit_msg = summary
+        mr_title = summary
+    else:
+        commit_msg = f"{ticket}: {summary}"
+        mr_title = f"{ticket} {summary}"
     force_flag = " --force-push" if force_push else ""
     include_desc = "" if is_slack_context else " --include-ticket-description"
     no_jira = " --no-jira" if is_slack_context else ""

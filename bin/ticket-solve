@@ -632,7 +632,7 @@ if $SLACK_CONTEXT; then
             tr '[:upper:]' '[:lower:]' | \
             sed 's/[^a-z0-9]/-/g' | \
             sed 's/-\+/-/g' | sed 's/^-//; s/-$//' | \
-            cut -c1-50 | sed 's/-$//')
+            cut -c1-38 | sed 's/-$//')
         NEW_BRANCH="hotfix/${HOTFIX_SLUG}"
         OLD_BRANCH="$TICKET"
 
