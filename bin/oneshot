@@ -7,6 +7,8 @@
 #   oneshot "Ticket title here"          Create new ticket with given title
 #   oneshot https://slack.com/.../p...    Create ticket + link to Slack thread
 #   oneshot https://slack.com/.../       Create ticket + post to Slack channel
+#   oneshot --bug                        Create ticket as Bug (shorthand for --issue-type Bug)
+#   oneshot --issue-type Story           Create ticket with specific issue type
 #   oneshot --hotfix                     Hotfix mode: skip ticket, branch as hotfix/<slug>
 #   oneshot --hotfix "description"       Hotfix with description (skips prompt)
 #   oneshot --hotfix https://slack...    Hotfix + post MR link to Slack thread/channel
@@ -65,6 +67,7 @@ HOTFIX_DESCRIPTION=""
 PREEXISTING_COMMITS=false
 PREEXISTING_COMMITS_BRANCH=""
 REBASED=false
+ISSUE_TYPE=""
 
 # Colors
 RED='\033[38;5;167m'
@@ -95,6 +98,14 @@ while [[ "$#" -gt 0 ]]; do
         --hotfix)
             HOTFIX_MODE=true
             shift
+            ;;
+        --bug)
+            ISSUE_TYPE="Bug"
+            shift
+            ;;
+        --issue-type)
+            ISSUE_TYPE="$2"
+            shift 2
             ;;
         --help|-h)
             head -20 "$0" | tail -19
@@ -741,6 +752,10 @@ elif [ -n "$SLACK_URL" ]; then
             flags+=(--slack-url "$SLACK_URL")
         fi
 
+        if [ -n "$ISSUE_TYPE" ]; then
+            flags+=(--issue-type "$ISSUE_TYPE")
+        fi
+
         # Call the shared create-jira-ticket script
         # Use temp file to capture JSON output
         result_file=$(mktemp)
@@ -798,13 +813,17 @@ elif [ -n "$NEW_TICKET_TITLE" ]; then
     if [ "$DRY_RUN" = true ]; then
         dry_run_flag="--dry-run"
     fi
-    
+    issue_type_flag=""
+    if [ -n "$ISSUE_TYPE" ]; then
+        issue_type_flag="--issue-type $ISSUE_TYPE"
+    fi
+
     # Call the shared create-jira-ticket script with title
     # Use temp file to capture JSON output
     result_file=$(mktemp)
     trap "rm -f '$result_file'" EXIT
-    
-    if ! "$SCRIPT_DIR/create-jira-ticket" $dry_run_flag --summary "$NEW_TICKET_TITLE" --output-file "$result_file"; then
+
+    if ! "$SCRIPT_DIR/create-jira-ticket" $dry_run_flag $issue_type_flag --summary "$NEW_TICKET_TITLE" --output-file "$result_file"; then
         echo -e "  ${RED}✗ Failed to create ticket${RESET}" >&2
         rm -f "$result_file"
         exit 1
@@ -839,12 +858,15 @@ else
         if [ "$DRY_RUN" = true ]; then
             flags+=(--dry-run)
         fi
-        
+        if [ -n "$ISSUE_TYPE" ]; then
+            flags+=(--issue-type "$ISSUE_TYPE")
+        fi
+
         # Call the shared create-jira-ticket script
         # Use temp file to capture JSON output
         result_file=$(mktemp)
         trap "rm -f '$result_file'" EXIT
-        
+
         if ! "$SCRIPT_DIR/create-jira-ticket" "${flags[@]}" --output-file "$result_file"; then
             echo -e "  ${RED}✗ Failed to create ticket${RESET}" >&2
             rm -f "$result_file"
@@ -856,7 +878,7 @@ else
         summary=$(jq -r '.summary' < "$result_file")
         ticket_description=$(jq -r '.description // empty' < "$result_file")
         rm -f "$result_file"
-        
+
         if [ -z "$TICKET_KEY" ] || ! [[ "$TICKET_KEY" =~ ^${JIRA_PROJECT}-[0-9]+$ ]]; then
             echo -e "  ${RED}✗ Failed to create ticket${RESET}" >&2
             exit 1
@@ -872,13 +894,17 @@ else
         if [ "$DRY_RUN" = true ]; then
             dry_run_flag="--dry-run"
         fi
-        
+        issue_type_flag=""
+        if [ -n "$ISSUE_TYPE" ]; then
+            issue_type_flag="--issue-type $ISSUE_TYPE"
+        fi
+
         # Call the shared create-jira-ticket script with title
         # Use temp file to capture JSON output
         result_file=$(mktemp)
         trap "rm -f '$result_file'" EXIT
-        
-        if ! "$SCRIPT_DIR/create-jira-ticket" $dry_run_flag --summary "$ticket_title" --output-file "$result_file"; then
+
+        if ! "$SCRIPT_DIR/create-jira-ticket" $dry_run_flag $issue_type_flag --summary "$ticket_title" --output-file "$result_file"; then
             echo -e "  ${RED}✗ Failed to create ticket${RESET}" >&2
             rm -f "$result_file"
             exit 1
@@ -934,6 +960,9 @@ else
             flags=()
             if [ "$DRY_RUN" = true ]; then
                 flags+=(--dry-run)
+            fi
+            if [ -n "$ISSUE_TYPE" ]; then
+                flags+=(--issue-type "$ISSUE_TYPE")
             fi
 
             # Call the shared create-jira-ticket script with Slack URL

@@ -5,6 +5,7 @@
 # Usage:
 #   create-jira-ticket                                    Interactive creation
 #   create-jira-ticket --summary "Fix bug"                Quick creation with summary
+#   create-jira-ticket --issue-type Bug                   Pre-select issue type (Bug, Task, Story, etc.)
 #   create-jira-ticket --summary "..." --slack-url URL    Link to Slack thread
 #   create-jira-ticket --dry-run                          Test without creating
 #
@@ -35,6 +36,7 @@ DRY_RUN=false
 DEFAULT_LABELS="front-end"
 OUTPUT_FILE=""
 CLEAR_SCREEN=false
+ISSUE_TYPE=""
 
 # Parse command line arguments
 INITIAL_SUMMARY=""
@@ -49,7 +51,8 @@ while [[ "$#" -gt 0 ]]; do
         --labels) DEFAULT_LABELS="$2"; shift 2 ;;
         --output-file) OUTPUT_FILE="$2"; shift 2 ;;
         --clear) CLEAR_SCREEN=true; shift ;;
-        *) 
+        --issue-type) ISSUE_TYPE="$2"; shift 2 ;;
+        *)
             echo "Unknown argument: $1" >&2
             exit 1
             ;;
@@ -226,18 +229,24 @@ printf "  \033[38;5;114m✓\033[0m Summary: \033[0m%s\033[0m\n" "$summary" >&2
 echo "" >&2
 
 # Step 2: Issue Type
-printf "\033[38;5;109m┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\033[0m\n" >&2
-printf "\033[38;5;109m┃\033[0m \033[38;5;81mStep 2/8:\033[0m Select issue type                             \033[38;5;109m┃\033[0m\n" >&2
-printf "\033[38;5;109m┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\033[0m\n" >&2
-issue_type=$(get_issue_types | $FZF --prompt="  🏷️  Issue Type > " --height=12 --reverse --border=rounded)
-if [ -z "$issue_type" ]; then
+if [ -n "$ISSUE_TYPE" ]; then
+    issue_type="$ISSUE_TYPE"
+    printf "  \033[38;5;114m✓\033[0m Type: \033[0m%s\033[0m (preset)\n" "$issue_type" >&2
     echo "" >&2
-    printf "\033[38;5;167m  ✗ Cancelled\033[0m\n" >&2
-    rm -rf "$tmpdir"
-    exit 1
+else
+    printf "\033[38;5;109m┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\033[0m\n" >&2
+    printf "\033[38;5;109m┃\033[0m \033[38;5;81mStep 2/8:\033[0m Select issue type                             \033[38;5;109m┃\033[0m\n" >&2
+    printf "\033[38;5;109m┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\033[0m\n" >&2
+    issue_type=$(get_issue_types | $FZF --prompt="  🏷️  Issue Type > " --height=12 --reverse --border=rounded)
+    if [ -z "$issue_type" ]; then
+        echo "" >&2
+        printf "\033[38;5;167m  ✗ Cancelled\033[0m\n" >&2
+        rm -rf "$tmpdir"
+        exit 1
+    fi
+    printf "  \033[38;5;114m✓\033[0m Type: \033[0m%s\033[0m\n" "$issue_type" >&2
+    echo "" >&2
 fi
-printf "  \033[38;5;114m✓\033[0m Type: \033[0m%s\033[0m\n" "$issue_type" >&2
-echo "" >&2
 
 # Step 3: Priority (default to Medium - first in list)
 printf "\033[38;5;109m┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\033[0m\n" >&2
