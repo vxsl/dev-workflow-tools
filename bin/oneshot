@@ -642,6 +642,7 @@ if [ -n "$saved_state" ]; then
                 # Branch doesn't exist yet (previous run failed before creating it)
                 echo -e "  ${YELLOW}⚠ Branch ${branch_name} not found locally — will create it${RESET}" >&2
                 SKIP_TO_COMMIT_LOOP=false
+                RESUME_CREATE_BRANCH=true
             fi
         fi
 
@@ -657,7 +658,7 @@ if [ -n "$saved_state" ]; then
 fi
 
 # Step 1: Check for staged changes
-if [ "${SKIP_TO_COMMIT_LOOP:-false}" != true ]; then
+if [ "${SKIP_TO_COMMIT_LOOP:-false}" != true ] && [ "${RESUME_CREATE_BRANCH:-false}" != true ]; then
     echo -e "${CYAN}┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓${RESET}" >&2
     echo -e "${CYAN}┃${RESET} ${BLUE}Step 1/4:${RESET} Checking changes                              ${CYAN}┃${RESET}" >&2
     echo -e "${CYAN}┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛${RESET}" >&2
@@ -713,7 +714,7 @@ if [ "${SKIP_TO_COMMIT_LOOP:-false}" != true ]; then
 fi
 
 # Step 2: Select ticket or handle Slack URL
-if [ "${SKIP_TO_COMMIT_LOOP:-false}" != true ]; then
+if [ "${SKIP_TO_COMMIT_LOOP:-false}" != true ] && [ "${RESUME_CREATE_BRANCH:-false}" != true ]; then
 echo -e "${CYAN}┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓${RESET}" >&2
 echo -e "${CYAN}┃${RESET} ${BLUE}Step 2/4:${RESET} Select Jira ticket                            ${CYAN}┃${RESET}" >&2
 echo -e "${CYAN}┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛${RESET}" >&2
