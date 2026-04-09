@@ -2004,10 +2004,9 @@ generate_remote_only_data() {
     fi
 
     # One bulk call for all remote branches with full info.
-    # awk filters out branches that exist locally and are older than the age limit —
-    # no per-branch git calls. Output is streamed directly via printf so SIGPIPE
-    # propagates immediately when fzf exits.
-    git for-each-ref --sort='-committerdate' refs/remotes/origin/ \
+    # awk filters out branches that exist locally and are older than the age limit.
+    local remote_lines
+    remote_lines=$(git for-each-ref --sort='-committerdate' refs/remotes/origin/ \
         --format='%(refname:short)%09%(committerdate:unix)%09%(committername)%09%(committerdate:relative)' 2>/dev/null |
     sed 's/^origin\///' |
     grep -v '^HEAD' |
@@ -2021,7 +2020,56 @@ generate_remote_only_data() {
             if (cutoff > 0 && $2 < cutoff) next
             print
         }
-    ' |
+    ')
+
+    [ -z "$remote_lines" ] && return
+
+    # Batch-fetch Jira data for remote-only tickets not already cached
+    if [ "${JIRA_ENABLED:-false}" = "true" ] && [ -n "$JIRA_EMAIL" ] && [ -n "$JIRA_API_TOKEN" ]; then
+        local _remote_fetch_pids=()
+        declare -A _remote_tickets_seen
+        while IFS=$'\t' read -r branch _rest; do
+            local ticket
+            ticket=$(echo "$branch" | grep -oi "${JIRA_PROJECT}-[0-9]\+" | tr '[:lower:]' '[:upper:]')
+            [ -z "$ticket" ] && continue
+            [ -n "${_remote_tickets_seen[$ticket]}" ] && continue
+            _remote_tickets_seen["$ticket"]=1
+
+            if ! grep -q "^$ticket:" ~/.jira_cache 2>/dev/null || \
+               ! grep -q "^$ticket:" ~/.jira_status_cache 2>/dev/null || \
+               ! grep -q "^$ticket:" ~/.jira_assignee_cache 2>/dev/null; then
+                (
+                    response=$(curl -s --max-time 8 -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
+                        "https://${JIRA_DOMAIN}/rest/api/2/issue/${ticket}" \
+                        -H "Content-Type: application/json" 2>/dev/null)
+
+                    if [ $? -eq 0 ] && [ -n "$response" ]; then
+                        title=$(echo "$response" | jq -r '.fields.summary // empty' 2>/dev/null)
+                        status=$(echo "$response" | jq -r '.fields.status.name // empty' 2>/dev/null)
+                        assignee=$(echo "$response" | jq -r '.fields.assignee.displayName // empty' 2>/dev/null)
+
+                        [ -n "$title" ] && echo "$ticket:$title" >> ~/.jira_cache
+                        [ -n "$status" ] && echo "$ticket:$status" >> ~/.jira_status_cache
+                        [ -n "$assignee" ] && echo "$ticket:$assignee" >> ~/.jira_assignee_cache
+                    fi
+                ) &
+                _remote_fetch_pids+=($!)
+            fi
+        done <<< "$remote_lines"
+
+        if [ ${#_remote_fetch_pids[@]} -gt 0 ]; then
+            ( sleep 3 && kill "${_remote_fetch_pids[@]}" 2>/dev/null ) &
+            local _killer_pid=$!
+            wait "${_remote_fetch_pids[@]}" 2>/dev/null
+            kill "$_killer_pid" 2>/dev/null
+            wait "$_killer_pid" 2>/dev/null
+        fi
+
+        # Reload caches to pick up newly fetched data
+        load_jira_caches
+    fi
+
+    # Emit rows
     while IFS=$'\t' read -r branch unix_time author rel_time; do
         [ -z "$branch" ] && continue
         author="${author:0:15}"
@@ -2040,7 +2088,7 @@ generate_remote_only_data() {
             "$truncated_branch" "${jira_title:-<EMPTY>}" "${jira_status:-<EMPTY>}" "$author" \
             "updated:$unix_time" "committed: $rel_time" \
             "REMOTE:$branch" "${jira_assignee:-<UNASSIGNED>}" "" "" ""
-    done
+    done <<< "$remote_lines"
 }
 
 # Function to format status with color/emoji - returns padded colored string
