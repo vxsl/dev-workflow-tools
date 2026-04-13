@@ -393,9 +393,15 @@ This posts to our Slack DM thread and blocks until I reply (up to 30 min). Use s
    - **Testing**: What tests were added/updated, what needs manual verification
    Keep it concise — bullet points, not prose.
 
-4. As your very last output, print a one-line summary prefixed with \`SUMMARY:\` — e.g.:
+4. As your very last output, print TWO lines — a short title and a longer summary:
+   \`TITLE: <commit-subject-style title — imperative mood, max 70 chars, no trailing period>\`
+   \`SUMMARY: <1-2 sentences describing what was done, for Slack notifications>\`
+
+   Example:
+   \`TITLE: filter empty aois param in useWorkspaceQueryParams\`
    \`SUMMARY: Removed empty aois param from URL by filtering it out in useWorkspaceQueryParams. Added tests. All checks pass.\`
-   This line is parsed by the wrapper for Slack notifications. Keep it concise (1-2 sentences max).
+
+   TITLE is used as the MR title, commit subject, and branch slug — it MUST be short and imperative. SUMMARY is shown in Slack and may be a couple of sentences.
 
 Do NOT push, do NOT create an MR, do NOT run publish-changes. Do NOT run a soft reset — the wrapper handles that. Do NOT \`git add\` REVIEW.md, diff.html, or .claude-output.log."
 
@@ -516,6 +522,7 @@ save_state() {
     jq -n \
         --arg ticket "$TICKET" \
         --arg summary "$TICKET_SUMMARY" \
+        --arg title "${CLAUDE_TITLE:-}" \
         --arg worktree "$WORKTREE_PATH" \
         --arg work_dir "$WORK_DIR" \
         --arg thread_ts "$SLACK_THREAD_TS" \
@@ -526,7 +533,7 @@ save_state() {
         --argjson slack_context "$($SLACK_CONTEXT && echo true || echo false)" \
         --argjson slack_urls "$slack_urls_json" \
         --arg updated_at "$(date -Iseconds)" \
-        '{ticket: $ticket, summary: $summary, worktree: $worktree, work_dir: $work_dir,
+        '{ticket: $ticket, summary: $summary, title: $title, worktree: $worktree, work_dir: $work_dir,
           thread_ts: $thread_ts, dm_channel: $dm_channel, session_id: $session_id,
           model: $model, status: $status, slack_context: $slack_context,
           slack_urls: $slack_urls, updated_at: $updated_at}' \
@@ -622,13 +629,18 @@ else
     fi
 fi
 
-# ── Rename branch for Slack-context mode (hotfix/<summary-slug>) ──
+# ── Rename branch for Slack-context mode (hotfix/<title-slug>) ──
 if $SLACK_CONTEXT; then
+    CLAUDE_TITLE=$(grep -m1 '^TITLE:' "$WORKTREE_PATH/.claude-output.log" 2>/dev/null | sed 's/^TITLE: *//' || true)
     CLAUDE_SUMMARY=$(grep -m1 '^SUMMARY:' "$WORKTREE_PATH/.claude-output.log" 2>/dev/null | sed 's/^SUMMARY: *//' || true)
+    # Prefer TITLE for the branch slug; fall back to SUMMARY for backwards compat
+    SLUG_SOURCE="${CLAUDE_TITLE:-$CLAUDE_SUMMARY}"
     if [ -n "$CLAUDE_SUMMARY" ]; then
         TICKET_SUMMARY="$CLAUDE_SUMMARY"
-        # Slugify: lowercase, replace non-alnum with hyphens, trim, max 50 chars
-        HOTFIX_SLUG=$(echo "$CLAUDE_SUMMARY" | \
+    fi
+    if [ -n "$SLUG_SOURCE" ]; then
+        # Slugify: lowercase, replace non-alnum with hyphens, trim, max 38 chars
+        HOTFIX_SLUG=$(echo "$SLUG_SOURCE" | \
             tr '[:upper:]' '[:lower:]' | \
             sed 's/[^a-z0-9]/-/g' | \
             sed 's/-\+/-/g' | sed 's/^-//; s/-$//' | \
