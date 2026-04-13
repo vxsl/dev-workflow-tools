@@ -469,6 +469,108 @@ def slack_update(channel, ts, text):
     )
 
 
+def classify_intent(text, slack_urls=None):
+    """Classify a freeform message as either 'question' or 'implement'.
+
+    Uses Haiku via `claude -p` for a fast, cheap call. Always returns one
+    of those two strings — on error or ambiguity, defaults to 'implement'
+    (the existing, safer behavior).
+
+    User overrides: a leading `?` forces 'question', a leading `!` forces
+    'implement'. These prefixes are stripped by the caller before routing.
+    """
+    stripped = text.strip()
+    if stripped.startswith("?"):
+        return "question"
+    if stripped.startswith("!"):
+        return "implement"
+
+    prompt = (
+        "Classify the following user message as either a QUESTION (asking "
+        "about code, wanting to understand something) or an IMPLEMENT "
+        "request (asking to make a change, fix a bug, add a feature). "
+        "Reply with exactly one word: `question` or `implement`. No "
+        "explanation, no other text.\n\n"
+        f"Message: {stripped}"
+    )
+    if slack_urls:
+        prompt += f"\n\n(Message also references these Slack threads: {', '.join(slack_urls)})"
+
+    try:
+        result = subprocess.run(
+            ["claude", "-p", "--model", "haiku",
+             "--dangerously-skip-permissions", prompt],
+            capture_output=True, text=True, timeout=30,
+        )
+        out = result.stdout.strip().lower()
+        # Claude sometimes wraps in backticks or adds punctuation
+        out = out.strip("`.:\" \n")
+        if "question" in out.split():
+            return "question"
+        if "implement" in out.split():
+            return "implement"
+        # First-token fallback
+        first = out.split()[0] if out.split() else ""
+        if first in ("question", "implement"):
+            return first
+    except Exception as e:
+        print(f"  classify_intent error: {e}")
+    # Default to the existing behavior on any failure
+    return "implement"
+
+
+def start_ticket_ask(question, thread_ts, channel, slack_urls=None):
+    """Run ticket-ask (Q&A mode) as a background subprocess.
+
+    No worktree-per-question, no state-file tracking like solve jobs —
+    ticket-ask clones once to ~/.cache/ticket-ask/repo, fetches origin/main,
+    runs Claude read-only, and posts the answer to the thread itself. We
+    just dispatch and forget (Popen); its stdout/stderr go to a log file.
+    """
+    # Post a status message so the user knows we're on it
+    resp = slack_reply(channel, thread_ts,
+                       f":mag: _Reading code to answer..._")
+    status_ts = resp.get("ts", "") if resp and resp.get("ok") else ""
+
+    cmd = [str(SCRIPT_DIR / "ticket-ask"),
+           "--thread-ts", thread_ts,
+           "--dm-channel", channel]
+    for url in (slack_urls or []):
+        cmd.extend(["--slack-url", url])
+    cmd.extend(["--", question])
+
+    log_path = STATE_DIR / f"ask_{thread_ts.replace('.', '_')}.log"
+    log_file = open(log_path, "w")
+
+    proc = subprocess.Popen(
+        cmd,
+        cwd=PROJECT_ROOT,
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+
+    print(f"  Starting ticket-ask PID {proc.pid} for thread {thread_ts}: {question[:60]}...")
+
+    # Track so we can clean up the status message when it finishes
+    dedup_key = f"ask-{thread_ts}"
+    running_procs[dedup_key] = {
+        "proc": proc,
+        "log_file": log_file,
+        "log_path": log_path,
+        "log_offset": 0,
+        "thread_ts": thread_ts,
+        "channel": channel,
+        "status_ts": status_ts,
+        "last_stage": "",
+        "last_activity_update": 0,
+        "last_files_snapshot": "",
+        "start_time": time.time(),
+        "ticket": dedup_key,
+        "is_ask": True,
+    }
+
+
 def start_ticket_solve(ticket, thread_ts, channel, slack_urls=None, extra_context=None, mock=False, force=False, slack_context=False):
     """Start ticket-solve as a background process.
 
@@ -918,7 +1020,30 @@ def check_running_procs():
             info["log_file"].close()
             exit_code = proc.returncode
             is_publish = info.get("is_publish", False)
-            print(f"  {ticket} {'publish' if is_publish else 'solve'} finished (exit {exit_code})")
+            is_ask = info.get("is_ask", False)
+            kind = "publish" if is_publish else ("ask" if is_ask else "solve")
+            print(f"  {ticket} {kind} finished (exit {exit_code})")
+
+            # Handle Q&A (ticket-ask) completion: the script already posted
+            # its answer to the thread, so we just clear the status message.
+            if is_ask:
+                if info.get("status_ts"):
+                    if exit_code == 0:
+                        # Delete the "reading code..." placeholder — answer
+                        # was posted separately by ticket-ask.
+                        try:
+                            slack_post("chat.delete",
+                                       channel=info.get("channel", DM_CHANNEL),
+                                       ts=info["status_ts"])
+                        except Exception:
+                            pass
+                    else:
+                        slack_update(
+                            info.get("channel", DM_CHANNEL), info["status_ts"],
+                            f":x: Q&A failed (exit {exit_code}). See `{info['log_path']}`.",
+                        )
+                del running_procs[ticket]
+                continue
 
             # Handle publish completion
             if is_publish:
@@ -1300,22 +1425,46 @@ def handle_message(channel, ts, user, text, thread_ts=None):
                     json.dumps({"msg_ts": confirm_ts, "channel": channel, "expires": time.time() + 120}))
 
     elif text.strip():
-        # If posted in a thread, use the thread as Slack context
+        # Classify: is this a question (read-only Q&A) or an implement request?
+        # Prefix overrides: leading `?` → question, `!` → implement.
+        msg_text = text.strip()
+        forced_prefix = None
+        if msg_text.startswith("?") or msg_text.startswith("!"):
+            forced_prefix = msg_text[0]
+            msg_text = msg_text[1:].strip()
+
         parent_ts = thread_ts if (thread_ts and thread_ts != ts) else None
+        thread_urls = []
         if parent_ts and WORKSPACE_URL:
-            thread_url = f"{WORKSPACE_URL}/archives/{channel}/p{parent_ts.replace('.', '')}"
-            print(f"New thread-context request: {thread_url} (channel={channel}){' (mock)' if MOCK_MODE else ''}: {text[:60]}...")
-            start_ticket_solve(
-                ticket=None, thread_ts=parent_ts, channel=channel,
-                slack_urls=[thread_url],
-                extra_context=text.strip(),
-                mock=MOCK_MODE, slack_context=True,
+            thread_urls.append(f"{WORKSPACE_URL}/archives/{channel}/p{parent_ts.replace('.', '')}")
+
+        intent = classify_intent(msg_text if forced_prefix is None else text.strip(),
+                                 slack_urls=thread_urls or None)
+        print(f"  classified intent={intent} for: {msg_text[:60]}...")
+
+        if intent == "question":
+            # Q&A: reuse the parent thread for continuity if we're in one,
+            # otherwise start a fresh thread from this message.
+            ask_thread_ts = parent_ts if parent_ts else ts
+            start_ticket_ask(
+                question=msg_text, thread_ts=ask_thread_ts,
+                channel=channel, slack_urls=thread_urls or None,
             )
         else:
-            # Top-level freeform text without a ticket ID or Slack URL — nudge the user
-            slack_reply(channel, ts,
-                        ":thinking_face: I need a *ticket ID* (e.g. `UB-1234`) or a *Slack thread link* to get started.\n"
-                        "You can also add instructions after the ticket/link.")
+            # Implementation path (existing behavior). Requires thread context
+            # to have something to work from; without it we nudge the user.
+            if parent_ts and WORKSPACE_URL:
+                print(f"New thread-context request: {thread_urls[0]} (channel={channel}){' (mock)' if MOCK_MODE else ''}: {msg_text[:60]}...")
+                start_ticket_solve(
+                    ticket=None, thread_ts=parent_ts, channel=channel,
+                    slack_urls=thread_urls,
+                    extra_context=msg_text,
+                    mock=MOCK_MODE, slack_context=True,
+                )
+            else:
+                slack_reply(channel, ts,
+                            ":thinking_face: To *implement* something I need a *ticket ID* (e.g. `UB-1234`) or a *Slack thread link*. "
+                            "To *ask* a question about the code, prefix with `?` or just ask — I'll try to answer.")
 
 
 def handle_reaction(channel, ts, user, reaction):

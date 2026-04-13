@@ -1,0 +1,207 @@
+#!/usr/bin/env bash
+# Q&A mode for ticket-bot: answers a question about the codebase without
+# spinning up a per-task worktree or making any changes.
+#
+# Maintains a single shared clone at ~/.cache/ticket-ask/repo kept fresh
+# at origin/main. Read-only: Claude is prompted not to modify files or
+# run build/test/git commands. Session is persistent per Slack thread so
+# follow-up questions retain context.
+#
+# Usage (called by ticket-bot):
+#   ticket-ask --thread-ts 123.456 --dm-channel C0123 [--model sonnet] \
+#              [--slack-url https://slack.com/...] -- "the question text"
+#
+# Stdout: Claude's answer. Also posted to the Slack thread.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$(type -P "$0" || echo "$0")")")" && pwd)"
+
+if [ -f "$SCRIPT_DIR/../.env" ]; then
+    set -a
+    source "$SCRIPT_DIR/../.env"
+    set +a
+fi
+source "$SCRIPT_DIR/../lib/env-validate.sh"
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+CYAN='\033[0;36m'
+DIM='\033[2m'
+RESET='\033[0m'
+
+# ── Paths ──
+ASK_DIR="$HOME/.cache/ticket-ask"
+ASK_REPO="$ASK_DIR/repo"
+ASK_SESSIONS="$ASK_DIR/sessions"
+ASK_LOGS="$ASK_DIR/logs"
+ASK_LOCK="$ASK_DIR/lock"
+mkdir -p "$ASK_DIR" "$ASK_SESSIONS" "$ASK_LOGS"
+
+# ── Defaults ──
+MODEL="sonnet"
+THREAD_TS=""
+DM_CHANNEL=""
+SLACK_URLS=()
+QUESTION=""
+
+# ── Parse args ──
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --thread-ts)    THREAD_TS="$2"; shift 2 ;;
+        --dm-channel)   DM_CHANNEL="$2"; shift 2 ;;
+        --model)        MODEL="$2"; shift 2 ;;
+        --slack-url)    SLACK_URLS+=("$2"); shift 2 ;;
+        --) shift; QUESTION="$*"; break ;;
+        *)
+            if [ -z "$QUESTION" ]; then
+                QUESTION="$1"
+            else
+                QUESTION="$QUESTION $1"
+            fi
+            shift
+            ;;
+    esac
+done
+
+if [ -z "$QUESTION" ]; then
+    echo -e "${RED}Usage: ticket-ask --thread-ts <ts> --dm-channel <ch> -- <question>${RESET}" >&2
+    exit 1
+fi
+
+# ── Slack post helper ──
+slack_reply() {
+    local text="$1"
+    if [ -z "${TICKET_CREATOR_BOT_TOKEN:-}" ] || [ -z "$DM_CHANNEL" ] || [ -z "$THREAD_TS" ]; then
+        return 0
+    fi
+    local payload
+    payload=$(jq -n \
+        --arg channel "$DM_CHANNEL" \
+        --arg thread_ts "$THREAD_TS" \
+        --arg text "$text" \
+        '{channel: $channel, thread_ts: $thread_ts, text: $text, mrkdwn: true}')
+    curl -sf -X POST "https://slack.com/api/chat.postMessage" \
+        -H "Authorization: Bearer ${TICKET_CREATOR_BOT_TOKEN}" \
+        -H "Content-Type: application/json; charset=utf-8" \
+        -d "$payload" >/dev/null 2>&1 || true
+}
+
+# ── Find origin URL from the invoking repo (ticket-bot's cwd) ──
+INVOKING_REPO=$(git rev-parse --show-toplevel 2>/dev/null || echo "")
+if [ -z "$INVOKING_REPO" ]; then
+    echo -e "${RED}Not in a git repository — can't determine origin URL${RESET}" >&2
+    slack_reply ":x: Can't answer — not invoked from a git repo."
+    exit 1
+fi
+ORIGIN_URL=$(git -C "$INVOKING_REPO" remote get-url origin 2>/dev/null || echo "")
+if [ -z "$ORIGIN_URL" ]; then
+    echo -e "${RED}No 'origin' remote in $INVOKING_REPO${RESET}" >&2
+    slack_reply ":x: Can't answer — no origin remote configured."
+    exit 1
+fi
+
+# ── Lock to prevent concurrent clone/fetch ──
+exec 9>"$ASK_LOCK"
+flock 9
+
+# ── Ensure QA repo exists and is fresh at origin/main ──
+if [ ! -d "$ASK_REPO/.git" ]; then
+    echo -e "  ${DIM}Cloning QA workspace...${RESET}" >&2
+    git clone --quiet "$ORIGIN_URL" "$ASK_REPO" || {
+        echo -e "${RED}Clone failed${RESET}" >&2
+        slack_reply ":x: Failed to clone workspace for Q&A."
+        exit 1
+    }
+fi
+
+echo -e "  ${DIM}Refreshing QA workspace to origin/main...${RESET}" >&2
+(
+    cd "$ASK_REPO"
+    # Refuse to refresh if somehow dirty (shouldn't happen, but safety)
+    if [ -n "$(git status --porcelain)" ]; then
+        git reset --hard HEAD >/dev/null 2>&1 || true
+        git clean -fdx >/dev/null 2>&1 || true
+    fi
+    git fetch --quiet origin main 2>&1 || {
+        echo -e "${RED}fetch failed${RESET}" >&2
+        exit 1
+    }
+    git checkout --quiet -B _qa origin/main 2>&1 || git reset --hard origin/main >/dev/null
+) || {
+    slack_reply ":x: Failed to refresh workspace (fetch origin/main)."
+    exit 1
+}
+
+# ── Session handling (persistent per thread) ──
+SESSION_FILE="$ASK_SESSIONS/${THREAD_TS:-standalone}.txt"
+if [ -f "$SESSION_FILE" ]; then
+    SESSION_ID=$(cat "$SESSION_FILE")
+    RESUME=true
+else
+    SESSION_ID=$(python3 -c "import uuid; print(uuid.uuid4())")
+    echo "$SESSION_ID" > "$SESSION_FILE"
+    RESUME=false
+fi
+
+# ── Release the lock before running Claude (only clone/fetch needs exclusion) ──
+flock -u 9
+
+# ── Build prompt ──
+PROMPT="You are answering a question about a codebase. You are in a READ-ONLY context.
+
+STRICT RULES:
+- DO NOT modify, create, or delete any files.
+- DO NOT run git, yarn, npm, or any build/test commands.
+- DO NOT create branches, commits, or PRs.
+- You MAY use Read, Grep, and Glob to explore the code.
+
+The user's question:
+
+$QUESTION"
+
+if [ ${#SLACK_URLS[@]} -gt 0 ]; then
+    PROMPT="$PROMPT
+
+Additional Slack thread context (use the Slack MCP to fetch if needed):"
+    for url in "${SLACK_URLS[@]}"; do
+        PROMPT="$PROMPT
+- $url"
+    done
+fi
+
+PROMPT="$PROMPT
+
+Answer concisely in plain prose. Markdown formatting is fine (code fences, bullets). Cite file paths using \`file_path:line_number\` so the user can click through. If the question is ambiguous, state your assumption up front and answer the most likely interpretation. Keep it focused — don't dump large code blocks unless necessary."
+
+# ── Run Claude ──
+LOG_FILE="$ASK_LOGS/$(date +%Y%m%d-%H%M%S).${THREAD_TS:-standalone}.log"
+echo -e "  ${DIM}Running Claude (${MODEL}) [session: ${SESSION_ID:0:8}, resume: $RESUME]...${RESET}" >&2
+
+CLAUDE_ARGS=(-p --model "$MODEL" --dangerously-skip-permissions
+    --append-system-prompt "You are running headlessly in a Q&A context. Do NOT run notify-send or notification-sound.sh. Do NOT modify files or run shell commands that mutate state.")
+if $RESUME; then
+    CLAUDE_ARGS+=(--resume "$SESSION_ID")
+else
+    CLAUDE_ARGS+=(--session-id "$SESSION_ID")
+fi
+
+# Claude -p prints its final response to stdout; tee it for logging.
+ANSWER=$(cd "$ASK_REPO" && claude "${CLAUDE_ARGS[@]}" "$PROMPT" 2> >(tee -a "$LOG_FILE" >&2) | tee "$LOG_FILE.stdout")
+EXIT_CODE=${PIPESTATUS[0]}
+
+if [ $EXIT_CODE -ne 0 ]; then
+    echo -e "${RED}Claude exited with code ${EXIT_CODE}${RESET}" >&2
+    slack_reply ":x: Q&A failed (claude exit $EXIT_CODE). See \`$LOG_FILE\`."
+    exit $EXIT_CODE
+fi
+
+if [ -z "$ANSWER" ]; then
+    ANSWER="_(Claude returned no answer — this usually means the session hit a tool error. See \`$LOG_FILE\`.)_"
+fi
+
+# ── Post the answer to Slack ──
+slack_reply "$ANSWER"
+
+# Also print to stdout so the caller can capture it
+echo "$ANSWER"
