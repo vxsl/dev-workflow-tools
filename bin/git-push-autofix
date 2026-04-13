@@ -16,8 +16,8 @@ if [ "$exit_code" -eq 0 ]; then
 fi
 
 if grep -q "Autofix commits were added" "$push_tmp"; then
-    echo "Pre-push hook added autofix commits — retrying push..." >&2
-    exec git push "$@"
+    echo "Pre-push hook added autofix commits — retrying push (skipping autofix stage)..." >&2
+    exec env SKIP_PRE_PUSH_AUTOFIX=true git push "$@"
 fi
 
 exit "$exit_code"
