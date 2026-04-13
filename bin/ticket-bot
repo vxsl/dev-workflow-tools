@@ -677,7 +677,10 @@ def resume_claude(state, feedback_text):
         "thread_ts": thread_ts,
         "channel": channel,
         "status_ts": status_ts,
-        "last_stage": ":arrows_counterclockwise: resuming...",
+        # Use :brain: prefix so check_running_procs's activity poller kicks in
+        # (it gates on last_stage.startswith(":brain:")) — resume has no
+        # STAGE_PATTERN match to transition it, so we start there directly.
+        "last_stage": ":brain: applying feedback...",
         "last_activity_update": 0,
         "last_files_snapshot": "",
         "start_time": time.time(),
