@@ -180,18 +180,20 @@ alias gcpa="git cherry-pick --abort"          # Abort cherry-pick
 push() {
     local push_tmp
     push_tmp=$(mktemp)
-    trap "rm -f '$push_tmp'" RETURN
 
     git push "$@" 2>&1 | tee "$push_tmp"
     local exit_code="${pipestatus[1]}"
 
     if [ "$exit_code" -eq 0 ]; then
+        rm -f "$push_tmp"
         return 0
     elif grep -q "Autofix commits were added" "$push_tmp"; then
+        rm -f "$push_tmp"
         echo "Pre-push hook added autofix commits — retrying push..."
         git push "$@"
         return $?
     else
+        rm -f "$push_tmp"
         return "$exit_code"
     fi
 }
