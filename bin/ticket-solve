@@ -393,15 +393,17 @@ This posts to our Slack DM thread and blocks until I reply (up to 30 min). Use s
    - **Testing**: What tests were added/updated, what needs manual verification
    Keep it concise — bullet points, not prose.
 
-4. As your very last output, print TWO lines — a short title and a longer summary:
-   \`TITLE: <commit-subject-style title — imperative mood, max 70 chars, no trailing period>\`
+4. As your very last output, print THREE lines — a branch slug, an MR title, and a Slack summary:
+   \`BRANCH: <kebab-case branch slug — lowercase, words separated by hyphens, no prefix>\`
+   \`TITLE: <commit-subject-style MR title — imperative mood, sentence case, no trailing period>\`
    \`SUMMARY: <1-2 sentences describing what was done, for Slack notifications>\`
 
    Example:
-   \`TITLE: filter empty aois param in useWorkspaceQueryParams\`
+   \`BRANCH: filter-empty-aois-param\`
+   \`TITLE: Filter empty aois param from URL in useWorkspaceQueryParams\`
    \`SUMMARY: Removed empty aois param from URL by filtering it out in useWorkspaceQueryParams. Added tests. All checks pass.\`
 
-   TITLE is used as the MR title, commit subject, and branch slug — it MUST be short and imperative. SUMMARY is shown in Slack and may be a couple of sentences.
+   Choose a BRANCH and TITLE that will be meaningful to a reviewer reading the merge request list — concise but specific. The wrapper uses BRANCH directly as \`hotfix/<BRANCH>\` and TITLE directly as the MR title and commit subject. Do not include a prefix like \`hotfix/\` in BRANCH.
 
 Do NOT push, do NOT create an MR, do NOT run publish-changes. Do NOT run a soft reset — the wrapper handles that. Do NOT \`git add\` REVIEW.md, diff.html, or .claude-output.log."
 
@@ -629,22 +631,29 @@ else
     fi
 fi
 
-# ── Rename branch for Slack-context mode (hotfix/<title-slug>) ──
+# ── Rename branch for Slack-context mode (hotfix/<BRANCH>) ──
 if $SLACK_CONTEXT; then
+    CLAUDE_BRANCH=$(grep -m1 '^BRANCH:' "$WORKTREE_PATH/.claude-output.log" 2>/dev/null | sed 's/^BRANCH: *//' || true)
     CLAUDE_TITLE=$(grep -m1 '^TITLE:' "$WORKTREE_PATH/.claude-output.log" 2>/dev/null | sed 's/^TITLE: *//' || true)
     CLAUDE_SUMMARY=$(grep -m1 '^SUMMARY:' "$WORKTREE_PATH/.claude-output.log" 2>/dev/null | sed 's/^SUMMARY: *//' || true)
-    # Prefer TITLE for the branch slug; fall back to SUMMARY for backwards compat
-    SLUG_SOURCE="${CLAUDE_TITLE:-$CLAUDE_SUMMARY}"
     if [ -n "$CLAUDE_SUMMARY" ]; then
         TICKET_SUMMARY="$CLAUDE_SUMMARY"
     fi
+    # Prefer Claude's explicit BRANCH; fall back to slugifying TITLE if missing.
+    if [ -n "$CLAUDE_BRANCH" ]; then
+        SLUG_SOURCE="$CLAUDE_BRANCH"
+    else
+        SLUG_SOURCE="${CLAUDE_TITLE:-$CLAUDE_SUMMARY}"
+    fi
     if [ -n "$SLUG_SOURCE" ]; then
-        # Slugify: lowercase, replace non-alnum with hyphens, trim, max 38 chars
+        # Sanity-pass: lowercase, non-alnum → hyphens, collapse/trim. If Claude
+        # followed the prompt (kebab-case, no prefix), this is a no-op; if not,
+        # it keeps us safe. No length cap — trust the name Claude chose.
         HOTFIX_SLUG=$(echo "$SLUG_SOURCE" | \
+            sed 's|^hotfix/||' | \
             tr '[:upper:]' '[:lower:]' | \
             sed 's/[^a-z0-9]/-/g' | \
-            sed 's/-\+/-/g' | sed 's/^-//; s/-$//' | \
-            cut -c1-38 | sed 's/-$//')
+            sed 's/-\+/-/g' | sed 's/^-//; s/-$//')
         NEW_BRANCH="hotfix/${HOTFIX_SLUG}"
         OLD_BRANCH="$TICKET"
 

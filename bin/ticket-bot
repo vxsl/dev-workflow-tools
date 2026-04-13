@@ -437,29 +437,6 @@ def _safe_filename(name):
     return name.replace("/", "_")
 
 
-def _shorten_title(text, max_chars=70):
-    """Derive a short MR-title-style string from a longer summary.
-
-    Takes the first sentence; if still too long, truncates at the last word
-    boundary. Strips trailing punctuation. Used as a fallback when Claude
-    didn't emit an explicit TITLE: line.
-    """
-    s = (text or "").strip()
-    # Take the first sentence if multiple
-    for sep in [". ", "! ", "? "]:
-        if sep in s:
-            s = s.split(sep, 1)[0]
-            break
-    s = s.rstrip(".!?")
-    if len(s) <= max_chars:
-        return s
-    # Truncate at last word boundary under the limit
-    cut = s[:max_chars]
-    if " " in cut:
-        cut = cut.rsplit(" ", 1)[0]
-    return cut
-
-
 def save_job(state):
     """Save job state to disk."""
     safe_name = _safe_filename(state["ticket"])
@@ -789,12 +766,10 @@ def publish_ticket(state, force_push=False):
 
     install = 'test -f node_modules/.yarn-state.yml || yarn install; test -f src/styles/css/tailwind.css || yarn tailwind-build;'
     if is_slack_context:
-        # For slack-context (hotfix), use Claude's short TITLE as the MR title
-        # and commit subject. Fall back to summary if TITLE wasn't emitted
-        # (older runs, or Claude didn't comply), truncated to a sane length.
-        title = (state.get("title") or "").strip()
-        if not title:
-            title = _shorten_title(summary)
+        # For slack-context (hotfix), use Claude's explicit TITLE as the MR
+        # title and commit subject. Fall back to summary only if TITLE is
+        # missing (older runs before the prompt change).
+        title = (state.get("title") or "").strip() or summary
         commit_msg = title
         mr_title = title
     else:
