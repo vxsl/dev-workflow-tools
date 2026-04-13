@@ -393,7 +393,9 @@ This posts to our Slack DM thread and blocks until I reply (up to 30 min). Use s
    - **Testing**: What tests were added/updated, what needs manual verification
    Keep it concise — bullet points, not prose.
 
-4. As your very last output, print THREE lines — a branch slug, an MR title, and a Slack summary:
+4. As your very last output, print ONE of these three shapes:
+
+   **(A) Normal completion** — you implemented the change:
    \`BRANCH: <kebab-case branch slug — lowercase, words separated by hyphens, no prefix>\`
    \`TITLE: <commit-subject-style MR title — imperative mood, sentence case, no trailing period>\`
    \`SUMMARY: <1-2 sentences describing what was done, for Slack notifications>\`
@@ -403,7 +405,19 @@ This posts to our Slack DM thread and blocks until I reply (up to 30 min). Use s
    \`TITLE: Filter empty aois param from URL in useWorkspaceQueryParams\`
    \`SUMMARY: Removed empty aois param from URL by filtering it out in useWorkspaceQueryParams. Added tests. All checks pass.\`
 
-   Choose a BRANCH and TITLE that will be meaningful to a reviewer reading the merge request list — concise but specific. The wrapper uses BRANCH directly as \`hotfix/<BRANCH>\` and TITLE directly as the MR title and commit subject. Do not include a prefix like \`hotfix/\` in BRANCH.
+   Choose a BRANCH and TITLE that will be meaningful to a reviewer reading the merge request list — concise but specific. The wrapper uses BRANCH directly as \`hotfix/<BRANCH>\` and TITLE directly as the MR title and commit subject.
+
+   **(B) You need clarification before proceeding** — don't commit or push anything; emit:
+   \`CLARIFY: <your question to the user, plain English>\`
+
+   Use (B) when the request is ambiguous enough that guessing wrong would waste significant effort, you've already tried \`slack-ask\` and got no reply (or the question arose too early to ask mid-run), or you started implementing and hit a fork that needs human input. The user will reply in the Slack thread and you'll be resumed with their response.
+
+   **(C) You've determined the task should not proceed** — emit:
+   \`DECLINE: <your reason, plain English>\`
+
+   Use (C) when the request is based on a misunderstanding (code already does what's being asked, bug isn't reproducible, fix would break something worse), or when it isn't actually a code change (the user wanted an explanation, not an implementation). Be specific about *why*.
+
+   Only emit ONE of A, B, or C — never more than one. For B and C, omit BRANCH/TITLE/SUMMARY entirely.
 
 Do NOT push, do NOT create an MR, do NOT run publish-changes. Do NOT run a soft reset — the wrapper handles that. Do NOT \`git add\` REVIEW.md, diff.html, or .claude-output.log."
 
@@ -525,6 +539,8 @@ save_state() {
         --arg ticket "$TICKET" \
         --arg summary "$TICKET_SUMMARY" \
         --arg title "${CLAUDE_TITLE:-}" \
+        --arg clarify "${CLAUDE_CLARIFY:-}" \
+        --arg decline "${CLAUDE_DECLINE:-}" \
         --arg worktree "$WORKTREE_PATH" \
         --arg work_dir "$WORK_DIR" \
         --arg thread_ts "$SLACK_THREAD_TS" \
@@ -535,7 +551,8 @@ save_state() {
         --argjson slack_context "$($SLACK_CONTEXT && echo true || echo false)" \
         --argjson slack_urls "$slack_urls_json" \
         --arg updated_at "$(date -Iseconds)" \
-        '{ticket: $ticket, summary: $summary, title: $title, worktree: $worktree, work_dir: $work_dir,
+        '{ticket: $ticket, summary: $summary, title: $title, clarify: $clarify, decline: $decline,
+          worktree: $worktree, work_dir: $work_dir,
           thread_ts: $thread_ts, dm_channel: $dm_channel, session_id: $session_id,
           model: $model, status: $status, slack_context: $slack_context,
           slack_urls: $slack_urls, updated_at: $updated_at}' \
@@ -629,6 +646,26 @@ else
         save_state "failed"
         exit $EXIT_CODE
     fi
+fi
+
+# ── Detect CLARIFY / DECLINE shapes (short-circuit: no branch rename, no
+# soft reset, no diff generation — ticket-bot picks up the status and
+# posts Claude's message to the thread) ──
+CLAUDE_CLARIFY=$(grep -m1 '^CLARIFY:' "$WORKTREE_PATH/.claude-output.log" 2>/dev/null | sed 's/^CLARIFY: *//' || true)
+CLAUDE_DECLINE=$(grep -m1 '^DECLINE:' "$WORKTREE_PATH/.claude-output.log" 2>/dev/null | sed 's/^DECLINE: *//' || true)
+
+if [ -n "$CLAUDE_CLARIFY" ]; then
+    echo ""
+    echo -e "${CYAN}Claude requested clarification:${RESET} $CLAUDE_CLARIFY"
+    save_state "clarify"
+    exit 0
+fi
+
+if [ -n "$CLAUDE_DECLINE" ]; then
+    echo ""
+    echo -e "${CYAN}Claude declined the task:${RESET} $CLAUDE_DECLINE"
+    save_state "declined"
+    exit 0
 fi
 
 # ── Rename branch for Slack-context mode (hotfix/<BRANCH>) ──

@@ -1221,6 +1221,24 @@ def check_running_procs():
                 prompt_lines.append("")
                 prompt_lines.append("_Reply with feedback for another pass. React :white_check_mark: to publish._")
                 _post_action_prompt(state, thread_ts, "\n".join(prompt_lines))
+            elif state.get("status") == "clarify":
+                # Claude asked for clarification before proceeding. Post its
+                # question and wait for a user reply in the thread — the
+                # existing feedback/resume path will pick it up (we allow
+                # "clarify" alongside "done" as a resumable status).
+                question = state.get("clarify", "").strip() or "(no question given)"
+                msg = (f":question: *{ticket}* — Claude needs clarification before proceeding:\n"
+                       f"> {question}\n"
+                       f"_Reply in this thread to continue._")
+                _post_action_prompt(state, thread_ts, msg)
+            elif state.get("status") == "declined":
+                # Claude decided the task should not proceed. Post its reason
+                # and stop — no publish prompt, no retry by default.
+                reason = state.get("decline", "").strip() or "(no reason given)"
+                msg = (f":no_entry_sign: *{ticket}* — Claude declined to proceed:\n"
+                       f"> {reason}\n"
+                       f"_Reply in this thread if you want to push back or provide more context._")
+                _post_action_prompt(state, thread_ts, msg)
             elif state.get("status") == "failed":
                 reason = ""
                 if log_path.exists():
@@ -1303,14 +1321,16 @@ def handle_message(channel, ts, user, text, thread_ts=None):
     # the user shouldn't need to @mention us to give feedback.
     if thread_ts and thread_ts != ts:
         state = jobs.get(thread_ts)
-        if state and state.get("status") == "done":
+        # "clarify" is resumable just like "done" — user's reply is the
+        # answer to Claude's question, which we feed back via resume.
+        if state and state.get("status") in ("done", "clarify"):
             # Strip @mention if present, but don't require it here.
             feedback_text, _ = strip_bot_mention(text)
             if feedback_text.strip().lower() == "refresh":
                 print(f"  Refreshing diff for {state['ticket']}")
                 refresh_diff(state)
             else:
-                print(f"Feedback on {state['ticket']}: {feedback_text[:60]}...")
+                print(f"Feedback on {state['ticket']} (status={state.get('status')}): {feedback_text[:60]}...")
                 resume_claude(state, feedback_text)
             state["last_checked_ts"] = ts
             save_job(state)
