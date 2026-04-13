@@ -1198,27 +1198,31 @@ def handle_message(channel, ts, user, text, thread_ts=None):
 
     is_dm = is_dm_channel(channel)
 
-    # In channels (non-DM), require @mention
+    # Thread reply on a completed job → feedback/resume.
+    # Checked BEFORE the @mention gate: if the reply is in a thread we own,
+    # the user shouldn't need to @mention us to give feedback.
+    if thread_ts and thread_ts != ts:
+        state = jobs.get(thread_ts)
+        if state and state.get("status") == "done":
+            # Strip @mention if present, but don't require it here.
+            feedback_text, _ = strip_bot_mention(text)
+            if feedback_text.strip().lower() == "refresh":
+                print(f"  Refreshing diff for {state['ticket']}")
+                refresh_diff(state)
+            else:
+                print(f"Feedback on {state['ticket']}: {feedback_text[:60]}...")
+                resume_claude(state, feedback_text)
+            state["last_checked_ts"] = ts
+            save_job(state)
+            return
+        # If no matching job, fall through to mention gate + command routing
+        # (e.g. @mention in an unrelated thread)
+
+    # In channels (non-DM), require @mention for top-level commands
     if not is_dm:
         text, was_mentioned = strip_bot_mention(text)
         if not was_mentioned:
             return
-
-    # Thread reply on a completed job → feedback/resume
-    if thread_ts and thread_ts != ts:
-        state = jobs.get(thread_ts)
-        if state and state.get("status") == "done":
-            if text.strip().lower() == "refresh":
-                print(f"  Refreshing diff for {state['ticket']}")
-                refresh_diff(state)
-            else:
-                print(f"Feedback on {state['ticket']}: {text[:60]}...")
-                resume_claude(state, text)
-            state["last_checked_ts"] = ts
-            save_job(state)
-            return
-        # If no matching job, fall through to treat as a new command
-        # (e.g. @mention in an unrelated thread)
 
     # ── Top-level command routing ──
     ticket_match = TICKET_RE.search(text)
