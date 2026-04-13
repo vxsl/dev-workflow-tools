@@ -176,28 +176,9 @@ alias grmm="gfpa; gfmm; git rebase master"   # Full fetch + rebase master
 alias gcpc="git cherry-pick --continue"       # Continue cherry-pick
 alias gcpa="git cherry-pick --abort"          # Abort cherry-pick
 
-# Push Operations — retries automatically if pre-push hook adds autofix commits
-push() {
-    local push_tmp
-    push_tmp=$(mktemp)
-
-    git push "$@" 2>&1 | tee "$push_tmp"
-    local exit_code="${pipestatus[1]}"
-
-    if [ "$exit_code" -eq 0 ]; then
-        rm -f "$push_tmp"
-        return 0
-    elif grep -q "Autofix commits were added" "$push_tmp"; then
-        rm -f "$push_tmp"
-        echo "Pre-push hook added autofix commits — retrying push..."
-        git push "$@"
-        return $?
-    else
-        rm -f "$push_tmp"
-        return "$exit_code"
-    fi
-}
-alias mush="push"                             # Push changes (fat-finger friendly)
+# Push Operations — git-push-autofix retries if pre-push hook adds autofix commits
+alias push="git-push-autofix"                 # Push changes
+alias mush="git-push-autofix"                 # Push changes (fat-finger friendly)
 
 # Status & Info
 alias gds="git-branch-status"                 # Branch status (if available)
