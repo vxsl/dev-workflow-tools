@@ -7,7 +7,7 @@
 #   ticket-solve https://slack.com/.../p123...   Solve from Slack thread (no Jira ticket)
 #   ticket-solve UB-1234 --context "extra info"  Pass additional context
 #   ticket-solve UB-1234 --dry-run               Show what would be done
-#   ticket-solve UB-1234 --model sonnet          Use a specific model (default: sonnet)
+#   ticket-solve UB-1234 --model sonnet          Use a specific model (default: opus)
 #
 # When called by ticket-bot:
 #   ticket-solve UB-1234 --thread-ts 123.456 --dm-channel C0123 --session-id <uuid>
@@ -52,7 +52,7 @@ mkdir -p "$STATE_DIR"
 DRY_RUN=false
 MOCK=false
 FORCE=false
-MODEL="sonnet"
+MODEL="opus"
 EXTRA_CONTEXT=""
 SLACK_URLS=()
 THREAD_TS=""          # If set, reply in existing thread (from ticket-bot)
@@ -374,7 +374,9 @@ This posts to our Slack DM thread and blocks until I reply (up to 30 min). Use s
 
 1. Write tests for your changes. If there are existing tests for the code you modified, update them. If not, add new test files following the existing test patterns in the codebase. Run \`yarn test:run\` and fix any failures.
 
-2. Run the pre-push checks and fix any failures:
+2. Commit your implementation. \`git add -A\` and commit with a placeholder message like \`WIP\` — the wrapper rewrites the commit message later, so the message itself doesn't matter. What matters is that every change you made (modified files AND new files) is in a commit. If you skip this step, your work is invisible to the wrapper and the run silently produces no diff.
+
+3. Run the pre-push checks and fix any failures:
    \`\`\`bash
    cd client/web
    yarn prettier-write:since-main   # autofix formatting
@@ -382,9 +384,9 @@ This posts to our Slack DM thread and blocks until I reply (up to 30 min). Use s
    yarn tsc --noEmit                # type check — fix any errors
    yarn test:run                    # tests — fix any failures
    \`\`\`
-   Commit the fixes. Repeat until all checks pass. The ticket is NOT done until these all pass.
+   Commit any fixes (\`git add -A && git commit -m WIP\`). Repeat until all checks pass. The ticket is NOT done until these all pass.
 
-3. Write \`REVIEW.md\` in the git repo root (the parent of \`client/web\`). Do NOT \`git add\` this file — the wrapper manages it separately. Only include sections that have content — omit any section with nothing to say:
+4. Write \`REVIEW.md\` in the git repo root (the parent of \`client/web\`). Do NOT \`git add\` this file — the wrapper manages it separately. Only include sections that have content — omit any section with nothing to say:
    - **Summary**: What was done (1-3 sentences)
    - **Changes**: Files changed and why (bullet list)
    - **Tradeoffs**: Shortcuts taken, alternative approaches considered
@@ -393,27 +395,27 @@ This posts to our Slack DM thread and blocks until I reply (up to 30 min). Use s
    - **Testing**: What tests were added/updated, what needs manual verification
    Keep it concise — bullet points, not prose.
 
-4. As your very last output, print ONE of these three shapes:
+5. As your very last output, print ONE of these three shapes. Emit each line exactly as shown — plain text, starting at column 0, NO surrounding backticks, NO markdown code fences, NO bold. The wrapper greps for lines literally beginning with \`BRANCH:\`, \`TITLE:\`, \`SUMMARY:\`, \`CLARIFY:\`, or \`DECLINE:\`, and any wrapping will cause the line to be missed.
 
-   **(A) Normal completion** — you implemented the change:
-   \`BRANCH: <kebab-case branch slug — lowercase, words separated by hyphens, no prefix>\`
-   \`TITLE: <commit-subject-style MR title — imperative mood, sentence case, no trailing period>\`
-   \`SUMMARY: <1-2 sentences describing what was done, for Slack notifications>\`
+   (A) Normal completion — you implemented the change:
+   BRANCH: <kebab-case branch slug — lowercase, words separated by hyphens, no prefix>
+   TITLE: <commit-subject-style MR title — imperative mood, sentence case, no trailing period>
+   SUMMARY: <1-2 sentences describing what was done, for Slack notifications>
 
-   Example:
-   \`BRANCH: filter-empty-aois-param\`
-   \`TITLE: Filter empty aois param from URL in useWorkspaceQueryParams\`
-   \`SUMMARY: Removed empty aois param from URL by filtering it out in useWorkspaceQueryParams. Added tests. All checks pass.\`
+   Example (emit exactly this shape — no backticks, no code block):
+   BRANCH: filter-empty-aois-param
+   TITLE: Filter empty aois param from URL in useWorkspaceQueryParams
+   SUMMARY: Removed empty aois param from URL by filtering it out in useWorkspaceQueryParams. Added tests. All checks pass.
 
-   Choose a BRANCH and TITLE that will be meaningful to a reviewer reading the merge request list — concise but specific. The wrapper uses BRANCH directly as \`hotfix/<BRANCH>\` and TITLE directly as the MR title and commit subject.
+   Choose a BRANCH and TITLE that will be meaningful to a reviewer reading the merge request list — concise but specific. The wrapper uses BRANCH directly as hotfix/<BRANCH> and TITLE directly as the MR title and commit subject.
 
-   **(B) You need clarification before proceeding** — don't commit or push anything; emit:
-   \`CLARIFY: <your question to the user, plain English>\`
+   (B) You need clarification before proceeding — don't commit or push anything; emit:
+   CLARIFY: <your question to the user, plain English>
 
    Use (B) when the request is ambiguous enough that guessing wrong would waste significant effort, you've already tried \`slack-ask\` and got no reply (or the question arose too early to ask mid-run), or you started implementing and hit a fork that needs human input. The user will reply in the Slack thread and you'll be resumed with their response.
 
-   **(C) You've determined the task should not proceed** — emit:
-   \`DECLINE: <your reason, plain English>\`
+   (C) You've determined the task should not proceed — emit:
+   DECLINE: <your reason, plain English>
 
    Use (C) when the request is based on a misunderstanding (code already does what's being asked, bug isn't reproducible, fix would break something worse), or when it isn't actually a code change (the user wanted an explanation, not an implementation). Be specific about *why*.
 
@@ -651,8 +653,8 @@ fi
 # ── Detect CLARIFY / DECLINE shapes (short-circuit: no branch rename, no
 # soft reset, no diff generation — ticket-bot picks up the status and
 # posts Claude's message to the thread) ──
-CLAUDE_CLARIFY=$(grep -m1 '^CLARIFY:' "$WORKTREE_PATH/.claude-output.log" 2>/dev/null | sed 's/^CLARIFY: *//' || true)
-CLAUDE_DECLINE=$(grep -m1 '^DECLINE:' "$WORKTREE_PATH/.claude-output.log" 2>/dev/null | sed 's/^DECLINE: *//' || true)
+CLAUDE_CLARIFY=$(grep -m1 -E '^`?CLARIFY:' "$WORKTREE_PATH/.claude-output.log" 2>/dev/null | sed -E 's/^`?CLARIFY: *//; s/`$//' || true)
+CLAUDE_DECLINE=$(grep -m1 -E '^`?DECLINE:' "$WORKTREE_PATH/.claude-output.log" 2>/dev/null | sed -E 's/^`?DECLINE: *//; s/`$//' || true)
 
 if [ -n "$CLAUDE_CLARIFY" ]; then
     echo ""
@@ -670,9 +672,11 @@ fi
 
 # ── Rename branch for Slack-context mode (hotfix/<BRANCH>) ──
 if $SLACK_CONTEXT; then
-    CLAUDE_BRANCH=$(grep -m1 '^BRANCH:' "$WORKTREE_PATH/.claude-output.log" 2>/dev/null | sed 's/^BRANCH: *//' || true)
-    CLAUDE_TITLE=$(grep -m1 '^TITLE:' "$WORKTREE_PATH/.claude-output.log" 2>/dev/null | sed 's/^TITLE: *//' || true)
-    CLAUDE_SUMMARY=$(grep -m1 '^SUMMARY:' "$WORKTREE_PATH/.claude-output.log" 2>/dev/null | sed 's/^SUMMARY: *//' || true)
+    # Tolerant of optional wrapping backticks — Claude sometimes emits
+    # `BRANCH: foo` (with backticks) despite the prompt telling it not to.
+    CLAUDE_BRANCH=$(grep -m1 -E '^`?BRANCH:' "$WORKTREE_PATH/.claude-output.log" 2>/dev/null | sed -E 's/^`?BRANCH: *//; s/`$//' || true)
+    CLAUDE_TITLE=$(grep -m1 -E '^`?TITLE:' "$WORKTREE_PATH/.claude-output.log" 2>/dev/null | sed -E 's/^`?TITLE: *//; s/`$//' || true)
+    CLAUDE_SUMMARY=$(grep -m1 -E '^`?SUMMARY:' "$WORKTREE_PATH/.claude-output.log" 2>/dev/null | sed -E 's/^`?SUMMARY: *//; s/`$//' || true)
     if [ -n "$CLAUDE_SUMMARY" ]; then
         TICKET_SUMMARY="$CLAUDE_SUMMARY"
     fi
@@ -709,13 +713,18 @@ if $SLACK_CONTEXT; then
     fi
 fi
 
-# ── Soft reset to merge-base ──
+# ── Collapse Claude's work into one staged diff ──
+# Claude may have committed, staged, left unstaged, or created untracked
+# files — all of which are valid "I did the work" outcomes. Normalize all
+# of them into a single staged diff vs merge-base for review.
 echo ""
 cd "$WORK_DIR"
-echo -e "  ${DIM}Soft resetting to merge-base...${RESET}"
+echo -e "  ${DIM}Collecting changes for review...${RESET}"
+# 1. Collapse any commits Claude made back into the index.
 git reset --soft "$(git merge-base HEAD origin/main)" 2>/dev/null || true
-
-# Unstage non-deliverable files (run from repo root so paths resolve)
+# 2. Stage anything Claude left unstaged or untracked.
+git -C "$WORKTREE_PATH" add -A 2>/dev/null || true
+# 3. Unstage non-deliverable files (run from repo root so paths resolve).
 for f in REVIEW.md .claude-output.log diff.html; do
     git -C "$WORKTREE_PATH" rm --cached -f "$f" 2>/dev/null || true
 done

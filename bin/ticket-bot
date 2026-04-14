@@ -18,6 +18,7 @@ Stop: Ctrl+C
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -214,6 +215,14 @@ def slack_reply(channel, thread_ts, text):
         text=text,
         mrkdwn=True,
     )
+
+
+def react(channel, ts, name):
+    """Add a reaction to a message. Silently ignores 'already_reacted'."""
+    resp = slack_post("reactions.add", channel=channel, timestamp=ts, name=name)
+    if not resp.get("ok") and resp.get("error") not in ("already_reacted",):
+        print(f"  reactions.add({name}) failed: {resp.get('error')}")
+    return resp
 
 
 # ── Open DM channel ──
@@ -519,6 +528,177 @@ def classify_intent(text, slack_urls=None):
     return "implement"
 
 
+def summarize_intent(text, ticket=None, slack_urls=None):
+    """Generate a concise headline describing what the bot will do.
+
+    Uses Haiku via `claude -p` for a fast, cheap call. Returns the headline
+    string, or empty string on error (caller should skip the ack line rather
+    than fall back to reposting the raw message verbatim).
+    """
+    stripped = (text or "").strip()
+    if not stripped:
+        return ""
+
+    prompt = (
+        "You are a bot that implements code changes in response to user "
+        "requests. Based on the user's message below, write a single-line "
+        "headline (imperative mood, no trailing period, no quotes, no "
+        "markdown, no emoji) that captures what you understand you've been "
+        "asked to do. Be specific — name the symptom, component, or goal. "
+        "Keep it short (roughly one sentence). Output ONLY the headline.\n\n"
+        f"Message:\n{stripped}"
+    )
+    if ticket:
+        prompt += f"\n\nJira ticket: {ticket}"
+    if slack_urls:
+        prompt += f"\n\nReferenced Slack thread(s): {', '.join(slack_urls)}"
+
+    try:
+        result = subprocess.run(
+            ["claude", "-p", "--model", "haiku",
+             "--dangerously-skip-permissions", prompt],
+            capture_output=True, text=True, timeout=30,
+        )
+        out = result.stdout.strip()
+        # Strip common wrapping Claude sometimes emits
+        out = out.strip("`*_\"' \n")
+        # First line only, in case Claude adds a preamble
+        out = out.split("\n")[0].strip().strip("`*_\"' ")
+        if out:
+            return out
+    except Exception as e:
+        print(f"  summarize_intent error: {e}")
+    return ""
+
+
+SLACK_MSG_URL_RE = re.compile(r"/archives/([A-Z0-9]+)/p(\d{10})(\d{1,6})")
+
+
+def parse_slack_url(url):
+    """Parse a Slack archive URL → (channel, ts, thread_ts) or None.
+
+    `thread_ts` falls back to the message ts when no `?thread_ts=...` query
+    param is present, so the URL always resolves to a conversations.replies
+    call rooted at the right parent.
+    """
+    m = SLACK_MSG_URL_RE.search(url)
+    if not m:
+        return None
+    channel = m.group(1)
+    msg_ts = f"{m.group(2)}.{m.group(3)}"
+    qm = re.search(r"thread_ts=(\d+\.\d+)", url)
+    thread_ts = qm.group(1) if qm else msg_ts
+    return channel, msg_ts, thread_ts
+
+
+def resolve_user_name(user_id, cache):
+    """Look up a Slack user's display name with in-process caching."""
+    if not user_id:
+        return ""
+    if user_id in cache:
+        return cache[user_id]
+    resp = slack_get("users.info", user=user_id)
+    name = ""
+    if resp.get("ok"):
+        p = resp.get("user", {}).get("profile", {})
+        name = (p.get("display_name")
+                or p.get("real_name")
+                or p.get("real_name_normalized")
+                or "")
+    cache[user_id] = name or user_id
+    return cache[user_id]
+
+
+def fetch_thread_transcript(url, user_cache=None):
+    """Fetch a Slack thread and format it as a plain-text transcript."""
+    if user_cache is None:
+        user_cache = {}
+    parsed = parse_slack_url(url)
+    if not parsed:
+        return ""
+    channel, _msg_ts, thread_ts = parsed
+    resp = slack_get("conversations.replies",
+                     channel=channel, ts=thread_ts, limit=200)
+    if not resp.get("ok"):
+        return ""
+    lines = []
+    for msg in resp.get("messages", []):
+        uid = msg.get("user")
+        if uid:
+            name = resolve_user_name(uid, user_cache)
+        else:
+            name = msg.get("username") or "bot"
+        text = (msg.get("text") or "").strip()
+        if text:
+            lines.append(f"@{name}: {text}")
+    return "\n".join(lines)
+
+
+def summarize_slack_thread(slack_urls, commit_summary=""):
+    """Generate a short MR-description blurb summarizing the Slack context.
+
+    Returns plain prose (2-3 sentences) describing who asked, what they
+    asked for, and what the change does — or empty string if the thread
+    can't be fetched or Claude fails.
+    """
+    if not slack_urls:
+        return ""
+    user_cache = {}
+    transcripts = []
+    for url in slack_urls:
+        t = fetch_thread_transcript(url, user_cache)
+        if t:
+            transcripts.append(t)
+    if not transcripts:
+        return ""
+    transcript_blob = "\n\n---\n\n".join(transcripts)
+    prompt = (
+        "Below is a Slack thread that prompted a code change, followed by "
+        "the commit message for the change. Write a 2-3 sentence summary "
+        "for the merge request description that explains: who asked, what "
+        "they asked for (including any clarifications or follow-ups in the "
+        "thread), and what the change does. Refer to Slack participants by "
+        "their handle (e.g. @kyle). Plain prose, no bullet points, no "
+        "markdown, no preamble. Output ONLY the summary.\n\n"
+        f"Thread:\n{transcript_blob}\n\n"
+        f"Commit message:\n{commit_summary}"
+    )
+    try:
+        result = subprocess.run(
+            ["claude", "-p", "--model", "haiku",
+             "--dangerously-skip-permissions", prompt],
+            capture_output=True, text=True, timeout=60,
+        )
+        out = result.stdout.strip()
+        out = out.strip("`*_\"' \n")
+        if out:
+            return out
+    except Exception as e:
+        print(f"  summarize_slack_thread error: {e}")
+    return ""
+
+
+def build_slack_context_description(slack_urls, commit_summary=""):
+    """Build the MR description block for slack-context runs.
+
+    Includes the thread link(s) and a short AI-generated summary of what
+    happened in the thread. Returns empty string if there are no URLs.
+    """
+    if not slack_urls:
+        return ""
+    parts = []
+    if len(slack_urls) == 1:
+        parts.append(f"Slack thread: {slack_urls[0]}")
+    else:
+        parts.append("Slack threads:")
+        parts.extend(f"- {u}" for u in slack_urls)
+    blurb = summarize_slack_thread(slack_urls, commit_summary)
+    if blurb:
+        parts.append("")
+        parts.append(blurb)
+    return "\n".join(parts)
+
+
 def start_ticket_ask(question, thread_ts, channel, slack_urls=None):
     """Run ticket-ask (Q&A mode) as a background subprocess.
 
@@ -597,14 +777,22 @@ def start_ticket_solve(ticket, thread_ts, channel, slack_urls=None, extra_contex
                     f":warning: *{dedup_key}* is already running (PID {running_procs[dedup_key]['proc'].pid})")
         return
 
-    # Post an acknowledgment so the user can see what the bot understood
+    # Post an acknowledgment so the user can see what the bot understood.
+    # For the freeform context we generate a concise AI headline instead of
+    # echoing the raw message verbatim (which is just noise for the user).
     ack_parts = []
     if ticket and not slack_context:
         ack_parts.append(f":ticket: *{ticket}*")
     if slack_urls:
         ack_parts.append(f":link: {'  '.join(slack_urls)}")
     if extra_context:
-        ack_parts.append(f":pencil: _{extra_context}_")
+        headline = summarize_intent(
+            extra_context,
+            ticket=ticket if not slack_context else None,
+            slack_urls=slack_urls,
+        )
+        if headline:
+            ack_parts.append(f":pencil: _{headline}_")
     if ack_parts:
         slack_reply(channel, thread_ts, "\n".join(ack_parts))
 
@@ -694,7 +882,7 @@ def resume_claude(state, feedback_text):
     work_dir = state.get("work_dir", "")
     thread_ts = state["thread_ts"]
     channel = state.get("channel", DM_CHANNEL)
-    model = state.get("model", "sonnet")
+    model = state.get("model", "opus")
 
     if not work_dir or not os.path.isdir(work_dir):
         slack_reply(
@@ -867,6 +1055,7 @@ def publish_ticket(state, force_push=False):
     publish = SCRIPT_DIR / "publish-changes"
 
     install = 'test -f node_modules/.yarn-state.yml || yarn install; test -f src/styles/css/tailwind.css || yarn tailwind-build;'
+    desc_flag = ""
     if is_slack_context:
         # For slack-context (hotfix), use Claude's explicit TITLE as the MR
         # title and commit subject. Fall back to summary only if TITLE is
@@ -874,13 +1063,23 @@ def publish_ticket(state, force_push=False):
         title = (state.get("title") or "").strip() or summary
         commit_msg = title
         mr_title = title
+        # Build the MR description from the originating Slack thread(s):
+        # thread link(s) + a short AI-generated summary of who asked for
+        # what and what we did. The commit body itself already describes
+        # the change, so we pass `summary` as context to the summarizer.
+        slack_urls_state = state.get("slack_urls", []) or []
+        mr_description = build_slack_context_description(
+            slack_urls_state, commit_summary=summary,
+        )
+        if mr_description:
+            desc_flag = f" --description {shlex.quote(mr_description)}"
     else:
         commit_msg = f"{ticket}: {summary}"
         mr_title = f"{ticket} {summary}"
     force_flag = " --force-push" if force_push else ""
     include_desc = "" if is_slack_context else " --include-ticket-description"
     no_jira = " --no-jira" if is_slack_context else ""
-    cmd = f'{install} git commit -m {json.dumps(commit_msg)} && {publish} --branch "$(git rev-parse --abbrev-ref HEAD)" --target main --no-draft-prompt --title {json.dumps(mr_title)}{include_desc}{no_jira}{force_flag}'
+    cmd = f'{install} git commit -m {json.dumps(commit_msg)} && {publish} --branch "$(git rev-parse --abbrev-ref HEAD)" --target main --no-draft-prompt --title {json.dumps(mr_title)}{include_desc}{no_jira}{desc_flag}{force_flag}'
 
     print(f"  Publishing {ticket}: {commit_msg}")
 
@@ -1096,13 +1295,29 @@ def check_running_procs():
                 del running_procs[ticket]
                 continue
 
+            # Peek at the on-disk state so the top-level status message
+            # reflects done_empty (no staged changes) instead of plain "done".
+            # The full state load + write happens below; this is read-only.
+            peek_status = None
+            if exit_code == 0:
+                current_thread_ts = info["thread_ts"]
+                for candidate in STATE_DIR.glob("*.json"):
+                    try:
+                        s = json.loads(candidate.read_text())
+                        if s.get("thread_ts") == current_thread_ts:
+                            peek_status = s.get("status")
+                            break
+                    except (json.JSONDecodeError, KeyError):
+                        pass
+
             # Final status update
             if info["status_ts"]:
                 if exit_code == 0:
-                    slack_update(
-                        ch, info["status_ts"],
-                        f"*{ticket}* — :heavy_check_mark: done",
-                    )
+                    if peek_status == "done_empty":
+                        msg = f"*{ticket}* — :warning: done, but no changes were staged"
+                    else:
+                        msg = f"*{ticket}* — :heavy_check_mark: done"
+                    slack_update(ch, info["status_ts"], msg)
                 else:
                     slack_update(
                         ch, info["status_ts"],
@@ -1204,13 +1419,16 @@ def check_running_procs():
                 if work_dir:
                     prompt_lines.append(f"`cd {work_dir}`")
 
-                # Claude's summary (check resume log first, then main log)
+                # Claude's summary (check resume log first, then main log).
+                # Tolerate optional wrapping backticks — Claude sometimes
+                # emits `SUMMARY: foo` despite the prompt saying not to.
                 summary_line = ""
                 for log_candidate in [log_path, Path(os.path.join(worktree, ".claude-output.log")) if worktree else None]:
                     if log_candidate and log_candidate.exists():
                         for line in log_candidate.read_text().splitlines():
-                            if line.startswith("SUMMARY:"):
-                                summary_line = line[8:].strip()
+                            stripped = line.lstrip("`")
+                            if stripped.startswith("SUMMARY:"):
+                                summary_line = stripped[8:].strip().rstrip("`").strip()
                                 break
                     if summary_line:
                         break
@@ -1221,6 +1439,36 @@ def check_running_procs():
                 prompt_lines.append("")
                 prompt_lines.append("_Reply with feedback for another pass. React :white_check_mark: to publish._")
                 _post_action_prompt(state, thread_ts, "\n".join(prompt_lines))
+            elif state.get("status") == "done_empty":
+                # Claude finished cleanly but produced no staged diff.
+                # Could be: nothing to do, work was already on main, Claude
+                # made changes outside the repo, or the soft-reset wiped
+                # everything. Surface REVIEW.md if present so the user can
+                # see what Claude *thought* it did.
+                worktree = state.get("worktree", "")
+                review_excerpt = ""
+                if worktree:
+                    review_path = os.path.join(worktree, "REVIEW.md")
+                    if os.path.exists(review_path):
+                        try:
+                            with open(review_path) as f:
+                                review_excerpt = f.read().strip()
+                        except Exception:
+                            pass
+                msg_lines = [f":warning: *{ticket}* — Claude finished but produced no staged changes."]
+                if review_excerpt:
+                    # Truncate long REVIEW.md to keep the Slack message readable
+                    if len(review_excerpt) > 1500:
+                        review_excerpt = review_excerpt[:1500] + "\n…"
+                    msg_lines.append("")
+                    msg_lines.append("Claude's REVIEW.md:")
+                    msg_lines.append(f"```\n{review_excerpt}\n```")
+                if worktree:
+                    msg_lines.append("")
+                    msg_lines.append(f"`cd {state.get('work_dir', worktree)}`")
+                msg_lines.append("")
+                msg_lines.append("_Reply with feedback to give Claude another pass. React :white_check_mark: to wipe and re-run from scratch._")
+                _post_action_prompt(state, thread_ts, "\n".join(msg_lines))
             elif state.get("status") == "clarify":
                 # Claude asked for clarification before proceeding. Post its
                 # question and wait for a user reply in the thread — the
@@ -1323,7 +1571,11 @@ def handle_message(channel, ts, user, text, thread_ts=None):
         state = jobs.get(thread_ts)
         # "clarify" is resumable just like "done" — user's reply is the
         # answer to Claude's question, which we feed back via resume.
-        if state and state.get("status") in ("done", "clarify"):
+        # "done_empty" is also resumable so the user can nudge Claude to
+        # actually commit / re-stage when no diff was produced.
+        if state and state.get("status") in ("done", "clarify", "done_empty"):
+            # Acknowledge receipt immediately so the user knows the bot saw it.
+            react(channel, ts, "eyes")
             # Strip @mention if present, but don't require it here.
             feedback_text, _ = strip_bot_mention(text)
             if feedback_text.strip().lower() == "refresh":
@@ -1343,6 +1595,11 @@ def handle_message(channel, ts, user, text, thread_ts=None):
         text, was_mentioned = strip_bot_mention(text)
         if not was_mentioned:
             return
+
+    # Acknowledge receipt immediately — covers DMs (which skip the mention
+    # gate above) and @mentioned channel messages. Placed before any
+    # processing so the user sees it even if dispatch takes a moment.
+    react(channel, ts, "eyes")
 
     # ── Top-level command routing ──
     ticket_match = TICKET_RE.search(text)
