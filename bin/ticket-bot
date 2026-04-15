@@ -482,7 +482,6 @@ if "--test-dm" in sys.argv:
         "3 files changed, 12 insertions(+), 4 deletions(-)",
         "",
         f":mag: <{mock_diff_url}|View diff>",
-        f"`cd {mock_work_dir}`",
         "",
         "*Questions*",
         "- Assumed empty array means no AOIs rather than 'all AOIs'",
@@ -2078,10 +2077,6 @@ def check_running_procs():
                     if os.path.exists(diff_path):
                         prompt_lines.append(diff_prompt_line(ch, worktree))
                         diff_path_to_share = diff_path
-
-                # cd command
-                if work_dir:
-                    prompt_lines.append(f"`cd {work_dir}`")
 
                 # Claude's summary (check resume log first, then main log).
                 # Tolerate optional wrapping backticks — Claude sometimes
