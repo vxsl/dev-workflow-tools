@@ -1293,6 +1293,11 @@ def _post_action_prompt(state, thread_ts, text, buttons=None):
     resp = slack_post("chat.postMessage", **args)
     if resp and resp.get("ok"):
         state["action_prompt_ts"] = resp["ts"]
+        # Stash the rendered text so _clear_action_buttons can preserve
+        # the body (diff link, Claude's summary) when the user picks an
+        # action — only the trailing "Reply..." footer and buttons should
+        # be replaced with the action status.
+        state["action_prompt_text"] = text
     save_job(state)
     if thread_ts in jobs:
         jobs[thread_ts] = state
@@ -1451,19 +1456,32 @@ def _publish_choice_buttons(thread_ts):
     ]
 
 
-def _clear_action_buttons(channel, ts, replacement_text):
-    """Replace an action-prompt message's buttons with a plain status note.
+def _clear_action_buttons(channel, ts, status_note, prior_text=""):
+    """Replace an action-prompt message's buttons with a status note.
 
     Prevents the user from clicking the same button twice and makes it
-    obvious which choice was taken."""
+    obvious which choice was taken. Preserves the body of the original
+    prompt (diff link, Claude's summary) and only replaces the trailing
+    italicized "Reply..." footer with `status_note`, so the user can
+    still see what was on the table when they clicked."""
     if not channel or not ts:
         return
+    body_lines = (prior_text or "").rstrip().splitlines()
+    # Drop the trailing italicized "_Reply..._" footer if present (one
+    # line only, so a Claude summary that happens to end in italics
+    # doesn't get clipped).
+    if body_lines:
+        last = body_lines[-1].strip()
+        if last.startswith("_") and last.endswith("_"):
+            body_lines.pop()
+    body = "\n".join(body_lines).rstrip()
+    full_text = f"{body}\n{status_note}" if body else status_note
     slack_post(
         "chat.update",
         channel=channel,
         ts=ts,
-        text=replacement_text,
-        blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": replacement_text}}],
+        text=full_text,
+        blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": full_text}}],
     )
 
 
@@ -1613,10 +1631,13 @@ def handle_block_action(payload, action):
 
     if action_id == "publish_hotfix":
         print(f"  [button] publish_hotfix on {ticket}")
+        prior_text = state.get("action_prompt_text", "")
         state.pop("action_prompt_ts", None)
+        state.pop("action_prompt_text", None)
         save_job(state)
         _clear_action_buttons(channel, prompt_ts,
-                              f":rocket: *{ticket}* — publishing as hotfix...")
+                              f":rocket: *{ticket}* — publishing as hotfix...",
+                              prior_text=prior_text)
         publish_ticket(state)
 
     elif action_id == "create_ticket":
@@ -1701,7 +1722,9 @@ def handle_view_submission(payload):
     # Clear the publish-choice buttons now that we've committed to a path.
     if action_prompt_ts:
         _clear_action_buttons(channel, action_prompt_ts,
-                              f":ticket: Created <{url}|*{key}*> — publishing...")
+                              f":ticket: Created <{url}|*{key}*> — publishing...",
+                              prior_text=state.get("action_prompt_text", ""))
+        state.pop("action_prompt_text", None)
 
     slack_post("chat.postMessage", channel=channel, thread_ts=thread_ts,
                text=f":heavy_check_mark: Created <{url}|*{key}*>: {summary}")
@@ -2508,6 +2531,7 @@ def handle_reaction(channel, ts, user, reaction):
 
         # Clear the prompt so we don't act on it again
         state.pop("action_prompt_ts", None)
+        state.pop("action_prompt_text", None)
         save_job(state)
 
         status = state.get("status")
