@@ -1850,8 +1850,8 @@ else
         if post_to_slack "$SLACK_CHANNEL" "$SLACK_THREAD_TS" "mr" "$mr_url" "$commit_message"; then
             echo -e "  ${GREEN}✓${RESET} Posted MR link to Slack ${slack_target}" >&2
         fi
-    elif [ "$HOTFIX_MODE" = true ] && [ -n "$mr_url" ] && [ -z "$SLACK_URL" ]; then
-        # Offer to post to a Slack thread/channel for hotfixes without an initial Slack URL
+    elif [ -n "$mr_url" ] && [ -z "$SLACK_URL" ]; then
+        # Offer to post to a Slack thread/channel when no Slack URL was provided
         echo "" >&2
         echo -e "  ${CYAN}Post MR link to Slack?${RESET} ${DIM}(y/N)${RESET}" >&2
         read -p "  > " -n 1 -r post_slack_choice < /dev/tty
