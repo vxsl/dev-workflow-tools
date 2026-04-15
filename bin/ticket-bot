@@ -1401,6 +1401,7 @@ def publish_ticket(state, force_push=False, jira_ticket_key=None):
     )
 
     state["status"] = "publishing"
+    state["mr_title"] = mr_title
     state["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
     save_job(state)
 
@@ -1876,11 +1877,19 @@ def check_running_procs():
                                         mr_url = url_match.group(0)
                                         break
                         # Update the "publishing..." message into the final
-                        # Published! notification. This is its own standalone
-                        # thread message, separate from the action prompt.
-                        msg = f":heavy_check_mark: *{ticket}* — published"
-                        if mr_url:
-                            msg += f"\n{mr_url}"
+                        # Published! notification. Mirror the oneshot format
+                        # (`:gitlab: Posted MR: <url|!N — title>`) so the
+                        # outcome is intelligible at a glance instead of a
+                        # bare URL on its own line.
+                        mr_title = state.get("mr_title", "")
+                        if mr_url and mr_title:
+                            mr_num = mr_url.rstrip("/").rsplit("/", 1)[-1]
+                            msg = f":gitlab: Posted MR: <{mr_url}|!{mr_num} — {mr_title}>"
+                        elif mr_url:
+                            mr_num = mr_url.rstrip("/").rsplit("/", 1)[-1]
+                            msg = f":gitlab: Posted MR: <{mr_url}|!{mr_num}>"
+                        else:
+                            msg = f":heavy_check_mark: *{ticket}* — published"
                         if info["status_ts"]:
                             slack_update(ch, info["status_ts"], msg)
                         else:
