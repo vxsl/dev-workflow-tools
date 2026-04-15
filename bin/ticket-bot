@@ -933,13 +933,12 @@ def start_ticket_solve(ticket, thread_ts, channel, slack_urls=None, extra_contex
         swap_reaction(req_msg, "loading", "warning")
         return
 
-    # We're about to make our first reply — advance the request reaction
-    # from :loading: (received) to :eyes: (in progress).
-    swap_reaction(req_msg, "loading", "eyes")
-
     # Post an acknowledgment so the user can see what the bot understood.
     # For the freeform context we generate a concise AI headline instead of
     # echoing the raw message verbatim (which is just noise for the user).
+    # NOTE: summarize_intent is an LLM call that can take ~10s, so we run it
+    # BEFORE flipping the reaction to :eyes: — otherwise :eyes: appears ~10s
+    # before the message it's announcing.
     ack_parts = []
     if ticket and not slack_context:
         ack_parts.append(f":ticket: *{ticket}*")
@@ -951,6 +950,11 @@ def start_ticket_solve(ticket, thread_ts, channel, slack_urls=None, extra_contex
         )
         if headline:
             ack_parts.append(f":pencil: _{headline}_")
+
+    # Headline is ready (or not needed) — flip the reaction now so :eyes:
+    # appears in sync with the first reply, not before it.
+    swap_reaction(req_msg, "loading", "eyes")
+
     if ack_parts:
         slack_reply(channel, thread_ts, "\n".join(ack_parts))
 
