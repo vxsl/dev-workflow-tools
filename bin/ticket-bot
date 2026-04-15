@@ -1242,8 +1242,10 @@ def refresh_diff(state, req_msg=None):
         # Share the refreshed diff as a threaded attachment after the notice.
         post_diff_attachment(diff_html, channel, thread_ts,
                              title=f"{ticket}: {summary}")
-        # Synchronous success — straight to :white_check_mark:.
-        swap_reaction(req_msg, "loading", "white_check_mark")
+        # Synchronous success — just clear the :loading: indicator.
+        # :white_check_mark: is reserved for the initial request message
+        # when the MR has been successfully posted; not used here.
+        swap_reaction(req_msg, "loading", None)
     else:
         slack_reply(channel, thread_ts,
                     f":warning: Failed to regenerate diff\n```\n{result.stderr[:500]}\n```")
@@ -1829,8 +1831,12 @@ def check_running_procs():
                             f":x: Q&A failed (exit {exit_code}). See `{info['log_path']}`.",
                         )
                 # Final reaction lifecycle on the user's request message.
+                # Q&A is one-shot and never produces an MR, so success just
+                # clears :eyes: (no :white_check_mark: — that's reserved for
+                # the initial message when the MR posts). Failures keep an
+                # :x: react for visibility.
                 swap_reaction(info.get("req_msg"), "eyes",
-                              "white_check_mark" if exit_code == 0 else "x")
+                              None if exit_code == 0 else "x")
                 del running_procs[ticket]
                 continue
 
@@ -1863,7 +1869,20 @@ def check_running_procs():
                             slack_update(ch, info["status_ts"], msg)
                         else:
                             slack_reply(ch, info["thread_ts"], msg)
-                        publish_terminal = "white_check_mark"
+                        # The publish status anchor just clears its
+                        # :loading: react — :white_check_mark: is reserved
+                        # for the user's initial request message (handled
+                        # below).
+                        publish_terminal = None
+                        # Mark the very initial request message with
+                        # :white_check_mark: now that the MR has been
+                        # successfully posted. This is the ONLY place
+                        # we add :white_check_mark: as a react — it's
+                        # the success signal for the entire workflow.
+                        initial_req_msg = state.get("req_msg")
+                        if initial_req_msg:
+                            swap_reaction(tuple(initial_req_msg),
+                                          "eyes", "white_check_mark")
 
                     else:
                         # Check if it was a push rejection (non-fast-forward)
@@ -1919,7 +1938,10 @@ def check_running_procs():
                         terminal_emoji = "warning"
                     else:
                         msg = f"*{ticket}* — :heavy_check_mark: done"
-                        terminal_emoji = "white_check_mark"
+                        # Plain success on a bot status anchor just clears
+                        # :loading: — :white_check_mark: is reserved for
+                        # the initial request message at MR-publish time.
+                        terminal_emoji = None
                     slack_update(ch, info["status_ts"], msg)
                 else:
                     slack_update(
@@ -1928,15 +1950,16 @@ def check_running_procs():
                     )
                     terminal_emoji = "x"
                 # Swap the status anchor's :loading: react for a terminal
-                # one so the message visibly stops "spinning."
+                # one (or just unreact when there's no informative terminal).
                 swap_reaction((ch, info["status_ts"]), "loading", terminal_emoji)
 
-            # Final reaction lifecycle on the user's request message.
-            # done_empty is still "successful completion" of the run, so we
-            # mark it with :white_check_mark: too — the warning is already
-            # visible in the thread's status message.
-            swap_reaction(info.get("req_msg"), "eyes",
-                          "white_check_mark" if exit_code == 0 else "x")
+            # Don't add :white_check_mark: on the user's request message
+            # here — solve completion just means "ready for review/publish",
+            # not "done done." :white_check_mark: lands when the publish
+            # subprocess succeeds. Failures still get :x: for visibility;
+            # success leaves :eyes: in place since the bot is still engaged.
+            if exit_code != 0:
+                swap_reaction(info.get("req_msg"), "eyes", "x")
 
             del running_procs[ticket]
 
@@ -1967,6 +1990,14 @@ def check_running_procs():
                 state["status"] = "done"
             elif exit_code != 0 and state.get("status") not in ("failed", "checks_failed"):
                 state["status"] = "failed"
+
+            # Persist the very-initial request message onto state so the
+            # publish subprocess (triggered later by a user reaction) can
+            # find it and add the final :white_check_mark: when the MR
+            # posts. Only set on FIRST completion — feedback iterations
+            # have a different req_msg, but we always want the very first.
+            if not state.get("req_msg") and info.get("req_msg"):
+                state["req_msg"] = list(info["req_msg"])
 
             state_path.write_text(json.dumps(state, indent=2))
             jobs[current_thread_ts] = state
@@ -2280,8 +2311,9 @@ def handle_message(channel, ts, user, text, thread_ts=None):
 
     elif text.strip().lower() == "help":
         slack_post("chat.postMessage", channel=channel, text=HELP_FULL, mrkdwn=True)
-        # Synchronous response — mark done.
-        swap_reaction(req_msg, "loading", "white_check_mark")
+        # Synchronous response — just clear :loading:. :white_check_mark:
+        # is reserved for the initial request message at MR-publish time.
+        swap_reaction(req_msg, "loading", None)
 
     elif text.strip().lower() == "status":
         jobs = load_jobs()
@@ -2312,7 +2344,7 @@ def handle_message(channel, ts, user, text, thread_ts=None):
             lines.append("")
             lines.append(f"_Running processes: {len(running_procs)}_")
         slack_post("chat.postMessage", channel=channel, text="\n".join(lines), mrkdwn=True)
-        swap_reaction(req_msg, "loading", "white_check_mark")
+        swap_reaction(req_msg, "loading", None)
 
     elif text.strip().lower() == "clear":
         if running_procs:
@@ -2348,7 +2380,7 @@ def handle_message(channel, ts, user, text, thread_ts=None):
             if confirm_ts:
                 STATE_DIR.joinpath(".pending_clear").write_text(
                     json.dumps({"msg_ts": confirm_ts, "channel": channel, "expires": time.time() + 120}))
-        swap_reaction(req_msg, "loading", "white_check_mark")
+        swap_reaction(req_msg, "loading", None)
 
     elif text.strip():
         # Classify: is this a question (read-only Q&A) or an implement request?
@@ -2398,8 +2430,8 @@ def handle_message(channel, ts, user, text, thread_ts=None):
                 slack_reply(channel, ts,
                             ":thinking_face: To *implement* something I need a *ticket ID* (e.g. `UB-1234`) or a *Slack thread link*. "
                             "To *ask* a question about the code, prefix with `?` or just ask — I'll try to answer.")
-                # Synchronous nudge — mark done so the loading indicator clears.
-                swap_reaction(req_msg, "loading", "white_check_mark")
+                # Synchronous nudge — just clear the :loading: indicator.
+                swap_reaction(req_msg, "loading", None)
 
 
 def handle_reaction(channel, ts, user, reaction):
