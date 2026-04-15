@@ -82,6 +82,10 @@ Requires in .env:
   SLACK_NOTIFY_USER_ID       Your Slack user ID
   JIRA_EMAIL, JIRA_API_TOKEN, JIRA_DOMAIN
 
+Optional in .env (enables startup check that Interactivity is turned on):
+  SLACK_APP_CONFIG_TOKEN     App Configuration Token (xoxe-...)
+  SLACK_APP_ID               Numeric app id (e.g. A01234567)
+
 Slack app setup:
   1. Create a Slack app at https://api.slack.com/apps
   2. Enable Socket Mode (Settings → Socket Mode → Enable)
@@ -128,6 +132,10 @@ USER_ID = os.environ.get("SLACK_NOTIFY_USER_ID", "")
 JIRA_PROJECT = os.environ.get("JIRA_PROJECT", "UB")
 JIRA_DOMAIN = os.environ.get("JIRA_DOMAIN", "")
 PROJECT_ROOT = os.environ.get("TICKET_BOT_PROJECT_ROOT", "")
+# Optional: lets us verify Interactivity is turned on at startup via
+# apps.manifest.export. See the startup check for the full rationale.
+APP_CONFIG_TOKEN = os.environ.get("SLACK_APP_CONFIG_TOKEN", "")
+SLACK_APP_ID = os.environ.get("SLACK_APP_ID", "")
 
 if not BOT_TOKEN or not USER_ID or not APP_TOKEN:
     missing = []
@@ -319,11 +327,102 @@ if _missing_scopes:
     for _scope in sorted(REQUIRED_SCOPES):
         marker = "✓" if _scope in _granted_scopes else "✗"
         print(f"    {marker} {_scope}")
-    print()
-    print("Note: the 'Create Jira ticket' button + modal also require *Interactivity*")
-    print("to be enabled on the Slack app (Features → Interactivity & Shortcuts).")
-    print("Interactivity is a feature toggle, not a scope, so it can't be checked here.")
     sys.exit(1)
+
+
+# ── Best-effort Interactivity feature check ──
+#
+# The "Create Jira ticket" button + modal depend on Slack's *Interactivity*
+# feature being turned on (Features → Interactivity & Shortcuts). That's a
+# feature toggle, not a scope, so it's NOT reported by auth.test.
+#
+# The only API that exposes it is `apps.manifest.export`, and that method
+# requires an **app-configuration access token** (xoxe-…) — not the bot
+# token we already have — plus the numeric app_id. Generate the config
+# token at https://api.slack.com/apps → your app → "App-Level Tokens" /
+# "App Configuration Tokens" → Generate.
+#
+# If the user hasn't set up those optional env vars, we can't verify it;
+# print a big, hard-to-miss warning and continue, since the rest of the
+# bot's functionality still works — only the ticket-creation modal flow
+# is at risk.
+
+def _check_interactivity_enabled():
+    """Return True/False if we can tell, else None. Uses apps.manifest.export."""
+    if not APP_CONFIG_TOKEN or not SLACK_APP_ID:
+        return None
+    try:
+        req = urllib.request.Request(
+            "https://slack.com/api/apps.manifest.export",
+            data=json.dumps({"app_id": SLACK_APP_ID}).encode(),
+            headers={
+                "Authorization": f"Bearer {APP_CONFIG_TOKEN}",
+                "Content-Type": "application/json; charset=utf-8",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            body = json.loads(resp.read())
+    except Exception as e:
+        print(f"  Interactivity check failed (apps.manifest.export): {e}")
+        return None
+    if not body.get("ok"):
+        print(f"  Interactivity check failed (apps.manifest.export): {body.get('error')}")
+        return None
+    return bool(
+        body.get("manifest", {})
+            .get("settings", {})
+            .get("interactivity", {})
+            .get("is_enabled")
+    )
+
+
+_interactivity = _check_interactivity_enabled()
+if _interactivity is True:
+    print("✓ Interactivity is enabled on the Slack app")
+elif _interactivity is False:
+    print()
+    print("┏" + "━" * 76 + "┓")
+    print("┃" + " ERROR: Interactivity is DISABLED on the Slack app ".center(76) + "┃")
+    print("┗" + "━" * 76 + "┛")
+    print()
+    print("The 'Create Jira ticket' button + modal on slack-thread jobs will NOT")
+    print("work until Interactivity is turned on.")
+    print()
+    print("Enable it: https://api.slack.com/apps → your app →")
+    print("           Features → Interactivity & Shortcuts → toggle ON")
+    print("           (Socket Mode apps can leave the Request URL blank.)")
+    print()
+    sys.exit(1)
+else:
+    # Couldn't verify — print a big warning box so this stays visible.
+    print()
+    print("┏" + "━" * 76 + "┓")
+    print("┃" + " WARNING: Unable to verify that Slack Interactivity is enabled ".center(76) + "┃")
+    print("┗" + "━" * 76 + "┛")
+    print()
+    print("  The 'Create Jira ticket' button + modal on slack-thread jobs require")
+    print("  Slack's *Interactivity* feature to be ON. Without it, clicking those")
+    print("  buttons will silently fail (or drop trigger_ids on the floor).")
+    print()
+    print("  Interactivity is a feature toggle, not an OAuth scope, so we can't")
+    print("  check it from the bot token. To let ticket-bot verify it at startup,")
+    print("  set both of these in .env:")
+    print()
+    print("      SLACK_APP_CONFIG_TOKEN    # xoxe-... (App Configuration Token)")
+    print("      SLACK_APP_ID              # numeric app id, e.g. A01234567")
+    print()
+    print("  Generate the config token at:")
+    print("    https://api.slack.com/apps → your app →")
+    print("    App-Level Tokens / App Configuration Tokens → Generate")
+    print()
+    print("  The app_id is visible in the URL of your app's settings page")
+    print("  (https://api.slack.com/apps/<APP_ID>).")
+    print()
+    print("  Continuing without the check. If the ticket modal silently fails to")
+    print("  open, the most likely cause is Interactivity being turned off.")
+    print()
+
 
 # ── Open DM channel ──
 #
