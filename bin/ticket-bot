@@ -225,6 +225,31 @@ def react(channel, ts, name):
     return resp
 
 
+def unreact(channel, ts, name):
+    """Remove a reaction from a message. Silently ignores 'no_reaction'."""
+    resp = slack_post("reactions.remove", channel=channel, timestamp=ts, name=name)
+    if not resp.get("ok") and resp.get("error") not in ("no_reaction",):
+        print(f"  reactions.remove({name}) failed: {resp.get('error')}")
+    return resp
+
+
+def swap_reaction(req_msg, old, new):
+    """Replace `old` reaction with `new` on the given (channel, ts) tuple.
+    Used to advance the request-message reaction through its lifecycle:
+    :loading: (received) → :eyes: (first response sent) → :white_check_mark:
+    (done) or :x: (failed). Either side may be None to skip add/remove.
+    Tolerates a None req_msg for callers that don't track the request."""
+    if not req_msg:
+        return
+    channel, ts = req_msg
+    if not channel or not ts:
+        return
+    if new:
+        react(channel, ts, new)
+    if old:
+        unreact(channel, ts, old)
+
+
 # ── Open DM channel ──
 
 dm_resp = slack_post("conversations.open", users=USER_ID)
@@ -702,7 +727,7 @@ def build_slack_context_description(slack_urls, commit_summary=""):
     return "\n".join(parts)
 
 
-def start_ticket_ask(question, thread_ts, channel, slack_urls=None):
+def start_ticket_ask(question, thread_ts, channel, slack_urls=None, req_msg=None):
     """Run ticket-ask (Q&A mode) as a background subprocess.
 
     No worktree-per-question, no state-file tracking like solve jobs —
@@ -710,6 +735,8 @@ def start_ticket_ask(question, thread_ts, channel, slack_urls=None):
     runs Claude read-only, and posts the answer to the thread itself. We
     just dispatch and forget (Popen); its stdout/stderr go to a log file.
     """
+    # Advance request reaction now that we're about to post our first reply.
+    swap_reaction(req_msg, "loading", "eyes")
     # Post a status message so the user knows we're on it
     resp = slack_reply(channel, thread_ts,
                        f":mag: _Reading code to answer..._")
@@ -751,10 +778,11 @@ def start_ticket_ask(question, thread_ts, channel, slack_urls=None):
         "start_time": time.time(),
         "ticket": dedup_key,
         "is_ask": True,
+        "req_msg": req_msg,
     }
 
 
-def start_ticket_solve(ticket, thread_ts, channel, slack_urls=None, extra_context=None, mock=False, force=False, slack_context=False):
+def start_ticket_solve(ticket, thread_ts, channel, slack_urls=None, extra_context=None, mock=False, force=False, slack_context=False, req_msg=None):
     """Start ticket-solve as a background process.
 
     If slack_context=True, ticket-solve runs in Slack-context mode (no Jira ticket required).
@@ -778,7 +806,13 @@ def start_ticket_solve(ticket, thread_ts, channel, slack_urls=None, extra_contex
     if dedup_key in running_procs:
         slack_reply(channel, thread_ts,
                     f":warning: *{dedup_key}* is already running (PID {running_procs[dedup_key]['proc'].pid})")
+        # We did respond (with a warning), so clear the loading indicator.
+        swap_reaction(req_msg, "loading", "warning")
         return
+
+    # We're about to make our first reply — advance the request reaction
+    # from :loading: (received) to :eyes: (in progress).
+    swap_reaction(req_msg, "loading", "eyes")
 
     # Post an acknowledgment so the user can see what the bot understood.
     # For the freeform context we generate a concise AI headline instead of
@@ -859,6 +893,7 @@ def start_ticket_solve(ticket, thread_ts, channel, slack_urls=None, extra_contex
         "start_time": time.time(),
         "ticket": dedup_key,
         "slack_context": slack_context,
+        "req_msg": req_msg,
     }
 
     # Update jobs dict so ✅ reaction checks use the current thread
@@ -876,7 +911,7 @@ def start_ticket_solve(ticket, thread_ts, channel, slack_urls=None, extra_contex
     print(f"  PID {proc.pid}, log: {log_path}")
 
 
-def resume_claude(state, feedback_text):
+def resume_claude(state, feedback_text, req_msg=None):
     """Resume a Claude session with user feedback."""
     ticket = state["ticket"]
     session_id = state["session_id"]
@@ -890,7 +925,12 @@ def resume_claude(state, feedback_text):
             channel, thread_ts,
             f":warning: Can't resume — worktree not found at `{work_dir}`"
         )
+        # Responded with a warning — clear the loading indicator.
+        swap_reaction(req_msg, "loading", "warning")
         return
+
+    # Advance request reaction now that we're about to post our first reply.
+    swap_reaction(req_msg, "loading", "eyes")
 
     status_resp = slack_reply(
         channel, thread_ts,
@@ -953,6 +993,7 @@ def resume_claude(state, feedback_text):
         "last_files_snapshot": "",
         "start_time": time.time(),
         "ticket": ticket,
+        "req_msg": req_msg,
     }
     print(f"  Resuming {ticket} (PID {proc.pid})")
 
@@ -982,7 +1023,7 @@ STAGE_PATTERNS = [
 ]
 
 
-def refresh_diff(state):
+def refresh_diff(state, req_msg=None):
     """Regenerate diff.html from current staged changes and notify."""
     ticket = state["ticket"]
     summary = state.get("summary", "")
@@ -994,6 +1035,7 @@ def refresh_diff(state):
     if not work_dir or not os.path.isdir(work_dir):
         slack_reply(channel, thread_ts,
                     f":warning: Worktree not found at `{work_dir}`")
+        swap_reaction(req_msg, "loading", "warning")
         return
 
     diff_html = os.path.join(worktree, "diff.html") if worktree else os.path.join(work_dir, "..", "diff.html")
@@ -1011,9 +1053,12 @@ def refresh_diff(state):
         # Share the refreshed diff as a threaded attachment after the notice.
         post_diff_attachment(diff_html, channel, thread_ts,
                              title=f"{ticket}: {summary}")
+        # Synchronous success — straight to :white_check_mark:.
+        swap_reaction(req_msg, "loading", "white_check_mark")
     else:
         slack_reply(channel, thread_ts,
                     f":warning: Failed to regenerate diff\n```\n{result.stderr[:500]}\n```")
+        swap_reaction(req_msg, "loading", "x")
 
 
 
@@ -1240,6 +1285,9 @@ def check_running_procs():
                             info.get("channel", DM_CHANNEL), info["status_ts"],
                             f":x: Q&A failed (exit {exit_code}). See `{info['log_path']}`.",
                         )
+                # Final reaction lifecycle on the user's request message.
+                swap_reaction(info.get("req_msg"), "eyes",
+                              "white_check_mark" if exit_code == 0 else "x")
                 del running_procs[ticket]
                 continue
 
@@ -1324,6 +1372,13 @@ def check_running_procs():
                         ch, info["status_ts"],
                         f"*{ticket}* — :x: failed (exit {exit_code})",
                     )
+
+            # Final reaction lifecycle on the user's request message.
+            # done_empty is still "successful completion" of the run, so we
+            # mark it with :white_check_mark: too — the warning is already
+            # visible in the thread's status message.
+            swap_reaction(info.get("req_msg"), "eyes",
+                          "white_check_mark" if exit_code == 0 else "x")
 
             del running_procs[ticket]
 
@@ -1585,16 +1640,19 @@ def handle_message(channel, ts, user, text, thread_ts=None):
         # "done_empty" is also resumable so the user can nudge Claude to
         # actually commit / re-stage when no diff was produced.
         if state and state.get("status") in ("done", "clarify", "done_empty"):
-            # Acknowledge receipt immediately so the user knows the bot saw it.
-            react(channel, ts, "eyes")
+            # Acknowledge receipt immediately. :loading: signals "received,
+            # not yet responded"; downstream handlers swap it to :eyes: once
+            # they post their first reply, and to :white_check_mark: on done.
+            react(channel, ts, "loading")
+            req_msg = (channel, ts)
             # Strip @mention if present, but don't require it here.
             feedback_text, _ = strip_bot_mention(text)
             if feedback_text.strip().lower() == "refresh":
                 print(f"  Refreshing diff for {state['ticket']}")
-                refresh_diff(state)
+                refresh_diff(state, req_msg=req_msg)
             else:
                 print(f"Feedback on {state['ticket']} (status={state.get('status')}): {feedback_text[:60]}...")
-                resume_claude(state, feedback_text)
+                resume_claude(state, feedback_text, req_msg=req_msg)
             state["last_checked_ts"] = ts
             save_job(state)
             return
@@ -1610,7 +1668,10 @@ def handle_message(channel, ts, user, text, thread_ts=None):
     # Acknowledge receipt immediately — covers DMs (which skip the mention
     # gate above) and @mentioned channel messages. Placed before any
     # processing so the user sees it even if dispatch takes a moment.
-    react(channel, ts, "eyes")
+    # :loading: means "received, not yet responded"; downstream handlers
+    # swap to :eyes: on first reply and :white_check_mark: on done.
+    react(channel, ts, "loading")
+    req_msg = (channel, ts)
 
     # ── Top-level command routing ──
     ticket_match = TICKET_RE.search(text)
@@ -1629,7 +1690,7 @@ def handle_message(channel, ts, user, text, thread_ts=None):
             ticket, thread_ts=ts, channel=channel,
             slack_urls=slack_urls if slack_urls else None,
             extra_context=extra if extra else None,
-            mock=MOCK_MODE,
+            mock=MOCK_MODE, req_msg=req_msg,
         )
 
     elif slack_urls:
@@ -1642,11 +1703,13 @@ def handle_message(channel, ts, user, text, thread_ts=None):
             ticket=None, thread_ts=ts, channel=channel,
             slack_urls=slack_urls,
             extra_context=extra if extra else None,
-            mock=MOCK_MODE, slack_context=True,
+            mock=MOCK_MODE, slack_context=True, req_msg=req_msg,
         )
 
     elif text.strip().lower() == "help":
         slack_post("chat.postMessage", channel=channel, text=HELP_FULL, mrkdwn=True)
+        # Synchronous response — mark done.
+        swap_reaction(req_msg, "loading", "white_check_mark")
 
     elif text.strip().lower() == "status":
         jobs = load_jobs()
@@ -1677,12 +1740,14 @@ def handle_message(channel, ts, user, text, thread_ts=None):
             lines.append("")
             lines.append(f"_Running processes: {len(running_procs)}_")
         slack_post("chat.postMessage", channel=channel, text="\n".join(lines), mrkdwn=True)
+        swap_reaction(req_msg, "loading", "white_check_mark")
 
     elif text.strip().lower() == "clear":
         if running_procs:
             slack_post("chat.postMessage", channel=channel,
                        text=f":warning: Can't clear while {len(running_procs)} job(s) are running.",
                        mrkdwn=True)
+            swap_reaction(req_msg, "loading", "warning")
             return
         total = 0
         has_more = True
@@ -1711,6 +1776,7 @@ def handle_message(channel, ts, user, text, thread_ts=None):
             if confirm_ts:
                 STATE_DIR.joinpath(".pending_clear").write_text(
                     json.dumps({"msg_ts": confirm_ts, "channel": channel, "expires": time.time() + 120}))
+        swap_reaction(req_msg, "loading", "white_check_mark")
 
     elif text.strip():
         # Classify: is this a question (read-only Q&A) or an implement request?
@@ -1737,6 +1803,7 @@ def handle_message(channel, ts, user, text, thread_ts=None):
             start_ticket_ask(
                 question=msg_text, thread_ts=ask_thread_ts,
                 channel=channel, slack_urls=thread_urls or None,
+                req_msg=req_msg,
             )
         else:
             # Implementation path (existing behavior). Requires thread context
@@ -1747,12 +1814,14 @@ def handle_message(channel, ts, user, text, thread_ts=None):
                     ticket=None, thread_ts=parent_ts, channel=channel,
                     slack_urls=thread_urls,
                     extra_context=msg_text,
-                    mock=MOCK_MODE, slack_context=True,
+                    mock=MOCK_MODE, slack_context=True, req_msg=req_msg,
                 )
             else:
                 slack_reply(channel, ts,
                             ":thinking_face: To *implement* something I need a *ticket ID* (e.g. `UB-1234`) or a *Slack thread link*. "
                             "To *ask* a question about the code, prefix with `?` or just ask — I'll try to answer.")
+                # Synchronous nudge — mark done so the loading indicator clears.
+                swap_reaction(req_msg, "loading", "white_check_mark")
 
 
 def handle_reaction(channel, ts, user, reaction):
