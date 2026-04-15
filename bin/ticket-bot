@@ -256,17 +256,12 @@ def swap_reaction(req_msg, old, new):
         unreact(channel, ts, old)
 
 
-# ── Open DM channel ──
+# ── Verify bot token + scopes before doing anything else ──
+#
+# We check scopes *before* conversations.open so a missing scope produces
+# a clear "reinstall the app with these scopes" error instead of a less
+# obvious "Error opening DM channel: missing_scope" from the first API call.
 
-dm_resp = slack_post("conversations.open", users=USER_ID)
-if not dm_resp.get("ok"):
-    print(f"Error opening DM channel: {dm_resp.get('error')}")
-    print("Check TICKET_CREATOR_BOT_TOKEN and SLACK_NOTIFY_USER_ID")
-    sys.exit(1)
-
-DM_CHANNEL = dm_resp["channel"]["id"]
-
-# Get bot's own user ID and check scopes
 _auth_req = urllib.request.Request(
     "https://slack.com/api/auth.test",
     headers={"Authorization": f"Bearer {BOT_TOKEN}", "Content-Type": "application/x-www-form-urlencoded"},
@@ -274,7 +269,11 @@ _auth_req = urllib.request.Request(
 )
 try:
     with urllib.request.urlopen(_auth_req) as _auth_raw:
-        _granted_scopes = set(_auth_raw.headers.get("x-oauth-scopes", "").split(","))
+        _granted_scopes = set(
+            s.strip()
+            for s in _auth_raw.headers.get("x-oauth-scopes", "").split(",")
+            if s.strip()
+        )
         auth_resp = json.loads(_auth_raw.read())
 except urllib.error.URLError as e:
     print(f"Error connecting to Slack: {e}")
@@ -287,17 +286,56 @@ if not auth_resp.get("ok"):
     print("Check that TICKET_CREATOR_BOT_TOKEN is a valid bot token (xoxb-...)")
     sys.exit(1)
 
+# Scopes the bot actually uses, grouped by purpose. Keep in sync with the
+# Slack API calls in this file — each one's required scope per
+# https://api.slack.com/methods. Missing a scope here means the bot will
+# fail when it tries to use that feature, so we refuse to start.
 REQUIRED_SCOPES = {
-    "chat:write", "files:write",
+    # Messaging (chat.postMessage / chat.update / chat.delete)
+    "chat:write",
+    # DMs: conversations.open to find/open the operator's DM channel,
+    # and im:history to read thread replies in DMs.
+    "im:write", "im:history",
+    # Channels: need both history (read messages) and read (channel info)
+    # for both public (channels:*) and private (groups:*) channels.
     "channels:history", "channels:read",
     "groups:history", "groups:read",
-    "im:history", "reactions:read",
+    # Reactions: read to receive reaction_added events, write to add/remove
+    # the :loading:/:eyes:/:white_check_mark: reaction lifecycle.
+    "reactions:read", "reactions:write",
+    # File uploads (diff.html attachments on slack-context runs).
+    "files:write",
+    # users.info for resolving Slack display names in thread transcripts.
+    "users:read",
 }
 _missing_scopes = REQUIRED_SCOPES - _granted_scopes
 if _missing_scopes:
-    print(f"Warning: bot token is missing scopes: {', '.join(sorted(_missing_scopes))}")
-    print("Add them in your Slack app → OAuth & Permissions → Bot Token Scopes, then reinstall.")
-    print("The bot will start, but some features may not work.\n")
+    print(f"Error: bot token is missing required scopes: {', '.join(sorted(_missing_scopes))}")
+    print()
+    print("Add them in your Slack app → OAuth & Permissions → Bot Token Scopes,")
+    print("then reinstall the app to your workspace and update TICKET_CREATOR_BOT_TOKEN.")
+    print()
+    print("Full required scope list:")
+    for _scope in sorted(REQUIRED_SCOPES):
+        marker = "✓" if _scope in _granted_scopes else "✗"
+        print(f"    {marker} {_scope}")
+    print()
+    print("Note: the 'Create Jira ticket' button + modal also require *Interactivity*")
+    print("to be enabled on the Slack app (Features → Interactivity & Shortcuts).")
+    print("Interactivity is a feature toggle, not a scope, so it can't be checked here.")
+    sys.exit(1)
+
+# ── Open DM channel ──
+#
+# Safe to call now that scopes are verified.
+
+dm_resp = slack_post("conversations.open", users=USER_ID)
+if not dm_resp.get("ok"):
+    print(f"Error opening DM channel: {dm_resp.get('error')}")
+    print("Check TICKET_CREATOR_BOT_TOKEN and SLACK_NOTIFY_USER_ID")
+    sys.exit(1)
+
+DM_CHANNEL = dm_resp["channel"]["id"]
 
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -405,8 +443,7 @@ def diff_prompt_line(channel, worktree):
     aren't useful when the operator is the only viewer."""
     if is_dm_channel(channel):
         return f":mag: <{diff_url(worktree)}|View diff>"
-    return (":mag: *Diff ready* — download the attached HTML file below "
-            ":arrow_down: and open it in your browser.")
+    return ":mag: *Diff ready* :arrow_down:"
 
 
 def post_diff_attachment(diff_path, channel, thread_ts, title=""):
@@ -574,12 +611,19 @@ def summarize_intent(text, ticket=None, slack_urls=None):
         return ""
 
     prompt = (
-        "You are a bot that implements code changes in response to user "
-        "requests. Based on the user's message below, write a single-line "
-        "headline (imperative mood, no trailing period, no quotes, no "
-        "markdown, no emoji) that captures what you understand you've been "
-        "asked to do. Be specific — name the symptom, component, or goal. "
-        "Keep it short (roughly one sentence). Output ONLY the headline.\n\n"
+        "You are a summarization utility. A user sent the message below to a "
+        "code-change bot. Output a single-line headline, in imperative mood, "
+        "that restates the requested change (e.g. 'Add foo', 'Fix bar in "
+        "baz'). Be specific — name the symptom, component, or goal when "
+        "they're stated.\n\n"
+        "Rules:\n"
+        "- Do NOT reply to the user, ask clarifying questions, or explain "
+        "anything. You are NOT the bot — you are describing what the bot "
+        "was asked to do.\n"
+        "- If the request is vague, still produce a short imperative "
+        "headline that paraphrases it. Never refuse.\n"
+        "- Output ONLY the headline — no markdown, quotes, emoji, trailing "
+        "punctuation, or preamble.\n\n"
         f"Message:\n{stripped}"
     )
     if ticket:
@@ -598,7 +642,17 @@ def summarize_intent(text, ticket=None, slack_urls=None):
         out = out.strip("`*_\"' \n")
         # First line only, in case Claude adds a preamble
         out = out.split("\n")[0].strip().strip("`*_\"' ")
+        # Defensive sanity check: Haiku sometimes ignores the summarizer
+        # persona and replies *as* the bot ("I need more context...",
+        # "Can you clarify..."). Imperative-mood headlines never start with
+        # "I " and never contain a question mark, so reject those rather
+        # than posting a confusing pseudo-headline. Returning "" causes the
+        # caller to skip the ack line entirely.
         if out:
+            lowered = out.lower()
+            if "?" in out or lowered.startswith(("i ", "i'")):
+                print(f"  summarize_intent rejected non-headline output: {out!r}")
+                return ""
             return out
     except Exception as e:
         print(f"  summarize_intent error: {e}")
@@ -1403,10 +1457,25 @@ def open_create_ticket_modal(trigger_id, state):
     initial_summary = (state.get("title") or state.get("summary") or "").strip()
     # Pre-fill description with the per-thread summary so the ticket has
     # some context; the user can edit before submitting.
+    # Pre-fill description with Claude's summary + plain Slack thread link(s).
+    # IMPORTANT: Do NOT call build_slack_context_description here — it invokes
+    # the Claude CLI to summarize the thread, which takes several seconds
+    # and will burn through Slack's 3-second trigger_id TTL, causing
+    # views.open to fail with "expired_trigger_id". The user can flesh out
+    # the description in the modal; the full AI-generated blurb still lands
+    # in the MR description at publish time.
     slack_urls = state.get("slack_urls", []) or []
-    initial_description = build_slack_context_description(
-        slack_urls, commit_summary=state.get("summary", "")
-    ) or state.get("summary", "")
+    desc_parts = []
+    summary_body = (state.get("summary") or "").strip()
+    if summary_body:
+        desc_parts.append(summary_body)
+    if slack_urls:
+        if len(slack_urls) == 1:
+            desc_parts.append(f"Slack thread: {slack_urls[0]}")
+        else:
+            desc_parts.append("Slack threads:")
+            desc_parts.extend(f"- {u}" for u in slack_urls)
+    initial_description = "\n\n".join(desc_parts)
 
     # Slack modal fields have a 3000-char limit on initial_value
     if len(initial_description) > 2900:
@@ -1980,18 +2049,15 @@ def check_running_procs():
                     if summary_line:
                         break
                 if summary_line:
-                    prompt_lines.append("")
                     prompt_lines.append(summary_line)
 
-                prompt_lines.append("")
                 # For slack-context jobs we can't assume hotfix — surface
                 # both options as buttons and let the user pick. For
                 # ticket-based jobs the ticket already dictates the path,
                 # so the reaction shortcut is fine.
                 if state.get("slack_context"):
                     prompt_lines.append(
-                        "_Reply with feedback for another pass, "
-                        "or choose how to publish below:_"
+                        "_Reply for another pass, or publish:_"
                     )
                     _post_action_prompt(
                         state, thread_ts, "\n".join(prompt_lines),
@@ -1999,8 +2065,7 @@ def check_running_procs():
                     )
                 else:
                     prompt_lines.append(
-                        "_Reply with feedback for another pass. "
-                        "React :white_check_mark: to publish._"
+                        "_Reply for another pass, or react :white_check_mark: to publish._"
                     )
                     _post_action_prompt(state, thread_ts, "\n".join(prompt_lines))
 
