@@ -320,15 +320,15 @@ def diff_url(worktree_path):
 
 
 def upload_diff_to_slack(diff_path, channel, thread_ts, title=""):
-    """Upload diff.html to Slack so anyone in the channel can view it.
-    Returns the permalink URL on success, or empty string on failure."""
+    """Upload diff.html and share it into the given thread so everyone can
+    grab it. The shared file appears as a separate threaded message below
+    whatever text message the caller just posted. Returns True on success."""
     if not os.path.exists(diff_path):
-        return ""
+        return False
     try:
-        # Use files.upload_v2 (multipart form POST)
         file_size = os.path.getsize(diff_path)
         if file_size == 0:
-            return ""
+            return False
 
         # Step 1: Get upload URL
         resp = slack_get("files.getUploadURLExternal",
@@ -336,7 +336,7 @@ def upload_diff_to_slack(diff_path, channel, thread_ts, title=""):
                          length=file_size)
         if not resp.get("ok"):
             print(f"  Failed to get upload URL: {resp.get('error')}")
-            return ""
+            return False
 
         upload_url = resp["upload_url"]
         file_id = resp["file_id"]
@@ -348,38 +348,41 @@ def upload_diff_to_slack(diff_path, channel, thread_ts, title=""):
         req.add_header("Content-Type", "text/html")
         urllib.request.urlopen(req)
 
-        # Step 3: Complete upload (don't share to channel — avoids inline HTML preview)
+        # Step 3: Complete upload and share into the thread so the file
+        # attachment appears as a reply directly below the action prompt.
         payload = {
             "files": [{"id": file_id, "title": title or "diff.html"}],
+            "channel_id": channel,
+            "thread_ts": thread_ts,
         }
         complete = slack_post("files.completeUploadExternal", **payload)
         if not complete.get("ok"):
             print(f"  Failed to complete upload: {complete.get('error')}")
-            return ""
-
-        # Extract permalink
-        for f in complete.get("files", []):
-            if f.get("permalink"):
-                return f["permalink"]
-        return ""
+            return False
+        return True
     except Exception as e:
         print(f"  Failed to upload diff: {e}")
-        return ""
+        return False
 
 
-def share_diff(diff_path, worktree, channel, thread_ts, title=""):
-    """Share a diff — upload to Slack in channels, local link in DMs.
-    Returns the markdown line to include in messages."""
+def diff_prompt_line(channel, worktree):
+    """Return the diff line to embed in the action prompt.
+
+    For channels the actual HTML file is uploaded separately (see
+    ``post_diff_attachment``) so the line here just points the user to the
+    attachment. For DMs we fall back to a local link since file uploads
+    aren't useful when the operator is the only viewer."""
     if is_dm_channel(channel):
-        # DM: local link (only the bot operator sees it)
         return f":mag: <{diff_url(worktree)}|View diff>"
+    return (":mag: *Diff ready* — download the attached HTML file below "
+            ":arrow_down: and open it in your browser.")
 
-    # Channel: upload so everyone can view
-    permalink = upload_diff_to_slack(diff_path, channel, thread_ts, title)
-    if permalink:
-        return f":mag: <{permalink}|View diff> _(download and open in browser)_"
-    # Fallback to local link with disclaimer
-    return f":mag: <{diff_url(worktree)}|View diff> _(local link — only available on bot host)_"
+
+def post_diff_attachment(diff_path, channel, thread_ts, title=""):
+    """Share the diff HTML file into the thread (no-op in DMs)."""
+    if is_dm_channel(channel):
+        return False
+    return upload_diff_to_slack(diff_path, channel, thread_ts, title)
 
 
 # ── Test DM mode ──
@@ -783,8 +786,6 @@ def start_ticket_solve(ticket, thread_ts, channel, slack_urls=None, extra_contex
     ack_parts = []
     if ticket and not slack_context:
         ack_parts.append(f":ticket: *{ticket}*")
-    if slack_urls:
-        ack_parts.append(f":link: {'  '.join(slack_urls)}")
     if extra_context:
         headline = summarize_intent(
             extra_context,
@@ -1004,11 +1005,12 @@ def refresh_diff(state):
     )
 
     if result.returncode == 0 and os.path.exists(diff_html):
-        diff_line = share_diff(diff_html, worktree, channel, thread_ts,
-                               title=f"{ticket}: {summary}")
-        # Replace the search emoji with refresh emoji
-        slack_reply(channel, thread_ts,
-                    diff_line.replace(":mag:", ":arrows_counterclockwise:"))
+        diff_line = diff_prompt_line(channel, worktree).replace(
+            ":mag:", ":arrows_counterclockwise:")
+        slack_reply(channel, thread_ts, diff_line)
+        # Share the refreshed diff as a threaded attachment after the notice.
+        post_diff_attachment(diff_html, channel, thread_ts,
+                             title=f"{ticket}: {summary}")
     else:
         slack_reply(channel, thread_ts,
                     f":warning: Failed to regenerate diff\n```\n{result.stderr[:500]}\n```")
@@ -1042,14 +1044,11 @@ def publish_ticket(state, force_push=False):
         )
         return
 
-    # Reuse the action prompt message for publish status updates
-    publish_status_ts = state.get("action_prompt_ts", "")
-    if publish_status_ts:
-        slack_update(channel, publish_status_ts,
-                     f":rocket: *{ticket}* — publishing...")
-    else:
-        resp = slack_reply(channel, thread_ts, f":rocket: *{ticket}* — publishing...")
-        publish_status_ts = resp.get("ts", "") if resp and resp.get("ok") else ""
+    # Post publish status as its own new thread message so the action
+    # prompt above (with diff link, summary, etc.) stays intact and the
+    # "Published!" notification stands on its own.
+    resp = slack_reply(channel, thread_ts, f":rocket: *{ticket}* — publishing...")
+    publish_status_ts = resp.get("ts", "") if resp and resp.get("ok") else ""
 
     is_slack_context = state.get("slack_context", False)
     publish = SCRIPT_DIR / "publish-changes"
@@ -1261,10 +1260,12 @@ def check_running_procs():
                                     if url_match:
                                         mr_url = url_match.group(0)
                                         break
-                        # Update the existing message
-                        msg = f":heavy_check_mark: Published!"
+                        # Update the "publishing..." message into the final
+                        # Published! notification. This is its own standalone
+                        # thread message, separate from the action prompt.
+                        msg = f":heavy_check_mark: *{ticket}* — published"
                         if mr_url:
-                            msg += f" {mr_url}"
+                            msg += f"\n{mr_url}"
                         if info["status_ts"]:
                             slack_update(ch, info["status_ts"], msg)
                         else:
@@ -1407,13 +1408,15 @@ def check_running_procs():
                     except Exception:
                         pass
 
-                # Diff link
+                # Diff line (the actual HTML file is uploaded separately,
+                # after the action prompt is posted, so it appears as a
+                # threaded attachment directly below the prompt).
+                diff_path_to_share = None
                 if worktree:
                     diff_path = os.path.join(worktree, "diff.html")
                     if os.path.exists(diff_path):
-                        diff_line = share_diff(diff_path, worktree, ch, current_thread_ts,
-                                               title=f"{ticket}: {state.get('summary', '')}")
-                        prompt_lines.append(diff_line)
+                        prompt_lines.append(diff_prompt_line(ch, worktree))
+                        diff_path_to_share = diff_path
 
                 # cd command
                 if work_dir:
@@ -1439,6 +1442,14 @@ def check_running_procs():
                 prompt_lines.append("")
                 prompt_lines.append("_Reply with feedback for another pass. React :white_check_mark: to publish._")
                 _post_action_prompt(state, thread_ts, "\n".join(prompt_lines))
+
+                # Share the diff file as a threaded attachment (appears below
+                # the action prompt we just posted).
+                if diff_path_to_share:
+                    post_diff_attachment(
+                        diff_path_to_share, ch, current_thread_ts,
+                        title=f"{ticket}: {state.get('summary', '')}",
+                    )
             elif state.get("status") == "done_empty":
                 # Claude finished cleanly but produced no staged diff.
                 # Could be: nothing to do, work was already on main, Claude
