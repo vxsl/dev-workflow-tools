@@ -968,6 +968,12 @@ def start_ticket_solve(ticket, thread_ts, channel, slack_urls=None, extra_contex
     if not resp or not resp.get("ok"):
         print(f"  WARNING: initial status reply failed: {resp.get('error', 'unknown')}")
         print(f"    channel={channel} thread_ts={thread_ts}")
+    # :loading: react on the status anchor — gives an animated "alive,
+    # working" indicator that complements the static text emoji. Swapped
+    # to a terminal reaction (:white_check_mark: / :warning: / :x:) when
+    # the run finishes in check_running_procs.
+    if status_ts:
+        react(channel, status_ts, "loading")
 
     session_id = str(uuid.uuid4())
 
@@ -1064,6 +1070,8 @@ def resume_claude(state, feedback_text, req_msg=None):
         f":arrows_counterclockwise: Resuming work on {ticket}..."
     )
     status_ts = status_resp.get("ts", "")
+    if status_ts:
+        react(channel, status_ts, "loading")
 
     prompt = (
         f"The user reviewed your changes and has this feedback:\n\n"
@@ -1254,6 +1262,8 @@ def publish_ticket(state, force_push=False, jira_ticket_key=None):
     publish_label = jira_ticket_key or ticket
     resp = slack_reply(channel, thread_ts, f":rocket: *{publish_label}* — publishing...")
     publish_status_ts = resp.get("ts", "") if resp and resp.get("ok") else ""
+    if publish_status_ts:
+        react(channel, publish_status_ts, "loading")
 
     # slack_context hotfix is only the default path when no Jira ticket was
     # created mid-flow; presence of jira_ticket_key moves us to the ticket
@@ -1758,6 +1768,8 @@ def check_running_procs():
             # Handle publish completion
             if is_publish:
                 state_path = STATE_DIR / f"{ticket.replace('/', '_')}.json"
+                # Track terminal reaction for the publish status anchor.
+                publish_terminal = "x"
                 if state_path.exists():
                     state = json.loads(state_path.read_text())
                     if exit_code == 0:
@@ -1782,6 +1794,7 @@ def check_running_procs():
                             slack_update(ch, info["status_ts"], msg)
                         else:
                             slack_reply(ch, info["thread_ts"], msg)
+                        publish_terminal = "white_check_mark"
 
                     else:
                         # Check if it was a push rejection (non-fast-forward)
@@ -1792,6 +1805,7 @@ def check_running_procs():
                             state["status"] = "needs_force_push"
                             _post_action_prompt(state, info["thread_ts"],
                                 ":warning: Push rejected — remote branch has diverged. React :white_check_mark: to force-push.")
+                            publish_terminal = "warning"
                         else:
                             state["status"] = "publish_failed"
                             tail = ""
@@ -1805,6 +1819,11 @@ def check_running_procs():
                                 f":x: Publish failed (exit {exit_code}). React :white_check_mark: to retry.\n```\n{tail}\n```")
                     if info["thread_ts"] in jobs:
                         jobs[info["thread_ts"]] = state
+                # Swap the publish status anchor's :loading: react for a
+                # terminal one (matches the in-text emoji that just got
+                # slack_update'd above, or the action-prompt outcome).
+                if info.get("status_ts"):
+                    swap_reaction((ch, info["status_ts"]), "loading", publish_terminal)
                 del running_procs[ticket]
                 continue
 
@@ -1828,14 +1847,20 @@ def check_running_procs():
                 if exit_code == 0:
                     if peek_status == "done_empty":
                         msg = f"*{ticket}* — :warning: done, but no changes were staged"
+                        terminal_emoji = "warning"
                     else:
                         msg = f"*{ticket}* — :heavy_check_mark: done"
+                        terminal_emoji = "white_check_mark"
                     slack_update(ch, info["status_ts"], msg)
                 else:
                     slack_update(
                         ch, info["status_ts"],
                         f"*{ticket}* — :x: failed (exit {exit_code})",
                     )
+                    terminal_emoji = "x"
+                # Swap the status anchor's :loading: react for a terminal
+                # one so the message visibly stops "spinning."
+                swap_reaction((ch, info["status_ts"]), "loading", terminal_emoji)
 
             # Final reaction lifecycle on the user's request message.
             # done_empty is still "successful completion" of the run, so we
