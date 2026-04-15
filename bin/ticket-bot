@@ -15,6 +15,7 @@ Run:  ticket-bot
 Stop: Ctrl+C
 """
 
+import base64
 import json
 import os
 import re
@@ -91,9 +92,12 @@ Slack app setup:
        groups:history, groups:read, im:history, reactions:read
   5. Subscribe to bot events (Event Subscriptions → Subscribe to bot events):
        message.channels, message.groups, message.im, reaction_added
-  6. Install the app to your workspace
+  6. Enable Interactivity (Features → Interactivity & Shortcuts → toggle on)
+     → required for the "Create Jira ticket" button + modal on slack-thread jobs.
+       With Socket Mode you can leave the Request URL blank.
+  7. Install the app to your workspace
      → copy the Bot User OAuth Token as TICKET_CREATOR_BOT_TOKEN (starts with xoxb-)
-  7. Invite the bot to any channels you want it to listen in: /invite @botname
+  8. Invite the bot to any channels you want it to listen in: /invite @botname
 """)
     sys.exit(0)
 
@@ -145,9 +149,11 @@ if not BOT_TOKEN or not USER_ID or not APP_TOKEN:
     print("       groups:history, groups:read, im:history, reactions:read")
     print("  5. Subscribe to bot events (Event Subscriptions → Subscribe to bot events):")
     print("       message.channels, message.groups, message.im, reaction_added")
-    print("  6. Install the app to your workspace")
+    print("  6. Enable Interactivity (Features → Interactivity & Shortcuts → toggle on)")
+    print("     → required for the 'Create Jira ticket' button + modal on slack-thread jobs.")
+    print("  7. Install the app to your workspace")
     print("     → save Bot User OAuth Token as TICKET_CREATOR_BOT_TOKEN (starts with xoxb-)")
-    print("  7. Set SLACK_NOTIFY_USER_ID to your Slack user ID")
+    print("  8. Set SLACK_NOTIFY_USER_ID to your Slack user ID")
     print("     (find it: click your profile → ⋯ → Copy member ID)")
     print(f"\n  .env location: {ENV_FILE}")
     sys.exit(1)
@@ -727,6 +733,123 @@ def build_slack_context_description(slack_urls, commit_summary=""):
     return "\n".join(parts)
 
 
+# ── Jira API (direct; mirrors what oneshot/create-jira-ticket does) ──
+
+
+def _jira_auth_header():
+    email = os.environ.get("JIRA_EMAIL", "")
+    token = os.environ.get("JIRA_API_TOKEN", "")
+    if not email or not token:
+        return ""
+    return "Basic " + base64.b64encode(f"{email}:{token}".encode()).decode()
+
+
+def _jira_get(path):
+    domain = os.environ.get("JIRA_DOMAIN", "")
+    auth = _jira_auth_header()
+    if not domain or not auth:
+        return None
+    req = urllib.request.Request(
+        f"https://{domain}/rest/api/3/{path}",
+        headers={"Authorization": auth, "Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read())
+    except Exception as e:
+        print(f"  Jira GET {path} failed: {e}")
+        return None
+
+
+def create_jira_ticket_api(summary, description="", issue_type="Task",
+                           priority="Medium", labels=None, slack_url=""):
+    """Create a Jira ticket via REST API. Returns {key, url} or None on failure.
+
+    Builds an ADF description from `description`, optionally appending a
+    Slack thread link paragraph. Defaults mirror oneshot/create-jira-ticket:
+    labels=[front-end], priority=Medium, assignee=self. Values the caller
+    doesn't supply fall back to those defaults so callers (e.g. the Slack
+    modal) only need to collect the essentials.
+    """
+    domain = os.environ.get("JIRA_DOMAIN", "")
+    project = os.environ.get("JIRA_PROJECT", "UB")
+    auth = _jira_auth_header()
+    if not domain or not auth:
+        print("  create_jira_ticket_api: missing JIRA env vars")
+        return None
+
+    if labels is None:
+        labels = ["front-end"]
+
+    # Build ADF description (plain paragraphs + optional Slack link)
+    adf_content = []
+    for para in (description or "").split("\n\n"):
+        para = para.strip()
+        if para:
+            adf_content.append({
+                "type": "paragraph",
+                "content": [{"type": "text", "text": para}],
+            })
+    if slack_url:
+        adf_content.append({
+            "type": "paragraph",
+            "content": [
+                {"type": "text", "text": "Slack thread: "},
+                {"type": "text", "text": slack_url,
+                 "marks": [{"type": "link", "attrs": {"href": slack_url}}]},
+            ],
+        })
+    if not adf_content:
+        adf_content = [{"type": "paragraph", "content": []}]
+
+    fields = {
+        "project": {"key": project},
+        "summary": summary,
+        "issuetype": {"name": issue_type},
+        "description": {"type": "doc", "version": 1, "content": adf_content},
+        "priority": {"name": priority},
+        "labels": labels,
+    }
+
+    # Bug has required custom fields in this Jira config; match the defaults
+    # used by bin/create-jira-ticket so the API call doesn't get rejected.
+    if issue_type == "Bug":
+        fields["customfield_10156"] = [{"value": "Discovered internally  "}]
+        fields["customfield_10165"] = [{"value": "No"}]
+        fields["customfield_10177"] = [
+            {"value": "Production (home.urbanlogiq.ca or home.urbanlogiq.us) "}
+        ]
+        fields["customfield_10170"] = [{"value": "None"}]
+
+    # Try to self-assign (like create-jira-ticket does by default).
+    me = _jira_get("myself")
+    if me and me.get("accountId"):
+        fields["assignee"] = {"accountId": me["accountId"]}
+
+    payload = {"fields": fields}
+    req = urllib.request.Request(
+        f"https://{domain}/rest/api/3/issue",
+        data=json.dumps(payload).encode(),
+        headers={"Authorization": auth, "Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            body = json.loads(resp.read())
+        key = body.get("key")
+        if key:
+            return {"key": key, "url": f"https://{domain}/browse/{key}"}
+    except urllib.error.HTTPError as e:
+        try:
+            err_body = e.read().decode()
+        except Exception:
+            err_body = ""
+        print(f"  Jira create failed: HTTP {e.code} {err_body[:500]}")
+    except Exception as e:
+        print(f"  Jira create error: {e}")
+    return None
+
+
 def start_ticket_ask(question, thread_ts, channel, slack_urls=None, req_msg=None):
     """Run ticket-ask (Q&A mode) as a background subprocess.
 
@@ -1062,11 +1185,28 @@ def refresh_diff(state, req_msg=None):
 
 
 
-def _post_action_prompt(state, thread_ts, text):
-    """Post a message that the user can react ✅ on to trigger an action.
-    Records the message ts so we only check THIS message for reactions."""
+def _post_action_prompt(state, thread_ts, text, buttons=None):
+    """Post a message that the user can react ✅ on (or click a button) to
+    trigger an action. Records the message ts so we can identify the job
+    later from the reaction ts or the button's block_actions payload.
+
+    If `buttons` is provided, renders them as a Block Kit actions row below
+    the text. Each button dict should already be a full Block Kit button
+    element (with action_id, text, value, optional style).
+    """
     channel = state.get("channel", DM_CHANNEL)
-    resp = slack_reply(channel, thread_ts, text)
+    args = {
+        "channel": channel,
+        "thread_ts": thread_ts,
+        "text": text,
+        "mrkdwn": True,
+    }
+    if buttons:
+        args["blocks"] = [
+            {"type": "section", "text": {"type": "mrkdwn", "text": text}},
+            {"type": "actions", "elements": buttons},
+        ]
+    resp = slack_post("chat.postMessage", **args)
     if resp and resp.get("ok"):
         state["action_prompt_ts"] = resp["ts"]
     save_job(state)
@@ -1074,8 +1214,15 @@ def _post_action_prompt(state, thread_ts, text):
         jobs[thread_ts] = state
 
 
-def publish_ticket(state, force_push=False):
-    """Commit staged changes and run publish-changes."""
+def publish_ticket(state, force_push=False, jira_ticket_key=None):
+    """Commit staged changes and run publish-changes.
+
+    When `jira_ticket_key` is provided, the job is published against that
+    Jira ticket (overriding the slack-context hotfix path): commit and MR
+    titles are prefixed with the key and `publish-changes` is invoked with
+    the ticket as a positional arg so it links the MR to Jira. This is
+    used by the 'Create Jira ticket' modal flow.
+    """
     ticket = state["ticket"]
     summary = state.get("summary", "")
     work_dir = state.get("work_dir", "")
@@ -1089,18 +1236,47 @@ def publish_ticket(state, force_push=False):
         )
         return
 
+    # If the caller is publishing against a freshly created Jira ticket,
+    # remember it on the state so retries and future reactions use the
+    # ticket flow rather than falling back to hotfix.
+    if jira_ticket_key:
+        state["jira_ticket_key"] = jira_ticket_key
+    else:
+        jira_ticket_key = state.get("jira_ticket_key") or None
+
     # Post publish status as its own new thread message so the action
     # prompt above (with diff link, summary, etc.) stays intact and the
     # "Published!" notification stands on its own.
-    resp = slack_reply(channel, thread_ts, f":rocket: *{ticket}* — publishing...")
+    publish_label = jira_ticket_key or ticket
+    resp = slack_reply(channel, thread_ts, f":rocket: *{publish_label}* — publishing...")
     publish_status_ts = resp.get("ts", "") if resp and resp.get("ok") else ""
 
-    is_slack_context = state.get("slack_context", False)
+    # slack_context hotfix is only the default path when no Jira ticket was
+    # created mid-flow; presence of jira_ticket_key moves us to the ticket
+    # path (no --no-jira, link MR to ticket).
+    is_slack_context = state.get("slack_context", False) and not jira_ticket_key
     publish = SCRIPT_DIR / "publish-changes"
 
     install = 'test -f node_modules/.yarn-state.yml || yarn install; test -f src/styles/css/tailwind.css || yarn tailwind-build;'
     desc_flag = ""
-    if is_slack_context:
+    ticket_arg = ""
+    if jira_ticket_key:
+        # Use Claude's explicit TITLE (same as hotfix path) prefixed with
+        # the Jira key so the commit and MR subject are "<KEY>: <title>".
+        title = (state.get("title") or "").strip() or summary
+        commit_msg = f"{jira_ticket_key}: {title}"
+        mr_title = f"{jira_ticket_key}: {title}"
+        # Include the originating Slack thread(s) in the MR description
+        # so readers see the context that prompted the change.
+        slack_urls_state = state.get("slack_urls", []) or []
+        mr_description = build_slack_context_description(
+            slack_urls_state, commit_summary=summary,
+        )
+        if mr_description:
+            desc_flag = f" --description {shlex.quote(mr_description)}"
+        # Pass ticket as a positional arg so publish-changes links the MR.
+        ticket_arg = f" {shlex.quote(jira_ticket_key)}"
+    elif is_slack_context:
         # For slack-context (hotfix), use Claude's explicit TITLE as the MR
         # title and commit subject. Fall back to summary only if TITLE is
         # missing (older runs before the prompt change).
@@ -1121,9 +1297,9 @@ def publish_ticket(state, force_push=False):
         commit_msg = f"{ticket}: {summary}"
         mr_title = f"{ticket} {summary}"
     force_flag = " --force-push" if force_push else ""
-    include_desc = "" if is_slack_context else " --include-ticket-description"
+    include_desc = "" if (is_slack_context or jira_ticket_key) else " --include-ticket-description"
     no_jira = " --no-jira" if is_slack_context else ""
-    cmd = f'{install} git commit -m {json.dumps(commit_msg)} && {publish} --branch "$(git rev-parse --abbrev-ref HEAD)" --target main --no-draft-prompt --title {json.dumps(mr_title)}{include_desc}{no_jira}{desc_flag}{force_flag}'
+    cmd = f'{install} git commit -m {json.dumps(commit_msg)} && {publish}{ticket_arg} --branch "$(git rev-parse --abbrev-ref HEAD)" --target main --no-draft-prompt --title {json.dumps(mr_title)}{include_desc}{no_jira}{desc_flag}{force_flag}'
 
     print(f"  Publishing {ticket}: {commit_msg}")
 
@@ -1156,6 +1332,290 @@ def publish_ticket(state, force_push=False):
         "is_publish": True,
     }
     print(f"  Publish PID {proc.pid}, log: {log_path}")
+
+
+# ── Publish-choice buttons + 'Create Jira ticket' modal ──
+#
+# For slack-context jobs (hotfix-by-default), we don't want to assume the
+# user wants to publish without a ticket. Instead of the bare ":white_check_mark:
+# reaction to publish" prompt, we surface two buttons ("Create Jira ticket",
+# "Publish as hotfix") on the completion message. The ticket path opens a
+# Slack modal (mirroring the oneshot/create-jira-ticket form) to collect
+# summary/issue-type/description, then creates the ticket via the Jira REST
+# API and runs publish with the new ticket linked.
+
+
+def _publish_choice_buttons(thread_ts):
+    """Block Kit buttons shown beneath the completion message for slack-context jobs."""
+    return [
+        {
+            "type": "button",
+            "action_id": "create_ticket",
+            "text": {"type": "plain_text", "text": "Create Jira ticket"},
+            "style": "primary",
+            "value": thread_ts,
+        },
+        {
+            "type": "button",
+            "action_id": "publish_hotfix",
+            "text": {"type": "plain_text", "text": "Publish as hotfix"},
+            "value": thread_ts,
+        },
+    ]
+
+
+def _clear_action_buttons(channel, ts, replacement_text):
+    """Replace an action-prompt message's buttons with a plain status note.
+
+    Prevents the user from clicking the same button twice and makes it
+    obvious which choice was taken."""
+    if not channel or not ts:
+        return
+    slack_post(
+        "chat.update",
+        channel=channel,
+        ts=ts,
+        text=replacement_text,
+        blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": replacement_text}}],
+    )
+
+
+def open_create_ticket_modal(trigger_id, state):
+    """Open a Slack modal to collect Jira ticket fields, pre-filled from state."""
+    thread_ts = state.get("thread_ts", "")
+    channel = state.get("channel", DM_CHANNEL)
+    # Pre-fill summary from Claude's TITLE (same thing used as commit subject
+    # in hotfix mode). Fall back to the state summary.
+    initial_summary = (state.get("title") or state.get("summary") or "").strip()
+    # Pre-fill description with the per-thread summary so the ticket has
+    # some context; the user can edit before submitting.
+    slack_urls = state.get("slack_urls", []) or []
+    initial_description = build_slack_context_description(
+        slack_urls, commit_summary=state.get("summary", "")
+    ) or state.get("summary", "")
+
+    # Slack modal fields have a 3000-char limit on initial_value
+    if len(initial_description) > 2900:
+        initial_description = initial_description[:2900] + "…"
+
+    # Private metadata lets us look up the job again on view_submission —
+    # the submission payload doesn't include channel/thread by default.
+    private_meta = json.dumps({
+        "thread_ts": thread_ts,
+        "channel": channel,
+        "action_prompt_ts": state.get("action_prompt_ts", ""),
+    })
+
+    view = {
+        "type": "modal",
+        "callback_id": "create_ticket_submit",
+        "private_metadata": private_meta,
+        "title": {"type": "plain_text", "text": "Create Jira ticket"},
+        "submit": {"type": "plain_text", "text": "Create & publish"},
+        "close": {"type": "plain_text", "text": "Cancel"},
+        "blocks": [
+            {
+                "type": "input",
+                "block_id": "summary",
+                "label": {"type": "plain_text", "text": "Summary"},
+                "element": {
+                    "type": "plain_text_input",
+                    "action_id": "value",
+                    "initial_value": initial_summary[:255],
+                    "max_length": 255,
+                },
+            },
+            {
+                "type": "input",
+                "block_id": "issue_type",
+                "label": {"type": "plain_text", "text": "Issue type"},
+                "element": {
+                    "type": "static_select",
+                    "action_id": "value",
+                    "initial_option": {
+                        "text": {"type": "plain_text", "text": "Task"},
+                        "value": "Task",
+                    },
+                    "options": [
+                        {"text": {"type": "plain_text", "text": "Task"}, "value": "Task"},
+                        {"text": {"type": "plain_text", "text": "Bug"}, "value": "Bug"},
+                        {"text": {"type": "plain_text", "text": "Story"}, "value": "Story"},
+                    ],
+                },
+            },
+            {
+                "type": "input",
+                "block_id": "priority",
+                "label": {"type": "plain_text", "text": "Priority"},
+                "element": {
+                    "type": "static_select",
+                    "action_id": "value",
+                    "initial_option": {
+                        "text": {"type": "plain_text", "text": "Medium"},
+                        "value": "Medium",
+                    },
+                    "options": [
+                        {"text": {"type": "plain_text", "text": "Highest"}, "value": "Highest"},
+                        {"text": {"type": "plain_text", "text": "High"}, "value": "High"},
+                        {"text": {"type": "plain_text", "text": "Medium"}, "value": "Medium"},
+                        {"text": {"type": "plain_text", "text": "Low"}, "value": "Low"},
+                        {"text": {"type": "plain_text", "text": "Lowest"}, "value": "Lowest"},
+                    ],
+                },
+            },
+            {
+                "type": "input",
+                "block_id": "description",
+                "label": {"type": "plain_text", "text": "Description"},
+                "optional": True,
+                "element": {
+                    "type": "plain_text_input",
+                    "action_id": "value",
+                    "multiline": True,
+                    "initial_value": initial_description,
+                },
+            },
+        ],
+    }
+    resp = slack_post("views.open", trigger_id=trigger_id, view=view)
+    if not resp.get("ok"):
+        # Surface the error to the thread so the user knows why the form
+        # didn't open (usually: app Interactivity is disabled).
+        slack_reply(channel, thread_ts,
+                    f":warning: Couldn't open ticket form: `{resp.get('error', 'unknown')}`.\n"
+                    "Check that *Interactivity* is enabled for this Slack app.")
+
+
+def handle_block_action(payload, action):
+    """Handle a button click on a publish-choice prompt."""
+    user = (payload.get("user") or {}).get("id", "")
+    if user != USER_ID:
+        return
+
+    action_id = action.get("action_id", "")
+    thread_ts = action.get("value", "")  # we stored thread_ts in the button value
+    state = jobs.get(thread_ts)
+    if not state:
+        print(f"  No job found for action {action_id} (thread_ts={thread_ts})")
+        return
+
+    ticket = state.get("ticket", "")
+    channel = state.get("channel", DM_CHANNEL)
+
+    # Don't double-act if we're already publishing this job.
+    if ticket in running_procs:
+        return
+
+    prompt_ts = ((payload.get("message") or {}).get("ts")
+                 or state.get("action_prompt_ts", ""))
+
+    if action_id == "publish_hotfix":
+        print(f"  [button] publish_hotfix on {ticket}")
+        state.pop("action_prompt_ts", None)
+        save_job(state)
+        _clear_action_buttons(channel, prompt_ts,
+                              f":rocket: *{ticket}* — publishing as hotfix...")
+        publish_ticket(state)
+
+    elif action_id == "create_ticket":
+        print(f"  [button] create_ticket on {ticket}")
+        trigger_id = payload.get("trigger_id", "")
+        if not trigger_id:
+            slack_reply(channel, state.get("thread_ts", ""),
+                        ":warning: Missing trigger_id — can't open the form.")
+            return
+        # Don't clear the buttons yet — the user might cancel the modal and
+        # want to try again or choose hotfix instead. We'll clear them on
+        # successful submission.
+        open_create_ticket_modal(trigger_id, state)
+
+
+def handle_view_submission(payload):
+    """Handle a submitted 'Create Jira ticket' modal.
+
+    Runs synchronously (the socket_event_handler already sent the ack that
+    closes the modal) — expected to take ~1-3s for the Jira API call.
+    """
+    view = payload.get("view", {})
+    if view.get("callback_id") != "create_ticket_submit":
+        return
+
+    try:
+        meta = json.loads(view.get("private_metadata") or "{}")
+    except json.JSONDecodeError:
+        meta = {}
+    thread_ts = meta.get("thread_ts", "")
+    channel = meta.get("channel", DM_CHANNEL)
+    action_prompt_ts = meta.get("action_prompt_ts", "")
+    state = jobs.get(thread_ts)
+    if not state:
+        slack_post("chat.postMessage", channel=channel, thread_ts=thread_ts,
+                   text=":x: Couldn't find the job this form belongs to. Try again.")
+        return
+
+    # Extract the submitted values.
+    values = (view.get("state") or {}).get("values", {})
+    def _val(block, key="value"):
+        el = values.get(block, {}).get(key, {})
+        if el.get("type") == "static_select":
+            opt = el.get("selected_option") or {}
+            return opt.get("value", "")
+        return (el.get("value") or "").strip()
+
+    summary = _val("summary")
+    issue_type = _val("issue_type") or "Task"
+    priority = _val("priority") or "Medium"
+    description = _val("description")
+
+    if not summary:
+        # Shouldn't happen — plain_text_input inputs are required by default —
+        # but guard anyway so we don't post a broken ticket.
+        slack_post("chat.postMessage", channel=channel, thread_ts=thread_ts,
+                   text=":warning: Summary is required — skipping ticket creation.")
+        return
+
+    # Pick the first slack URL on the job (if any) to link on the ticket.
+    slack_urls_state = state.get("slack_urls", []) or []
+    slack_url = slack_urls_state[0] if slack_urls_state else ""
+
+    slack_post("chat.postMessage", channel=channel, thread_ts=thread_ts,
+               text=f":hourglass_flowing_sand: Creating Jira ticket: _{summary}_ ({issue_type})...")
+
+    result = create_jira_ticket_api(
+        summary=summary, description=description,
+        issue_type=issue_type, priority=priority,
+        slack_url=slack_url,
+    )
+
+    if not result:
+        slack_post("chat.postMessage", channel=channel, thread_ts=thread_ts,
+                   text=":x: Failed to create Jira ticket. See the bot logs for details. "
+                        "You can click *Publish as hotfix* instead, or try again.")
+        return
+
+    key = result["key"]
+    url = result["url"]
+
+    # Clear the publish-choice buttons now that we've committed to a path.
+    if action_prompt_ts:
+        _clear_action_buttons(channel, action_prompt_ts,
+                              f":ticket: Created <{url}|*{key}*> — publishing...")
+
+    slack_post("chat.postMessage", channel=channel, thread_ts=thread_ts,
+               text=f":heavy_check_mark: Created <{url}|*{key}*>: {summary}")
+
+    # Update state for future retries and save, then kick off publish with
+    # the new ticket linked.
+    state["jira_ticket_key"] = key
+    state["summary"] = summary
+    # Use the user-edited summary as the title too so commit/MR subject
+    # reflect what they typed (rather than Claude's original TITLE).
+    state["title"] = summary
+    save_job(state)
+    if thread_ts in jobs:
+        jobs[thread_ts] = state
+
+    publish_ticket(state, jira_ticket_key=key)
 
 
 def check_running_procs():
@@ -1495,8 +1955,25 @@ def check_running_procs():
                     prompt_lines.append(summary_line)
 
                 prompt_lines.append("")
-                prompt_lines.append("_Reply with feedback for another pass. React :white_check_mark: to publish._")
-                _post_action_prompt(state, thread_ts, "\n".join(prompt_lines))
+                # For slack-context jobs we can't assume hotfix — surface
+                # both options as buttons and let the user pick. For
+                # ticket-based jobs the ticket already dictates the path,
+                # so the reaction shortcut is fine.
+                if state.get("slack_context"):
+                    prompt_lines.append(
+                        "_Reply with feedback for another pass, "
+                        "or choose how to publish below:_"
+                    )
+                    _post_action_prompt(
+                        state, thread_ts, "\n".join(prompt_lines),
+                        buttons=_publish_choice_buttons(thread_ts),
+                    )
+                else:
+                    prompt_lines.append(
+                        "_Reply with feedback for another pass. "
+                        "React :white_check_mark: to publish._"
+                    )
+                    _post_action_prompt(state, thread_ts, "\n".join(prompt_lines))
 
                 # Share the diff file as a threaded attachment (appears below
                 # the action prompt we just posted).
@@ -1607,13 +2084,14 @@ HELP_FULL = "\n".join([
     "*Usage* (DM me directly, or @mention me in a channel):",
     ">`UB-1234` — create worktree, run Claude, notify when done",
     ">`UB-1234 <slack-url> extra context` — include thread + instructions",
-    ">`<slack-url>` — solve from Slack thread (no Jira ticket needed)",
+    ">`<slack-url>` — solve from Slack thread (choose ticket or hotfix at publish time)",
     ">`<slack-url> extra context` — Slack thread + extra instructions",
     "",
     "*After completion:*",
     ">Reply with feedback → Claude resumes",
     ">Reply `refresh` → re-stage + regenerate diff",
-    ">React :white_check_mark: → commit + publish MR",
+    ">React :white_check_mark: (ticket jobs) → commit + publish MR",
+    ">Click *Create Jira ticket* / *Publish as hotfix* (slack-thread jobs)",
 ])
 
 
@@ -1967,6 +2445,27 @@ def socket_event_handler(client: SocketModeClient, req: SocketModeRequest):
                 handle_reaction(channel, ts, user, reaction)
             except Exception as e:
                 print(f"  Error handling reaction: {e}")
+
+    elif req.type == "interactive":
+        # Button clicks (block_actions) and modal submissions (view_submission)
+        # flow through the same Socket Mode connection once Interactivity is
+        # enabled on the Slack app.
+        payload = req.payload or {}
+        itype = payload.get("type", "")
+        print(f"  [interactive] {itype}")
+
+        if itype == "block_actions":
+            for action in payload.get("actions", []):
+                try:
+                    handle_block_action(payload, action)
+                except Exception as e:
+                    print(f"  Error handling block action: {e}")
+
+        elif itype == "view_submission":
+            try:
+                handle_view_submission(payload)
+            except Exception as e:
+                print(f"  Error handling view submission: {e}")
 
 
 sm_client.socket_mode_request_listeners.append(socket_event_handler)
