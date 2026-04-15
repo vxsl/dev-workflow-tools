@@ -34,6 +34,7 @@ setup() {
     declare -gA JIRA_TITLE_CACHE=()
     declare -gA JIRA_STATUS_CACHE=()
     declare -gA JIRA_ASSIGNEE_CACHE=()
+    declare -gA AUTO_WORKTREES=()
 
     # Define get_eponymous_branch (called by generate_instant_data, defined in rr.sh)
     get_eponymous_branch() {

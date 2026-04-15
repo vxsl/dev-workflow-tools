@@ -992,6 +992,18 @@ generate_instant_data() {
 
         [ "$_display_branch" = "$_current_branch" ] && continue
 
+        # Demoted (ticket-bot-auto + not-yet-navigated) worktrees skip Phase 1
+        # entirely — Phase 2 (generate_worktree_data) will route them into
+        # AUTO_WT_ROWS_FILE for bottom-tier emission. Still claim here so they
+        # don't leak out as plain branch rows via generate_branch_data.
+        if [ -n "${AUTO_WORKTREES[$_wt_path]+x}" ] && [ -z "${WORKTREE_NAV_TIMES[$_wt_path]+x}" ]; then
+            if [ -n "$claimed_file" ]; then
+                echo "$_display_branch" >> "$claimed_file"
+                [ "$_epo_branch" != "$_display_branch" ] && echo "$_epo_branch" >> "$claimed_file"
+            fi
+            continue
+        fi
+
         # Compute timestamp inline (no subprocess — bash builtins + one stat)
         local _ts=0
         if [ "$PWD" = "$_wt_path" ] || [[ "$PWD" == "$_wt_path/"* ]]; then
@@ -1091,10 +1103,49 @@ generate_instant_data() {
     [ -n "$_instant_rows" ] && printf '%s' "$_instant_rows" | sort -t$'\t' -k1,1nr | cut -f2-
 }
 
+# ============================================================================
+# Ticket-bot auto-worktree detection
+# ============================================================================
+# Worktrees created by ticket-bot in Slack-context mode hold non-ticket
+# branches (e.g. hotfix/<slug>). Until the user navigates into one via rr,
+# they sit in the bottom tier of the list (below remote-only). Signal: the
+# ticket-solve state file records slack_context=true and the worktree path.
+
+# Populate AUTO_WORKTREES[path]=1 for each ticket-solve state file whose
+# slack_context is true and whose worktree directory still exists.
+# TICKET_SOLVE_STATE_DIR env var overrides the default path (for testing).
+load_auto_worktrees() {
+    local state_dir="${TICKET_SOLVE_STATE_DIR:-$HOME/.cache/ticket-solve}"
+    [ -d "$state_dir" ] || return 0
+
+    # jq is a hard dependency elsewhere in rr; use it for robust parsing.
+    local _wt_path
+    while IFS= read -r _wt_path; do
+        if [ -n "$_wt_path" ] && [ -d "$_wt_path" ]; then
+            AUTO_WORKTREES["$_wt_path"]=1
+        fi
+    done < <(
+        jq -r 'select(.slack_context == true) | .worktree // empty' \
+            "$state_dir"/*.json 2>/dev/null
+    )
+    return 0
+}
+
+# True if the worktree is ticket-bot-auto AND the user has not yet navigated
+# to it via rr (no entry in WORKTREE_ACCESS_LOG / WORKTREE_NAV_TIMES).
+is_worktree_demoted() {
+    local wt_path="$1"
+    [ -n "${AUTO_WORKTREES[$wt_path]+x}" ] && [ -z "${WORKTREE_NAV_TIMES[$wt_path]+x}" ]
+}
+
 # Generate TSV rows for all non-main worktrees instantly (no reflog parsing needed).
 # Outputs rows for the eponymous branch of each worktree; if a different branch is
 # currently checked out, the wt_indicator is set to "WT_MISMATCH:<actual_branch>".
 # Writes eponymous branch names to claimed_file so generate_branch_data can skip them.
+# Demoted (ticket-bot-auto, not-yet-navigated) worktrees are emitted with
+# wt_indicator=WT_AUTO into the AUTO_WT_ROWS_FILE (a temp file that survives
+# subshells) instead of the normal _collected_rows, so they can be printed
+# below all other tiers by the caller.
 generate_worktree_data() {
     local claimed_file="${1:-}"
     local main_wt="$GIT_ROOT"
@@ -1179,22 +1230,42 @@ generate_worktree_data() {
         local sort_ts=0
         [[ "$time_info" =~ :([0-9]+)$ ]] && sort_ts="${BASH_REMATCH[1]}"
 
+        # Demoted? An auto-created worktree that the user hasn't navigated to
+        # via rr yet. A "mismatch" (actual_branch != eponymous_branch) is
+        # expected for auto worktrees — ticket-solve renames the branch to
+        # hotfix/<slug> after creating the worktree dir, so the eponymous
+        # name (from the dir) never matches the final branch name.
+        local _is_demoted=false
+        if is_worktree_demoted "$wt_path"; then
+            _is_demoted=true
+            wt_indicator="WT_AUTO"
+        fi
+
         local _row
         _row=$(printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s" \
             "$truncated_branch" "$title" "$jira_status" "$author" \
             "$time_info" "committed: ${commit_relative:-unknown}" \
             "$display_branch" "$jira_assignee" "$wt_indicator" "$wt_path" "$wt_status")
 
-        # Accumulate with sort key prefix; output is sorted at the end
-        if [ -z "$_collected_rows" ]; then
-            _collected_rows="${sort_ts}"$'\t'"${_row}"
+        if [ "$_is_demoted" = true ]; then
+            # Bottom-tier stream: appended to a file (shared across subshells)
+            # and printed after remote-only by the caller.
+            if [ -n "$AUTO_WT_ROWS_FILE" ]; then
+                printf '%s\n' "$_row" >> "$AUTO_WT_ROWS_FILE"
+            fi
         else
-            _collected_rows="${_collected_rows}"$'\n'"${sort_ts}"$'\t'"${_row}"
+            # Accumulate with sort key prefix; output is sorted at the end
+            if [ -z "$_collected_rows" ]; then
+                _collected_rows="${sort_ts}"$'\t'"${_row}"
+            else
+                _collected_rows="${_collected_rows}"$'\n'"${sort_ts}"$'\t'"${_row}"
+            fi
         fi
 
-        # Write to claimed file immediately (order doesn't matter for dedup)
+        # Write to claimed file immediately (order doesn't matter for dedup).
         # Claim both the eponymous branch AND the actual branch to prevent duplicates
-        # when the worktree directory name includes extra info (e.g., JIRA title)
+        # when the worktree directory name includes extra info (e.g., JIRA title).
+        # Demoted rows claim too, so generate_branch_data doesn't re-emit them.
         if [ -n "$claimed_file" ]; then
             echo "$eponymous_branch" >> "$claimed_file"
             if [ -n "$actual_branch" ] && [ "$actual_branch" != "$eponymous_branch" ]; then
@@ -1206,10 +1277,15 @@ generate_worktree_data() {
     local _collected_rows=""
     while IFS= read -r line; do
         if [[ "$line" =~ ^worktree[[:space:]](.+)$ ]]; then
+            # Capture the matched worktree path BEFORE calling emit, because
+            # _emit_worktree_data_row runs `[[ =~ ]]` internally and clobbers
+            # BASH_REMATCH. Without this, current_wt would read the stale
+            # BASH_REMATCH[1] from an inner regex after emit returns.
+            local _next_wt="${BASH_REMATCH[1]}"
             if [ -n "$current_wt" ] && [ "$current_wt" != "$main_wt" ] && [ "$current_is_bare" = false ]; then
                 _emit_worktree_data_row "$current_wt" "$current_actual_branch"
             fi
-            current_wt="${BASH_REMATCH[1]}"
+            current_wt="$_next_wt"
             current_actual_branch=""
             current_is_bare=false
         elif [[ "$line" =~ ^branch[[:space:]]refs/heads/(.+)$ ]]; then
@@ -2469,6 +2545,16 @@ if [ -f "$WORKTREE_ACCESS_LOG" ]; then
     done < "$WORKTREE_ACCESS_LOG"
 fi
 
+# Pre-load ticket-bot auto-created worktree set and prepare the bottom-tier
+# accumulator file. generate_worktree_data (_emit_worktree_data_row) runs in a
+# subshell at both call sites, so we append rows to a file that survives the
+# subshell boundary, then the outer pipeline cats it after remote-only rows.
+declare -A AUTO_WORKTREES=()
+AUTO_WT_ROWS_FILE=$(mktemp -t rr_auto_rows.XXXXXX)
+export AUTO_WT_ROWS_FILE
+trap 'rm -f "$AUTO_WT_ROWS_FILE"' EXIT
+load_auto_worktrees
+
 # Pre-load valid branch refs (eliminates git show-ref per branch)
 declare -A VALID_BRANCH_REFS=()
 while IFS= read -r _ref; do
@@ -2554,6 +2640,17 @@ if [ "$GENERATE_MORE_MODE" = true ]; then
             processed_data="${processed_data}"$'\n'"${remote_data}"
         else
             processed_data="$remote_data"
+        fi
+    fi
+
+    # Bottom tier: ticket-bot auto-created non-ticket worktrees (populated by
+    # generate_worktree_data above) that the user hasn't navigated to yet.
+    if [ -s "$AUTO_WT_ROWS_FILE" ]; then
+        _auto_content=$(cat "$AUTO_WT_ROWS_FILE")
+        if [ -n "$processed_data" ]; then
+            processed_data="${processed_data}"$'\n'"${_auto_content}"
+        else
+            processed_data="$_auto_content"
         fi
     fi
 
@@ -2710,11 +2807,19 @@ if [ "$GENERATE_MORE_MODE" = true ]; then
         # Detect row type from full_branch prefix
         is_branchless=false
         is_remote=false
+        is_auto=false
         [[ "$full_branch" == TICKET:* ]] && is_branchless=true
         [[ "$full_branch" == REMOTE:* ]] && is_remote=true
+        [[ "$wt_indicator" == WT_AUTO* ]] && is_auto=true
 
         display_branch=""
-        if [ "$is_remote" = true ]; then
+        if [ "$is_auto" = true ]; then
+            # Bottom tier: ticket-bot auto-created, user hasn't navigated yet.
+            # Dim the whole row and use ~ prefix to distinguish from other tiers.
+            display_branch=$(printf "\033[2m~ %-${branch_width}s\033[0m" "$branch_display")
+            printf "%s │ \033[2m%s\033[0m │ %s │ \033[2m%s\033[0m │ \033[2m%-26s\033[0m │ \033[2m%-${COMMIT_MAX_LENGTH}s\033[0m │ %s │ %s\n" \
+                "$display_branch" "$title_column" "$display_status" "$display_assignee" "$time_info" "$commit_info" "$full_branch" "$title"
+        elif [ "$is_remote" = true ]; then
             # Remote-only branch - dim steel blue with ↑ prefix
             display_branch=$(printf "\033[38;5;67m↑ \033[38;5;67m%-${branch_width}s\033[0m" "$branch_display")
             printf "%s │ \033[38;5;67m%s\033[0m │ %s │ \033[38;5;244m%s\033[0m │ \033[2;37m%-26s\033[0m │ \033[2;37m%-${COMMIT_MAX_LENGTH}s\033[0m │ %s │ %s\n" \
@@ -2793,6 +2898,9 @@ mkfifo "$_data_fifo"
                 generate_branchless_ticket_data ""
             fi
             generate_remote_only_data
+            # Bottom tier: ticket-bot auto-created non-ticket worktrees that
+            # the user hasn't navigated to yet. Populated by generate_worktree_data.
+            [ -s "$AUTO_WT_ROWS_FILE" ] && cat "$AUTO_WT_ROWS_FILE"
             rm -f "$_wt_claimed_file"
         } |
         # Use │ as delimiter with proper column spacing
@@ -2903,11 +3011,19 @@ mkfifo "$_data_fifo"
             # Detect row type from full_branch prefix
             is_branchless=false
             is_remote=false
+            is_auto=false
             [[ "$full_branch" == TICKET:* ]] && is_branchless=true
             [[ "$full_branch" == REMOTE:* ]] && is_remote=true
+            [[ "$wt_indicator" == WT_AUTO* ]] && is_auto=true
 
             display_branch=""
-            if [ "$is_remote" = true ]; then
+            if [ "$is_auto" = true ]; then
+                # Bottom tier: ticket-bot auto-created, user hasn't navigated yet.
+                # Dim the whole row and use ~ prefix to distinguish from other tiers.
+                display_branch=$(printf "\033[2m~ %-${branch_width}s\033[0m" "$branch_display")
+                printf "%s │ \033[2m%s\033[0m │ %s │ \033[2m%s\033[0m │ \033[2m%-26s\033[0m │ \033[2m%-${COMMIT_MAX_LENGTH}s\033[0m │ %s │ %s\n" \
+                    "$display_branch" "$display_title" "$display_status" "$display_assignee" "$time_info" "$commit_info" "$full_branch" "$title"
+            elif [ "$is_remote" = true ]; then
                 # Remote-only branch - dim steel blue with ↑ prefix
                 display_branch=$(printf "\033[38;5;67m↑ \033[38;5;67m%-${branch_width}s\033[0m" "$branch_display")
                 printf "%s │ \033[38;5;67m%s\033[0m │ %s │ \033[38;5;244m%s\033[0m │ \033[2;37m%-26s\033[0m │ \033[2;37m%-${COMMIT_MAX_LENGTH}s\033[0m │ %s │ %s\n" \
