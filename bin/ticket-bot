@@ -377,51 +377,87 @@ def _check_interactivity_enabled():
     )
 
 
+# ANSI color codes for the startup messages below. Match the palette used
+# by the other scripts in this repo (oneshot, publish-changes, ...).
+_C_RED = "\033[38;5;167m"
+_C_GREEN = "\033[38;5;114m"
+_C_YELLOW = "\033[38;5;221m"
+_C_BOLD = "\033[1m"
+_C_DIM = "\033[2m"
+_C_RESET = "\033[0m"
+# Skip color if stderr isn't a TTY (e.g. when piped or captured in a log).
+if not sys.stdout.isatty():
+    _C_RED = _C_GREEN = _C_YELLOW = _C_BOLD = _C_DIM = _C_RESET = ""
+
+
+def _countdown_then_continue(seconds, label):
+    """Pause for `seconds` with an in-place countdown so the warning above
+    has time to register before the rest of the startup log scrolls it
+    away. Skips the animation entirely when stdout isn't a TTY."""
+    if not sys.stdout.isatty() or seconds <= 0:
+        return
+    for remaining in range(seconds, 0, -1):
+        sys.stdout.write(f"\r  {_C_DIM}{label} in {remaining}s... (Ctrl+C to abort){_C_RESET}   ")
+        sys.stdout.flush()
+        try:
+            time.sleep(1)
+        except KeyboardInterrupt:
+            sys.stdout.write("\n")
+            sys.exit(130)
+    # Clear the countdown line so it doesn't clutter the log.
+    sys.stdout.write("\r" + " " * 70 + "\r")
+    sys.stdout.flush()
+
+
 _interactivity = _check_interactivity_enabled()
 if _interactivity is True:
-    print("✓ Interactivity is enabled on the Slack app")
+    print(f"{_C_GREEN}✓ Interactivity is enabled on the Slack app{_C_RESET}")
 elif _interactivity is False:
+    border = "━" * 76
     print()
-    print("┏" + "━" * 76 + "┓")
-    print("┃" + " ERROR: Interactivity is DISABLED on the Slack app ".center(76) + "┃")
-    print("┗" + "━" * 76 + "┛")
+    print(f"{_C_RED}{_C_BOLD}┏{border}┓{_C_RESET}")
+    print(f"{_C_RED}{_C_BOLD}┃{' ERROR: Interactivity is DISABLED on the Slack app '.center(76)}┃{_C_RESET}")
+    print(f"{_C_RED}{_C_BOLD}┗{border}┛{_C_RESET}")
     print()
-    print("The 'Create Jira ticket' button + modal on slack-thread jobs will NOT")
-    print("work until Interactivity is turned on.")
+    print(f"{_C_RED}The 'Create Jira ticket' button + modal on slack-thread jobs will NOT{_C_RESET}")
+    print(f"{_C_RED}work until Interactivity is turned on.{_C_RESET}")
     print()
     print("Enable it: https://api.slack.com/apps → your app →")
     print("           Features → Interactivity & Shortcuts → toggle ON")
-    print("           (Socket Mode apps can leave the Request URL blank.)")
+    print(f"           {_C_DIM}(Socket Mode apps can leave the Request URL blank.){_C_RESET}")
     print()
     sys.exit(1)
 else:
-    # Couldn't verify — print a big warning box so this stays visible.
+    # Couldn't verify — print a big, bright warning box so this stays
+    # visible, then pause with a countdown before resuming startup.
+    border = "━" * 76
     print()
-    print("┏" + "━" * 76 + "┓")
-    print("┃" + " WARNING: Unable to verify that Slack Interactivity is enabled ".center(76) + "┃")
-    print("┗" + "━" * 76 + "┛")
+    print(f"{_C_YELLOW}{_C_BOLD}┏{border}┓{_C_RESET}")
+    print(f"{_C_YELLOW}{_C_BOLD}┃{' WARNING: Unable to verify that Slack Interactivity is enabled '.center(76)}┃{_C_RESET}")
+    print(f"{_C_YELLOW}{_C_BOLD}┗{border}┛{_C_RESET}")
     print()
-    print("  The 'Create Jira ticket' button + modal on slack-thread jobs require")
-    print("  Slack's *Interactivity* feature to be ON. Without it, clicking those")
-    print("  buttons will silently fail (or drop trigger_ids on the floor).")
+    print(f"  {_C_YELLOW}The 'Create Jira ticket' button + modal on slack-thread jobs require{_C_RESET}")
+    print(f"  {_C_YELLOW}Slack's *Interactivity* feature to be ON. Without it, clicking those{_C_RESET}")
+    print(f"  {_C_YELLOW}buttons will silently fail (or drop trigger_ids on the floor).{_C_RESET}")
     print()
     print("  Interactivity is a feature toggle, not an OAuth scope, so we can't")
     print("  check it from the bot token. To let ticket-bot verify it at startup,")
     print("  set both of these in .env:")
     print()
-    print("      SLACK_APP_CONFIG_TOKEN    # xoxe-... (App Configuration Token)")
-    print("      SLACK_APP_ID              # numeric app id, e.g. A01234567")
+    print(f"      {_C_BOLD}SLACK_APP_CONFIG_TOKEN{_C_RESET}    {_C_DIM}# xoxe-... (App Configuration Token){_C_RESET}")
+    print(f"      {_C_BOLD}SLACK_APP_ID{_C_RESET}              {_C_DIM}# numeric app id, e.g. A01234567{_C_RESET}")
     print()
     print("  Generate the config token at:")
     print("    https://api.slack.com/apps → your app →")
     print("    App-Level Tokens / App Configuration Tokens → Generate")
     print()
     print("  The app_id is visible in the URL of your app's settings page")
-    print("  (https://api.slack.com/apps/<APP_ID>).")
+    print(f"  {_C_DIM}(https://api.slack.com/apps/<APP_ID>).{_C_RESET}")
     print()
-    print("  Continuing without the check. If the ticket modal silently fails to")
-    print("  open, the most likely cause is Interactivity being turned off.")
+    print(f"  {_C_YELLOW}Continuing without the check. If the ticket modal silently fails to{_C_RESET}")
+    print(f"  {_C_YELLOW}open, the most likely cause is Interactivity being turned off.{_C_RESET}")
     print()
+    _countdown_then_continue(8, "Continuing startup")
 
 
 # ── Open DM channel ──
