@@ -1806,13 +1806,19 @@ def handle_message(channel, ts, user, text, thread_ts=None):
                 req_msg=req_msg,
             )
         else:
-            # Implementation path (existing behavior). Requires thread context
-            # to have something to work from; without it we nudge the user.
-            if parent_ts and WORKSPACE_URL:
-                print(f"New thread-context request: {thread_urls[0]} (channel={channel}){' (mock)' if MOCK_MODE else ''}: {msg_text[:60]}...")
+            # Implementation path. Treat the current message (or its parent
+            # thread if we're replying) as the Slack context for ticket-solve.
+            # A top-level message is its own thread — no need to require a
+            # pre-existing parent thread or an explicit ticket/URL.
+            if WORKSPACE_URL:
+                target_ts = parent_ts if parent_ts else ts
+                target_urls = thread_urls if thread_urls else [
+                    f"{WORKSPACE_URL}/archives/{channel}/p{target_ts.replace('.', '')}"
+                ]
+                print(f"New slack-context request: {target_urls[0]} (channel={channel}){' (mock)' if MOCK_MODE else ''}: {msg_text[:60]}...")
                 start_ticket_solve(
-                    ticket=None, thread_ts=parent_ts, channel=channel,
-                    slack_urls=thread_urls,
+                    ticket=None, thread_ts=target_ts, channel=channel,
+                    slack_urls=target_urls,
                     extra_context=msg_text,
                     mock=MOCK_MODE, slack_context=True, req_msg=req_msg,
                 )
