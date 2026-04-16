@@ -2607,6 +2607,7 @@ HELP_TEXT = "\n".join([
     ":robot_face: *ticket-bot is online*",
     "`UB-1234` or `<slack-url>` — start a task  |  `help` — full usage  |  `status` — list jobs",
     "_@mention me in channels, or DM me directly._",
+    "_Silence this greeting with_ `greet off` _(persists across restarts)._",
 ])
 
 HELP_FULL = "\n".join([
