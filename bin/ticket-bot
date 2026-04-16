@@ -1538,7 +1538,8 @@ def _post_action_prompt(state, thread_ts, text, buttons=None, update_ts=""):
         jobs[thread_ts] = state
 
 
-def publish_ticket(state, force_push=False, jira_ticket_key=None, reuse_status_ts=""):
+def publish_ticket(state, force_push=False, jira_ticket_key=None,
+                   reuse_status_ts="", prior_prompt_text=""):
     """Commit staged changes and run publish-changes.
 
     When `jira_ticket_key` is provided, the job is published against that
@@ -1548,10 +1549,12 @@ def publish_ticket(state, force_push=False, jira_ticket_key=None, reuse_status_t
     used by the 'Create Jira ticket' modal flow.
 
     When `reuse_status_ts` is provided (typically the action-prompt ts that
-    the user just acted on), publish stage updates overwrite that message
-    instead of posting a new "publishing..." reply. The "Posted MR"
-    notification is still posted as a brand-new thread message when the
-    publish succeeds — that's the notable milestone.
+    the user just acted on), ":rocket: publishing..." is appended below
+    the existing prompt text on that message rather than overwriting it.
+    Callers must pass `prior_prompt_text` (captured before they clear
+    `state["action_prompt_text"]`) so publish knows what text to preserve.
+    The "Posted MR" notification is still posted as a brand-new thread
+    message when the publish succeeds — that's the notable milestone.
     """
     ticket = state["ticket"]
     summary = state.get("summary", "")
@@ -1584,7 +1587,12 @@ def publish_ticket(state, force_push=False, jira_ticket_key=None, reuse_status_t
     # internally, but the implementation context stays visible above.
     publish_anchor = ""
     if reuse_status_ts:
-        prior_prompt_text = state.get("action_prompt_text", "")
+        # Callers pass prior_prompt_text explicitly because they clear
+        # state["action_prompt_text"] before dispatching (so the same
+        # button click can't double-act). Fall back to state only for
+        # back-compat with callers that forget.
+        if not prior_prompt_text:
+            prior_prompt_text = state.get("action_prompt_text", "")
         if prior_prompt_text:
             publish_anchor = f"{prior_prompt_text}\n\n{publishing_line}"
         else:
@@ -1970,13 +1978,15 @@ def handle_block_action(payload, action):
 
     if action_id == "publish_hotfix":
         print(f"  [button] publish_hotfix on {ticket}")
+        prior_prompt_text = state.get("action_prompt_text", "")
         state.pop("action_prompt_ts", None)
         state.pop("action_prompt_text", None)
         save_job(state)
-        # publish_ticket overwrites the action-prompt message in place with
-        # the publishing status — no separate "publishing as hotfix..." +
-        # "publishing..." pair of messages.
-        publish_ticket(state, reuse_status_ts=prompt_ts)
+        # publish_ticket appends ":rocket: publishing..." below the prior
+        # action prompt on the same message so the impl context stays
+        # visible above the publish stages.
+        publish_ticket(state, reuse_status_ts=prompt_ts,
+                       prior_prompt_text=prior_prompt_text)
 
     elif action_id == "create_ticket":
         print(f"  [button] create_ticket on {ticket}")
@@ -2058,8 +2068,9 @@ def handle_view_submission(payload):
     url = result["url"]
 
     # "Created Jira ticket" is a notable milestone — post as a new message.
-    # publish_ticket will overwrite the action-prompt message in place with
-    # the "publishing..." status, so we don't pre-clear its buttons here.
+    # publish_ticket will append the publishing line below the prior prompt
+    # on the same message, so capture its text before we clear state.
+    prior_prompt_text = state.get("action_prompt_text", "")
     state.pop("action_prompt_ts", None)
     state.pop("action_prompt_text", None)
 
@@ -2077,7 +2088,8 @@ def handle_view_submission(payload):
     if thread_ts in jobs:
         jobs[thread_ts] = state
 
-    publish_ticket(state, jira_ticket_key=key, reuse_status_ts=action_prompt_ts)
+    publish_ticket(state, jira_ticket_key=key, reuse_status_ts=action_prompt_ts,
+                   prior_prompt_text=prior_prompt_text)
 
 
 def check_running_procs():
@@ -2976,6 +2988,9 @@ def handle_reaction(channel, ts, user, reaction):
 
         react_ch = state.get("channel", DM_CHANNEL)
 
+        # Grab the prior prompt text before clearing; publish_ticket needs
+        # it to preserve the implementation context above the publish line.
+        prior_prompt_text = state.get("action_prompt_text", "")
         # Clear the prompt so we don't act on it again
         state.pop("action_prompt_ts", None)
         state.pop("action_prompt_text", None)
@@ -2985,15 +3000,18 @@ def handle_reaction(channel, ts, user, reaction):
         try:
             if status == "done":
                 print(f"  ✅ on {ticket} — publishing")
-                publish_ticket(state, reuse_status_ts=prompt_ts)
+                publish_ticket(state, reuse_status_ts=prompt_ts,
+                               prior_prompt_text=prior_prompt_text)
                 state["status"] = "publishing"
             elif status == "publish_failed":
                 print(f"  ✅ on {ticket} — retrying publish")
-                publish_ticket(state, reuse_status_ts=prompt_ts)
+                publish_ticket(state, reuse_status_ts=prompt_ts,
+                               prior_prompt_text=prior_prompt_text)
                 state["status"] = "publishing"
             elif status == "needs_force_push":
                 print(f"  ✅ on {ticket} — force-push approved")
-                publish_ticket(state, force_push=True, reuse_status_ts=prompt_ts)
+                publish_ticket(state, force_push=True, reuse_status_ts=prompt_ts,
+                               prior_prompt_text=prior_prompt_text)
                 state["status"] = "publishing"
             elif status in ("failed", "checks_failed", "done_empty"):
                 print(f"  ✅ on {ticket} — retrying (force)")
