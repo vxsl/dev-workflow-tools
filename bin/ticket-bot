@@ -2532,14 +2532,25 @@ def check_running_procs():
             elif state.get("status") == "failed":
                 reason = ""
                 if log_path.exists():
-                    for line in log_path.read_text().splitlines():
+                    log_text = log_path.read_text()
+                    for line in log_text.splitlines():
                         clean = re.sub(r"\x1b\[[0-9;]*m", "", line).strip()
                         if any(p in clean for p in [
                             "already exists", "has work on it", "not found",
                             "yarn install failed", "Failed to", "Claude exited",
-                        ]):
+                            "unbound variable", "command not found", "syntax error",
+                            "Permission denied",
+                        ]) or re.search(r": line \d+:", clean):
                             reason = clean
                             break
+                    if not reason:
+                        # Fall back to the last non-empty line so something
+                        # surfaces even when we don't have a pattern match.
+                        for raw in reversed(log_text.splitlines()):
+                            clean = re.sub(r"\x1b\[[0-9;]*m", "", raw).strip()
+                            if clean:
+                                reason = clean
+                                break
                 msg = f":x: *{ticket}* failed"
                 if reason:
                     msg += f": {reason}"
