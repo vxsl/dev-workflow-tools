@@ -2674,11 +2674,11 @@ def handle_message(channel, ts, user, text, thread_ts=None):
         # If no matching job, fall through to mention gate + command routing
         # (e.g. @mention in an unrelated thread)
 
-    # In channels (non-DM), require @mention for top-level commands
-    if not is_dm:
-        text, was_mentioned = strip_bot_mention(text)
-        if not was_mentioned:
-            return
+    # Always strip @mention so downstream matchers see clean text.
+    # In channels (non-DM), also require the mention as the command gate.
+    text, was_mentioned = strip_bot_mention(text)
+    if not is_dm and not was_mentioned:
+        return
 
     # Acknowledge receipt immediately — covers DMs (which skip the mention
     # gate above) and @mentioned channel messages. Placed before any
