@@ -366,6 +366,14 @@ fi
 # Add slack-ask instructions and review instructions
 PROMPT="${PROMPT}
 
+## Work ONLY Inside This Worktree
+
+Your working directory is \`${WORK_DIR}\` and the worktree root is \`${WORKTREE_PATH}\`. ALL file reads, edits, and \`git\` commands MUST happen inside \`${WORKTREE_PATH}\`. Do NOT \`cd\` out of it. Do NOT edit or inspect files under \`${GIT_ROOT}\` — that is a separate checkout on a different branch and any work landing there is invisible to this run and may corrupt the user's main branch.
+
+If a file you need isn't present in the worktree (for example a \`.python-version\` or \`.venv\` created by a local tool and not tracked in git), do NOT pivot to the other checkout to find it. Treat the worktree as the only source of truth: if the file isn't here, it isn't part of the repo, and your change should reference its absence rather than editing it in a different copy.
+
+All \`git add\`, \`git commit\`, and staging operations must run from inside \`${WORKTREE_PATH}\` (or a subdirectory of it). The wrapper verifies at the end that the worktree has staged changes; if you committed somewhere else, the wrapper will report "no staged changes" and your work is lost.
+
 ## Asking Questions
 
 If you encounter ambiguities, need clarification, or face a design decision that could go multiple ways, ask me via Slack:
