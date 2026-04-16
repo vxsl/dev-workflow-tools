@@ -547,9 +547,49 @@ running_procs = {}
 
 # Pending job configs awaiting user's model/effort selection.
 # Keyed by thread_ts. Populated when we post the config form, consumed
-# when the user clicks Start. In-memory only — if the bot restarts before
-# Start is clicked, the user can resubmit the original message.
+# when the user clicks Start. Persisted to STATE_DIR/pending/ so a bot
+# restart between form-post and Start click doesn't strand the form.
+PENDING_DIR = STATE_DIR / "pending"
+PENDING_DIR.mkdir(parents=True, exist_ok=True)
 pending_configs = {}
+
+
+def _pending_path(thread_ts):
+    return PENDING_DIR / f"{_safe_filename(thread_ts)}.json"
+
+
+def save_pending_config(thread_ts, config):
+    """Persist a pending config to disk. Stores in memory as a side effect."""
+    pending_configs[thread_ts] = config
+    try:
+        # req_msg is a (channel, ts) tuple — JSON normalizes tuples to lists,
+        # which is fine. _load picks it back up as a list.
+        _pending_path(thread_ts).write_text(json.dumps(config, indent=2))
+    except Exception as e:
+        print(f"  WARNING: failed to persist pending config for {thread_ts}: {e}")
+
+
+def delete_pending_config(thread_ts):
+    """Remove a pending config from memory and disk."""
+    pending_configs.pop(thread_ts, None)
+    try:
+        _pending_path(thread_ts).unlink(missing_ok=True)
+    except Exception as e:
+        print(f"  WARNING: failed to delete pending config for {thread_ts}: {e}")
+
+
+def load_pending_configs():
+    """Load any pending configs left over from a previous process."""
+    loaded = {}
+    for f in PENDING_DIR.glob("*.json"):
+        try:
+            config = json.loads(f.read_text())
+            ts = config.get("thread_ts")
+            if ts:
+                loaded[ts] = config
+        except (json.JSONDecodeError, KeyError) as e:
+            print(f"  WARNING: skipping malformed pending config {f.name}: {e}")
+    return loaded
 
 MODEL_OPTIONS = [("opus", "Opus"), ("sonnet", "Sonnet")]
 EFFORT_OPTIONS = [
@@ -1076,7 +1116,7 @@ def request_ticket_solve_config(ticket, thread_ts, channel, slack_urls=None, ext
     if ack_parts:
         slack_reply(channel, thread_ts, "\n".join(ack_parts))
 
-    pending_configs[thread_ts] = {
+    config = {
         "ticket": ticket,
         "thread_ts": thread_ts,
         "channel": channel,
@@ -1085,7 +1125,8 @@ def request_ticket_solve_config(ticket, thread_ts, channel, slack_urls=None, ext
         "mock": mock,
         "force": force,
         "slack_context": slack_context,
-        "req_msg": req_msg,
+        "req_msg": list(req_msg) if req_msg else None,
+        "created_at": time.time(),
     }
 
     form_text = ":gear: Pick model + effort, then hit Start."
@@ -1097,9 +1138,11 @@ def request_ticket_solve_config(ticket, thread_ts, channel, slack_urls=None, ext
         blocks=_config_form_blocks(thread_ts),
     )
     if form_resp and form_resp.get("ok"):
-        pending_configs[thread_ts]["form_ts"] = form_resp.get("ts", "")
+        config["form_ts"] = form_resp.get("ts", "")
     else:
         print(f"  WARNING: failed to post config form: {form_resp.get('error', 'unknown') if form_resp else 'no response'}")
+
+    save_pending_config(thread_ts, config)
 
 
 def start_ticket_solve(ticket, thread_ts, channel, slack_urls=None, extra_context=None,
@@ -1733,10 +1776,13 @@ def _handle_config_start(payload, action):
     """User clicked Start on the pre-run config form — kick off ticket-solve
     with the selected model and effort."""
     thread_ts = action.get("value", "")
-    config = pending_configs.pop(thread_ts, None)
+    config = pending_configs.get(thread_ts)
     if not config:
         print(f"  [config_start] no pending config for thread_ts={thread_ts}")
         return
+    # Pop+persist now — if start_ticket_solve raises mid-flight, we don't want
+    # a stale pending config lying around for a double-click to resurrect.
+    delete_pending_config(thread_ts)
 
     model, effort = _read_config_form_values(payload)
 
@@ -2415,6 +2461,24 @@ if jobs:
     for _ts, _j in jobs.items():
         print(f"    {_j.get('ticket','?')} status={_j.get('status','?')} thread={_ts}")
     print()
+
+# Load any pending config forms whose Start button hasn't been clicked yet.
+# Drop entries older than 24h so stale forms don't accumulate forever.
+PENDING_CONFIG_MAX_AGE_SEC = 86400
+_loaded_pending = load_pending_configs()
+_now = time.time()
+for _ts, _cfg in list(_loaded_pending.items()):
+    age = _now - _cfg.get("created_at", 0)
+    if age > PENDING_CONFIG_MAX_AGE_SEC:
+        print(f"  Dropping stale pending config thread={_ts} (age={int(age)}s)")
+        try:
+            _pending_path(_ts).unlink(missing_ok=True)
+        except Exception:
+            pass
+        continue
+    pending_configs[_ts] = _cfg
+if pending_configs:
+    print(f"  Loaded {len(pending_configs)} pending config form(s) awaiting Start")
 
 # Clean up stale state from previous sessions
 (STATE_DIR / ".pending_clear").unlink(missing_ok=True)
