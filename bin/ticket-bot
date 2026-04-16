@@ -636,9 +636,21 @@ def slack_update(channel, ts, text, blocks=None):
 
 
 def _with_headline(info, text):
-    """Prefix status text with the pass's headline (if any), so updating the
-    combined headline/status anchor preserves context across stage transitions."""
-    headline = info.get("headline_text", "") if isinstance(info, dict) else ""
+    """Prefix status text with the pass's headline (and any pinned anchor
+    text), so updating the combined headline/status anchor preserves
+    context across stage transitions.
+
+    When `info["anchor_text"]` is set it overrides `headline_text`; it's
+    used during publish to pin the full implementation log + ":rocket:
+    publishing..." line above stage updates, so each publish stage
+    overwrites only a single line below that pinned anchor rather than
+    wiping the action prompt."""
+    if not isinstance(info, dict):
+        return text
+    anchor = info.get("anchor_text") or ""
+    if anchor:
+        return f"{anchor}\n{text}"
+    headline = info.get("headline_text") or ""
     return f"{headline}\n\n{text}" if headline else text
 
 
@@ -1563,18 +1575,28 @@ def publish_ticket(state, force_push=False, jira_ticket_key=None, reuse_status_t
         jira_ticket_key = state.get("jira_ticket_key") or None
 
     publish_label = jira_ticket_key or ticket
-    publishing_text = f":rocket: *{publish_label}* — publishing..."
+    publishing_line = f":rocket: *{publish_label}* — publishing..."
+    # When the caller supplies the action-prompt message as the publish
+    # anchor, append the publishing line below the existing prompt text
+    # (rather than overwriting it). We pin the combined text as the
+    # `anchor_text` so publish stage updates in check_running_procs render
+    # as `<anchor>\n<current stage>` — stages still overwrite each other
+    # internally, but the implementation context stays visible above.
+    publish_anchor = ""
     if reuse_status_ts:
-        # Caller supplies the action-prompt message to reuse as the publish
-        # status anchor. We overwrite it with the publishing line; stage
-        # updates in check_running_procs continue to target the same ts.
+        prior_prompt_text = state.get("action_prompt_text", "")
+        if prior_prompt_text:
+            publish_anchor = f"{prior_prompt_text}\n\n{publishing_line}"
+        else:
+            head = state.get("headline_text", "")
+            publish_anchor = f"{head}\n\n{publishing_line}" if head else publishing_line
         slack_update(
-            channel, reuse_status_ts, publishing_text,
-            blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": publishing_text}}],
+            channel, reuse_status_ts, publish_anchor,
+            blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": publish_anchor}}],
         )
         publish_status_ts = reuse_status_ts
     else:
-        resp = slack_reply(channel, thread_ts, publishing_text)
+        resp = slack_reply(channel, thread_ts, publishing_line)
         publish_status_ts = resp.get("ts", "") if resp and resp.get("ok") else ""
     if publish_status_ts:
         react(channel, publish_status_ts, "loading")
@@ -1655,6 +1677,7 @@ def publish_ticket(state, force_push=False, jira_ticket_key=None, reuse_status_t
         "thread_ts": thread_ts,
         "channel": channel,
         "status_ts": publish_status_ts,
+        "anchor_text": publish_anchor,
         "last_stage": "",
         "start_time": time.time(),
         "ticket": ticket,
@@ -2234,15 +2257,18 @@ def check_running_procs():
                             msg = f":heavy_check_mark: *{ticket}* — published"
                         # "Posted MR" is a NEW thread message — it's the
                         # notable milestone and stands on its own. The
-                        # in-place publish status anchor gets collapsed
-                        # to a terse "published" line so it doesn't sit
-                        # stuck on ":rocket: publishing...".
+                        # in-place publish status anchor closes out with
+                        # ":heavy_check_mark: published" overwriting the
+                        # last publish stage, while the pinned anchor
+                        # (action prompt + ":rocket: publishing...") stays
+                        # visible above.
                         slack_reply(ch, info["thread_ts"], msg)
                         if info.get("status_ts"):
-                            done_text = f":heavy_check_mark: *{ticket}* — published"
+                            published_line = f":heavy_check_mark: *{ticket}* — published"
+                            final_text = _with_headline(info, published_line)
                             slack_update(
-                                ch, info["status_ts"], done_text,
-                                blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": done_text}}],
+                                ch, info["status_ts"], final_text,
+                                blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": final_text}}],
                             )
                         # The publish status anchor just clears its
                         # :loading: react — :white_check_mark: is reserved
@@ -2264,11 +2290,22 @@ def check_running_procs():
                         log_text = log_path.read_text() if log_path.exists() else ""
                         is_push_rejection = "non-fast-forward" in log_text or "tip of your current branch is behind" in log_text
 
+                        # Publish failures replace the stage line below the
+                        # pinned anchor (action prompt + publishing line)
+                        # with an actionable retry prompt, so the
+                        # implementation context stays visible above.
                         if is_push_rejection:
                             state["status"] = "needs_force_push"
-                            _post_action_prompt(state, info["thread_ts"],
-                                ":warning: Push rejected — remote branch has diverged. React :white_check_mark: to force-push.",
-                                update_ts=info.get("status_ts", ""))
+                            body = ":warning: Push rejected — remote branch has diverged. React :white_check_mark: to force-push."
+                            full = _with_headline(info, body)
+                            if info.get("status_ts"):
+                                slack_update(
+                                    ch, info["status_ts"], full,
+                                    blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": full}}],
+                                )
+                                state["action_prompt_ts"] = info["status_ts"]
+                                state["action_prompt_text"] = full
+                            save_job(state)
                             publish_terminal = "warning"
                         else:
                             state["status"] = "publish_failed"
@@ -2279,9 +2316,16 @@ def check_running_procs():
                                     re.sub(r"\x1b\[[0-9;]*m", "", l)
                                     for l in lines[-10:]
                                 )
-                            _post_action_prompt(state, info["thread_ts"],
-                                f":x: Publish failed (exit {exit_code}). React :white_check_mark: to retry.\n```\n{tail}\n```",
-                                update_ts=info.get("status_ts", ""))
+                            body = f":x: Publish failed (exit {exit_code}). React :white_check_mark: to retry.\n```\n{tail}\n```"
+                            full = _with_headline(info, body)
+                            if info.get("status_ts"):
+                                slack_update(
+                                    ch, info["status_ts"], full,
+                                    blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": full}}],
+                                )
+                                state["action_prompt_ts"] = info["status_ts"]
+                                state["action_prompt_text"] = full
+                            save_job(state)
                     if info["thread_ts"] in jobs:
                         jobs[info["thread_ts"]] = state
                 # Swap the publish status anchor's :loading: react for a
