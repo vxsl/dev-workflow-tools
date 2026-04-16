@@ -1593,6 +1593,16 @@ def publish_ticket(state, force_push=False, jira_ticket_key=None,
         # back-compat with callers that forget.
         if not prior_prompt_text:
             prior_prompt_text = state.get("action_prompt_text", "")
+        # Drop the trailing italicized "_Reply for another pass..._" footer
+        # from the prompt — we're publishing now, that prompt no longer
+        # applies. Same single-line heuristic _clear_action_buttons uses.
+        if prior_prompt_text:
+            body_lines = prior_prompt_text.rstrip().splitlines()
+            if body_lines:
+                last = body_lines[-1].strip()
+                if last.startswith("_") and last.endswith("_"):
+                    body_lines.pop()
+            prior_prompt_text = "\n".join(body_lines).rstrip()
         if prior_prompt_text:
             publish_anchor = f"{prior_prompt_text}\n\n{publishing_line}"
         else:
