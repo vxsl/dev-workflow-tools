@@ -356,6 +356,19 @@ DM_CHANNEL = dm_resp["channel"]["id"]
 
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 
+SETTINGS_PATH = STATE_DIR / "settings.json"
+
+
+def load_settings():
+    try:
+        return json.loads(SETTINGS_PATH.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_settings(s):
+    SETTINGS_PATH.write_text(json.dumps(s, indent=2))
+
 
 def is_dm_channel(channel_id):
     """Check if a channel is a DM (starts with D) vs a regular channel."""
@@ -2597,6 +2610,9 @@ HELP_FULL = "\n".join([
     ">Reply `refresh` → re-stage + regenerate diff",
     ">React :white_check_mark: (ticket jobs) → commit + publish MR",
     ">Click *Create Jira ticket* / *Publish as hotfix* (slack-thread jobs)",
+    "",
+    "*Settings:*",
+    ">`greet off` / `greet on` — silence or restore the startup greeting",
 ])
 
 
@@ -2700,6 +2716,17 @@ def handle_message(channel, ts, user, text, thread_ts=None):
             extra_context=extra if extra else None,
             mock=MOCK_MODE, slack_context=True, req_msg=req_msg,
         )
+
+    elif text.strip().lower() in ("greet on", "greet off"):
+        enable = text.strip().lower() == "greet on"
+        s = load_settings()
+        s["greet"] = enable
+        save_settings(s)
+        msg = (":wave: Startup greeting enabled."
+               if enable else ":mute: Startup greeting disabled.")
+        slack_post("chat.postMessage", channel=channel, text=msg, mrkdwn=True)
+        swap_reaction(req_msg, "loading", None)
+        return
 
     elif text.strip().lower() == "help":
         slack_post("chat.postMessage", channel=channel, text=HELP_FULL, mrkdwn=True)
@@ -3029,8 +3056,9 @@ _proc_thread.start()
 
 # ── Start ──
 
-# Send startup greeting to DM
-slack_post("chat.postMessage", channel=DM_CHANNEL, text=HELP_TEXT, mrkdwn=True)
+# Send startup greeting to DM (unless disabled via `greet off`)
+if load_settings().get("greet", True):
+    slack_post("chat.postMessage", channel=DM_CHANNEL, text=HELP_TEXT, mrkdwn=True)
 
 if "--debug" in sys.argv:
     import logging
