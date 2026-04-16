@@ -2282,6 +2282,10 @@ def handle_message(channel, ts, user, text, thread_ts=None):
     # the user shouldn't need to @mention us to give feedback.
     if thread_ts and thread_ts != ts:
         state = jobs.get(thread_ts)
+        if not state:
+            print(f"  thread reply in {channel} thread_ts={thread_ts} — no matching job (known: {list(jobs.keys())[:5]}{'…' if len(jobs) > 5 else ''})")
+        elif state.get("status") not in ("done", "clarify", "done_empty"):
+            print(f"  thread reply matches job {state.get('ticket')} but status={state.get('status')} — not resumable")
         # "clarify" is resumable just like "done" — user's reply is the
         # answer to Claude's question, which we feed back via resume.
         # "done_empty" is also resumable so the user can nudge Claude to
@@ -2588,7 +2592,10 @@ def socket_event_handler(client: SocketModeClient, req: SocketModeRequest):
         event = req.payload.get("event", {})
         event_type = event.get("type", "")
         subtype = event.get("subtype", "")
-        print(f"  [event] {event_type}{f'/{subtype}' if subtype else ''} channel={event.get('channel', event.get('item', {}).get('channel', '?'))} user={event.get('user', '?')}")
+        ev_ts = event.get("ts", "")
+        ev_thread_ts = event.get("thread_ts", "")
+        thread_suffix = f" thread_ts={ev_thread_ts}" if ev_thread_ts and ev_thread_ts != ev_ts else ""
+        print(f"  [event] {event_type}{f'/{subtype}' if subtype else ''} channel={event.get('channel', event.get('item', {}).get('channel', '?'))} user={event.get('user', '?')} ts={ev_ts}{thread_suffix}")
 
         if event_type == "message":
             # Skip bot messages, message_changed, message_deleted, etc.
