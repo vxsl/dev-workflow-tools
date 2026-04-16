@@ -1276,6 +1276,7 @@ def start_ticket_solve(ticket, thread_ts, channel, slack_urls=None, extra_contex
     jobs[thread_ts] = {
         "ticket": dedup_key, "thread_ts": thread_ts, "channel": channel,
         "status": "in_progress", "slack_context": slack_context,
+        "slack_urls": list(slack_urls) if slack_urls else [],
         "model": model, "effort": effort,
     }
 
@@ -2315,7 +2316,14 @@ def check_running_procs():
                     pass
 
             if state is None:
-                state = {"ticket": ticket, "status": "failed"}
+                # ticket-solve exited before writing save_state. Seed the
+                # fallback state from the in-memory jobs entry so retry knows
+                # slack_context/slack_urls — otherwise the retry path runs
+                # ticket-solve without --slack-context, uppercases the slug,
+                # and tries to fetch it from Jira.
+                state = dict(jobs.get(current_thread_ts, {}))
+                state["ticket"] = ticket
+                state["status"] = "failed"
                 state_path = STATE_DIR / f"{ticket.replace('/', '_')}.json"
 
             # Always use the current thread/channel (not whatever's in the state file from a previous run)
@@ -2887,7 +2895,11 @@ def handle_reaction(channel, ts, user, reaction):
                 state["status"] = "publishing"
             elif status in ("failed", "checks_failed", "done_empty"):
                 print(f"  ✅ on {ticket} — retrying (force)")
-                is_slack_ctx = state.get("slack_context", False)
+                # The "slack-<chan>-<ts>" slug is only produced for Slack-context
+                # runs, so infer slack_context from the ticket prefix when the
+                # state didn't record it (old state files, or ticket-solve died
+                # before save_state ran).
+                is_slack_ctx = state.get("slack_context") or ticket.startswith("slack-")
                 slack_urls_state = state.get("slack_urls", [])
                 # Reuse the prior action-prompt message as this retry's
                 # status anchor — the prompt is no longer relevant (we're
