@@ -2320,6 +2320,14 @@ def handle_message(channel, ts, user, text, thread_ts=None):
     react(channel, ts, "loading")
     req_msg = (channel, ts)
 
+    # If this message is itself a reply inside an existing thread, anchor
+    # the job to the parent thread root so subsequent replies in that same
+    # thread find the job via jobs.get(thread_ts). Using the user's own
+    # message ts would key the job under a ts that no follow-up reply
+    # carries, silently dropping feedback.
+    parent_ts = thread_ts if (thread_ts and thread_ts != ts) else None
+    job_thread_ts = parent_ts or ts
+
     # ── Top-level command routing ──
     ticket_match = TICKET_RE.search(text)
     slack_urls = [m.group(1) for m in SLACK_URL_RE.finditer(text)]
@@ -2334,7 +2342,7 @@ def handle_message(channel, ts, user, text, thread_ts=None):
 
         print(f"New request: {ticket} (channel={channel}){' (mock)' if MOCK_MODE else ''}")
         start_ticket_solve(
-            ticket, thread_ts=ts, channel=channel,
+            ticket, thread_ts=job_thread_ts, channel=channel,
             slack_urls=slack_urls if slack_urls else None,
             extra_context=extra if extra else None,
             mock=MOCK_MODE, req_msg=req_msg,
@@ -2347,7 +2355,7 @@ def handle_message(channel, ts, user, text, thread_ts=None):
 
         print(f"New Slack-context request: {slack_urls[0]} (channel={channel}){' (mock)' if MOCK_MODE else ''}")
         start_ticket_solve(
-            ticket=None, thread_ts=ts, channel=channel,
+            ticket=None, thread_ts=job_thread_ts, channel=channel,
             slack_urls=slack_urls,
             extra_context=extra if extra else None,
             mock=MOCK_MODE, slack_context=True, req_msg=req_msg,
@@ -2435,7 +2443,6 @@ def handle_message(channel, ts, user, text, thread_ts=None):
             forced_prefix = msg_text[0]
             msg_text = msg_text[1:].strip()
 
-        parent_ts = thread_ts if (thread_ts and thread_ts != ts) else None
         thread_urls = []
         if parent_ts and WORKSPACE_URL:
             thread_urls.append(f"{WORKSPACE_URL}/archives/{channel}/p{parent_ts.replace('.', '')}")
@@ -2447,9 +2454,8 @@ def handle_message(channel, ts, user, text, thread_ts=None):
         if intent == "question":
             # Q&A: reuse the parent thread for continuity if we're in one,
             # otherwise start a fresh thread from this message.
-            ask_thread_ts = parent_ts if parent_ts else ts
             start_ticket_ask(
-                question=msg_text, thread_ts=ask_thread_ts,
+                question=msg_text, thread_ts=job_thread_ts,
                 channel=channel, slack_urls=thread_urls or None,
                 req_msg=req_msg,
             )
@@ -2459,13 +2465,12 @@ def handle_message(channel, ts, user, text, thread_ts=None):
             # A top-level message is its own thread — no need to require a
             # pre-existing parent thread or an explicit ticket/URL.
             if WORKSPACE_URL:
-                target_ts = parent_ts if parent_ts else ts
                 target_urls = thread_urls if thread_urls else [
-                    f"{WORKSPACE_URL}/archives/{channel}/p{target_ts.replace('.', '')}"
+                    f"{WORKSPACE_URL}/archives/{channel}/p{job_thread_ts.replace('.', '')}"
                 ]
                 print(f"New slack-context request: {target_urls[0]} (channel={channel}){' (mock)' if MOCK_MODE else ''}: {msg_text[:60]}...")
                 start_ticket_solve(
-                    ticket=None, thread_ts=target_ts, channel=channel,
+                    ticket=None, thread_ts=job_thread_ts, channel=channel,
                     slack_urls=target_urls,
                     extra_context=msg_text,
                     mock=MOCK_MODE, slack_context=True, req_msg=req_msg,
