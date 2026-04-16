@@ -8,6 +8,7 @@
 #   ticket-solve UB-1234 --context "extra info"  Pass additional context
 #   ticket-solve UB-1234 --dry-run               Show what would be done
 #   ticket-solve UB-1234 --model sonnet          Use a specific model (default: opus)
+#   ticket-solve UB-1234 --effort high           Pass --effort to claude (low|medium|high|xhigh|max)
 #
 # When called by ticket-bot:
 #   ticket-solve UB-1234 --thread-ts 123.456 --dm-channel C0123 --session-id <uuid>
@@ -53,6 +54,7 @@ DRY_RUN=false
 MOCK=false
 FORCE=false
 MODEL="opus"
+EFFORT=""             # If set, pass --effort <level> to claude (low|medium|high|xhigh|max)
 EXTRA_CONTEXT=""
 SLACK_URLS=()
 THREAD_TS=""          # If set, reply in existing thread (from ticket-bot)
@@ -79,6 +81,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --model)
             MODEL="$2"
+            shift 2
+            ;;
+        --effort)
+            EFFORT="$2"
             shift 2
             ;;
         --context)
@@ -126,7 +132,7 @@ if [ -z "$TICKET" ] && [ ${#SLACK_URLS[@]} -gt 0 ]; then
 fi
 
 if [ -z "$TICKET" ] && ! $SLACK_CONTEXT; then
-    echo -e "${RED}Usage: ticket-solve <TICKET-ID|slack-url> [slack-urls...] [--context \"...\"] [--model MODEL]${RESET}"
+    echo -e "${RED}Usage: ticket-solve <TICKET-ID|slack-url> [slack-urls...] [--context \"...\"] [--model MODEL] [--effort LEVEL]${RESET}"
     echo -e "${DIM}  Pass a Jira ticket ID or a Slack thread URL as the primary input.${RESET}"
     exit 1
 fi
@@ -427,6 +433,9 @@ if $DRY_RUN; then
     echo ""
     echo -e "${CYAN}═══ DRY RUN ═══${RESET}"
     echo -e "${DIM}Model:${RESET} $MODEL"
+    if [ -n "$EFFORT" ]; then
+        echo -e "${DIM}Effort:${RESET} $EFFORT"
+    fi
     echo -e "${DIM}Session:${RESET} $SESSION_ID"
     echo ""
     echo -e "${DIM}Prompt:${RESET}"
@@ -549,6 +558,7 @@ save_state() {
         --arg dm_channel "$SLACK_DM_CHANNEL_ID" \
         --arg session_id "$SESSION_ID" \
         --arg model "$MODEL" \
+        --arg effort "$EFFORT" \
         --arg status "$status" \
         --argjson slack_context "$($SLACK_CONTEXT && echo true || echo false)" \
         --argjson slack_urls "$slack_urls_json" \
@@ -556,7 +566,7 @@ save_state() {
         '{ticket: $ticket, summary: $summary, title: $title, clarify: $clarify, decline: $decline,
           worktree: $worktree, work_dir: $work_dir,
           thread_ts: $thread_ts, dm_channel: $dm_channel, session_id: $session_id,
-          model: $model, status: $status, slack_context: $slack_context,
+          model: $model, effort: $effort, status: $status, slack_context: $slack_context,
           slack_urls: $slack_urls, updated_at: $updated_at}' \
         > "$STATE_DIR/${TICKET//\//_}.json"
 }
@@ -614,7 +624,11 @@ Mock implementation for testing the ticket-solve pipeline.
 - \`${MOCK_FILE}\` — dummy change
 MOCK_EOF
 else
-    echo -e "  ${DIM}Running Claude (${MODEL})...${RESET}"
+    if [ -n "$EFFORT" ]; then
+        echo -e "  ${DIM}Running Claude (${MODEL}, effort=${EFFORT})...${RESET}"
+    else
+        echo -e "  ${DIM}Running Claude (${MODEL})...${RESET}"
+    fi
     echo ""
 
     # Export env vars for slack-ask
@@ -623,8 +637,14 @@ else
     export TICKET_CREATOR_BOT_TOKEN
     export SLACK_NOTIFY_USER_ID
 
+    EFFORT_ARGS=()
+    if [ -n "$EFFORT" ]; then
+        EFFORT_ARGS=(--effort "$EFFORT")
+    fi
+
     (cd "$WORK_DIR" && claude -p \
         --model "$MODEL" \
+        "${EFFORT_ARGS[@]}" \
         --session-id "$SESSION_ID" \
         --dangerously-skip-permissions \
         --append-system-prompt "Do NOT run notify-send or notification-sound.sh. You are running headlessly — the wrapper script handles all notifications." \
