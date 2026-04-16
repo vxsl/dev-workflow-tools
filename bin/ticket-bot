@@ -1149,7 +1149,10 @@ def resume_claude(state, feedback_text, req_msg=None):
         f"Apply the requested changes. Commit your changes when done.\n"
         f"Update REVIEW.md in the git repo root with what changed in this pass.\n"
         f"Do NOT run a soft reset — the wrapper handles that.\n"
-        f"Do NOT push or create an MR."
+        f"Do NOT push or create an MR.\n\n"
+        f"When you're done, emit exactly one line describing THIS pass "
+        f"(not the cumulative change) in this shape — no backticks, no code block:\n"
+        f"SUMMARY: <1-2 sentences describing what you did in this feedback pass, for Slack notifications>"
     )
 
     cmd = [
@@ -2110,19 +2113,18 @@ def check_running_procs():
                         prompt_lines.append(diff_prompt_line(ch, worktree))
                         diff_path_to_share = diff_path
 
-                # Claude's summary (check resume log first, then main log).
+                # Claude's summary for THIS turn. Read only from the current
+                # turn's log (log_path) — on a resume, .claude-output.log
+                # still holds the initial turn's SUMMARY and would go stale.
                 # Tolerate optional wrapping backticks — Claude sometimes
                 # emits `SUMMARY: foo` despite the prompt saying not to.
                 summary_line = ""
-                for log_candidate in [log_path, Path(os.path.join(worktree, ".claude-output.log")) if worktree else None]:
-                    if log_candidate and log_candidate.exists():
-                        for line in log_candidate.read_text().splitlines():
-                            stripped = line.lstrip("`")
-                            if stripped.startswith("SUMMARY:"):
-                                summary_line = stripped[8:].strip().rstrip("`").strip()
-                                break
-                    if summary_line:
-                        break
+                if log_path and log_path.exists():
+                    for line in log_path.read_text().splitlines():
+                        stripped = line.lstrip("`")
+                        if stripped.startswith("SUMMARY:"):
+                            summary_line = stripped[8:].strip().rstrip("`").strip()
+                            break
                 if summary_line:
                     prompt_lines.append(summary_line)
 
