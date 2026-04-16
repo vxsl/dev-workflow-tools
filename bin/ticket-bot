@@ -1526,7 +1526,7 @@ def _post_action_prompt(state, thread_ts, text, buttons=None, update_ts=""):
         jobs[thread_ts] = state
 
 
-def publish_ticket(state, force_push=False, jira_ticket_key=None):
+def publish_ticket(state, force_push=False, jira_ticket_key=None, reuse_status_ts=""):
     """Commit staged changes and run publish-changes.
 
     When `jira_ticket_key` is provided, the job is published against that
@@ -1534,6 +1534,12 @@ def publish_ticket(state, force_push=False, jira_ticket_key=None):
     titles are prefixed with the key and `publish-changes` is invoked with
     the ticket as a positional arg so it links the MR to Jira. This is
     used by the 'Create Jira ticket' modal flow.
+
+    When `reuse_status_ts` is provided (typically the action-prompt ts that
+    the user just acted on), publish stage updates overwrite that message
+    instead of posting a new "publishing..." reply. The "Posted MR"
+    notification is still posted as a brand-new thread message when the
+    publish succeeds — that's the notable milestone.
     """
     ticket = state["ticket"]
     summary = state.get("summary", "")
@@ -1556,12 +1562,20 @@ def publish_ticket(state, force_push=False, jira_ticket_key=None):
     else:
         jira_ticket_key = state.get("jira_ticket_key") or None
 
-    # Post publish status as its own new thread message so the action
-    # prompt above (with diff link, summary, etc.) stays intact and the
-    # "Published!" notification stands on its own.
     publish_label = jira_ticket_key or ticket
-    resp = slack_reply(channel, thread_ts, f":rocket: *{publish_label}* — publishing...")
-    publish_status_ts = resp.get("ts", "") if resp and resp.get("ok") else ""
+    publishing_text = f":rocket: *{publish_label}* — publishing..."
+    if reuse_status_ts:
+        # Caller supplies the action-prompt message to reuse as the publish
+        # status anchor. We overwrite it with the publishing line; stage
+        # updates in check_running_procs continue to target the same ts.
+        slack_update(
+            channel, reuse_status_ts, publishing_text,
+            blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": publishing_text}}],
+        )
+        publish_status_ts = reuse_status_ts
+    else:
+        resp = slack_reply(channel, thread_ts, publishing_text)
+        publish_status_ts = resp.get("ts", "") if resp and resp.get("ok") else ""
     if publish_status_ts:
         react(channel, publish_status_ts, "loading")
 
@@ -1933,14 +1947,13 @@ def handle_block_action(payload, action):
 
     if action_id == "publish_hotfix":
         print(f"  [button] publish_hotfix on {ticket}")
-        prior_text = state.get("action_prompt_text", "")
         state.pop("action_prompt_ts", None)
         state.pop("action_prompt_text", None)
         save_job(state)
-        _clear_action_buttons(channel, prompt_ts,
-                              f":rocket: *{ticket}* — publishing as hotfix...",
-                              prior_text=prior_text)
-        publish_ticket(state)
+        # publish_ticket overwrites the action-prompt message in place with
+        # the publishing status — no separate "publishing as hotfix..." +
+        # "publishing..." pair of messages.
+        publish_ticket(state, reuse_status_ts=prompt_ts)
 
     elif action_id == "create_ticket":
         print(f"  [button] create_ticket on {ticket}")
@@ -2021,12 +2034,11 @@ def handle_view_submission(payload):
     key = result["key"]
     url = result["url"]
 
-    # Clear the publish-choice buttons now that we've committed to a path.
-    if action_prompt_ts:
-        _clear_action_buttons(channel, action_prompt_ts,
-                              f":ticket: Created <{url}|*{key}*> — publishing...",
-                              prior_text=state.get("action_prompt_text", ""))
-        state.pop("action_prompt_text", None)
+    # "Created Jira ticket" is a notable milestone — post as a new message.
+    # publish_ticket will overwrite the action-prompt message in place with
+    # the "publishing..." status, so we don't pre-clear its buttons here.
+    state.pop("action_prompt_ts", None)
+    state.pop("action_prompt_text", None)
 
     slack_post("chat.postMessage", channel=channel, thread_ts=thread_ts,
                text=f":heavy_check_mark: Created <{url}|*{key}*>: {summary}")
@@ -2042,7 +2054,7 @@ def handle_view_submission(payload):
     if thread_ts in jobs:
         jobs[thread_ts] = state
 
-    publish_ticket(state, jira_ticket_key=key)
+    publish_ticket(state, jira_ticket_key=key, reuse_status_ts=action_prompt_ts)
 
 
 def check_running_procs():
@@ -2207,8 +2219,7 @@ def check_running_procs():
                                     if url_match:
                                         mr_url = url_match.group(0)
                                         break
-                        # Update the "publishing..." message into the final
-                        # Published! notification. Mirror the oneshot format
+                        # Mirror the oneshot format
                         # (`:gitlab: Posted MR: <url|!N — title>`) so the
                         # outcome is intelligible at a glance instead of a
                         # bare URL on its own line.
@@ -2221,10 +2232,18 @@ def check_running_procs():
                             msg = f":gitlab: Posted MR: <{mr_url}|!{mr_num}>"
                         else:
                             msg = f":heavy_check_mark: *{ticket}* — published"
-                        if info["status_ts"]:
-                            slack_update(ch, info["status_ts"], msg)
-                        else:
-                            slack_reply(ch, info["thread_ts"], msg)
+                        # "Posted MR" is a NEW thread message — it's the
+                        # notable milestone and stands on its own. The
+                        # in-place publish status anchor gets collapsed
+                        # to a terse "published" line so it doesn't sit
+                        # stuck on ":rocket: publishing...".
+                        slack_reply(ch, info["thread_ts"], msg)
+                        if info.get("status_ts"):
+                            done_text = f":heavy_check_mark: *{ticket}* — published"
+                            slack_update(
+                                ch, info["status_ts"], done_text,
+                                blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": done_text}}],
+                            )
                         # The publish status anchor just clears its
                         # :loading: react — :white_check_mark: is reserved
                         # for the user's initial request message (handled
@@ -2922,15 +2941,15 @@ def handle_reaction(channel, ts, user, reaction):
         try:
             if status == "done":
                 print(f"  ✅ on {ticket} — publishing")
-                publish_ticket(state)
+                publish_ticket(state, reuse_status_ts=prompt_ts)
                 state["status"] = "publishing"
             elif status == "publish_failed":
                 print(f"  ✅ on {ticket} — retrying publish")
-                publish_ticket(state)
+                publish_ticket(state, reuse_status_ts=prompt_ts)
                 state["status"] = "publishing"
             elif status == "needs_force_push":
                 print(f"  ✅ on {ticket} — force-push approved")
-                publish_ticket(state, force_push=True)
+                publish_ticket(state, force_push=True, reuse_status_ts=prompt_ts)
                 state["status"] = "publishing"
             elif status in ("failed", "checks_failed", "done_empty"):
                 print(f"  ✅ on {ticket} — retrying (force)")
