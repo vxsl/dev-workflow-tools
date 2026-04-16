@@ -386,7 +386,7 @@ This posts to our Slack DM thread and blocks until I reply (up to 30 min). Use s
 
 ## When you are done
 
-1. Write tests for your changes. If there are existing tests for the code you modified, update them. If not, add new test files following the existing test patterns in the codebase. Run \`yarn test:run\` and fix any failures.
+1. Decide whether tests are warranted for this change. Add or update tests when the change is behavioral — new logic, bug fixes, features, or refactors that could regress. Skip writing new tests for changes where a test would just mirror a config value and catch no real bug: Sentry alert tweaks, feature-flag flips, constant/threshold bumps, monitoring/dashboard config, copy or UI-text edits, dependency bumps, and other declarative changes. If existing tests cover code you modified, update them so they still reflect reality. Run \`yarn test:run\` and fix any failures.
 
 2. Commit your implementation. \`git add -A\` and commit with a placeholder message like \`WIP\` — the wrapper rewrites the commit message later, so the message itself doesn't matter. What matters is that every change you made (modified files AND new files) is in a commit. If you skip this step, your work is invisible to the wrapper and the run silently produces no diff.
 
