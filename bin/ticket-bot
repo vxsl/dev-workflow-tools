@@ -535,6 +535,13 @@ def load_jobs():
             state = json.loads(f.read_text())
             thread_ts = state.get("thread_ts")
             if thread_ts:
+                # ticket-solve writes `dm_channel` (historical: the bot was
+                # DM-only originally); the bot completion handler later sets
+                # `channel`. If completion didn't run (e.g. an earlier crash
+                # or restart mid-job), fall back to dm_channel so thread
+                # replies don't get misrouted to DM_CHANNEL.
+                if not state.get("channel") and state.get("dm_channel"):
+                    state["channel"] = state["dm_channel"]
                 jobs[thread_ts] = state
         except (json.JSONDecodeError, KeyError):
             pass
