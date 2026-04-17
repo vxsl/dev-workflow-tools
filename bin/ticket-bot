@@ -1524,6 +1524,17 @@ def refresh_diff(state, req_msg=None):
         swap_reaction(req_msg, "loading", "x")
         return
 
+    # Unstage non-deliverable meta files — ticket-solve strips these at
+    # initial completion, but `git add -A` here re-stages them. Without
+    # this, publish bundles REVIEW.md / .claude-output.log / diff.html
+    # into the MR.
+    if worktree:
+        for meta in ["REVIEW.md", ".claude-output.log", "diff.html"]:
+            subprocess.run(
+                ["git", "rm", "--cached", "-f", meta],
+                cwd=worktree, capture_output=True, timeout=5,
+            )
+
     diff_res = subprocess.run(
         ["git", "diff", "--cached"], cwd=work_dir, capture_output=True,
     )
