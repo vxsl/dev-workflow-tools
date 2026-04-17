@@ -1550,6 +1550,27 @@ def refresh_diff(state, req_msg=None):
         # Share the refreshed diff as a threaded attachment after the notice.
         post_diff_attachment(diff_html, channel, thread_ts,
                              title=f"{ticket}: {summary}")
+        # If no action prompt exists yet (solve-completion was skipped or
+        # crashed), post one now so the user has a way to publish. Normal
+        # flow: completion handler already posted the prompt and refresh
+        # just regenerates the diff — in that case action_prompt_ts is set
+        # and we skip.
+        if not state.get("action_prompt_ts"):
+            prompt_body_lines = [f":heavy_check_mark: *{ticket}* — done", diff_line]
+            if summary:
+                prompt_body_lines.append(summary)
+            if state.get("slack_context"):
+                prompt_body_lines.append("_Reply for another pass, or publish:_")
+                _post_action_prompt(
+                    state, thread_ts, "\n".join(prompt_body_lines),
+                    buttons=_publish_choice_buttons(thread_ts),
+                )
+            else:
+                prompt_body_lines.append(
+                    "_Reply for another pass, or react :white_check_mark: to publish._"
+                )
+                _post_action_prompt(state, thread_ts, "\n".join(prompt_body_lines))
+            save_job(state)
         # Synchronous success — just clear the :loading: indicator.
         # :white_check_mark: is reserved for the initial request message
         # when the MR has been successfully posted; not used here.
