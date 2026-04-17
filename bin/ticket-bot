@@ -1503,11 +1503,38 @@ def refresh_diff(state, req_msg=None):
 
     diff_html = os.path.join(worktree, "diff.html") if worktree else os.path.join(work_dir, "..", "diff.html")
 
-    # Stage all changes and regenerate diff
-    result = subprocess.run(
-        f'git add -A && git diff --cached | diff2html -i stdin -s side -o stdout --title "{ticket}: {summary}" > {json.dumps(diff_html)}',
-        cwd=work_dir, shell=True, capture_output=True, text=True,
+    # Stage all changes and regenerate diff. Avoid shell=True f-string
+    # interpolation — the summary can contain embedded double quotes (e.g.
+    # `"Error banner shown!"`) that break the outer `--title "..."` quoting
+    # and cause diff2html to receive stray args and print its usage banner.
+    title = f"{ticket}: {summary}"
+    add_res = subprocess.run(
+        ["git", "add", "-A"], cwd=work_dir, capture_output=True, text=True,
     )
+    if add_res.returncode != 0:
+        slack_reply(channel, thread_ts,
+                    f":warning: Failed to stage changes\n```\n{add_res.stderr[:500]}\n```")
+        swap_reaction(req_msg, "loading", "x")
+        return
+
+    diff_res = subprocess.run(
+        ["git", "diff", "--cached"], cwd=work_dir, capture_output=True,
+    )
+    result = subprocess.run(
+        ["diff2html", "-i", "stdin", "-s", "side", "-o", "stdout", "--title", title],
+        cwd=work_dir, input=diff_res.stdout, capture_output=True,
+    )
+    if result.returncode == 0 and result.stdout:
+        try:
+            with open(diff_html, "wb") as f:
+                f.write(result.stdout)
+        except Exception as e:
+            slack_reply(channel, thread_ts,
+                        f":warning: Failed to write diff.html: {e}")
+            swap_reaction(req_msg, "loading", "x")
+            return
+    # result.stderr is bytes here (no text=True); decode for logging.
+    result_stderr = result.stderr.decode("utf-8", errors="replace") if isinstance(result.stderr, bytes) else (result.stderr or "")
 
     if result.returncode == 0 and os.path.exists(diff_html):
         diff_line = diff_prompt_line(channel, worktree).replace(
@@ -1522,7 +1549,7 @@ def refresh_diff(state, req_msg=None):
         swap_reaction(req_msg, "loading", None)
     else:
         slack_reply(channel, thread_ts,
-                    f":warning: Failed to regenerate diff\n```\n{result.stderr[:500]}\n```")
+                    f":warning: Failed to regenerate diff\n```\n{result_stderr[:500]}\n```")
         swap_reaction(req_msg, "loading", "x")
 
 
