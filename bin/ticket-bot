@@ -1012,11 +1012,24 @@ def create_jira_ticket_api(summary, description="", issue_type="Task",
 def start_ticket_ask(question, thread_ts, channel, slack_urls=None, req_msg=None):
     """Run ticket-ask (Q&A mode) as a background subprocess.
 
-    No worktree-per-question, no state-file tracking like solve jobs —
-    ticket-ask clones once to ~/.cache/ticket-ask/repo, fetches origin/main,
-    runs Claude read-only, and posts the answer to the thread itself. We
-    just dispatch and forget (Popen); its stdout/stderr go to a log file.
+    No worktree-per-question — ticket-ask clones once to
+    ~/.cache/ticket-ask/repo, fetches origin/main, runs Claude read-only,
+    and posts the answer to the thread itself. We dispatch and forget
+    (Popen); its stdout/stderr go to a log file.
+
+    We persist a minimal job state to STATE_DIR so thread replies after
+    completion are recognized and routed to a follow-up ask (otherwise
+    replies in channel fall through to the mention gate and are dropped).
     """
+    dedup_key = f"ask-{thread_ts}"
+
+    # Don't clobber an in-flight ask on the same thread.
+    if dedup_key in running_procs:
+        slack_reply(channel, thread_ts,
+                    ":warning: _Still answering the previous question — give me a moment._")
+        swap_reaction(req_msg, "loading", "warning")
+        return
+
     # Advance request reaction now that we're about to post our first reply.
     swap_reaction(req_msg, "loading", "eyes")
     # Post a status message so the user knows we're on it
@@ -1044,8 +1057,6 @@ def start_ticket_ask(question, thread_ts, channel, slack_urls=None, req_msg=None
 
     print(f"  Starting ticket-ask PID {proc.pid} for thread {thread_ts}: {question[:60]}...")
 
-    # Track so we can clean up the status message when it finishes
-    dedup_key = f"ask-{thread_ts}"
     running_procs[dedup_key] = {
         "proc": proc,
         "log_file": log_file,
@@ -1062,6 +1073,18 @@ def start_ticket_ask(question, thread_ts, channel, slack_urls=None, req_msg=None
         "is_ask": True,
         "req_msg": req_msg,
     }
+
+    ask_state = {
+        "ticket": dedup_key,
+        "thread_ts": thread_ts,
+        "channel": channel,
+        "slack_urls": list(slack_urls) if slack_urls else [],
+        "status": "asking",
+        "req_msg": list(req_msg) if req_msg else None,
+        "is_ask": True,
+    }
+    save_job(ask_state)
+    jobs[thread_ts] = ask_state
 
 
 def _dedup_key_for(ticket, slack_urls):
@@ -2242,6 +2265,19 @@ def check_running_procs():
                 # :x: react for visibility.
                 swap_reaction(info.get("req_msg"), "eyes",
                               None if exit_code == 0 else "x")
+                # Flip the persisted state to a terminal status so a thread
+                # reply triggers a follow-up ask (handled in handle_message).
+                ask_thread_ts = info.get("thread_ts")
+                state_path = STATE_DIR / f"{_safe_filename(ticket)}.json"
+                if state_path.exists():
+                    try:
+                        ask_state = json.loads(state_path.read_text())
+                        ask_state["status"] = "asked" if exit_code == 0 else "ask_failed"
+                        save_job(ask_state)
+                        if ask_thread_ts:
+                            jobs[ask_thread_ts] = ask_state
+                    except Exception as e:
+                        print(f"  WARNING: failed to update ask state: {e}")
                 del running_procs[ticket]
                 continue
 
@@ -2731,15 +2767,33 @@ def handle_message(channel, ts, user, text, thread_ts=None):
     # the user shouldn't need to @mention us to give feedback.
     if thread_ts and thread_ts != ts:
         state = jobs.get(thread_ts)
+        resumable_solve = ("done", "clarify", "done_empty")
+        resumable_ask = ("asked", "ask_failed")
         if not state:
             print(f"  thread reply in {channel} thread_ts={thread_ts} — no matching job (known: {list(jobs.keys())[:5]}{'…' if len(jobs) > 5 else ''})")
-        elif state.get("status") not in ("done", "clarify", "done_empty"):
+        elif state.get("status") not in resumable_solve + resumable_ask:
             print(f"  thread reply matches job {state.get('ticket')} but status={state.get('status')} — not resumable")
+        # Follow-up question in an ask thread → kick off another ask with
+        # the reply as the new question. Keeps parity with solve-job feedback
+        # (no @mention required in the bot's own threads).
+        if state and state.get("status") in resumable_ask:
+            react(channel, ts, "loading")
+            req_msg = (channel, ts)
+            question_text, _ = strip_bot_mention(text)
+            print(f"Follow-up ask on {state['ticket']}: {question_text[:60]}...")
+            start_ticket_ask(
+                question=question_text,
+                thread_ts=thread_ts,
+                channel=channel,
+                slack_urls=state.get("slack_urls") or None,
+                req_msg=req_msg,
+            )
+            return
         # "clarify" is resumable just like "done" — user's reply is the
         # answer to Claude's question, which we feed back via resume.
         # "done_empty" is also resumable so the user can nudge Claude to
         # actually commit / re-stage when no diff was produced.
-        if state and state.get("status") in ("done", "clarify", "done_empty"):
+        if state and state.get("status") in resumable_solve:
             # Acknowledge receipt immediately. :loading: signals "received,
             # not yet responded"; downstream handlers swap it to :eyes: once
             # they post their first reply, and to :white_check_mark: on done.
