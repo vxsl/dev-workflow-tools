@@ -2450,12 +2450,18 @@ def check_running_procs():
             # Reload state from disk, but ensure thread_ts matches current thread.
             # ticket-solve may have renamed the branch (e.g. slack-context → hotfix/...),
             # so search all state files by thread_ts instead of assuming the filename.
+            # Skip is_ask entries — an ask state file can coexist with a solve
+            # state file for the same thread (ask → solve escalation path), and
+            # picking the ask entry here would prevent the done-branch from
+            # posting the diff/action prompt.
             current_thread_ts = info["thread_ts"]
             state = None
             state_path = None
             for candidate in STATE_DIR.glob("*.json"):
                 try:
                     s = json.loads(candidate.read_text())
+                    if s.get("is_ask"):
+                        continue
                     if s.get("thread_ts") == current_thread_ts:
                         state = s
                         state_path = candidate
@@ -2820,6 +2826,16 @@ def handle_message(channel, ts, user, text, thread_ts=None):
                     f"{WORKSPACE_URL}/archives/{channel}/p{thread_ts.replace('.', '')}"
                 ]
                 print(f"  escalating ask thread to solve: {target_urls[0]}")
+                # Clear the ask state file — otherwise it coexists with the
+                # soon-to-be-written solve state for the same thread_ts, and
+                # the solve-completion handler (which searches by thread_ts)
+                # could pick up the ask entry by glob-order accident.
+                ask_state_path = STATE_DIR / f"{_safe_filename(state['ticket'])}.json"
+                try:
+                    ask_state_path.unlink(missing_ok=True)
+                except Exception as e:
+                    print(f"  WARNING: failed to remove ask state {ask_state_path}: {e}")
+                jobs.pop(thread_ts, None)
                 request_ticket_solve_config(
                     ticket=None, thread_ts=thread_ts, channel=channel,
                     slack_urls=target_urls,
