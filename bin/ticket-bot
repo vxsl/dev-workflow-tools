@@ -734,7 +734,20 @@ def summarize_intent(text, ticket=None, slack_urls=None):
     if ticket:
         prompt += f"\n\nJira ticket: {ticket}"
     if slack_urls:
-        prompt += f"\n\nReferenced Slack thread(s): {', '.join(slack_urls)}"
+        # Fetch the referenced threads inline. Haiku has no tools to open
+        # URLs, so handing it a bare link produces "I can't access this"
+        # refusals. The transcript gives it actual content to summarize.
+        user_cache = {}
+        transcripts = []
+        for url in slack_urls:
+            t = fetch_thread_transcript(url, user_cache)
+            if t:
+                transcripts.append(t)
+        if transcripts:
+            joined = "\n\n---\n\n".join(transcripts)
+            prompt += f"\n\nReferenced Slack thread(s):\n{joined}"
+        else:
+            prompt += f"\n\nReferenced Slack thread(s): {', '.join(slack_urls)}"
 
     try:
         result = subprocess.run(
@@ -749,13 +762,14 @@ def summarize_intent(text, ticket=None, slack_urls=None):
         out = out.split("\n")[0].strip().strip("`*_\"' ")
         # Defensive sanity check: Haiku sometimes ignores the summarizer
         # persona and replies *as* the bot ("I need more context...",
-        # "Can you clarify..."). Imperative-mood headlines never start with
-        # "I " and never contain a question mark, so reject those rather
-        # than posting a confusing pseudo-headline. Returning "" causes the
-        # caller to skip the ack line entirely.
+        # "Can you clarify...", "Unable to access..."). Reject refusal-like
+        # or question-shaped output rather than posting it as a headline.
         if out:
             lowered = out.lower()
-            if "?" in out or lowered.startswith(("i ", "i'")):
+            refusal_starts = (
+                "i ", "i'", "unable to", "cannot ", "can't ", "sorry",
+            )
+            if "?" in out or lowered.startswith(refusal_starts):
                 print(f"  summarize_intent rejected non-headline output: {out!r}")
                 return ""
             return out
