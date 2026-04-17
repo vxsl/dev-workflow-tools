@@ -2773,21 +2773,49 @@ def handle_message(channel, ts, user, text, thread_ts=None):
             print(f"  thread reply in {channel} thread_ts={thread_ts} — no matching job (known: {list(jobs.keys())[:5]}{'…' if len(jobs) > 5 else ''})")
         elif state.get("status") not in resumable_solve + resumable_ask:
             print(f"  thread reply matches job {state.get('ticket')} but status={state.get('status')} — not resumable")
-        # Follow-up question in an ask thread → kick off another ask with
-        # the reply as the new question. Keeps parity with solve-job feedback
-        # (no @mention required in the bot's own threads).
+        # Follow-up reply in an ask thread → classify intent so the user can
+        # either ask another question OR escape to an implement request.
+        # Without classification, "implement the above" would just loop into
+        # another read-only Q&A. Parity with solve-job feedback (no @mention
+        # required in the bot's own threads).
         if state and state.get("status") in resumable_ask:
             react(channel, ts, "loading")
             req_msg = (channel, ts)
-            question_text, _ = strip_bot_mention(text)
-            print(f"Follow-up ask on {state['ticket']}: {question_text[:60]}...")
-            start_ticket_ask(
-                question=question_text,
-                thread_ts=thread_ts,
-                channel=channel,
-                slack_urls=state.get("slack_urls") or None,
-                req_msg=req_msg,
+            reply_text, _ = strip_bot_mention(text)
+            msg_text = reply_text.strip()
+            forced_prefix = None
+            if msg_text.startswith("?") or msg_text.startswith("!"):
+                forced_prefix = msg_text[0]
+                msg_text = msg_text[1:].strip()
+            thread_slack_urls = state.get("slack_urls") or []
+            intent = classify_intent(
+                msg_text if forced_prefix is None else reply_text.strip(),
+                slack_urls=thread_slack_urls or None,
             )
+            print(f"  thread reply on {state['ticket']}: intent={intent} — {msg_text[:60]}...")
+            if intent == "question":
+                start_ticket_ask(
+                    question=msg_text,
+                    thread_ts=thread_ts,
+                    channel=channel,
+                    slack_urls=thread_slack_urls or None,
+                    req_msg=req_msg,
+                )
+            elif WORKSPACE_URL:
+                target_urls = thread_slack_urls or [
+                    f"{WORKSPACE_URL}/archives/{channel}/p{thread_ts.replace('.', '')}"
+                ]
+                print(f"  escalating ask thread to solve: {target_urls[0]}")
+                request_ticket_solve_config(
+                    ticket=None, thread_ts=thread_ts, channel=channel,
+                    slack_urls=target_urls,
+                    extra_context=msg_text,
+                    mock=MOCK_MODE, slack_context=True, req_msg=req_msg,
+                )
+            else:
+                slack_reply(channel, ts,
+                            ":thinking_face: To implement, give me a ticket ID or Slack thread URL.")
+                swap_reaction(req_msg, "loading", None)
             return
         # "clarify" is resumable just like "done" — user's reply is the
         # answer to Claude's question, which we feed back via resume.
