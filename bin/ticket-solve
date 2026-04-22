@@ -326,8 +326,9 @@ if $SLACK_CONTEXT; then
 
 ## Slack Context
 
-**IMPORTANT: You must use the Slack MCP tools to fetch the thread content.** Use the slack search or read tools to fetch the conversation from the URL(s) below. If the Slack MCP is not connected or not authorized, print this exact line and stop:
+**IMPORTANT: Before doing anything else — no codebase exploration, no other tool calls — verify the Slack MCP is connected by attempting to fetch the thread below. If the Slack MCP is not connected or returns an auth error, your very first output must be this exact line, after which you must terminate immediately without further tool use:
 \`SLACK_MCP_AUTH_REQUIRED: Slack MCP is not authorized. Please run the Slack MCP authentication flow first.\`
+Do not try \`slack-ask\`, do not explore the repo, do not search for workarounds — the thread content is load-bearing context and without it the task cannot proceed. Only once the Slack MCP successfully returns the thread should you continue with the rest of this task.
 
 Fetch these Slack thread(s) for the task context:"
 
