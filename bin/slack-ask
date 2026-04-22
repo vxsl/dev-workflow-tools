@@ -19,6 +19,22 @@ QUESTION="$*"
 TIMEOUT="${SLACK_ASK_TIMEOUT_SECONDS:-1800}"
 POLL_INTERVAL=5
 
+case "${1:-}" in
+    -h|--help)
+        cat <<'EOF'
+Usage: slack-ask <question>
+
+Posts <question> to the current Slack DM thread and blocks until the user
+replies (default timeout: 30 min; override via SLACK_ASK_TIMEOUT_SECONDS).
+The reply text is printed on stdout.
+
+Requires SLACK_DM_CHANNEL_ID, SLACK_THREAD_TS, TICKET_CREATOR_BOT_TOKEN,
+and SLACK_NOTIFY_USER_ID in the environment (set by ticket-solve).
+EOF
+        exit 0
+        ;;
+esac
+
 if [ -z "$QUESTION" ]; then
     echo "Usage: slack-ask <question>" >&2
     exit 1
