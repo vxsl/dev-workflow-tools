@@ -2511,6 +2511,14 @@ def check_running_procs():
             if exit_code != 0:
                 swap_reaction(info.get("req_msg"), "eyes", "x")
 
+            # Advance any :loading: reactions we left on thread replies that
+            # arrived during this pass. slack-ask polls the thread directly,
+            # so by the time the pass exits it has either consumed the reply
+            # (happy path) or the reply was unrelated to a slack-ask wait —
+            # either way, :eyes: is the right "seen" signal to leave.
+            for ch_ts in info.get("pending_feedback_reacts", []):
+                swap_reaction(ch_ts, "loading", "eyes")
+
             del running_procs[ticket]
 
             # Reload state from disk, but ensure thread_ts matches current thread.
@@ -2857,6 +2865,22 @@ def handle_message(channel, ts, user, text, thread_ts=None):
         resumable_ask = ("asked", "ask_failed")
         if not state:
             print(f"  thread reply in {channel} thread_ts={thread_ts} — no matching job (known: {list(jobs.keys())[:5]}{'…' if len(jobs) > 5 else ''})")
+        elif state.get("status") == "in_progress":
+            # Claude is still running. slack-ask polls the thread directly
+            # and will pick up the reply if it's waiting on one — ticket-bot
+            # doesn't need to resume here. Ack with :loading: so the user
+            # sees we noticed; check_running_procs swaps to :eyes: when the
+            # pass exits (slack-ask has presumably consumed the reply by then).
+            job_ticket = state.get("ticket")
+            if job_ticket and job_ticket in running_procs:
+                react(channel, ts, "loading")
+                running_procs[job_ticket].setdefault(
+                    "pending_feedback_reacts", []
+                ).append((channel, ts))
+                print(f"  thread reply on {job_ticket} (status=in_progress) — slack-ask will pick it up if polling")
+            else:
+                print(f"  thread reply on {state.get('ticket')} (status=in_progress) but no running proc — ignoring")
+            return
         elif state.get("status") not in resumable_solve + resumable_ask:
             print(f"  thread reply matches job {state.get('ticket')} but status={state.get('status')} — not resumable")
         # Follow-up reply in an ask thread → classify intent so the user can
