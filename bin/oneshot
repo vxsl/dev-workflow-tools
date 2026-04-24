@@ -351,11 +351,21 @@ run_prepush_checks() {
         # Provide dummy data so it thinks there are commits to check
         local current_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "HEAD")
         local current_sha=$(git rev-parse HEAD 2>/dev/null || echo "0000000000000000000000000000000000000000")
-        
-        # Run hook and capture exit code
-        # Skip protected branch check since we're creating a new branch anyway
+
+        # Git invokes pre-push hooks with `<remote-name> <remote-url>` as positional args.
+        # pre-commit's hook-impl validates this (exits "expected 2 arguments but got 0"
+        # otherwise), so pass real values even though our personal script ignores them.
+        local remote_name="origin"
+        local remote_url
+        remote_url=$(git config --get remote.origin.url 2>/dev/null || echo "https://example.invalid/repo.git")
+
+        # Run hook and capture exit code.
+        # - SKIP_PROTECTED_BRANCH_CHECK: we're creating a new branch anyway.
+        # - FORCE_PRE_PUSH_RUN: tells the personal pre-push to skip its
+        #   "no unpushed commits" short-circuits and validate the staged index
+        #   directly (nothing is committed yet at this point).
         local exit_code=0
-        echo "refs/heads/${current_branch} ${current_sha} refs/heads/main 0000000000000000000000000000000000000000" | SKIP_PROTECTED_BRANCH_CHECK=true "$pre_push_hook" 2>&1 >&2
+        echo "refs/heads/${current_branch} ${current_sha} refs/heads/main 0000000000000000000000000000000000000000" | SKIP_PROTECTED_BRANCH_CHECK=true FORCE_PRE_PUSH_RUN=true "$pre_push_hook" "$remote_name" "$remote_url" 2>&1 >&2
         exit_code="${PIPESTATUS[1]}"
         
         if [ $exit_code -eq 0 ]; then
