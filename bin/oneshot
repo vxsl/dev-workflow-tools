@@ -132,8 +132,8 @@ while [[ "$#" -gt 0 ]]; do
             elif [[ "$1" =~ ^${JIRA_PROJECT_REGEX}-[0-9]+$ ]]; then
                 TICKET_KEY="$1"
             elif [[ "$1" =~ ^[0-9]+$ ]]; then
-                # Just a number - prefix with project
-                TICKET_KEY="${JIRA_PROJECT}-$1"
+                # Just a number - resolve against configured boards (UB, UL, ...)
+                TICKET_KEY="$(disambiguate_ticket_number "$1")"
             else
                 # Treat as ticket title for new ticket creation
                 NEW_TICKET_TITLE="$1"

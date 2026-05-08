@@ -103,7 +103,7 @@ select_ticket_or_slack() {
     elif [[ "$query" =~ ^${JIRA_PROJECT_REGEX}-[0-9]+$ ]]; then
         echo "$query"
     elif [[ "$query" =~ ^[0-9]+$ ]]; then
-        echo "${JIRA_PROJECT}-$query"
+        disambiguate_ticket_number "$query"
     elif [ -n "$query" ]; then
         echo "TITLE:$query"
     else

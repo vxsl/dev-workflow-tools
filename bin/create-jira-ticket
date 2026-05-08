@@ -42,6 +42,7 @@ ISSUE_TYPE=""
 INITIAL_SUMMARY=""
 SLACK_URL=""
 USER_DESCRIPTION=""
+PROJECT_OVERRIDE=""
 while [[ "$#" -gt 0 ]]; do
     case $1 in
         --dry-run) DRY_RUN=true; shift ;;
@@ -52,6 +53,7 @@ while [[ "$#" -gt 0 ]]; do
         --output-file) OUTPUT_FILE="$2"; shift 2 ;;
         --clear) CLEAR_SCREEN=true; shift ;;
         --issue-type) ISSUE_TYPE="$2"; shift 2 ;;
+        --project) PROJECT_OVERRIDE="$2"; shift 2 ;;
         *)
             echo "Unknown argument: $1" >&2
             exit 1
@@ -197,6 +199,36 @@ get_custom_field_options() {
 mkdir -p "$CACHE_DIR"
 tmpdir="$CACHE_DIR/create_tmp"
 mkdir -p "$tmpdir"
+
+# Resolve target project. With multiple boards configured (JIRA_PROJECTS) and
+# no --project override, prompt the user to pick. All downstream code reads
+# JIRA_PROJECT, so we just assign the chosen key to it.
+if [ -n "$PROJECT_OVERRIDE" ]; then
+    _valid=false
+    for _p in "${JIRA_PROJECT_LIST[@]}"; do
+        [ "$_p" = "$PROJECT_OVERRIDE" ] && _valid=true && break
+    done
+    if [ "$_valid" != true ]; then
+        printf "\033[38;5;167m  ✗ Error: --project '%s' is not in JIRA_PROJECTS (%s)\033[0m\n" \
+            "$PROJECT_OVERRIDE" "${JIRA_PROJECT_LIST[*]}" >&2
+        exit 1
+    fi
+    JIRA_PROJECT="$PROJECT_OVERRIDE"
+elif [ "${#JIRA_PROJECT_LIST[@]}" -gt 1 ]; then
+    printf "\033[38;5;109m┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\033[0m\n" >&2
+    printf "\033[38;5;109m┃\033[0m \033[38;5;81mStep 0:\033[0m Select board                                    \033[38;5;109m┃\033[0m\n" >&2
+    printf "\033[38;5;109m┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\033[0m\n" >&2
+    _picked=$(printf '%s\n' "${JIRA_PROJECT_LIST[@]}" | $FZF \
+        --prompt="  📋 Board > " --height=8 --reverse --border=rounded \
+        --header="Pick the Jira project to create the ticket in" </dev/tty)
+    if [ -z "$_picked" ]; then
+        printf "\033[38;5;167m  ✗ Cancelled\033[0m\n" >&2
+        rm -rf "$tmpdir"
+        exit 1
+    fi
+    JIRA_PROJECT="$_picked"
+    printf "  \033[38;5;114m✓\033[0m Board: \033[0m%s\033[0m\n\n" "$JIRA_PROJECT" >&2
+fi
 
 # Clear screen for clean output (only if --clear specified)
 if [ "$CLEAR_SCREEN" = true ]; then

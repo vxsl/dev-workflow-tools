@@ -160,7 +160,7 @@ else
     # Normalize ticket ID
     TICKET=$(echo "$TICKET" | tr '[:lower:]' '[:upper:]')
     if [[ "$TICKET" =~ ^[0-9]+$ ]]; then
-        TICKET="${JIRA_PROJECT:-UB}-${TICKET}"
+        TICKET="$(disambiguate_ticket_number "$TICKET")"
     fi
 fi
 
