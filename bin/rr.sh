@@ -176,7 +176,7 @@ build_worktree_map() {
             # ticket ID so get_worktree_path("UB-6709") finds the worktree
             if [[ "$_epo" != "$_branch"* ]]; then
                 local _ticket
-                _ticket=$(echo "$_epo" | grep -oi "${JIRA_PROJECT}-[0-9]\+" | tr '[:lower:]' '[:upper:]' | head -1)
+                _ticket=$(echo "$_epo" | grep -oiE "${JIRA_PROJECT_REGEX}-[0-9]\+" | tr '[:lower:]' '[:upper:]' | head -1)
                 if [ -n "$_ticket" ] && [ "$_ticket" != "$_branch" ] && [ "$_ticket" != "$_epo" ] \
                    && git show-ref --verify --quiet "refs/heads/$_ticket" 2>/dev/null; then
                     WORKTREE_MAP["$_ticket"]="$_wt"
@@ -587,7 +587,7 @@ create_worktree() {
     local repo_name=$(basename "$GIT_ROOT")
 
     # Try to get JIRA title and include it in the path
-    local ticket=$(echo "$branch" | grep -oi "${JIRA_PROJECT}-[0-9]\+" | tr '[:lower:]' '[:upper:]' | head -1)
+    local ticket=$(echo "$branch" | grep -oiE "${JIRA_PROJECT_REGEX}-[0-9]\+" | tr '[:lower:]' '[:upper:]' | head -1)
     local wt_name="$branch"
     if [ -n "$ticket" ]; then
         local jira_title=$(get_jira_title "$ticket")
@@ -983,7 +983,7 @@ generate_instant_data() {
             # track the displaced branch so it appears in the branch list.
             if [[ "$_epo_branch" != "$_display_branch"* ]]; then
                 local _displaced_ticket=""
-                [[ "$_epo_branch" =~ (${JIRA_PROJECT}-[0-9]+) ]] && _displaced_ticket="${BASH_REMATCH[1]^^}"
+                [[ "$_epo_branch" =~ (${JIRA_PROJECT_REGEX}-[0-9]+) ]] && _displaced_ticket="${BASH_REMATCH[1]^^}"
                 if [ -n "$_displaced_ticket" ] && [ -n "${VALID_BRANCH_REFS[$_displaced_ticket]+x}" ]; then
                     DISPLACED_BRANCHES+=("$_displaced_ticket")
                 fi
@@ -1034,7 +1034,7 @@ generate_instant_data() {
 
         # JIRA lookup (O(1), no subprocess)
         local _ticket=""
-        [[ "$_display_branch" =~ (${JIRA_PROJECT}-[0-9]+) ]] && _ticket="${BASH_REMATCH[1]^^}"
+        [[ "$_display_branch" =~ (${JIRA_PROJECT_REGEX}-[0-9]+) ]] && _ticket="${BASH_REMATCH[1]^^}"
         local _title="${JIRA_TITLE_CACHE[$_ticket]:-<EMPTY>}"
         local _jira_status="${JIRA_STATUS_CACHE[$_ticket]:-<EMPTY>}"
         local _jira_assignee="${JIRA_ASSIGNEE_CACHE[$_ticket]:-<UNASSIGNED>}"
@@ -1077,7 +1077,7 @@ generate_instant_data() {
         [ "$_rbranch" = "$_current_branch" ] && continue
 
         local _ticket=""
-        [[ "$_rbranch" =~ (${JIRA_PROJECT}-[0-9]+) ]] && _ticket="${BASH_REMATCH[1]^^}"
+        [[ "$_rbranch" =~ (${JIRA_PROJECT_REGEX}-[0-9]+) ]] && _ticket="${BASH_REMATCH[1]^^}"
         local _title="${JIRA_TITLE_CACHE[$_ticket]:-<EMPTY>}"
         local _jira_status="${JIRA_STATUS_CACHE[$_ticket]:-<EMPTY>}"
         local _jira_assignee="${JIRA_ASSIGNEE_CACHE[$_ticket]:-<UNASSIGNED>}"
@@ -1162,7 +1162,7 @@ generate_worktree_data() {
         # Note: ticket lookup happens before display_branch is set, but eponymous_branch
         # contains the ticket ID either way (e.g., UB-6668-implement-foo still matches UB-6668)
         local ticket
-        ticket=$(echo "$eponymous_branch" | grep -oi "${JIRA_PROJECT}-[0-9]\+" | tr '[:lower:]' '[:upper:]' | head -1)
+        ticket=$(echo "$eponymous_branch" | grep -oiE "${JIRA_PROJECT_REGEX}-[0-9]\+" | tr '[:lower:]' '[:upper:]' | head -1)
         local title="<EMPTY>" jira_status="<EMPTY>" jira_assignee="<UNASSIGNED>"
         if [ -n "$ticket" ]; then
             title="${JIRA_TITLE_CACHE[$ticket]:-<EMPTY>}"
@@ -1213,7 +1213,7 @@ generate_worktree_data() {
                 # Track the displaced branch so it still appears in the branch list.
                 # Extract the ticket ID from the eponymous name and check if it's a real branch.
                 local _displaced_ticket
-                _displaced_ticket=$(echo "$eponymous_branch" | grep -oi "${JIRA_PROJECT}-[0-9]\+" | tr '[:lower:]' '[:upper:]' | head -1)
+                _displaced_ticket=$(echo "$eponymous_branch" | grep -oiE "${JIRA_PROJECT_REGEX}-[0-9]\+" | tr '[:lower:]' '[:upper:]' | head -1)
                 if [ -n "$_displaced_ticket" ]; then
                     # Check if the ticket ID itself is a branch, or find a branch starting with it
                     if git show-ref --verify --quiet "refs/heads/$_displaced_ticket" 2>/dev/null; then
@@ -1546,7 +1546,7 @@ generate_branch_data() {
         fi
 
         # Extract JIRA ticket
-        ticket=$(echo "$branch" | grep -oi "${JIRA_PROJECT}-[0-9]\+" | tr '[:lower:]' '[:upper:]')
+        ticket=$(echo "$branch" | grep -oiE "${JIRA_PROJECT_REGEX}-[0-9]\+" | tr '[:lower:]' '[:upper:]')
         if [ -n "$ticket" ]; then
             tickets_to_fetch["$ticket"]=1
         fi
@@ -1647,7 +1647,7 @@ generate_branch_data() {
         author="${author:0:15}"
 
         # Extract JIRA ticket (case-insensitive) and normalize to uppercase
-        ticket=$(echo "$branch" | grep -oi "${JIRA_PROJECT}-[0-9]\+" | tr '[:lower:]' '[:upper:]')
+        ticket=$(echo "$branch" | grep -oiE "${JIRA_PROJECT_REGEX}-[0-9]\+" | tr '[:lower:]' '[:upper:]')
         jira_title=$(get_jira_title "$ticket")
         jira_status=$(get_jira_status "$ticket")
         jira_assignee=$(get_jira_assignee "$ticket")
@@ -1769,7 +1769,7 @@ load_jira_caches() {
 # Function to get JIRA ticket title
 get_jira_title() {
     local ticket=$1
-    if [[ $ticket =~ ^${JIRA_PROJECT}-[0-9]+$ ]]; then
+    if [[ $ticket =~ ^${JIRA_PROJECT_REGEX}-[0-9]+$ ]]; then
         echo "${JIRA_TITLE_CACHE[$ticket]}"
     fi
 }
@@ -1795,7 +1795,7 @@ sanitize_title_for_path() {
 # Function to get JIRA ticket status
 get_jira_status() {
     local ticket=$1
-    if [[ $ticket =~ ^${JIRA_PROJECT}-[0-9]+$ ]]; then
+    if [[ $ticket =~ ^${JIRA_PROJECT_REGEX}-[0-9]+$ ]]; then
         echo "${JIRA_STATUS_CACHE[$ticket]}"
     fi
 }
@@ -1803,7 +1803,7 @@ get_jira_status() {
 # Function to get JIRA ticket assignee
 get_jira_assignee() {
     local ticket=$1
-    if [[ $ticket =~ ^${JIRA_PROJECT}-[0-9]+$ ]]; then
+    if [[ $ticket =~ ^${JIRA_PROJECT_REGEX}-[0-9]+$ ]]; then
         echo "${JIRA_ASSIGNEE_CACHE[$ticket]}"
     fi
 }
@@ -1833,7 +1833,7 @@ fetch_assigned_jira_tickets() {
     fi
 
     # Fetch from JIRA using JQL (v3 API with POST)
-    local jql="assignee = currentUser() AND status NOT IN (Done, Closed) AND project = ${JIRA_PROJECT} ORDER BY updated DESC"
+    local jql="assignee = currentUser() AND status NOT IN (Done, Closed) AND project IN (${JIRA_PROJECT_JQL_LIST}) ORDER BY updated DESC"
     local response
     response=$(curl -s --max-time 10 -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
         -X POST \
@@ -1902,7 +1902,7 @@ fetch_all_active_jira_tickets() {
     fi
 
     # Fetch from JIRA using JQL (v3 API with POST)
-    local jql="project = ${JIRA_PROJECT} AND status NOT IN (Done, Closed) AND updated >= \"-180d\" ORDER BY updated DESC"
+    local jql="project IN (${JIRA_PROJECT_JQL_LIST}) AND status NOT IN (Done, Closed) AND updated >= \"-180d\" ORDER BY updated DESC"
     local response
     response=$(curl -s --max-time 10 -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
         -X POST \
@@ -1954,15 +1954,15 @@ generate_branchless_ticket_data() {
     # Extract ticket IDs already represented in branch data (from full_branch field - column 7)
     local existing_tickets=""
     if [ -n "$existing_data" ]; then
-        existing_tickets=$(echo "$existing_data" | cut -f7 | grep -oi "${JIRA_PROJECT}-[0-9]\+" | tr '[:lower:]' '[:upper:]' | sort -u)
+        existing_tickets=$(echo "$existing_data" | cut -f7 | grep -oiE "${JIRA_PROJECT_REGEX}-[0-9]\+" | tr '[:lower:]' '[:upper:]' | sort -u)
     else
         # No data passed; query git directly - always reflects current state, unlike cache file
-        existing_tickets=$(git branch 2>/dev/null | sed 's/^[* ]*//' | grep -oi "${JIRA_PROJECT}-[0-9]\+" | tr '[:lower:]' '[:upper:]' | sort -u)
+        existing_tickets=$(git branch 2>/dev/null | sed 's/^[* ]*//' | grep -oiE "${JIRA_PROJECT_REGEX}-[0-9]\+" | tr '[:lower:]' '[:upper:]' | sort -u)
     fi
 
     # Also exclude tickets that have remote-only branches (avoids duplicates with ↑ entries)
     local remote_tickets
-    remote_tickets=$(git for-each-ref --format='%(refname:short)' refs/remotes/origin/ 2>/dev/null | sed 's/^origin\///' | grep -oi "${JIRA_PROJECT}-[0-9]\+" | tr '[:lower:]' '[:upper:]' | sort -u)
+    remote_tickets=$(git for-each-ref --format='%(refname:short)' refs/remotes/origin/ 2>/dev/null | sed 's/^origin\///' | grep -oiE "${JIRA_PROJECT_REGEX}-[0-9]\+" | tr '[:lower:]' '[:upper:]' | sort -u)
     if [ -n "$remote_tickets" ]; then
         existing_tickets=$(printf '%s\n%s' "$existing_tickets" "$remote_tickets" | sort -u)
     fi
@@ -1985,7 +1985,7 @@ generate_branchless_ticket_data() {
         local ticket="$1" title="$2" status="$3" assignee="$4" updated_ts="$5"
 
         [ -z "$ticket" ] && return
-        [[ ! "$ticket" =~ ^${JIRA_PROJECT}-[0-9]+$ ]] && return
+        [[ ! "$ticket" =~ ^${JIRA_PROJECT_REGEX}-[0-9]+$ ]] && return
 
         # Skip if this ticket already has a branch
         echo "$existing_tickets" | grep -qx "$ticket" && return
@@ -2106,7 +2106,7 @@ generate_remote_only_data() {
         declare -A _remote_tickets_seen
         while IFS=$'\t' read -r branch _rest; do
             local ticket
-            ticket=$(echo "$branch" | grep -oi "${JIRA_PROJECT}-[0-9]\+" | tr '[:lower:]' '[:upper:]')
+            ticket=$(echo "$branch" | grep -oiE "${JIRA_PROJECT_REGEX}-[0-9]\+" | tr '[:lower:]' '[:upper:]')
             [ -z "$ticket" ] && continue
             [ -n "${_remote_tickets_seen[$ticket]}" ] && continue
             _remote_tickets_seen["$ticket"]=1
@@ -2151,7 +2151,7 @@ generate_remote_only_data() {
         author="${author:0:15}"
 
         local ticket
-        ticket=$(echo "$branch" | grep -oi "${JIRA_PROJECT}-[0-9]\+" | tr '[:lower:]' '[:upper:]')
+        ticket=$(echo "$branch" | grep -oiE "${JIRA_PROJECT_REGEX}-[0-9]\+" | tr '[:lower:]' '[:upper:]')
         local jira_title jira_status jira_assignee
         jira_title=$(get_jira_title "$ticket")
         jira_status=$(get_jira_status "$ticket")
@@ -2282,7 +2282,7 @@ get_current_state() {
 
     # Get JIRA title for current branch
     local jira_display=""
-    local ticket=$(echo "$current_branch" | grep -oi "${JIRA_PROJECT}-[0-9]\+" | tr '[:lower:]' '[:upper:]' | head -1)
+    local ticket=$(echo "$current_branch" | grep -oiE "${JIRA_PROJECT_REGEX}-[0-9]\+" | tr '[:lower:]' '[:upper:]' | head -1)
     if [ -n "$ticket" ]; then
         local jira_title=$(get_jira_title "$ticket")
         if [ -n "$jira_title" ]; then
@@ -2308,7 +2308,7 @@ format_current_branch_as_row() {
     local current_location="$PWD"
 
     # Get JIRA info for current branch
-    local ticket=$(echo "$current_branch" | grep -oi "${JIRA_PROJECT}-[0-9]\+" | tr '[:lower:]' '[:upper:]' | head -1)
+    local ticket=$(echo "$current_branch" | grep -oiE "${JIRA_PROJECT_REGEX}-[0-9]\+" | tr '[:lower:]' '[:upper:]' | head -1)
     local jira_title=""
     local jira_status=""
     local jira_assignee=""
@@ -2751,7 +2751,7 @@ if [ "$GENERATE_MORE_MODE" = true ]; then
         assignee_lower=$(echo "$assignee" | tr '[:upper:]' '[:lower:]')
         jira_me_lower=$(echo "$JIRA_ME" | tr '[:upper:]' '[:lower:]')
         # Extract ticket from branch name and check if branch IS the ticket (not a variant like -wip, -good)
-        ticket_from_branch=$(echo "$branch" | grep -oi "${JIRA_PROJECT}-[0-9]\+" | tr '[:lower:]' '[:upper:]' | head -1)
+        ticket_from_branch=$(echo "$branch" | grep -oiE "${JIRA_PROJECT_REGEX}-[0-9]\+" | tr '[:lower:]' '[:upper:]' | head -1)
         branch_upper=$(echo "$branch" | tr '[:lower:]' '[:upper:]')
         is_authoritative=false
         [ "$branch_upper" = "$ticket_from_branch" ] && is_authoritative=true
@@ -2958,7 +2958,7 @@ mkfifo "$_data_fifo"
             assignee_lower="${assignee,,}"
             # Extract ticket from branch name using bash regex (no grep/tr/head pipeline)
             ticket_from_branch=""
-            if [[ "$branch" =~ (${JIRA_PROJECT}-[0-9]+) ]]; then
+            if [[ "$branch" =~ (${JIRA_PROJECT_REGEX}-[0-9]+) ]]; then
                 ticket_from_branch="${BASH_REMATCH[1]^^}"
             fi
             branch_upper="${branch^^}"
@@ -3186,7 +3186,7 @@ if [ -f "$ACTION_FILE" ]; then
                 repo_name=$(basename "$GIT_ROOT")
 
                 # Try to get JIRA title and include it in the path
-                ticket=$(echo "$branch" | grep -oi "${JIRA_PROJECT}-[0-9]\+" | tr '[:lower:]' '[:upper:]' | head -1)
+                ticket=$(echo "$branch" | grep -oiE "${JIRA_PROJECT_REGEX}-[0-9]\+" | tr '[:lower:]' '[:upper:]' | head -1)
                 wt_name="$branch"
                 if [ -n "$ticket" ]; then
                     jira_title=$(get_jira_title "$ticket")
@@ -3233,7 +3233,7 @@ if [ -f "$ACTION_FILE" ]; then
             repo_name=$(basename "$GIT_ROOT")
 
             # Try to get JIRA title and include it in the path
-            ticket=$(echo "$branch" | grep -oi "${JIRA_PROJECT}-[0-9]\+" | tr '[:lower:]' '[:upper:]' | head -1)
+            ticket=$(echo "$branch" | grep -oiE "${JIRA_PROJECT_REGEX}-[0-9]\+" | tr '[:lower:]' '[:upper:]' | head -1)
             wt_name="$branch"
             if [ -n "$ticket" ]; then
                 jira_title=$(get_jira_title "$ticket")
@@ -3300,7 +3300,7 @@ if [ -f "$ACTION_FILE" ]; then
         repo_name=$(basename "$GIT_ROOT")
 
         # Try to get JIRA title and include it in the path
-        ticket=$(echo "$branch" | grep -oi "${JIRA_PROJECT}-[0-9]\+" | tr '[:lower:]' '[:upper:]' | head -1)
+        ticket=$(echo "$branch" | grep -oiE "${JIRA_PROJECT_REGEX}-[0-9]\+" | tr '[:lower:]' '[:upper:]' | head -1)
         wt_name="$branch"
         if [ -n "$ticket" ]; then
             jira_title=$(get_jira_title "$ticket")
@@ -3816,7 +3816,7 @@ if [ -n "$branch" ]; then
                     repo_name=$(basename "$GIT_ROOT")
 
                     # Try to get JIRA title and include it in the path
-                    ticket=$(echo "$branch" | grep -oi "${JIRA_PROJECT}-[0-9]\+" | tr '[:lower:]' '[:upper:]' | head -1)
+                    ticket=$(echo "$branch" | grep -oiE "${JIRA_PROJECT_REGEX}-[0-9]\+" | tr '[:lower:]' '[:upper:]' | head -1)
                     wt_name="$branch"
                     if [ -n "$ticket" ]; then
                         jira_title=$(get_jira_title "$ticket")
@@ -3919,7 +3919,7 @@ if [ -n "$branch" ]; then
                 repo_name=$(basename "$GIT_ROOT")
 
                 # Try to get JIRA title and include it in the path
-                ticket=$(echo "$branch" | grep -oi "${JIRA_PROJECT}-[0-9]\+" | tr '[:lower:]' '[:upper:]' | head -1)
+                ticket=$(echo "$branch" | grep -oiE "${JIRA_PROJECT_REGEX}-[0-9]\+" | tr '[:lower:]' '[:upper:]' | head -1)
                 wt_name="$branch"
                 if [ -n "$ticket" ]; then
                     jira_title=$(get_jira_title "$ticket")

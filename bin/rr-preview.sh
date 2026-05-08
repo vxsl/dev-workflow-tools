@@ -5,6 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$(type -P "$0" || echo "$0")")")" &&
 if [ -f "$SCRIPT_DIR/../.env" ]; then
     source "$SCRIPT_DIR/../.env"
 fi
+[ -f "$SCRIPT_DIR/../lib/jira-projects.sh" ] && source "$SCRIPT_DIR/../lib/jira-projects.sh"
 
 strip_ansi() { sed 's/\x1b\[[0-9;]*m//g' | sed 's/\x1b\[[0-9;]*[a-zA-Z]//g'; }
 trim() { echo "$1" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'; }
@@ -24,7 +25,7 @@ branch="${full_branch#REMOTE:}"
 branch="${branch#TICKET:}"
 
 # Extract JIRA ticket number
-ticket=$(echo "$branch" | grep -oi "${JIRA_PROJECT}-[0-9]\+" | tr '[:lower:]' '[:upper:]' | head -1)
+ticket=$(echo "$branch" | grep -oiE "${JIRA_PROJECT_REGEX}-[0-9]\+" | tr '[:lower:]' '[:upper:]' | head -1)
 
 jira_url=""
 [ -n "$ticket" ] && [ -n "$JIRA_DOMAIN" ] && jira_url="https://${JIRA_DOMAIN}/browse/${ticket}"

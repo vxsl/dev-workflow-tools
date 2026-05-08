@@ -28,6 +28,14 @@ if [ ! -f "$_ENV_VALIDATE_REPO_DIR/.env" ]; then
     ENV_WARNINGS="⚠ No .env file — run: cp .env.example .env"
 fi
 
+# Derive multi-project Jira helpers (JIRA_PROJECT_REGEX, JIRA_PROJECT_JQL_LIST)
+# from JIRA_PROJECTS. Bash-only — guarded so POSIX-shell callers don't trip on
+# array syntax. In practice every caller of this lib runs under bash.
+if [ -n "${BASH_VERSION:-}" ] && [ -f "$_ENV_VALIDATE_LIB_DIR/jira-projects.sh" ]; then
+    # shellcheck disable=SC1091
+    . "$_ENV_VALIDATE_LIB_DIR/jira-projects.sh"
+fi
+
 # require_env VAR1 VAR2 ...
 # Exits with error if any of the listed variables are empty/unset.
 # Shows a formatted box listing all missing vars.

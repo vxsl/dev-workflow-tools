@@ -129,7 +129,7 @@ while [[ "$#" -gt 0 ]]; do
                 SLACK_CHANNEL=${BASH_REMATCH[1]}
                 SLACK_THREAD_TS=""
             # Check if it looks like a Jira ticket
-            elif [[ "$1" =~ ^${JIRA_PROJECT}-[0-9]+$ ]]; then
+            elif [[ "$1" =~ ^${JIRA_PROJECT_REGEX}-[0-9]+$ ]]; then
                 TICKET_KEY="$1"
             elif [[ "$1" =~ ^[0-9]+$ ]]; then
                 # Just a number - prefix with project
@@ -788,7 +788,7 @@ elif [ -n "$SLACK_URL" ]; then
         ticket_description=$(jq -r '.description // empty' < "$result_file")
         rm -f "$result_file"
 
-        if [ -z "$TICKET_KEY" ] || ! [[ "$TICKET_KEY" =~ ^${JIRA_PROJECT}-[0-9]+$ ]]; then
+        if [ -z "$TICKET_KEY" ] || ! [[ "$TICKET_KEY" =~ ^${JIRA_PROJECT_REGEX}-[0-9]+$ ]]; then
             echo -e "  ${RED}✗ Failed to create ticket${RESET}" >&2
             exit 1
         fi
@@ -850,7 +850,7 @@ elif [ -n "$NEW_TICKET_TITLE" ]; then
     ticket_description=$(jq -r '.description // empty' < "$result_file")
     rm -f "$result_file"
     
-    if [ -z "$TICKET_KEY" ] || ! [[ "$TICKET_KEY" =~ ^${JIRA_PROJECT}-[0-9]+$ ]]; then
+    if [ -z "$TICKET_KEY" ] || ! [[ "$TICKET_KEY" =~ ^${JIRA_PROJECT_REGEX}-[0-9]+$ ]]; then
         echo -e "  ${RED}✗ Failed to create ticket${RESET}" >&2
         exit 1
     fi
@@ -894,7 +894,7 @@ else
         ticket_description=$(jq -r '.description // empty' < "$result_file")
         rm -f "$result_file"
 
-        if [ -z "$TICKET_KEY" ] || ! [[ "$TICKET_KEY" =~ ^${JIRA_PROJECT}-[0-9]+$ ]]; then
+        if [ -z "$TICKET_KEY" ] || ! [[ "$TICKET_KEY" =~ ^${JIRA_PROJECT_REGEX}-[0-9]+$ ]]; then
             echo -e "  ${RED}✗ Failed to create ticket${RESET}" >&2
             exit 1
         fi
@@ -931,7 +931,7 @@ else
         ticket_description=$(jq -r '.description // empty' < "$result_file")
         rm -f "$result_file"
         
-        if [ -z "$TICKET_KEY" ] || ! [[ "$TICKET_KEY" =~ ^${JIRA_PROJECT}-[0-9]+$ ]]; then
+        if [ -z "$TICKET_KEY" ] || ! [[ "$TICKET_KEY" =~ ^${JIRA_PROJECT_REGEX}-[0-9]+$ ]]; then
             echo -e "  ${RED}✗ Failed to create ticket${RESET}" >&2
             exit 1
         fi
@@ -997,7 +997,7 @@ else
             ticket_description=$(jq -r '.description // empty' < "$result_file")
             rm -f "$result_file"
 
-            if [ -z "$TICKET_KEY" ] || ! [[ "$TICKET_KEY" =~ ^${JIRA_PROJECT}-[0-9]+$ ]]; then
+            if [ -z "$TICKET_KEY" ] || ! [[ "$TICKET_KEY" =~ ^${JIRA_PROJECT_REGEX}-[0-9]+$ ]]; then
                 echo -e "  ${RED}✗ Failed to create ticket${RESET}" >&2
                 exit 1
             fi

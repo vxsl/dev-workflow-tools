@@ -289,7 +289,7 @@ get_all_tickets() {
     fi
     
     # Fetch fresh data with pagination - API limits to 100 per page
-    local jql="project=${JIRA_PROJECT} AND issuetype != Epic ORDER BY ${sort_order}"
+    local jql="project IN (${JIRA_PROJECT_JQL_LIST}) AND issuetype != Epic ORDER BY ${sort_order}"
     local jql_encoded=$(echo "$jql" | jq -sRr @uri)
     local all_issues="[]"
     local next_page_token=""
@@ -434,7 +434,7 @@ get_recent_branches_without_tickets() {
         --format='%(refname:short)|%(committerdate:relative)|%(subject)' \
         refs/heads/ 2>/dev/null | \
         grep -vE "^(main|master|develop|dev|release|hotfix)$" | \
-        grep -viE "^${JIRA_PROJECT}-[0-9]+" | \
+        grep -viE "^${JIRA_PROJECT_REGEX}-[0-9]+" | \
         head -n "$max_branches"
 }
 
@@ -467,7 +467,7 @@ search_tickets_by_query() {
     fi
     
     # Build JQL for text search
-    local jql="project=${JIRA_PROJECT} AND issuetype != Epic AND text ~ \"${query}*\" ORDER BY updated DESC"
+    local jql="project IN (${JIRA_PROJECT_JQL_LIST}) AND issuetype != Epic AND text ~ \"${query}*\" ORDER BY updated DESC"
     local jql_encoded=$(echo "$jql" | jq -sRr @uri)
     
     # Fetch search results (limit to 50 to keep it fast)
@@ -599,7 +599,7 @@ create_mr_interactive() {
     # Extract ticket key - it's the second field (first is MR indicator ⎇ or space)
     local key=$(echo "$line" | sed 's/\x1b\[[0-9;]*m//g' | awk '{print $2}')
     # If second field isn't a ticket, try first field (for lines without MR indicator)
-    if ! [[ "$key" =~ ^${JIRA_PROJECT}-[0-9]+$ ]]; then
+    if ! [[ "$key" =~ ^${JIRA_PROJECT_REGEX}-[0-9]+$ ]]; then
         key=$(echo "$line" | sed 's/\x1b\[[0-9;]*m//g' | awk '{print $1}')
     fi
     local branch_arg=""
@@ -612,7 +612,7 @@ create_mr_interactive() {
         local branch_from_entry=$(echo "$line" | grep -oE '🌿[^ ]+' | sed 's/🌿//')
         branch_arg="--branch $branch_from_entry"
         key=""  # No Jira ticket
-    elif ! [[ "$key" =~ ^${JIRA_PROJECT}-[0-9]+$ ]]; then
+    elif ! [[ "$key" =~ ^${JIRA_PROJECT_REGEX}-[0-9]+$ ]]; then
         echo "" >&2
         printf "\033[38;5;167m  ✗ Error: No valid ticket or branch selected\033[0m\n" >&2
         printf "\033[2m  Select a ticket or branch first, then press Ctrl+G\033[0m\n" >&2
@@ -655,14 +655,14 @@ copy_ticket_dialog() {
     # Extract ticket key - it's the second field (first is MR indicator ⎇ or space)
     local key=$(echo "$line" | sed 's/\x1b\[[0-9;]*m//g' | awk '{print $2}')
     # If second field isn't a ticket, try first field (for lines without MR indicator)
-    if ! [[ "$key" =~ ^${JIRA_PROJECT}-[0-9]+$ ]]; then
+    if ! [[ "$key" =~ ^${JIRA_PROJECT_REGEX}-[0-9]+$ ]]; then
         key=$(echo "$line" | sed 's/\x1b\[[0-9;]*m//g' | awk '{print $1}')
     fi
     
     # Clear screen for clean output
     clear >&2
     
-    if [[ "$key" =~ ^${JIRA_PROJECT}-[0-9]+$ ]]; then
+    if [[ "$key" =~ ^${JIRA_PROJECT_REGEX}-[0-9]+$ ]]; then
         local url="https://${JIRA_DOMAIN}/browse/$key"
         
         # Get ticket summary from cache if available
@@ -914,14 +914,14 @@ open_ticket() {
     # Extract ticket key - it's the second field (first is MR indicator ⎇ or space)
     local key=$(echo "$line" | sed 's/\x1b\[[0-9;]*m//g' | awk '{print $2}')
     # If second field isn't a ticket, try first field (for lines without MR indicator)
-    if ! [[ "$key" =~ ^${JIRA_PROJECT}-[0-9]+$ ]]; then
+    if ! [[ "$key" =~ ^${JIRA_PROJECT_REGEX}-[0-9]+$ ]]; then
         key=$(echo "$line" | sed 's/\x1b\[[0-9;]*m//g' | awk '{print $1}')
     fi
     
     # Clear screen for clean output
     clear >&2
     
-    if [[ "$key" =~ ^${JIRA_PROJECT}-[0-9]+$ ]]; then
+    if [[ "$key" =~ ^${JIRA_PROJECT_REGEX}-[0-9]+$ ]]; then
         local jira_url="https://${JIRA_DOMAIN}/browse/$key"
         local mr_url=""
         
@@ -1272,7 +1272,7 @@ switch_to_branch_interactive() {
     # Extract ticket key - it's the second field (first is MR indicator ⎇ or space)
     local key=$(echo "$line" | sed 's/\x1b\[[0-9;]*m//g' | awk '{print $2}')
     # If second field isn't a ticket, try first field (for lines without MR indicator)
-    if ! [[ "$key" =~ ^${JIRA_PROJECT}-[0-9]+$ ]]; then
+    if ! [[ "$key" =~ ^${JIRA_PROJECT_REGEX}-[0-9]+$ ]]; then
         key=$(echo "$line" | sed 's/\x1b\[[0-9;]*m//g' | awk '{print $1}')
     fi
     local target_branch=""
@@ -1283,7 +1283,7 @@ switch_to_branch_interactive() {
     # Check if this is a branch entry (🌿)
     if [[ "$line" == *"🌿"* ]]; then
         target_branch=$(echo "$line" | grep -oE '🌿[^ ]+' | sed 's/🌿//')
-    elif [[ "$key" =~ ^${JIRA_PROJECT}-[0-9]+$ ]]; then
+    elif [[ "$key" =~ ^${JIRA_PROJECT_REGEX}-[0-9]+$ ]]; then
         # This is a ticket - find matching branch
         target_branch="$key"
     else
@@ -1315,7 +1315,7 @@ switch_to_branch_interactive() {
     
     # If target is a ticket key, find a matching branch
     local found_branch=""
-    if [[ "$target_branch" =~ ^${JIRA_PROJECT}-[0-9]+$ ]]; then
+    if [[ "$target_branch" =~ ^${JIRA_PROJECT_REGEX}-[0-9]+$ ]]; then
         # Look for branches containing this ticket key
         local matching_branches=$(git branch --format='%(refname:short)' 2>/dev/null | grep -i "$target_branch")
         local branch_count=$(echo "$matching_branches" | grep -c .)
@@ -1481,10 +1481,10 @@ if [ "$1" = "--open-qa-branch" ]; then
     shift
     line="$1"
     key=$(echo "$line" | sed 's/\x1b\[[0-9;]*m//g' | awk '{print $2}')
-    if ! [[ "$key" =~ ^${JIRA_PROJECT}-[0-9]+$ ]]; then
+    if ! [[ "$key" =~ ^${JIRA_PROJECT_REGEX}-[0-9]+$ ]]; then
         key=$(echo "$line" | sed 's/\x1b\[[0-9;]*m//g' | awk '{print $1}')
     fi
-    if [[ "$key" =~ ^${JIRA_PROJECT}-[0-9]+$ ]] && [ -n "${JIRA_QA_BRANCH_DOMAIN:-}" ]; then
+    if [[ "$key" =~ ^${JIRA_PROJECT_REGEX}-[0-9]+$ ]] && [ -n "${JIRA_QA_BRANCH_DOMAIN:-}" ]; then
         qa_field_id="${JIRA_QA_BRANCH_FIELD:-}"
         if [ -z "$qa_field_id" ]; then
             editmeta=$(curl -s --max-time 5 -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
@@ -1610,7 +1610,7 @@ export JIRA_FZF_DEFAULT_LABELS="$DEFAULT_LABELS"
     --preview='
         # Extract key
         key=$(echo {} | awk "{print \$1}" | sed "s/\x1b\[[0-9;]*m//g");
-        if [[ "$key" =~ ^'"${JIRA_PROJECT}"'-[0-9]+$ ]]; then
+        if [[ "$key" =~ ^'"${JIRA_PROJECT_REGEX}"'-[0-9]+$ ]]; then
             tmpfile="/tmp/jira-preview-${key}.json"
             
             # Check if we have recent cached data (within 60 seconds)

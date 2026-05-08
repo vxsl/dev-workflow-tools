@@ -153,7 +153,7 @@ while [[ "$#" -gt 0 ]]; do
             ;;
         *)
             # Check if it looks like a Jira ticket
-            if [[ "$1" =~ ^${JIRA_PROJECT}-[0-9]+$ ]] || [[ "$1" =~ ^[A-Z]+-[0-9]+$ ]]; then
+            if [[ "$1" =~ ^${JIRA_PROJECT_REGEX}-[0-9]+$ ]] || [[ "$1" =~ ^[A-Z]+-[0-9]+$ ]]; then
                 if [ -z "$TICKET_KEY" ]; then
                     TICKET_KEY="$1"
                 else
@@ -485,7 +485,7 @@ update_jira_ticket() {
 # Try to detect ticket from branch name
 detect_ticket_from_branch() {
     local branch="$1"
-    if [[ "$branch" =~ (${JIRA_PROJECT}-[0-9]+) ]]; then
+    if [[ "$branch" =~ (${JIRA_PROJECT_REGEX}-[0-9]+) ]]; then
         echo "${BASH_REMATCH[1]}"
     fi
 }

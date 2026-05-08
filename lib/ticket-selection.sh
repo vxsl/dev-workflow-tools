@@ -100,7 +100,7 @@ select_ticket_or_slack() {
 
     if [ -n "$selected" ] && [ "$selected" != "$query" ]; then
         echo "$selected" | cut -f1
-    elif [[ "$query" =~ ^${JIRA_PROJECT}-[0-9]+$ ]]; then
+    elif [[ "$query" =~ ^${JIRA_PROJECT_REGEX}-[0-9]+$ ]]; then
         echo "$query"
     elif [[ "$query" =~ ^[0-9]+$ ]]; then
         echo "${JIRA_PROJECT}-$query"
