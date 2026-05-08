@@ -746,29 +746,23 @@ echo -e "  ${DIM}Source: ${selected_branch} → Target: ${target_branch}${RESET}
 echo "" >&2
 
 # First check if an MR already exists for this branch
-echo -e "  ${DIM}$ glab mr list --source-branch=\"${selected_branch}\" --state=opened${RESET}" >&2
-existing_mr=$(glab mr list --source-branch="$selected_branch" --state=opened 2>/dev/null | head -1)
+echo -e "  ${DIM}$ glab mr list --source-branch=\"${selected_branch}\" --output=json${RESET}" >&2
+existing_mr_url=$(glab mr list --source-branch="$selected_branch" --output=json 2>/dev/null | jq -r '.[0].web_url // empty' 2>/dev/null)
 
-if [ -n "$existing_mr" ]; then
-    # MR already exists - get its URL and open it
-    echo -e "  ${DIM}$ glab mr view \"${selected_branch}\"${RESET}" >&2
-    mr_url=$(glab mr view "$selected_branch" 2>/dev/null | grep -oE 'https://[^ ]+merge_requests/[0-9]+' | head -1)
-    
-    echo "" >&2
+if [ -n "$existing_mr_url" ]; then
+    # MR already exists - reuse its URL
+    mr_url="$existing_mr_url"
+
     echo "" >&2
     echo -e "  ${BLUE}Merge Request already exists${RESET}" >&2
-    
-    if [ -n "$mr_url" ]; then
-        echo -e "  ${DIM}URL:${RESET}  ${UNDERLINE}${BLUE}${mr_url}${RESET}" >&2
-        
+    echo -e "  ${DIM}URL:${RESET}  ${UNDERLINE}${BLUE}${mr_url}${RESET}" >&2
+
+    if [ "$OUTPUT_URL" != "true" ]; then
         if copy_to_clipboard "$mr_url"; then
             echo -e "  ${DIM}(URL copied to clipboard)${RESET}" >&2
         fi
-        
         echo -e "  ${DIM}Opening in browser...${RESET}" >&2
         open_url "${mr_url}/diffs"
-    else
-        echo -e "  ${DIM}${existing_mr}${RESET}" >&2
     fi
 else
     # No existing MR - create one
@@ -777,7 +771,9 @@ else
     echo -e "  ${DIM}$ glab mr create ${draft_flag_display}--title \"${mr_title}\" --description \"${mr_description}\" \\\\${RESET}" >&2
     echo -e "  ${DIM}    --source-branch \"${selected_branch}\" --target-branch \"${target_branch}\" --push=false${RESET}" >&2
     
-    mr_output=$(glab mr create \
+    # Use `if` so set -e doesn't kill the script on glab failure;
+    # we want to handle "already exists" and other errors below.
+    if mr_output=$(glab mr create \
         $IS_DRAFT \
         --title "$mr_title" \
         --description "$mr_description" \
@@ -785,8 +781,11 @@ else
         --target-branch "$target_branch" \
         --push=false \
         --yes \
-        < /dev/null 2>&1)
-    mr_exit_code=$?
+        < /dev/null 2>&1); then
+        mr_exit_code=0
+    else
+        mr_exit_code=$?
+    fi
     
     if [ $mr_exit_code -eq 0 ]; then
         # Extract MR URL from output
