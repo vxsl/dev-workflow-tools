@@ -546,7 +546,7 @@ create_ticket_worktree() {
         echo "Tracking existing remote branch 'origin/$ticket_id'..." >&2
         echo "Creating worktree at '$wt_path'..." >&2
 
-        if git worktree add --track -b "$ticket_id" "$wt_path" "origin/$ticket_id" 2>&1 >&2; then
+        if git worktree add --track -b "$ticket_id" "$wt_path" "origin/$ticket_id" >&2; then
             echo "✓ Branch and worktree created successfully!" >&2
             copy_worktree_files "$GIT_ROOT" "$wt_path"
             echo "$wt_path"
@@ -559,7 +559,7 @@ create_ticket_worktree() {
         echo "Creating branch '$ticket_id' from '$default_branch'..." >&2
         echo "Creating worktree at '$wt_path'..." >&2
 
-        if git worktree add -b "$ticket_id" "$wt_path" "$default_branch" 2>&1 >&2; then
+        if git worktree add -b "$ticket_id" "$wt_path" "$default_branch" >&2; then
             echo "✓ Branch and worktree created successfully!" >&2
             copy_worktree_files "$GIT_ROOT" "$wt_path"
             echo "$wt_path"
@@ -600,7 +600,7 @@ create_worktree() {
     local wt_path="$GIT_ROOT/../$repo_name.$wt_name"
 
     echo "Creating worktree for branch '$branch' at '$wt_path'..." >&2
-    if git worktree add "$wt_path" "$branch" 2>&1 >&2; then
+    if git worktree add "$wt_path" "$branch" >&2; then
         echo "✓ Worktree created successfully!" >&2
 
         copy_worktree_files "$GIT_ROOT" "$wt_path"
@@ -3687,7 +3687,7 @@ if [ -n "$branch" ]; then
             case "$choice" in
                 *"Switch worktree back"*)
                     echo "Switching '$wt_basename' back to '$branch'..." >&2
-                    if ! git -C "$wt_path" checkout "$branch" 2>&1 >&2; then
+                    if ! git -C "$wt_path" checkout "$branch" >&2; then
                         echo -e "\033[38;5;167mFailed to switch — worktree may have uncommitted changes.\033[0m" >&2
                         echo "Try: cd $wt_path && git stash && git checkout $branch" >&2
                         exit 1
