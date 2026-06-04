@@ -10,6 +10,7 @@
 #   publish-changes --draft                   Create as draft MR
 #   publish-changes --no-jira                 Skip Jira integration even if ticket detected
 #   publish-changes --include-ticket-description  Include ticket description in MR description
+#   publish-changes --slack-url <url>         Post MR link to the given Slack thread/channel (no prompt)
 #
 # Features:
 #   - Interactive branch selection with fzf
@@ -54,6 +55,7 @@ read_tty() {
 
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$(type -P "$0" || echo "$0")")")" && pwd)"
 source "$SCRIPT_DIR/../lib/ticket-selection.sh"
+source "$SCRIPT_DIR/../lib/slack.sh"
 
 # Load environment from parent directory
 if [ -f "$SCRIPT_DIR/../.env" ]; then
@@ -84,6 +86,9 @@ INCLUDE_TICKET_DESCRIPTION=false
 TICKET_DESCRIPTION=""
 MR_TITLE_OVERRIDE=""
 MR_DESCRIPTION_OVERRIDE=""
+SLACK_URL=""
+SLACK_CHANNEL=""
+SLACK_THREAD_TS=""
 
 # Colors
 RED='\033[38;5;167m'
@@ -145,6 +150,10 @@ while [[ "$#" -gt 0 ]]; do
             ;;
         --description)
             MR_DESCRIPTION_OVERRIDE="$2"
+            shift 2
+            ;;
+        --slack-url)
+            SLACK_URL="$2"
             shift 2
             ;;
         --help|-h)
@@ -488,6 +497,27 @@ detect_ticket_from_branch() {
     if [[ "$branch" =~ (${JIRA_PROJECT_REGEX}-[0-9]+) ]]; then
         echo "${BASH_REMATCH[1]}"
     fi
+}
+
+# Append a Slack reference to the MR description (idempotent — skips if already present).
+# Fetches the current description first so existing content (e.g. "Closes PROJ-1234") is preserved.
+add_slack_ref_to_mr() {
+    local branch="$1"
+    local url="$2"
+    local current=""
+    current=$(glab mr view "$branch" --output json 2>/dev/null | jq -r '.description // ""' 2>/dev/null) || current=""
+    if echo "$current" | grep -qF "$url"; then
+        return 0  # already referenced
+    fi
+    local new_desc
+    if [ -n "$current" ]; then
+        new_desc="${current}"$'\n\n'"Slack: ${url}"
+    else
+        new_desc="Slack: ${url}"
+    fi
+    # Don't let a failed update abort the caller (set -e); the Slack post is what matters.
+    glab mr update "$branch" --description "$new_desc" >/dev/null 2>&1 || true
+    return 0
 }
 
 # ============================================================================
@@ -882,6 +912,48 @@ else
 fi
 
 echo "" >&2
+
+# Post MR link to Slack. Consolidated here so callers (e.g. oneshot) reuse it
+# instead of duplicating the prompt. A caller can pass --slack-url to post
+# non-interactively; otherwise we offer an interactive prompt.
+if [ -n "$mr_url" ]; then
+    if [ -n "$SLACK_URL" ]; then
+        # Non-interactive: caller provided a Slack URL
+        if parse_slack_url "$SLACK_URL"; then
+            slack_target="channel"
+            [ -n "$SLACK_THREAD_TS" ] && slack_target="thread"
+            add_slack_ref_to_mr "$selected_branch" "$SLACK_URL"
+            echo -e "  ${DIM}Posting MR link to Slack ${slack_target}...${RESET}" >&2
+            if post_to_slack "$SLACK_CHANNEL" "$SLACK_THREAD_TS" "mr" "$mr_url" "$mr_title"; then
+                echo -e "  ${GREEN}✓${RESET} Posted MR link to Slack ${slack_target}" >&2
+            fi
+        else
+            echo -e "  ${YELLOW}⚠ Invalid Slack URL, skipping Slack post${RESET}" >&2
+        fi
+    elif is_interactive; then
+        # Interactive: offer to post the MR link to a Slack thread/channel
+        printf "  ${CYAN}Post MR link to Slack?${RESET} ${DIM}(y/N)${RESET} " >&2
+        read_tty -n 1 post_slack_choice
+        echo "" >&2
+        if [[ "$post_slack_choice" =~ ^[Yy]$ ]]; then
+            printf "  ${CYAN}Paste Slack URL (thread or channel):${RESET} " >&2
+            read_tty -r pasted_slack_url
+            if parse_slack_url "$pasted_slack_url"; then
+                echo "" >&2
+                add_slack_ref_to_mr "$selected_branch" "$pasted_slack_url"
+                echo -e "  ${GREEN}✓${RESET} Added Slack reference to MR description" >&2
+                if [ -n "$TICKET_CREATOR_BOT_TOKEN" ] && ! verify_slack_channel_access "$SLACK_CHANNEL"; then
+                    echo -e "  ${YELLOW}⚠ Skipping Slack post${RESET}" >&2
+                elif post_to_slack "$SLACK_CHANNEL" "$SLACK_THREAD_TS" "mr" "$mr_url" "$mr_title"; then
+                    echo -e "  ${GREEN}✓${RESET} Posted MR link to Slack" >&2
+                fi
+            else
+                echo -e "  ${YELLOW}⚠ Invalid Slack URL, skipping${RESET}" >&2
+            fi
+        fi
+    fi
+    echo "" >&2
+fi
 
 # Output URL to stdout if requested (for scripting)
 if [ "$OUTPUT_URL" = true ] && [ -n "$mr_url" ]; then
