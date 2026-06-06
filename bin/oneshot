@@ -68,6 +68,7 @@ HOTFIX_DESCRIPTION=""
 PREEXISTING_COMMITS=false
 PREEXISTING_COMMITS_BRANCH=""
 REBASED=false
+PREPUSH_VALIDATED=false
 ISSUE_TYPE=""
 
 # Colors
@@ -600,14 +601,19 @@ if [ "${SKIP_TO_COMMIT_LOOP:-false}" != true ] && [ "${RESUME_CREATE_BRANCH:-fal
         echo "" >&2
     fi
 
-    # Step 1.5: Run pre-push checks (only when there are staged changes to validate)
-    if [ "$staged_count" -gt 0 ] && [ "$DRY_RUN" != true ]; then
+    # Step 1.5: Run pre-push checks whenever there's something to validate —
+    # staged changes about to be committed, OR pre-existing unpushed commits we're
+    # about to move to a branch and publish. Both will be pushed, so both must pass
+    # the hook. (Previously this only ran for staged changes, so feeding oneshot an
+    # already-committed change skipped validation entirely.)
+    if { [ "$staged_count" -gt 0 ] || [ "$ahead_count" -gt 0 ]; } && [ "$DRY_RUN" != true ]; then
         # Determine repository root
         repo_root=$(git rev-parse --show-toplevel)
 
         if ! run_prepush_checks "$repo_root"; then
             exit 1
         fi
+        PREPUSH_VALIDATED=true
     fi
 fi
 
@@ -1646,10 +1652,12 @@ fi  # End of commit loop
 
 echo "" >&2
 
-# Step 3.5: Run pre-push checks again before publishing
-# This ensures any additional commits or rebased code is validated
-# Runs if extra commits were added after initial validation, or if code was rebased onto a different base
-if [ "$DRY_RUN" != true ] && { [ "${extra_commits_made:-false}" = true ] || [ "${REBASED:-false}" = true ]; }; then
+# Step 3.5: Run pre-push checks before publishing.
+# Validates if checks never ran (e.g. a resume path that skipped Step 1), if extra
+# commits were added after the initial validation, or if code was rebased onto a
+# different base. When checks already passed and nothing changed, this is skipped.
+# (run_prepush_checks is cached per HEAD+diff, so a redundant call here is a no-op.)
+if [ "$DRY_RUN" != true ] && { [ "${PREPUSH_VALIDATED:-false}" != true ] || [ "${extra_commits_made:-false}" = true ] || [ "${REBASED:-false}" = true ]; }; then
     repo_root=$(git rev-parse --show-toplevel)
     
     echo -e "${CYAN}┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓${RESET}" >&2
@@ -1664,7 +1672,7 @@ if [ "$DRY_RUN" != true ] && { [ "${extra_commits_made:-false}" = true ] || [ "$
         exit 1
     fi
 elif [ "$DRY_RUN" != true ]; then
-    echo -e "  ${DIM}Skipping pre-push checks (no additional commits since last validation)${RESET}" >&2
+    echo -e "  ${DIM}Skipping pre-push checks (already validated, no changes since)${RESET}" >&2
     echo "" >&2
 fi
 
