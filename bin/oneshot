@@ -954,35 +954,39 @@ if [ "${SKIP_TO_COMMIT_LOOP:-false}" != true ]; then
         # Try to get the remote tracking branch (|| true prevents set -e from killing script when no upstream)
         remote_tracking=$(git rev-parse --abbrev-ref --symbolic-full-name @{u} 2>/dev/null) || true
         
+        # "Current branch" base = upstream if there is one, else the local branch
         if [ -n "$remote_tracking" ]; then
+            _base_current="$remote_tracking"
             echo -e "  ${YELLOW}⚠ You're currently on branch: ${current_branch} (tracking ${remote_tracking})${RESET}" >&2
-            echo -e "  ${CYAN}Base new branch off of:${RESET}" >&2
-            echo -e "    ${DIM}1) Current branch (${remote_tracking})${RESET}" >&2
-            echo -e "    ${DIM}2) origin/main${RESET}" >&2
-            read -p "  > " -n 1 -r base_choice < /dev/tty
-            echo "" >&2
-            
-            if [[ $base_choice =~ ^[1]$ ]]; then
-                BASE_BRANCH="$remote_tracking"
-                echo -e "  ${GREEN}✓${RESET} Will branch from: ${remote_tracking}" >&2
+        else
+            _base_current="$current_branch"
+            echo -e "  ${YELLOW}⚠ You're currently on branch: ${current_branch} (no remote tracking)${RESET}" >&2
+        fi
+        echo -e "  ${CYAN}Base new branch off of:${RESET}" >&2
+        echo -e "    ${DIM}1) Current branch (${_base_current})${RESET}" >&2
+        echo -e "    ${DIM}2) origin/main${RESET}" >&2
+        echo -e "    ${DIM}3) Other branch…${RESET}" >&2
+        read -p "  > " -n 1 -r base_choice < /dev/tty
+        echo "" >&2
+
+        if [[ $base_choice =~ ^[1]$ ]]; then
+            BASE_BRANCH="$_base_current"
+        elif [[ $base_choice =~ ^[3]$ ]]; then
+            # Pick any local or remote branch. `|| true` so an ESC in fzf
+            # (exit 130) doesn't trip `set -e`.
+            _picked=$(git for-each-ref --format='%(refname:short)' refs/heads refs/remotes \
+                | grep -v '/HEAD$' | sort -u \
+                | "$FZF" --prompt="base branch> " --height=40% --reverse --no-multi || true)
+            if [ -n "$_picked" ]; then
+                BASE_BRANCH="$_picked"
             else
-                echo -e "  ${GREEN}✓${RESET} Will branch from: origin/main" >&2
+                BASE_BRANCH="$_base_current"
+                echo -e "  ${DIM}(no selection — falling back to ${_base_current})${RESET}" >&2
             fi
         else
-            echo -e "  ${YELLOW}⚠ You're currently on branch: ${current_branch} (no remote tracking)${RESET}" >&2
-            echo -e "  ${CYAN}Base new branch off of:${RESET}" >&2
-            echo -e "    ${DIM}1) Current branch (${current_branch})${RESET}" >&2
-            echo -e "    ${DIM}2) origin/main${RESET}" >&2
-            read -p "  > " -n 1 -r base_choice < /dev/tty
-            echo "" >&2
-            
-            if [[ $base_choice =~ ^[1]$ ]]; then
-                BASE_BRANCH="$current_branch"
-                echo -e "  ${GREEN}✓${RESET} Will branch from: ${current_branch}" >&2
-            else
-                echo -e "  ${GREEN}✓${RESET} Will branch from: origin/main" >&2
-            fi
+            BASE_BRANCH="origin/main"
         fi
+        echo -e "  ${GREEN}✓${RESET} Will branch from: ${BASE_BRANCH}" >&2
         echo "" >&2
     fi
 
@@ -1043,6 +1047,29 @@ if [ "${SKIP_TO_COMMIT_LOOP:-false}" != true ]; then
                     git diff > "$_wt_unstaged_patch"
                 fi
 
+                # ── Pre-flight: decide the target worktree BEFORE touching the
+                # working tree, so a collision can never strand uncommitted work.
+                # Build worktree path (same convention as rr.sh)
+                _wt_path="$_main_root/../$_repo_name.$branch_name"
+                _wt_reuse=false
+                # Is branch_name already checked out in some worktree? If so, reuse it.
+                _existing_wt=$(git worktree list --porcelain | awk -v b="refs/heads/$branch_name" '/^worktree /{p=substr($0,10)} $0=="branch "b{print p; exit}')
+                if [ -n "$_existing_wt" ]; then
+                    _wt_path="$_existing_wt"
+                    _wt_reuse=true
+                    echo -e "  ${CYAN}Branch ${branch_name} is already checked out — reusing its worktree:${RESET}" >&2
+                    echo -e "  ${DIM}    ${_wt_path}${RESET}" >&2
+                elif [ -e "$_wt_path" ]; then
+                    # Path exists but is NOT a worktree for this branch — refuse to clobber,
+                    # and crucially do this BEFORE cleaning the source working tree.
+                    echo -e "  ${RED}✗ Target path already exists and is not a worktree for ${branch_name}:${RESET}" >&2
+                    echo -e "  ${DIM}    ${_wt_path}${RESET}" >&2
+                    echo -e "  ${YELLOW}Your changes are untouched in ${_current_wt_root}.${RESET}" >&2
+                    echo -e "  ${DIM}Remove/rename that path, or re-run with --base from the right worktree.${RESET}" >&2
+                    rm -f "$_wt_staged_patch" "$_wt_unstaged_patch"
+                    exit 1
+                fi
+
                 # Clean working tree so original worktree returns to proper state
                 git reset HEAD --quiet 2>/dev/null
                 git checkout -- . 2>/dev/null
@@ -1054,32 +1081,51 @@ if [ "${SKIP_TO_COMMIT_LOOP:-false}" != true ]; then
                     git fetch origin "$_remote_branch" 2>&1 | while read -r line; do echo -e "    ${DIM}${line}${RESET}" >&2; done
                 fi
 
-                # Build worktree path (same convention as rr.sh)
-                _wt_path="$_main_root/../$_repo_name.$branch_name"
-
-                # Create worktree with the new branch
-                if git show-ref --verify --quiet "refs/heads/$branch_name"; then
-                    # Branch already exists — just create worktree for it
+                # Create the worktree (skip entirely if we're reusing an existing one)
+                # NOTE: each add runs as an `if` condition so a failure captures the
+                # exit code instead of tripping `set -e` (which previously killed the
+                # script before the restore handler below could run → stranded work).
+                _wt_add_output=""
+                if [ "$_wt_reuse" = true ]; then
+                    _wt_add_exit=0
+                elif git show-ref --verify --quiet "refs/heads/$branch_name"; then
+                    # Branch already exists (but not checked out) — create a worktree for it
                     echo -e "  ${DIM}$ git worktree add ${_wt_path} ${branch_name}${RESET}" >&2
-                    _wt_add_output=$(git worktree add "$_wt_path" "$branch_name" 2>&1)
+                    if _wt_add_output=$(git worktree add "$_wt_path" "$branch_name" 2>&1); then
+                        _wt_add_exit=0
+                    else
+                        _wt_add_exit=$?
+                    fi
                 else
                     echo -e "  ${DIM}$ git worktree add -b ${branch_name} ${_wt_path} ${BASE_BRANCH}${RESET}" >&2
-                    _wt_add_output=$(git worktree add -b "$branch_name" "$_wt_path" "$BASE_BRANCH" 2>&1)
+                    if _wt_add_output=$(git worktree add -b "$branch_name" "$_wt_path" "$BASE_BRANCH" 2>&1); then
+                        _wt_add_exit=0
+                    else
+                        _wt_add_exit=$?
+                    fi
                 fi
-                _wt_add_exit=$?
                 if [ -n "$_wt_add_output" ]; then
                     echo "$_wt_add_output" | while read -r line; do echo -e "    ${DIM}${line}${RESET}" >&2; done
                 fi
                 if [ $_wt_add_exit -ne 0 ]; then
-                    echo -e "  ${RED}✗ Failed to create worktree${RESET}" >&2
-                    # Restore staged changes in original worktree
+                    echo -e "  ${RED}✗ Failed to create worktree — restoring your changes in place${RESET}" >&2
+                    # Restore changes in the original worktree; KEEP patches if restore fails
+                    # (never swallow the error — that was the data-loss bug).
+                    _restore_ok=true
                     if [ -s "$_wt_staged_patch" ]; then
-                        git apply --index "$_wt_staged_patch" 2>/dev/null
+                        git apply --index "$_wt_staged_patch" || _restore_ok=false
                     fi
                     if [ -n "$_wt_unstaged_patch" ] && [ -s "$_wt_unstaged_patch" ]; then
-                        git apply "$_wt_unstaged_patch" 2>/dev/null
+                        git apply "$_wt_unstaged_patch" || _restore_ok=false
                     fi
-                    rm -f "$_wt_staged_patch" "$_wt_unstaged_patch"
+                    if [ "$_restore_ok" = true ]; then
+                        rm -f "$_wt_staged_patch" "$_wt_unstaged_patch"
+                    else
+                        echo -e "  ${YELLOW}⚠ Could not auto-restore — your changes are saved as patches:${RESET}" >&2
+                        echo -e "  ${DIM}    staged:   ${_wt_staged_patch}${RESET}" >&2
+                        [ -n "$_wt_unstaged_patch" ] && echo -e "  ${DIM}    unstaged: ${_wt_unstaged_patch}${RESET}" >&2
+                        echo -e "  ${DIM}Apply with: git apply --index <patch>${RESET}" >&2
+                    fi
                     exit 1
                 fi
 
