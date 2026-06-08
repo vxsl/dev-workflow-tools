@@ -220,7 +220,7 @@ elif [ "${#JIRA_PROJECT_LIST[@]}" -gt 1 ]; then
     printf "\033[38;5;109m┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\033[0m\n" >&2
     _picked=$(printf '%s\n' "${JIRA_PROJECT_LIST[@]}" | $FZF \
         --prompt="  📋 Board > " --height=8 --reverse --border=rounded \
-        --header="Pick the Jira project to create the ticket in" </dev/tty)
+        --header="Pick the Jira project to create the ticket in")
     if [ -z "$_picked" ]; then
         printf "\033[38;5;167m  ✗ Cancelled\033[0m\n" >&2
         rm -rf "$tmpdir"
