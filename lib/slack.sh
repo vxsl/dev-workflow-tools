@@ -16,6 +16,19 @@ if [ -n "$SLACK_LIB_LOADED" ]; then
 fi
 SLACK_LIB_LOADED=1
 
+# Escape text for Slack mrkdwn. Slack treats &, <, > as control characters
+# (entity/link delimiters), so any human-supplied text — ticket titles, names —
+# must HTML-entity-escape them, or a literal '<' (e.g. "TROI < 2 weeks") will
+# corrupt the surrounding <url|text> link. Apply ONLY to interpolated text,
+# never to the link structure itself.
+# See https://api.slack.com/reference/surfaces/formatting#escaping
+# sed (not bash ${//}) because bash 5.2's patsub_replacement treats a bare '&'
+# in the replacement as the matched text; sed's '\&' is a portable literal '&'.
+# Order matters: escape '&' first so the entities we add aren't re-escaped.
+slack_escape() {
+    printf '%s' "$1" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g'
+}
+
 # Parse a Slack URL into SLACK_CHANNEL and SLACK_THREAD_TS (global).
 # Handles thread (/archives/CHANNEL/pTIMESTAMP), channel (/archives/CHANNEL),
 # and client (/client/WORKSPACE/CHANNEL) URLs. Returns 1 for unrecognized URLs.
@@ -109,6 +122,9 @@ post_to_slack() {
         return 1
     fi
 
+    # Escape human text so literal &, <, > don't corrupt the mrkdwn link.
+    title=$(slack_escape "$title")
+
     local text
     case "$message_type" in
         ticket)
@@ -117,7 +133,7 @@ post_to_slack() {
         mr)
             local mr_num=$(echo "$url" | grep -oE '[0-9]+$')
             local author_first=$(git config user.name 2>/dev/null | cut -d' ' -f1)
-            local author="${author_first:-Someone}"
+            local author=$(slack_escape "${author_first:-Someone}")
             if [ -n "$thread_ts" ]; then
                 text=":gitlab: ${author} posted an MR related to this thread: <${url}|!${mr_num} — ${title}>"
             else
