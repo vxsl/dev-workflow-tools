@@ -1016,19 +1016,21 @@ if [ "${SKIP_TO_COMMIT_LOOP:-false}" != true ]; then
                 echo -e "  ${CYAN}Inside worktree for ${_wt_current_branch} — creating new worktree for ${branch_name}${RESET}" >&2
                 echo "" >&2
 
-                # Preexisting commits in a foreign worktree: save SHAs for cherry-pick after push
+                # Preexisting commits in a foreign worktree: move them to the new
+                # branch in THIS run. The commits are addressable by SHA locally, so
+                # there's no need to push first or defer to a resume — we create the
+                # new worktree off BASE_BRANCH, cherry-pick the commits there (see the
+                # CHERRY_PICK_COMMITS handling below), then rewind this branch to drop
+                # them. Pushing first would be wrong: it leaves the commits on the
+                # source branch, and when BASE_BRANCH *is* that branch it poisons the
+                # base so the cherry-pick conflicts on resume.
                 if [ "$PREEXISTING_COMMITS" = true ]; then
                     _cherry_pick_shas=$(git rev-list HEAD --not --remotes=origin --reverse | tr '\n' ' ' | sed 's/ $//')
-                    echo -e "  ${YELLOW}⚠ Found unpublished commits that need to move to ${branch_name}${RESET}" >&2
-                    echo -e "  ${DIM}Push your commits on ${_wt_current_branch} first, then run oneshot again${RESET}" >&2
-                    echo -e "  ${DIM}(Saved ${_cherry_pick_shas%% *}... for cherry-pick on resume)${RESET}" >&2
-                    # Re-save state with commit SHAs so resume can cherry-pick them
-                    if [ "$HOTFIX_MODE" = true ]; then
-                        save_state "HOTFIX" "$summary" "$branch_name" "$BASE_BRANCH" "$SLACK_URL" "$SLACK_CHANNEL" "$SLACK_THREAD_TS" "$_cherry_pick_shas"
-                    else
-                        save_state "$TICKET_KEY" "$summary" "$TICKET_KEY" "$BASE_BRANCH" "$SLACK_URL" "$SLACK_CHANNEL" "$SLACK_THREAD_TS" "$_cherry_pick_shas"
-                    fi
-                    exit 1
+                    _oldest_unpub=${_cherry_pick_shas%% *}
+                    _preexisting_src_base=$(git rev-parse "${_oldest_unpub}^" 2>/dev/null || echo "")
+                    CHERRY_PICK_COMMITS="$_cherry_pick_shas"
+                    _move_preexisting_from_worktree=true
+                    echo -e "  ${YELLOW}⚠ Moving $(echo "$_cherry_pick_shas" | wc -w) unpublished commit(s) from ${_wt_current_branch} to ${branch_name}${RESET}" >&2
                 fi
 
                 # Get main repo root and current worktree root
@@ -1178,22 +1180,59 @@ if [ "${SKIP_TO_COMMIT_LOOP:-false}" != true ]; then
                 echo -e "  ${GREEN}✓${RESET} Worktree: ${_wt_path}" >&2
                 echo -e "  ${GREEN}✓${RESET} Branch: ${branch_name}" >&2
 
-                # Cherry-pick commits saved from a previous "push first" interruption
+                # Move the preexisting commits onto the new branch by cherry-picking.
+                # (CHERRY_PICK_COMMITS is set inline above, or restored from a legacy
+                # saved state.) Skip any commit already reachable from the new base —
+                # otherwise re-applying an already-present commit fails as "empty".
                 if [ -n "${CHERRY_PICK_COMMITS:-}" ]; then
-                    _cherry_count=$(echo "$CHERRY_PICK_COMMITS" | wc -w)
-                    echo -e "  ${DIM}Cherry-picking ${_cherry_count} commit(s) from previous session...${RESET}" >&2
-                    # shellcheck disable=SC2086
-                    _cherry_output=$(git cherry-pick $CHERRY_PICK_COMMITS 2>&1)
-                    _cherry_exit=$?
-                    if [ -n "$_cherry_output" ]; then
-                        echo "$_cherry_output" | while read -r line; do echo -e "    ${DIM}${line}${RESET}" >&2; done
+                    _to_pick=""
+                    for _c in $CHERRY_PICK_COMMITS; do
+                        if git merge-base --is-ancestor "$_c" HEAD 2>/dev/null; then
+                            echo -e "  ${DIM}Skipping ${_c:0:12} — already present on ${BASE_BRANCH}${RESET}" >&2
+                        else
+                            _to_pick="${_to_pick:+$_to_pick }$_c"
+                        fi
+                    done
+                    if [ -n "$_to_pick" ]; then
+                        _cherry_count=$(echo "$_to_pick" | wc -w)
+                        echo -e "  ${DIM}Cherry-picking ${_cherry_count} commit(s) onto ${branch_name}...${RESET}" >&2
+                        # shellcheck disable=SC2086
+                        if _cherry_output=$(git cherry-pick $_to_pick 2>&1); then
+                            _cherry_exit=0
+                        else
+                            _cherry_exit=$?
+                        fi
+                        if [ -n "$_cherry_output" ]; then
+                            echo "$_cherry_output" | while read -r line; do echo -e "    ${DIM}${line}${RESET}" >&2; done
+                        fi
+                        if [ $_cherry_exit -ne 0 ]; then
+                            # Abort so we leave no half-applied state. The source branch
+                            # has NOT been rewound yet, so the commits are still safe there.
+                            git cherry-pick --abort 2>/dev/null || true
+                            echo -e "  ${RED}✗ Cherry-pick conflicts with ${BASE_BRANCH} — could not move commits automatically${RESET}" >&2
+                            echo -e "  ${DIM}Your commits are untouched on ${_wt_current_branch}. New worktree left at ${BASE_BRANCH}: ${_wt_path}${RESET}" >&2
+                            exit 1
+                        fi
+                        echo -e "  ${GREEN}✓${RESET} Cherry-picked ${_cherry_count} commit(s)" >&2
+                    else
+                        echo -e "  ${DIM}All commit(s) already present on ${BASE_BRANCH} — nothing to cherry-pick${RESET}" >&2
                     fi
-                    if [ $_cherry_exit -ne 0 ]; then
-                        echo -e "  ${RED}✗ Cherry-pick failed — resolve conflicts, then run oneshot to resume${RESET}" >&2
-                        exit 1
-                    fi
-                    echo -e "  ${GREEN}✓${RESET} Cherry-picked ${_cherry_count} commit(s)" >&2
                     CHERRY_PICKED=true
+                fi
+
+                # If we moved preexisting commits off the source branch, rewind it to
+                # the commits' parent so they live ONLY on the new branch (a real move,
+                # not a copy). The source branch is checked out in another worktree, so
+                # reset it through that worktree. Any uncommitted changes there were
+                # already carried over to the new worktree above, so --hard is safe.
+                if [ "${_move_preexisting_from_worktree:-false}" = true ] && [ -n "${_preexisting_src_base:-}" ]; then
+                    echo -e "  ${DIM}$ git -C ${_current_wt_root} reset --hard ${_preexisting_src_base:0:12}${RESET}" >&2
+                    if git -C "$_current_wt_root" reset --hard "$_preexisting_src_base" --quiet 2>/dev/null; then
+                        echo -e "  ${GREEN}✓${RESET} Rewound ${_wt_current_branch} → ${_preexisting_src_base:0:12} (commits now only on ${branch_name})" >&2
+                    else
+                        echo -e "  ${YELLOW}⚠ Could not rewind ${_wt_current_branch}; commits remain on it too. Rewind manually with:${RESET}" >&2
+                        echo -e "  ${DIM}    git -C ${_current_wt_root} reset --hard ${_preexisting_src_base:0:12}${RESET}" >&2
+                    fi
                 fi
 
                 WORKTREE_HANDLED=true
