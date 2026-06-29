@@ -249,6 +249,38 @@ Apply staged changes to a commit via fixup+autosquash.
 apply_staged_to_commit <commit-sha>
 ```
 
+### `slack-react-notify`
+Desktop notifications when people react to *your* Slack messages — something Slack
+doesn't do natively. A small cross-platform (Linux/macOS) Socket Mode daemon: it
+listens for `reaction_added` events, keeps only the ones on messages you authored,
+and fires a desktop notification (`notify-send` on Linux, `osascript`/
+`terminal-notifier` on macOS, or any command via `SLACK_REACT_NOTIFY_CMD`).
+
+```bash
+slack-react-notify             # run in the foreground
+slack-react-notify --check     # validate tokens + identity, then exit
+slack-react-notify --help      # full Slack-app setup walkthrough
+slack-react-notify --print-service systemd|launchd   # run it on login
+```
+
+Runs as its **own dedicated Slack app** (own `SLACK_REACT_APP_TOKEN` +
+`SLACK_REACT_TOKEN`), independent of `ticket-bot` — don't share tokens, since
+Slack load-balances events across simultaneous Socket Mode connections on one
+app. With a user-token `reaction_added` subscription ("on behalf of users") it
+covers every channel and DM you're in, no bot invites required. See the
+`Slack Reaction Notifications` block in `.env.example` for the scopes and steps.
+
+**Run it on login:**
+```bash
+# Linux (systemd user service)
+slack-react-notify --print-service systemd > ~/.config/systemd/user/slack-react-notify.service
+systemctl --user daemon-reload && systemctl --user enable --now slack-react-notify
+
+# macOS (launchd agent)
+slack-react-notify --print-service launchd > ~/Library/LaunchAgents/com.dev-workflow-tools.slack-react-notify.plist
+launchctl load -w ~/Library/LaunchAgents/com.dev-workflow-tools.slack-react-notify.plist
+```
+
 ## Shell Integration
 
 The `shell/dev-workflow.zsh` provides:

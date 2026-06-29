@@ -1,0 +1,554 @@
+#!/usr/bin/env -S python3 -u
+"""
+slack-react-notify: desktop notifications when people react to your Slack messages
+
+Slack has no native notification for reactions on your own messages. This is a
+small Socket Mode (WebSocket) daemon that listens for `reaction_added` events,
+keeps only the ones where the reacted message is *yours*, and fires a desktop
+notification (notify-send on Linux, osascript/terminal-notifier on macOS, or any
+command you point SLACK_REACT_NOTIFY_CMD at).
+
+It runs as its own dedicated Slack app — independent of ticket-bot — so the two
+never fight over the same Socket Mode connection (Slack load-balances events
+across simultaneous connections on one app, which would drop ~half of them).
+
+Run:   slack-react-notify
+Check: slack-react-notify --check     (validate tokens + identity, then exit)
+Stop:  Ctrl+C
+
+Requires in .env (see `slack-react-notify --help`):
+  SLACK_REACT_APP_TOKEN   App-level token (xapp-...) for Socket Mode
+  SLACK_REACT_TOKEN       OAuth token (xoxp- user token recommended) for Web API
+  SLACK_REACT_USER_ID     (optional) your Slack user id; auto-detected otherwise
+"""
+
+import os
+import platform
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import json
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+try:
+    from slack_sdk.web import WebClient
+    from slack_sdk.socket_mode import SocketModeClient
+    from slack_sdk.socket_mode.request import SocketModeRequest
+    from slack_sdk.socket_mode.response import SocketModeResponse
+except ImportError:
+    print("Error: slack_sdk is required but not installed.")
+    req = Path(__file__).resolve().parent.parent / "requirements.txt"
+    print(f"  pip install -r {req}" if req.exists() else "  pip install slack_sdk")
+    sys.exit(1)
+
+
+HELP = """slack-react-notify: desktop notifications for reactions on your Slack messages
+
+Usage:
+  slack-react-notify            Start the daemon (runs in foreground)
+  slack-react-notify --check    Validate tokens + print identity/scopes, then exit
+  slack-react-notify --selftest Run internal unit checks, then exit
+  slack-react-notify --print-service systemd|launchd
+                                Print a ready-to-use service definition
+  slack-react-notify --help     Show this help
+
+.env settings:
+  SLACK_REACT_APP_TOKEN   (required) App-level token, xapp-...  (Socket Mode)
+  SLACK_REACT_TOKEN       (required) OAuth token, xoxp-... (user) recommended
+  SLACK_REACT_USER_ID     (optional) Your Slack user id; auto-detected via auth.test
+  SLACK_REACT_NOTIFY_CMD  (optional) Custom notifier; called as: CMD "<title>" "<body>"
+                          e.g. ~/bin/notification/claude-notify.sh
+  SLACK_REACT_IGNORE_SELF (optional) "0" to also notify on your own reactions (default: ignore)
+  SLACK_REACT_SNIPPET     (optional) "0" to skip fetching the reacted message text
+  SLACK_REACT_DEBUG       (optional) "1" to log every reaction_added event received
+
+Dedicated Slack app setup (separate from ticket-bot):
+  1. Create a new app:  https://api.slack.com/apps  →  "From scratch"
+  2. Settings → Socket Mode → Enable.
+     Generate an App-Level Token with the `connections:write` scope.
+     → save as SLACK_REACT_APP_TOKEN (starts with xapp-)
+  3. OAuth & Permissions → User Token Scopes, add:
+       reactions:read, users:read,
+       channels:history, groups:history, im:history, mpim:history,
+       channels:read, groups:read
+     (User-token scopes cover EVERY channel/DM you're in — no bot invites needed.)
+  4. Event Subscriptions → Enable Events → "Subscribe to events on behalf of users":
+       reaction_added
+     (Use the "on behalf of users" section, NOT "Subscribe to bot events".)
+  5. Install to your workspace.
+     → save the "User OAuth Token" (xoxp-...) as SLACK_REACT_TOKEN
+  6. slack-react-notify --check   to confirm it all works.
+"""
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+ENV_FILE = SCRIPT_DIR.parent / ".env"
+
+SNIPPET_MAX = 140
+
+# A small map of the most common reaction names to glyphs, purely cosmetic —
+# anything not listed falls back to ":name:".
+EMOJI_MAP = {
+    "+1": "👍", "thumbsup": "👍", "-1": "👎", "thumbsdown": "👎",
+    "heart": "❤️", "heavy_heart_exclamation_mark_ornament": "❣️",
+    "tada": "🎉", "fire": "🔥", "eyes": "👀", "rocket": "🚀",
+    "white_check_mark": "✅", "heavy_check_mark": "✔️", "ballot_box_with_check": "☑️",
+    "x": "❌", "no_entry": "⛔", "warning": "⚠️", "100": "💯",
+    "joy": "😂", "rolling_on_the_floor_laughing": "🤣", "smile": "😄",
+    "smiley": "😃", "grinning": "😀", "slightly_smiling_face": "🙂",
+    "wink": "😉", "sob": "😭", "cry": "😢", "thinking_face": "🤔",
+    "open_mouth": "😮", "scream": "😱", "raised_hands": "🙌", "clap": "👏",
+    "pray": "🙏", "muscle": "💪", "ok_hand": "👌", "wave": "👋",
+    "point_up": "☝️", "point_right": "👉", "star": "⭐", "star2": "🌟",
+    "sparkles": "✨", "boom": "💥", "zap": "⚡", "bulb": "💡",
+    "bell": "🔔", "tada_party": "🥳", "partying_face": "🥳",
+    "thank_you": "🙏", "salute": "🫡", "saluting_face": "🫡",
+    "see_no_evil": "🙈", "facepalm": "🤦", "shrug": "🤷",
+    "eyes_shaking": "👀", "rotating_light": "🚨", "checkered_flag": "🏁",
+    "trophy": "🏆", "ship": "🚢", "shipit": "🚀", "tophat": "🎩",
+    "smiling_face_with_3_hearts": "🥰", "sunglasses": "😎",
+}
+
+
+# ── pure helpers (covered by --selftest) ────────────────────────────────────
+
+_LINK_RE = re.compile(r"<(https?://[^>|]+)\|([^>]+)>")     # <url|label>
+_BARE_LINK_RE = re.compile(r"<(https?://[^>]+)>")          # <url>
+_CHAN_RE = re.compile(r"<#[CG][A-Z0-9]+(?:\|([^>]*))?>")   # <#C123|name> / <#C123>
+_USER_RE = re.compile(r"<@[UW][A-Z0-9]+(?:\|([^>]*))?>")   # <@U123> / <@U123|name>
+_SPECIAL_RE = re.compile(r"<!([^>|]+)(?:\|[^>]*)?>")        # <!here>, <!channel>, <!subteam^..|@t>
+
+
+def slack_text_to_plain(text):
+    """Turn Slack wire mrkdwn into a readable one-line snippet."""
+    if not text:
+        return ""
+    t = text
+    t = _LINK_RE.sub(r"\2", t)
+    t = _BARE_LINK_RE.sub(r"\1", t)
+    t = _CHAN_RE.sub(lambda m: "#" + (m.group(1) or "channel"), t)
+    t = _USER_RE.sub(lambda m: "@" + (m.group(1) or "someone"), t)
+    t = _SPECIAL_RE.sub(lambda m: "@" + m.group(1), t)
+    # Unescape Slack's HTML entities AFTER stripping the real <...> markup.
+    t = t.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+
+def emojize(name):
+    """Map a reaction name to a glyph, falling back to :name: (skin tones stripped)."""
+    base = (name or "").split("::")[0]
+    return EMOJI_MAP.get(base, f":{base}:" if base else "")
+
+
+def truncate(text, n=SNIPPET_MAX):
+    if len(text) <= n:
+        return text
+    return text[: n - 1].rstrip() + "…"
+
+
+def should_notify(item_user, reactor, self_id, ignore_self=True):
+    """Notify only for reactions on *my* messages, optionally skipping my own."""
+    if not self_id:
+        return False
+    if item_user != self_id:
+        return False
+    if ignore_self and reactor == self_id:
+        return False
+    return True
+
+
+def format_notification(reactor_name, reaction, channel_name, snippet):
+    """Build (title, body) for the desktop notification. Pure / testable."""
+    glyph = emojize(reaction)
+    who = reactor_name or "Someone"
+    title = f"{glyph} {who} reacted".strip()
+    where = f"in {channel_name}" if channel_name else ""
+    snippet = slack_text_to_plain(snippet)  # defensive: never leak raw mrkdwn
+    if snippet:
+        snip = truncate(snippet)
+        body = f"{where}: “{snip}”" if where else f"“{snip}”"
+    else:
+        body = where or "reacted to your message"
+    return title, body
+
+
+def applescript_quote(s):
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+# ── env / config ────────────────────────────────────────────────────────────
+
+def load_env():
+    if ENV_FILE.exists():
+        for line in ENV_FILE.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                key, _, value = line.partition("=")
+                value = value.strip().strip('"').strip("'")
+                os.environ.setdefault(key.strip(), os.path.expandvars(value))
+
+
+def _truthy(v, default=True):
+    if v is None or v == "":
+        return default
+    return v.strip().lower() not in ("0", "false", "no", "off")
+
+
+# ── Slack Web API (uses SLACK_REACT_TOKEN) ──────────────────────────────────
+
+def slack_get(method, **params):
+    qs = urllib.parse.urlencode(params)
+    url = f"https://slack.com/api/{method}?{qs}"
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {API_TOKEN}"})
+    try:
+        with urllib.request.urlopen(req) as resp:
+            return json.loads(resp.read())
+    except urllib.error.URLError as e:
+        print(f"  Slack API error ({method}): {e}")
+        return {"ok": False, "error": str(e)}
+
+
+_user_cache = {}
+_channel_cache = {}
+
+
+def resolve_user_name(user_id):
+    if not user_id:
+        return ""
+    if user_id in _user_cache:
+        return _user_cache[user_id]
+    resp = slack_get("users.info", user=user_id)
+    name = ""
+    if resp.get("ok"):
+        p = resp.get("user", {}).get("profile", {})
+        name = p.get("display_name") or p.get("real_name") or p.get("real_name_normalized") or ""
+    _user_cache[user_id] = name or user_id
+    return _user_cache[user_id]
+
+
+def resolve_channel_name(channel_id):
+    if not channel_id:
+        return ""
+    if channel_id in _channel_cache:
+        return _channel_cache[channel_id]
+    resp = slack_get("conversations.info", channel=channel_id)
+    name = ""
+    if resp.get("ok"):
+        ch = resp.get("channel", {})
+        if ch.get("is_im"):
+            name = "a DM"
+        elif ch.get("is_mpim"):
+            name = "a group DM"
+        elif ch.get("name"):
+            name = "#" + ch["name"]
+    _channel_cache[channel_id] = name or channel_id
+    return _channel_cache[channel_id]
+
+
+def fetch_message_text(channel, ts):
+    """Best-effort: the text of the reacted message. Skipped silently on error."""
+    resp = slack_get(
+        "conversations.history",
+        channel=channel, latest=ts, oldest=ts, inclusive="true", limit=1,
+    )
+    if resp.get("ok"):
+        msgs = resp.get("messages", [])
+        if msgs:
+            return slack_text_to_plain(msgs[0].get("text", ""))
+    return ""
+
+
+def get_permalink(channel, ts):
+    resp = slack_get("chat.getPermalink", channel=channel, message_ts=ts)
+    return resp.get("permalink", "") if resp.get("ok") else ""
+
+
+# ── desktop notification (cross-platform) ───────────────────────────────────
+
+def send_notification(title, body, url=None):
+    print(f"  [notify] {title} — {body}" + (f"  {url}" if url else ""))
+    cmd = os.environ.get("SLACK_REACT_NOTIFY_CMD", "").strip()
+    try:
+        if cmd:
+            subprocess.run(shlex.split(cmd) + [title, body], check=False)
+            return
+        if platform.system() == "Darwin":
+            if shutil.which("terminal-notifier"):
+                args = ["terminal-notifier", "-title", title, "-message", body]
+                if url:
+                    args += ["-open", url]
+                subprocess.run(args, check=False)
+            else:
+                script = f"display notification {applescript_quote(body)} with title {applescript_quote(title)}"
+                subprocess.run(["osascript", "-e", script], check=False)
+        elif shutil.which("notify-send"):
+            subprocess.run(["notify-send", "-a", "Slack Reactions", title, body], check=False)
+        # else: stdout line above is the only output we can give
+    except Exception as e:
+        print(f"  notify error: {e}")
+
+
+# ── event handling ──────────────────────────────────────────────────────────
+
+def handle_reaction(channel, ts, reactor, reaction, item_user):
+    if not should_notify(item_user, reactor, SELF_ID, IGNORE_SELF):
+        return
+    reactor_name = resolve_user_name(reactor)
+    channel_name = resolve_channel_name(channel)
+    snippet = fetch_message_text(channel, ts) if INCLUDE_SNIPPET else ""
+    url = get_permalink(channel, ts)
+    title, body = format_notification(reactor_name, reaction, channel_name, snippet)
+    send_notification(title, body, url)
+
+
+def socket_event_handler(client, req):
+    client.send_socket_mode_response(SocketModeResponse(envelope_id=req.envelope_id))
+    if req.type != "events_api":
+        return
+    event = req.payload.get("event", {})
+    if event.get("type") != "reaction_added":
+        return
+    item = event.get("item", {})
+    if item.get("type") != "message":
+        return
+    item_user = event.get("item_user", "")
+    if DEBUG:
+        mine = " (yours)" if item_user == SELF_ID else ""
+        print(f"  [reaction_added] :{event.get('reaction','')}: by {event.get('user','')} "
+              f"on msg by {item_user}{mine} in {item.get('channel','')}")
+    handle_reaction(
+        item.get("channel", ""),
+        item.get("ts", ""),
+        event.get("user", ""),
+        event.get("reaction", ""),
+        item_user,
+    )
+
+
+# ── auth ─────────────────────────────────────────────────────────────────────
+
+def auth_test():
+    """Return (auth_response_dict, granted_scopes_set)."""
+    req = urllib.request.Request(
+        "https://slack.com/api/auth.test",
+        headers={"Authorization": f"Bearer {API_TOKEN}",
+                 "Content-Type": "application/x-www-form-urlencoded"},
+        data=b"",
+    )
+    with urllib.request.urlopen(req) as raw:
+        scopes = {s.strip() for s in raw.headers.get("x-oauth-scopes", "").split(",") if s.strip()}
+        return json.loads(raw.read()), scopes
+
+
+# ── subcommands ───────────────────────────────────────────────────────────────
+
+def run_selftest():
+    """Internal unit checks on the pure formatting/filtering helpers."""
+    failures = []
+
+    def check(label, got, want):
+        if got != want:
+            failures.append(f"{label}: got {got!r}, want {want!r}")
+
+    ME = "U_ME"
+    check("notify on my message", should_notify(ME, "U_OTHER", ME), True)
+    check("ignore other's message", should_notify("U_OTHER", "U_X", ME), False)
+    check("ignore my own reaction", should_notify(ME, ME, ME, ignore_self=True), False)
+    check("allow my own reaction when configured", should_notify(ME, ME, ME, ignore_self=False), True)
+    check("no self id -> never notify", should_notify(ME, "U_X", ""), False)
+
+    check("emoji known", emojize("tada"), "🎉")
+    check("emoji unknown fallback", emojize("weird_custom"), ":weird_custom:")
+    check("emoji skin tone stripped", emojize("+1::skin-tone-3"), "👍")
+
+    check("plain link label", slack_text_to_plain("see <https://x.com|the docs>"), "see the docs")
+    check("plain bare link", slack_text_to_plain("<https://x.com/a>"), "https://x.com/a")
+    check("plain user mention", slack_text_to_plain("hi <@U123>"), "hi @someone")
+    check("plain channel ref", slack_text_to_plain("in <#C1|general>"), "in #general")
+    check("plain special here", slack_text_to_plain("<!here> ping"), "@here ping")
+    check("plain entity unescape", slack_text_to_plain("a &lt;b&gt; &amp; c"), "a <b> & c")
+    check("plain collapse ws", slack_text_to_plain("line1\n\n  line2"), "line1 line2")
+
+    check("truncate short", truncate("hi", 10), "hi")
+    check("truncate long", truncate("abcdefghij", 5), "abcd…")
+
+    t, b = format_notification("Alice", "tada", "#general", "ship it")
+    check("fmt title", t, "🎉 Alice reacted")
+    check("fmt body", b, "in #general: “ship it”")
+    t, b = format_notification("", "weird", "", "")
+    check("fmt fallbacks", (t, b), (":weird: Someone reacted", "reacted to your message"))
+    _, b = format_notification("Bo", "fire", "#x", "see <https://y.com|docs> & go")
+    check("fmt cleans raw mrkdwn", b, "in #x: “see docs & go”")
+
+    check("applescript quote", applescript_quote('a"b\\c'), '"a\\"b\\\\c"')
+
+    if failures:
+        print("SELFTEST FAILED:")
+        for f in failures:
+            print(f"  ✗ {f}")
+        return 1
+    print("SELFTEST PASSED (all checks ok)")
+    return 0
+
+
+def run_check():
+    if not API_TOKEN or not APP_TOKEN:
+        missing = [n for n, v in (("SLACK_REACT_TOKEN", API_TOKEN),
+                                  ("SLACK_REACT_APP_TOKEN", APP_TOKEN)) if not v]
+        print(f"Missing from .env: {', '.join(missing)}")
+        print(f"\n  .env location: {ENV_FILE}\n\nRun `slack-react-notify --help` for setup steps.")
+        return 1
+    try:
+        auth, scopes = auth_test()
+    except urllib.error.URLError as e:
+        print(f"Error connecting to Slack: {e}")
+        return 1
+    if not auth.get("ok"):
+        print(f"auth.test failed: {auth.get('error')}  (check SLACK_REACT_TOKEN)")
+        return 1
+    print("Token OK")
+    print(f"  workspace: {auth.get('url', '?')}  ({auth.get('team', '?')})")
+    print(f"  user:      {auth.get('user', '?')}  ({auth.get('user_id', '?')})")
+    token_kind = "user (xoxp)" if API_TOKEN.startswith("xoxp-") else \
+                 "bot (xoxb)" if API_TOKEN.startswith("xoxb-") else "unknown"
+    print(f"  token:     {token_kind}")
+    print(f"  notify to: {SELF_ID or auth.get('user_id', '?')}")
+    needed = {"reactions:read", "users:read"}
+    nice = {"channels:history", "groups:history", "im:history", "mpim:history",
+            "channels:read", "groups:read"}
+    miss_needed = sorted(needed - scopes)
+    miss_nice = sorted(nice - scopes)
+    if miss_needed:
+        print(f"  ⚠ missing required scopes: {', '.join(miss_needed)}")
+    if miss_nice:
+        print(f"  · optional scopes not granted (snippets/channel names): {', '.join(miss_nice)}")
+    if not miss_needed:
+        print("  scopes look good ✓")
+    print("\nNote: API can't verify event subscriptions. Confirm in the app config:")
+    print("  Event Subscriptions → 'on behalf of users' → reaction_added")
+    return 0 if not miss_needed else 1
+
+
+def print_service(kind):
+    exe = str(SCRIPT_DIR / "slack-react-notify")
+    if kind == "systemd":
+        print(f"""# Save to ~/.config/systemd/user/slack-react-notify.service then:
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now slack-react-notify
+#   journalctl --user -u slack-react-notify -f      # view logs
+[Unit]
+Description=Slack reaction notification daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart={exe}
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target""")
+    elif kind == "launchd":
+        label = "com.dev-workflow-tools.slack-react-notify"
+        plist = Path.home() / "Library" / "LaunchAgents" / f"{label}.plist"
+        print(f"""<!-- Save to {plist} then:
+       launchctl load -w {plist}
+       launchctl list | grep slack-react   # confirm it's running
+     Logs go to /tmp/slack-react-notify.{{out,err}}.log -->
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>{label}</string>
+  <key>ProgramArguments</key>
+  <array><string>{exe}</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>/tmp/slack-react-notify.out.log</string>
+  <key>StandardErrorPath</key><string>/tmp/slack-react-notify.err.log</string>
+</dict>
+</plist>""")
+    else:
+        print(f"Unknown service kind: {kind!r} (use 'systemd' or 'launchd')")
+        return 1
+    return 0
+
+
+# ── globals populated after load_env() ────────────────────────────────────────
+
+load_env()
+API_TOKEN = os.environ.get("SLACK_REACT_TOKEN", "")
+APP_TOKEN = os.environ.get("SLACK_REACT_APP_TOKEN", "")
+SELF_ID = os.environ.get("SLACK_REACT_USER_ID", "")
+IGNORE_SELF = _truthy(os.environ.get("SLACK_REACT_IGNORE_SELF"), default=True)
+INCLUDE_SNIPPET = _truthy(os.environ.get("SLACK_REACT_SNIPPET"), default=True)
+DEBUG = _truthy(os.environ.get("SLACK_REACT_DEBUG"), default=False)
+
+
+def main(argv):
+    if "--help" in argv or "-h" in argv:
+        print(HELP)
+        return 0
+    if "--selftest" in argv:
+        return run_selftest()
+    if "--print-service" in argv:
+        i = argv.index("--print-service")
+        kind = argv[i + 1] if i + 1 < len(argv) else ""
+        return print_service(kind)
+    if "--check" in argv:
+        return run_check()
+
+    # ── normal run ──
+    if not API_TOKEN or not APP_TOKEN:
+        return run_check()  # prints the friendly "missing from .env" guidance
+
+    global SELF_ID
+    try:
+        auth, _ = auth_test()
+    except urllib.error.URLError as e:
+        print(f"Error connecting to Slack: {e}")
+        return 1
+    if not auth.get("ok"):
+        print(f"auth.test failed: {auth.get('error')}  (check SLACK_REACT_TOKEN)")
+        return 1
+    if not SELF_ID:
+        SELF_ID = auth.get("user_id", "")
+    if not SELF_ID:
+        print("Could not determine your Slack user id; set SLACK_REACT_USER_ID in .env.")
+        return 1
+
+    print(f"  Identity: {auth.get('user', '?')} ({SELF_ID}) on {auth.get('url', '?')}")
+    print(f"  Notifying on reactions to YOUR messages (ignore_self={IGNORE_SELF}, snippet={INCLUDE_SNIPPET})")
+
+    sm_client = SocketModeClient(app_token=APP_TOKEN, web_client=WebClient(token=API_TOKEN))
+    sm_client.socket_mode_request_listeners.append(socket_event_handler)
+
+    def _shutdown(*_):
+        print("\nShutting down...")
+        try:
+            sm_client.disconnect()
+        except Exception:
+            pass
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, _shutdown)
+    signal.signal(signal.SIGTERM, _shutdown)
+
+    print("  Connecting to Slack via Socket Mode...")
+    sm_client.connect()
+    print("  Connected! Listening for reactions on your messages...")
+    print("  (If nothing arrives, confirm Event Subscriptions has reaction_added")
+    print("   under 'Subscribe to events on behalf of users'.)")
+    while True:
+        time.sleep(1)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
