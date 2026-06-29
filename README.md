@@ -260,8 +260,14 @@ and fires a desktop notification (`notify-send` on Linux, `osascript`/
 slack-react-notify             # run in the foreground
 slack-react-notify --check     # validate tokens + identity, then exit
 slack-react-notify --help      # full Slack-app setup walkthrough
+slack-react-notify --print-manifest                  # paste into "Create New App"
 slack-react-notify --print-service systemd|launchd   # run it on login
 ```
+
+**Fastest setup:** `slack-react-notify --print-manifest`, paste it into
+https://api.slack.com/apps → *Create New App → From a manifest*. Then generate an
+App-Level Token (`connections:write`) → `SLACK_REACT_APP_TOKEN`, install the app
+and copy the User OAuth Token → `SLACK_REACT_TOKEN`, and run `--check`.
 
 Runs as its **own dedicated Slack app** (own `SLACK_REACT_APP_TOKEN` +
 `SLACK_REACT_TOKEN`), independent of `ticket-bot` — don't share tokens, since

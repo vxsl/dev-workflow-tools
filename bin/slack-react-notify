@@ -55,6 +55,9 @@ Usage:
   slack-react-notify            Start the daemon (runs in foreground)
   slack-react-notify --check    Validate tokens + print identity/scopes, then exit
   slack-react-notify --selftest Run internal unit checks, then exit
+  slack-react-notify --print-manifest
+                                Print a Slack app manifest to paste into
+                                "Create New App → From a manifest"
   slack-react-notify --print-service systemd|launchd
                                 Print a ready-to-use service definition
   slack-react-notify --help     Show this help
@@ -436,6 +439,40 @@ def run_check():
     return 0 if not miss_needed else 1
 
 
+def print_manifest():
+    print("""# Slack app manifest for slack-react-notify.
+# Create the app fast: https://api.slack.com/apps → "Create New App" →
+#   "From a manifest" → pick your workspace → paste this (YAML) → Create.
+# Then finish two manual steps the manifest can't do:
+#   1. Basic Information → App-Level Tokens → Generate a token with the
+#      `connections:write` scope  →  SLACK_REACT_APP_TOKEN (xapp-...)
+#   2. OAuth & Permissions → Install to Workspace, authorize, then copy the
+#      "User OAuth Token"  →  SLACK_REACT_TOKEN (xoxp-...)
+# Finally:  slack-react-notify --check
+display_information:
+  name: Reaction Notifier
+  description: Desktop notifications when people react to my messages
+oauth_config:
+  scopes:
+    user:
+      - reactions:read
+      - users:read
+      - channels:history
+      - groups:history
+      - im:history
+      - mpim:history
+      - channels:read
+      - groups:read
+settings:
+  event_subscriptions:
+    user_events:
+      - reaction_added
+  socket_mode_enabled: true
+  org_deploy_enabled: false
+  token_rotation_enabled: false""")
+    return 0
+
+
 def print_service(kind):
     exe = str(SCRIPT_DIR / "slack-react-notify")
     if kind == "systemd":
@@ -498,6 +535,8 @@ def main(argv):
         return 0
     if "--selftest" in argv:
         return run_selftest()
+    if "--print-manifest" in argv:
+        return print_manifest()
     if "--print-service" in argv:
         i = argv.index("--print-service")
         kind = argv[i + 1] if i + 1 < len(argv) else ""

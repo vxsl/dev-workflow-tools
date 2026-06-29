@@ -30,6 +30,15 @@ setup() {
     [[ "$output" == *"SLACK_REACT_TOKEN"* ]]
 }
 
+@test "slack-react-notify: --print-manifest emits a pasteable app manifest" {
+    run "$BIN" --print-manifest
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"event_subscriptions"* ]]
+    [[ "$output" == *"user_events"* ]]
+    [[ "$output" == *"reaction_added"* ]]
+    [[ "$output" == *"socket_mode_enabled: true"* ]]
+}
+
 @test "slack-react-notify: --print-service systemd emits a unit" {
     run "$BIN" --print-service systemd
     [ "$status" -eq 0 ]
