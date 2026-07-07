@@ -137,13 +137,13 @@ If you have tools that need to know which `.env` file is "currently active" (e.g
 RR_PANE_1_COMMAND="yarn install && yarn run-p tailwind dev"
 
 # Use (note: \$PWD/.env since we're already in client/web from RR_PANE_1_DIR):
-RR_PANE_1_COMMAND="mkdir -p ~/.config/dev-workflow && ln -sf \$PWD/.env ~/.config/dev-workflow/current-env; yarn install && yarn run-p tailwind dev"
+RR_PANE_1_COMMAND="mkdir -p ~/.config/dev-workflow && if [ -f \"\$PWD/.env\" ]; then ln -sf \"\$PWD/.env\" ~/.config/dev-workflow/current-env; yarn install && yarn run-p tailwind dev; else echo \"✗ \$PWD/.env is missing — dev server not started; copy .env into this worktree, then rerun\"; fi"
 ```
 
 **Important**:
 - Use `\$PWD` (escaped with backslash) so it expands in the target pane, not when sourcing `.env`
 - Use `\$PWD/.env` not `\$PWD/client/web/.env` since the pane is already in the `client/web` subdirectory (from `RR_PANE_1_DIR`)
-- Use semicolon (`;`) before `yarn` to ensure yarn runs even if symlink fails
+- The `[ -f "$PWD/.env" ]` guard fails loudly when the worktree has no `.env` — without it, `ln -sf` silently creates a dangling symlink and the dev server starts without env vars
 
 ### How it works:
 

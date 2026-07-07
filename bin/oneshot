@@ -1131,10 +1131,25 @@ if [ "${SKIP_TO_COMMIT_LOOP:-false}" != true ]; then
                     exit 1
                 fi
 
-                # Copy common files from current worktree to new one
-                for _f in .env .cursor .vscode; do
-                    if [ -e "$_current_wt_root/$_f" ]; then
-                        cp -r "$_current_wt_root/$_f" "$_wt_path/$_f" 2>/dev/null
+                # Copy common files from current worktree to new one.
+                # Honors WT_FILES_TO_COPY / WORKTREE_COPY_EXCLUDE like rr.sh and
+                # create-wt; defaults add root-level .env/.cursor/.vscode on top
+                # of the shared list so non-monorepo repos keep working.
+                _wt_copy_list="${WT_FILES_TO_COPY:-.env .cursor .vscode client/web/.env client/web/ulweb/pkg client/web/.cursor client/web/.vscode}"
+                for _f in $_wt_copy_list; do
+                    _wt_copy_src="$_current_wt_root/$_f"
+                    _wt_copy_dst="$_wt_path/$_f"
+                    if [ -e "$_wt_copy_src" ] && [ ! -e "$_wt_copy_dst" ]; then
+                        if [ -d "$_wt_copy_src" ] && [ -n "${WORKTREE_COPY_EXCLUDE:-}" ]; then
+                            _wt_copy_exclude_args=""
+                            for _wt_copy_pat in $WORKTREE_COPY_EXCLUDE; do
+                                _wt_copy_exclude_args="$_wt_copy_exclude_args --exclude=$_wt_copy_pat"
+                            done
+                            # shellcheck disable=SC2086
+                            rsync -a $_wt_copy_exclude_args "$_wt_copy_src/" "$_wt_copy_dst/" 2>/dev/null || true
+                        else
+                            cp -r "$_wt_copy_src" "$_wt_copy_dst" 2>/dev/null || true
+                        fi
                     fi
                 done
 
