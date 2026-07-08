@@ -250,11 +250,13 @@ apply_staged_to_commit <commit-sha>
 ```
 
 ### `slack-react-notify`
-Desktop notifications when people react to *your* Slack messages — something Slack
-doesn't do natively. A small cross-platform (Linux/macOS) Socket Mode daemon: it
-listens for `reaction_added` events, keeps only the ones on messages you authored,
-and fires a desktop notification (`notify-send` on Linux, `osascript`/
-`terminal-notifier` on macOS, or any command via `SLACK_REACT_NOTIFY_CMD`).
+Get pinged when people react to *your* Slack messages — something Slack doesn't do
+natively. A small cross-platform (Linux/macOS) Socket Mode daemon: it listens for
+`reaction_added` events, keeps only the ones on messages you authored, and **DMs
+you on Slack**. That Slack DM fires Slack's own desktop *and* mobile notification
+(a message you send yourself wouldn't), so you're reached on every device. Set
+`SLACK_REACT_DELIVERY=desktop` for a local `notify-send`/`osascript` popup instead,
+or `both` for both.
 
 ```bash
 slack-react-notify             # run in the foreground
@@ -266,15 +268,17 @@ slack-react-notify --print-service systemd|launchd   # run it on login
 
 **Fastest setup:** `slack-react-notify --print-manifest`, paste it into
 https://api.slack.com/apps → *Create New App → From a manifest*. Then generate an
-App-Level Token (`connections:write`) → `SLACK_REACT_APP_TOKEN`, install the app
-and copy the User OAuth Token → `SLACK_REACT_TOKEN`, and run `--check`.
+App-Level Token (`connections:write`) → `SLACK_REACT_APP_TOKEN`, install the app,
+and copy **both** the User OAuth Token → `SLACK_REACT_TOKEN` (reaction events +
+reads) and the Bot User OAuth Token → `SLACK_REACT_BOT_TOKEN` (DMs you). Run
+`--check` to confirm.
 
-Runs as its **own dedicated Slack app** (own `SLACK_REACT_APP_TOKEN` +
-`SLACK_REACT_TOKEN`), independent of `ticket-bot` — don't share tokens, since
-Slack load-balances events across simultaneous Socket Mode connections on one
-app. With a user-token `reaction_added` subscription ("on behalf of users") it
-covers every channel and DM you're in, no bot invites required. See the
-`Slack Reaction Notifications` block in `.env.example` for the scopes and steps.
+Runs as its **own dedicated Slack app**, independent of `ticket-bot` — don't share
+tokens, since Slack load-balances events across simultaneous Socket Mode
+connections on one app. The user-token `reaction_added` subscription ("on behalf
+of users") covers every channel and DM you're in with no bot invites; the bot
+token is used only to send you the DM. See the `Slack Reaction Notifications` block
+in `.env.example` for the full scope list and steps.
 
 **Run it on login:**
 ```bash

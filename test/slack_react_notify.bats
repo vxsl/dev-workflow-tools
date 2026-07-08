@@ -20,14 +20,24 @@ setup() {
     run "$BIN" --help
     [ "$status" -eq 0 ]
     [[ "$output" == *"SLACK_REACT_APP_TOKEN"* ]]
+    [[ "$output" == *"SLACK_REACT_BOT_TOKEN"* ]]
+    [[ "$output" == *"SLACK_REACT_DELIVERY"* ]]
     [[ "$output" == *"on behalf of users"* ]]
 }
 
-@test "slack-react-notify: --check reports missing tokens clearly" {
-    SLACK_REACT_TOKEN="" SLACK_REACT_APP_TOKEN="" run "$BIN" --check
+@test "slack-react-notify: --check (slack delivery) requires the bot token" {
+    SLACK_REACT_TOKEN="" SLACK_REACT_APP_TOKEN="" SLACK_REACT_BOT_TOKEN="" run "$BIN" --check
     [ "$status" -eq 1 ]
     [[ "$output" == *"Missing from .env"* ]]
-    [[ "$output" == *"SLACK_REACT_TOKEN"* ]]
+    [[ "$output" == *"SLACK_REACT_BOT_TOKEN"* ]]
+    [[ "$output" == *"delivery mode: slack"* ]]
+}
+
+@test "slack-react-notify: --check (desktop delivery) needs no bot token" {
+    SLACK_REACT_DELIVERY="desktop" SLACK_REACT_TOKEN="" SLACK_REACT_APP_TOKEN="" SLACK_REACT_BOT_TOKEN="" run "$BIN" --check
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"delivery mode: desktop"* ]]
+    [[ "$output" != *"SLACK_REACT_BOT_TOKEN"* ]]
 }
 
 @test "slack-react-notify: --print-manifest emits a pasteable app manifest" {
@@ -37,6 +47,9 @@ setup() {
     [[ "$output" == *"user_events"* ]]
     [[ "$output" == *"reaction_added"* ]]
     [[ "$output" == *"socket_mode_enabled: true"* ]]
+    [[ "$output" == *"bot_user"* ]]
+    [[ "$output" == *"chat:write"* ]]
+    [[ "$output" == *"im:write"* ]]
 }
 
 @test "slack-react-notify: --print-service systemd emits a unit" {

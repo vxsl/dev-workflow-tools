@@ -4,9 +4,11 @@ slack-react-notify: desktop notifications when people react to your Slack messag
 
 Slack has no native notification for reactions on your own messages. This is a
 small Socket Mode (WebSocket) daemon that listens for `reaction_added` events,
-keeps only the ones where the reacted message is *yours*, and fires a desktop
-notification (notify-send on Linux, osascript/terminal-notifier on macOS, or any
-command you point SLACK_REACT_NOTIFY_CMD at).
+keeps only the ones where the reacted message is *yours*, and — by default —
+DMs you on Slack. That Slack DM triggers Slack's own desktop + mobile
+notification (a message you send yourself wouldn't), so you're reached on every
+device. Set SLACK_REACT_DELIVERY=desktop for a local notify-send/osascript popup
+instead, or =both for both.
 
 It runs as its own dedicated Slack app — independent of ticket-bot — so the two
 never fight over the same Socket Mode connection (Slack load-balances events
@@ -18,7 +20,8 @@ Stop:  Ctrl+C
 
 Requires in .env (see `slack-react-notify --help`):
   SLACK_REACT_APP_TOKEN   App-level token (xapp-...) for Socket Mode
-  SLACK_REACT_TOKEN       OAuth token (xoxp- user token recommended) for Web API
+  SLACK_REACT_TOKEN       User OAuth token (xoxp-...) — reaction events + reads
+  SLACK_REACT_BOT_TOKEN   Bot token (xoxb-...) — DMs you (slack/both delivery)
   SLACK_REACT_USER_ID     (optional) your Slack user id; auto-detected otherwise
 """
 
@@ -62,32 +65,38 @@ Usage:
                                 Print a ready-to-use service definition
   slack-react-notify --help     Show this help
 
+By default it DMs you on Slack (which also fires Slack's own desktop + mobile
+notification, since a self-sent message wouldn't). Set SLACK_REACT_DELIVERY to
+change that.
+
 .env settings:
   SLACK_REACT_APP_TOKEN   (required) App-level token, xapp-...  (Socket Mode)
-  SLACK_REACT_TOKEN       (required) OAuth token, xoxp-... (user) recommended
+  SLACK_REACT_TOKEN       (required) User OAuth token, xoxp-...  (events + reads)
+  SLACK_REACT_BOT_TOKEN   (required for slack delivery) Bot token, xoxb-... (DMs you)
+  SLACK_REACT_DELIVERY    (optional) slack | desktop | both      (default: slack)
   SLACK_REACT_USER_ID     (optional) Your Slack user id; auto-detected via auth.test
-  SLACK_REACT_NOTIFY_CMD  (optional) Custom notifier; called as: CMD "<title>" "<body>"
-                          e.g. ~/bin/notification/claude-notify.sh
+  SLACK_REACT_NOTIFY_CMD  (optional) desktop-mode custom notifier; called as:
+                          CMD "<title>" "<body>"  e.g. ~/bin/notification/claude-notify.sh
   SLACK_REACT_IGNORE_SELF (optional) "0" to also notify on your own reactions (default: ignore)
   SLACK_REACT_SNIPPET     (optional) "0" to skip fetching the reacted message text
   SLACK_REACT_DEBUG       (optional) "1" to log every reaction_added event received
 
-Dedicated Slack app setup (separate from ticket-bot):
-  1. Create a new app:  https://api.slack.com/apps  →  "From scratch"
-  2. Settings → Socket Mode → Enable.
-     Generate an App-Level Token with the `connections:write` scope.
-     → save as SLACK_REACT_APP_TOKEN (starts with xapp-)
-  3. OAuth & Permissions → User Token Scopes, add:
-       reactions:read, users:read,
-       channels:history, groups:history, im:history, mpim:history,
-       channels:read, groups:read
-     (User-token scopes cover EVERY channel/DM you're in — no bot invites needed.)
-  4. Event Subscriptions → Enable Events → "Subscribe to events on behalf of users":
-       reaction_added
-     (Use the "on behalf of users" section, NOT "Subscribe to bot events".)
-  5. Install to your workspace.
-     → save the "User OAuth Token" (xoxp-...) as SLACK_REACT_TOKEN
-  6. slack-react-notify --check   to confirm it all works.
+Dedicated Slack app setup (separate from ticket-bot). Fastest path:
+  `slack-react-notify --print-manifest` → paste at https://api.slack.com/apps →
+  "Create New App" → "From a manifest". Then:
+  1. Basic Information → App-Level Tokens → generate one with `connections:write`
+     → save as SLACK_REACT_APP_TOKEN (xapp-...)
+  2. OAuth & Permissions → Install to Workspace, authorize, then copy BOTH tokens:
+       "User OAuth Token" (xoxp-...)      → SLACK_REACT_TOKEN     (events + reads)
+       "Bot User OAuth Token" (xoxb-...)  → SLACK_REACT_BOT_TOKEN (DMs you)
+  3. slack-react-notify --check   to confirm it all works.
+
+Manual scope reference (the manifest sets these for you):
+  User Token Scopes: reactions:read, users:read, channels:history, groups:history,
+                     im:history, mpim:history, channels:read, groups:read
+                     (cover EVERY channel/DM you're in — no bot invites needed)
+  Bot Token Scopes:  chat:write, im:write   (to DM you)
+  Event Subscriptions → "Subscribe to events on behalf of users": reaction_added
 """
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -144,10 +153,21 @@ def slack_text_to_plain(text):
     return t
 
 
+def reaction_base(name):
+    """Strip skin-tone / compound modifiers: '+1::skin-tone-3' -> '+1'."""
+    return (name or "").split("::")[0]
+
+
 def emojize(name):
     """Map a reaction name to a glyph, falling back to :name: (skin tones stripped)."""
-    base = (name or "").split("::")[0]
+    base = reaction_base(name)
     return EMOJI_MAP.get(base, f":{base}:" if base else "")
+
+
+def slack_escape(s):
+    """Escape mrkdwn control chars so dynamic text can't break links/mentions.
+    Mirrors lib/slack.sh slack_escape (& first, so added entities aren't re-escaped)."""
+    return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 def truncate(text, n=SNIPPET_MAX):
@@ -182,6 +202,20 @@ def format_notification(reactor_name, reaction, channel_name, snippet):
     return title, body
 
 
+def build_slack_message(reactor_name, reaction, channel_name, snippet, permalink):
+    """Build the mrkdwn DM text. Pure / testable. Dynamic text is escaped so a
+    stray <, > or & in a name/snippet can't corrupt the message or link."""
+    who = slack_escape(reactor_name or "Someone")
+    where = f" in {slack_escape(channel_name)}" if channel_name else ""
+    lines = [f":{reaction_base(reaction)}: *{who}* reacted to your message{where}"]
+    snippet = slack_text_to_plain(snippet)
+    if snippet:
+        lines.append("> " + slack_escape(truncate(snippet)))
+    if permalink:
+        lines.append(f"<{permalink}|View in Slack>")
+    return "\n".join(lines)
+
+
 def applescript_quote(s):
     return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
@@ -204,7 +238,11 @@ def _truthy(v, default=True):
     return v.strip().lower() not in ("0", "false", "no", "off")
 
 
-# ── Slack Web API (uses SLACK_REACT_TOKEN) ──────────────────────────────────
+# ── Slack Web API ────────────────────────────────────────────────────────────
+# Reads (users/channels/history/permalink) use the user token (SLACK_REACT_TOKEN)
+# so they work in every channel you're in without inviting a bot. Outbound DMs
+# use the bot token (SLACK_REACT_BOT_TOKEN) so the message comes from someone
+# other than you — a self-sent message wouldn't trigger a Slack notification.
 
 def slack_get(method, **params):
     qs = urllib.parse.urlencode(params)
@@ -216,6 +254,48 @@ def slack_get(method, **params):
     except urllib.error.URLError as e:
         print(f"  Slack API error ({method}): {e}")
         return {"ok": False, "error": str(e)}
+
+
+def slack_post_bot(method, **kwargs):
+    url = f"https://slack.com/api/{method}"
+    data = json.dumps(kwargs).encode()
+    req = urllib.request.Request(url, data=data, headers={
+        "Authorization": f"Bearer {BOT_TOKEN}",
+        "Content-Type": "application/json; charset=utf-8"})
+    try:
+        with urllib.request.urlopen(req) as resp:
+            return json.loads(resp.read())
+    except urllib.error.URLError as e:
+        print(f"  Slack API error ({method}): {e}")
+        return {"ok": False, "error": str(e)}
+
+
+_dm_channel = ""
+
+
+def ensure_dm_channel():
+    """Open (once) the bot↔you DM and cache its channel id."""
+    global _dm_channel
+    if _dm_channel:
+        return _dm_channel
+    resp = slack_post_bot("conversations.open", users=SELF_ID)
+    if resp.get("ok"):
+        _dm_channel = resp.get("channel", {}).get("id", "")
+    else:
+        print(f"  conversations.open failed: {resp.get('error')} (check bot token / im:write)")
+    return _dm_channel
+
+
+def send_slack_dm(text):
+    ch = ensure_dm_channel()
+    if not ch:
+        return
+    resp = slack_post_bot("chat.postMessage", channel=ch, text=text,
+                          mrkdwn=True, unfurl_links=False, unfurl_media=False)
+    if resp.get("ok"):
+        print(f"  [slack-dm] {text.splitlines()[0]}")
+    else:
+        print(f"  chat.postMessage failed: {resp.get('error')}")
 
 
 _user_cache = {}
@@ -307,8 +387,11 @@ def handle_reaction(channel, ts, reactor, reaction, item_user):
     channel_name = resolve_channel_name(channel)
     snippet = fetch_message_text(channel, ts) if INCLUDE_SNIPPET else ""
     url = get_permalink(channel, ts)
-    title, body = format_notification(reactor_name, reaction, channel_name, snippet)
-    send_notification(title, body, url)
+    if DELIVERY in ("slack", "both"):
+        send_slack_dm(build_slack_message(reactor_name, reaction, channel_name, snippet, url))
+    if DELIVERY in ("desktop", "both"):
+        title, body = format_notification(reactor_name, reaction, channel_name, snippet)
+        send_notification(title, body, url)
 
 
 def socket_event_handler(client, req):
@@ -337,11 +420,11 @@ def socket_event_handler(client, req):
 
 # ── auth ─────────────────────────────────────────────────────────────────────
 
-def auth_test():
-    """Return (auth_response_dict, granted_scopes_set)."""
+def auth_test(token):
+    """Return (auth_response_dict, granted_scopes_set) for the given token."""
     req = urllib.request.Request(
         "https://slack.com/api/auth.test",
-        headers={"Authorization": f"Bearer {API_TOKEN}",
+        headers={"Authorization": f"Bearer {token}",
                  "Content-Type": "application/x-www-form-urlencoded"},
         data=b"",
     )
@@ -392,6 +475,24 @@ def run_selftest():
 
     check("applescript quote", applescript_quote('a"b\\c'), '"a\\"b\\\\c"')
 
+    check("slack_escape order", slack_escape("A & <b>"), "A &amp; &lt;b&gt;")
+    check("reaction_base strips tone", reaction_base("+1::skin-tone-3"), "+1")
+    check(
+        "slack msg full",
+        build_slack_message("Alice", "tada", "#general", "ship it", "https://s/p1"),
+        ":tada: *Alice* reacted to your message in #general\n> ship it\n<https://s/p1|View in Slack>",
+    )
+    check(
+        "slack msg minimal (no channel/snippet/link)",
+        build_slack_message("", "wave", "", "", ""),
+        ":wave: *Someone* reacted to your message",
+    )
+    check(
+        "slack msg escapes + strips tone + cleans mrkdwn",
+        build_slack_message("A&B", "+1::skin-tone-3", "#x", "hi <@U1> & <b>", ""),
+        ":+1: *A&amp;B* reacted to your message in #x\n> hi @someone &amp; &lt;b&gt;",
+    )
+
     if failures:
         print("SELFTEST FAILED:")
         for f in failures:
@@ -402,26 +503,32 @@ def run_selftest():
 
 
 def run_check():
-    if not API_TOKEN or not APP_TOKEN:
-        missing = [n for n, v in (("SLACK_REACT_TOKEN", API_TOKEN),
-                                  ("SLACK_REACT_APP_TOKEN", APP_TOKEN)) if not v]
+    need_bot = DELIVERY in ("slack", "both")
+    required = [("SLACK_REACT_TOKEN", API_TOKEN), ("SLACK_REACT_APP_TOKEN", APP_TOKEN)]
+    if need_bot:
+        required.append(("SLACK_REACT_BOT_TOKEN", BOT_TOKEN))
+    missing = [n for n, v in required if not v]
+    if missing:
         print(f"Missing from .env: {', '.join(missing)}")
-        print(f"\n  .env location: {ENV_FILE}\n\nRun `slack-react-notify --help` for setup steps.")
+        print(f"\n  delivery mode: {DELIVERY}"
+              + ("  (needs a bot token to DM you)" if need_bot else ""))
+        print(f"  .env location: {ENV_FILE}\n\nRun `slack-react-notify --help` for setup steps.")
         return 1
+
+    ok = True
+
+    # ── user token: events + reads ──
     try:
-        auth, scopes = auth_test()
+        auth, scopes = auth_test(API_TOKEN)
     except urllib.error.URLError as e:
         print(f"Error connecting to Slack: {e}")
         return 1
     if not auth.get("ok"):
-        print(f"auth.test failed: {auth.get('error')}  (check SLACK_REACT_TOKEN)")
+        print(f"user token auth.test failed: {auth.get('error')}  (check SLACK_REACT_TOKEN)")
         return 1
-    print("Token OK")
+    print("User token OK (events + reads)")
     print(f"  workspace: {auth.get('url', '?')}  ({auth.get('team', '?')})")
     print(f"  user:      {auth.get('user', '?')}  ({auth.get('user_id', '?')})")
-    token_kind = "user (xoxp)" if API_TOKEN.startswith("xoxp-") else \
-                 "bot (xoxb)" if API_TOKEN.startswith("xoxb-") else "unknown"
-    print(f"  token:     {token_kind}")
     print(f"  notify to: {SELF_ID or auth.get('user_id', '?')}")
     needed = {"reactions:read", "users:read"}
     nice = {"channels:history", "groups:history", "im:history", "mpim:history",
@@ -429,29 +536,56 @@ def run_check():
     miss_needed = sorted(needed - scopes)
     miss_nice = sorted(nice - scopes)
     if miss_needed:
-        print(f"  ⚠ missing required scopes: {', '.join(miss_needed)}")
+        print(f"  ⚠ missing required user scopes: {', '.join(miss_needed)}")
+        ok = False
     if miss_nice:
-        print(f"  · optional scopes not granted (snippets/channel names): {', '.join(miss_nice)}")
+        print(f"  · optional user scopes not granted (snippets/channel names): {', '.join(miss_nice)}")
     if not miss_needed:
-        print("  scopes look good ✓")
-    print("\nNote: API can't verify event subscriptions. Confirm in the app config:")
-    print("  Event Subscriptions → 'on behalf of users' → reaction_added")
-    return 0 if not miss_needed else 1
+        print("  user scopes look good ✓")
+
+    # ── bot token: delivery ──
+    if need_bot:
+        try:
+            bauth, bscopes = auth_test(BOT_TOKEN)
+        except urllib.error.URLError as e:
+            print(f"Error connecting to Slack (bot token): {e}")
+            return 1
+        if not bauth.get("ok"):
+            print(f"bot token auth.test failed: {bauth.get('error')}  (check SLACK_REACT_BOT_TOKEN)")
+            return 1
+        print(f"Bot token OK (DM delivery as @{bauth.get('user', '?')})")
+        bmiss = sorted({"chat:write", "im:write"} - bscopes)
+        if bmiss:
+            print(f"  ⚠ missing bot scopes: {', '.join(bmiss)}")
+            ok = False
+        else:
+            print("  bot scopes look good ✓")
+    else:
+        print(f"Delivery mode '{DELIVERY}': desktop only, no bot token needed.")
+
+    print("\nNote: the API can't verify event subscriptions. Confirm in the app config:")
+    print("  Event Subscriptions → 'Subscribe to events on behalf of users' → reaction_added")
+    return 0 if ok else 1
 
 
 def print_manifest():
     print("""# Slack app manifest for slack-react-notify.
 # Create the app fast: https://api.slack.com/apps → "Create New App" →
 #   "From a manifest" → pick your workspace → paste this (YAML) → Create.
-# Then finish two manual steps the manifest can't do:
+# Then finish the manual steps the manifest can't do:
 #   1. Basic Information → App-Level Tokens → Generate a token with the
 #      `connections:write` scope  →  SLACK_REACT_APP_TOKEN (xapp-...)
-#   2. OAuth & Permissions → Install to Workspace, authorize, then copy the
-#      "User OAuth Token"  →  SLACK_REACT_TOKEN (xoxp-...)
+#   2. OAuth & Permissions → Install to Workspace, authorize, then copy BOTH:
+#        "User OAuth Token" (xoxp-...) →  SLACK_REACT_TOKEN     (events + reads)
+#        "Bot User OAuth Token" (xoxb-...) →  SLACK_REACT_BOT_TOKEN (DMs you)
 # Finally:  slack-react-notify --check
 display_information:
   name: Reaction Notifier
-  description: Desktop notifications when people react to my messages
+  description: Slack messages when people react to my messages
+features:
+  bot_user:
+    display_name: Reaction Notifier
+    always_online: true
 oauth_config:
   scopes:
     user:
@@ -463,6 +597,9 @@ oauth_config:
       - mpim:history
       - channels:read
       - groups:read
+    bot:
+      - chat:write
+      - im:write
 settings:
   event_subscriptions:
     user_events:
@@ -521,12 +658,17 @@ WantedBy=default.target""")
 # ── globals populated after load_env() ────────────────────────────────────────
 
 load_env()
-API_TOKEN = os.environ.get("SLACK_REACT_TOKEN", "")
-APP_TOKEN = os.environ.get("SLACK_REACT_APP_TOKEN", "")
+API_TOKEN = os.environ.get("SLACK_REACT_TOKEN", "")       # xoxp user token: events + reads
+APP_TOKEN = os.environ.get("SLACK_REACT_APP_TOKEN", "")   # xapp app-level token: Socket Mode
+BOT_TOKEN = os.environ.get("SLACK_REACT_BOT_TOKEN", "")   # xoxb bot token: DM delivery
 SELF_ID = os.environ.get("SLACK_REACT_USER_ID", "")
 IGNORE_SELF = _truthy(os.environ.get("SLACK_REACT_IGNORE_SELF"), default=True)
 INCLUDE_SNIPPET = _truthy(os.environ.get("SLACK_REACT_SNIPPET"), default=True)
 DEBUG = _truthy(os.environ.get("SLACK_REACT_DEBUG"), default=False)
+DELIVERY = (os.environ.get("SLACK_REACT_DELIVERY", "slack").strip().lower() or "slack")
+if DELIVERY not in ("slack", "desktop", "both"):
+    print(f"  (invalid SLACK_REACT_DELIVERY={DELIVERY!r}; using 'slack')")
+    DELIVERY = "slack"
 
 
 def main(argv):
@@ -545,12 +687,13 @@ def main(argv):
         return run_check()
 
     # ── normal run ──
-    if not API_TOKEN or not APP_TOKEN:
+    need_bot = DELIVERY in ("slack", "both")
+    if not API_TOKEN or not APP_TOKEN or (need_bot and not BOT_TOKEN):
         return run_check()  # prints the friendly "missing from .env" guidance
 
     global SELF_ID
     try:
-        auth, _ = auth_test()
+        auth, _ = auth_test(API_TOKEN)
     except urllib.error.URLError as e:
         print(f"Error connecting to Slack: {e}")
         return 1
@@ -564,7 +707,13 @@ def main(argv):
         return 1
 
     print(f"  Identity: {auth.get('user', '?')} ({SELF_ID}) on {auth.get('url', '?')}")
-    print(f"  Notifying on reactions to YOUR messages (ignore_self={IGNORE_SELF}, snippet={INCLUDE_SNIPPET})")
+    print(f"  Delivery: {DELIVERY} (ignore_self={IGNORE_SELF}, snippet={INCLUDE_SNIPPET})")
+    if need_bot:
+        dm = ensure_dm_channel()
+        if dm:
+            print(f"  DM channel ready ({dm})")
+        else:
+            print("  ⚠ could not open your DM — check SLACK_REACT_BOT_TOKEN / im:write")
 
     sm_client = SocketModeClient(app_token=APP_TOKEN, web_client=WebClient(token=API_TOKEN))
     sm_client.socket_mode_request_listeners.append(socket_event_handler)
