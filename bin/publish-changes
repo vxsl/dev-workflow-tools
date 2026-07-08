@@ -944,8 +944,20 @@ if [ -n "$mr_url" ]; then
                 echo -e "  ${GREEN}✓${RESET} Added Slack reference to MR description" >&2
                 if [ -n "$TICKET_CREATOR_BOT_TOKEN" ] && ! verify_slack_channel_access "$SLACK_CHANNEL"; then
                     echo -e "  ${YELLOW}⚠ Skipping Slack post${RESET}" >&2
-                elif post_to_slack "$SLACK_CHANNEL" "$SLACK_THREAD_TS" "mr" "$mr_url" "$mr_title"; then
-                    echo -e "  ${GREEN}✓${RESET} Posted MR link to Slack" >&2
+                else
+                    # Post the ticket link too, not just the MR. When the Slack URL
+                    # is pasted here (rather than passed up front), oneshot never got
+                    # to post the ticket link itself, so do it now.
+                    if [ -n "$TICKET_KEY" ] && [ "$NO_JIRA" != "true" ]; then
+                        ticket_title="$TICKET_KEY"
+                        [ -n "$summary" ] && ticket_title="$TICKET_KEY: $summary"
+                        if post_to_slack "$SLACK_CHANNEL" "$SLACK_THREAD_TS" "ticket" "https://${JIRA_DOMAIN}/browse/${TICKET_KEY}" "$ticket_title"; then
+                            echo -e "  ${GREEN}✓${RESET} Posted ticket link to Slack" >&2
+                        fi
+                    fi
+                    if post_to_slack "$SLACK_CHANNEL" "$SLACK_THREAD_TS" "mr" "$mr_url" "$mr_title"; then
+                        echo -e "  ${GREEN}✓${RESET} Posted MR link to Slack" >&2
+                    fi
                 fi
             else
                 echo -e "  ${YELLOW}⚠ Invalid Slack URL, skipping${RESET}" >&2
