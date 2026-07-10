@@ -128,7 +128,16 @@ post_to_slack() {
     local text
     case "$message_type" in
         ticket)
-            text=$':jira: A ticket was created referencing this thread: '"<${url}|${title}>"
+            # Neutral wording: the ticket may be newly created OR pre-existing
+            # (e.g. oneshot run against an existing ticket), so don't claim it
+            # "was created". Mirrors the author voice of the mr message below.
+            local author_first=$(git config user.name 2>/dev/null | cut -d' ' -f1)
+            local author=$(slack_escape "${author_first:-Someone}")
+            if [ -n "$thread_ts" ]; then
+                text=":jira: ${author} linked a ticket to this thread: <${url}|${title}>"
+            else
+                text=":jira: ${author} linked a ticket: <${url}|${title}>"
+            fi
             ;;
         mr)
             local mr_num=$(echo "$url" | grep -oE '[0-9]+$')
