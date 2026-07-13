@@ -93,7 +93,8 @@ Dedicated Slack app setup (separate from ticket-bot). Fastest path:
 
 Manual scope reference (the manifest sets these for you):
   User Token Scopes: reactions:read, users:read, channels:history, groups:history,
-                     im:history, mpim:history, channels:read, groups:read
+                     im:history, mpim:history, channels:read, groups:read,
+                     im:read, mpim:read
                      (cover EVERY channel/DM you're in — no bot invites needed)
   Bot Token Scopes:  chat:write, im:write   (to DM you)
   Event Subscriptions → "Subscribe to events on behalf of users": reaction_added
@@ -336,15 +337,18 @@ def resolve_channel_name(channel_id):
 
 
 def fetch_message_text(channel, ts):
-    """Best-effort: the text of the reacted message. Skipped silently on error."""
-    resp = slack_get(
-        "conversations.history",
-        channel=channel, latest=ts, oldest=ts, inclusive="true", limit=1,
-    )
+    """Best-effort: the text of the reacted message. Uses conversations.replies,
+    which returns the message at `ts` whether it's a top-level message, a thread
+    parent, or a thread reply — conversations.history omits thread replies, so
+    reactions on replies would otherwise come through with no snippet. Skipped
+    silently on error (e.g. missing history scope)."""
+    resp = slack_get("conversations.replies", channel=channel, ts=ts,
+                     limit=1, inclusive="true")
     if resp.get("ok"):
         msgs = resp.get("messages", [])
-        if msgs:
-            return slack_text_to_plain(msgs[0].get("text", ""))
+        msg = next((x for x in msgs if x.get("ts") == ts), msgs[0] if msgs else None)
+        if msg:
+            return slack_text_to_plain(msg.get("text", ""))
     return ""
 
 
@@ -532,7 +536,7 @@ def run_check():
     print(f"  notify to: {SELF_ID or auth.get('user_id', '?')}")
     needed = {"reactions:read", "users:read"}
     nice = {"channels:history", "groups:history", "im:history", "mpim:history",
-            "channels:read", "groups:read"}
+            "channels:read", "groups:read", "im:read", "mpim:read"}
     miss_needed = sorted(needed - scopes)
     miss_nice = sorted(nice - scopes)
     if miss_needed:
@@ -597,6 +601,8 @@ oauth_config:
       - mpim:history
       - channels:read
       - groups:read
+      - im:read
+      - mpim:read
     bot:
       - chat:write
       - im:write
