@@ -2358,7 +2358,22 @@ def check_running_procs():
                             jobs[ask_thread_ts] = ask_state
                     except Exception as e:
                         print(f"  WARNING: failed to update ask state: {e}")
+                pending_followups = info.get("pending_ask_followups", [])
                 del running_procs[ticket]
+                # Replay any follow-ups that arrived while the ask was still
+                # running (status=asking). Now that the state is terminal
+                # (asked/ask_failed — both resumable), routing them back
+                # through handle_message sends them down the follow-up path
+                # (classify → new ask or escalate to solve) instead of
+                # dropping them. If several queued, the first starts a new
+                # ask and later ones re-queue against it — no drops.
+                for fch, fts, fuser, ftext in pending_followups:
+                    print(f"  replaying queued follow-up on {ticket}: {ftext[:60]}...")
+                    try:
+                        handle_message(fch, fts, fuser, ftext, thread_ts=ask_thread_ts)
+                    except Exception as e:
+                        print(f"  WARNING: failed to replay queued follow-up: {e}")
+                        swap_reaction((fch, fts), "loading", "x")
                 continue
 
             # Handle publish completion
@@ -2881,6 +2896,29 @@ def handle_message(channel, ts, user, text, thread_ts=None):
             else:
                 print(f"  thread reply on {state.get('ticket')} (status=in_progress) but no running proc — ignoring")
             return
+        elif state.get("status") == "asking":
+            # An ask (read-only Q&A) is still running. Unlike solve jobs,
+            # ticket-ask is one-shot and doesn't poll the thread, so a
+            # follow-up posted mid-flight would otherwise be silently
+            # dropped (fall through → mention gate). Ack with :loading:
+            # and queue it on the running proc; check_running_procs replays
+            # queued replies through the follow-up path once the ask
+            # completes and its state flips to a resumable status.
+            job_ticket = state.get("ticket")
+            if job_ticket and job_ticket in running_procs:
+                react(channel, ts, "loading")
+                running_procs[job_ticket].setdefault(
+                    "pending_ask_followups", []
+                ).append((channel, ts, user, text))
+                print(f"  thread reply on {job_ticket} (status=asking) — queued as follow-up until the ask finishes")
+                return
+            # State says asking but no running proc tracks it — e.g.
+            # ticket-bot restarted mid-ask (the detached subprocess still
+            # posts its answer independently). Treat the reply as a normal
+            # post-completion follow-up by patching the in-memory status to
+            # a resumable value; the resumable_ask branch below handles it.
+            print(f"  thread reply on {state.get('ticket')} (status=asking) with no running proc — routing as follow-up")
+            state["status"] = "asked"
         elif state.get("status") not in resumable_solve + resumable_ask:
             print(f"  thread reply matches job {state.get('ticket')} but status={state.get('status')} — not resumable")
         # Follow-up reply in an ask thread → classify intent so the user can
