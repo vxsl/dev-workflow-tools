@@ -70,6 +70,10 @@ PREEXISTING_COMMITS_BRANCH=""
 REBASED=false
 PREPUSH_VALIDATED=false
 ISSUE_TYPE=""
+# Tracks whether THIS run created the Jira ticket (vs. publishing for an existing
+# one). Gates the ticket-link Slack post so we don't announce "a ticket" when
+# oneshot is just publishing an MR against a ticket that already existed.
+TICKET_WAS_CREATED=false
 
 # Colors
 RED='\033[38;5;167m'
@@ -421,6 +425,7 @@ save_state() {
         --arg slack_channel "$slack_channel" \
         --arg slack_thread_ts "$slack_thread_ts" \
         --arg cherry_pick_commits "$cherry_pick_commits" \
+        --arg ticket_was_created "${TICKET_WAS_CREATED:-false}" \
         '{
             ticket_key: $ticket_key,
             summary: $summary,
@@ -430,6 +435,7 @@ save_state() {
             slack_channel: $slack_channel,
             slack_thread_ts: $slack_thread_ts,
             cherry_pick_commits: $cherry_pick_commits,
+            ticket_was_created: $ticket_was_created,
             timestamp: now | todate
         }' > "$state_file"
 }
@@ -500,7 +506,8 @@ if [ -n "$saved_state" ]; then
         SLACK_CHANNEL=$(echo "$saved_state" | jq -r '.slack_channel // empty')
         SLACK_THREAD_TS=$(echo "$saved_state" | jq -r '.slack_thread_ts // empty')
         CHERRY_PICK_COMMITS=$(echo "$saved_state" | jq -r '.cherry_pick_commits // empty')
-        
+        TICKET_WAS_CREATED=$(echo "$saved_state" | jq -r '.ticket_was_created // "false"')
+
         # Detect hotfix resume
         if [ "$TICKET_KEY" = "HOTFIX" ]; then
             HOTFIX_MODE=true
@@ -712,6 +719,7 @@ elif [ -n "$TICKET_KEY" ]; then
 elif [ -n "$NEW_TICKET_TITLE" ]; then
     echo -e "  ${CYAN}Creating new ticket with title: ${NEW_TICKET_TITLE}${RESET}" >&2
     echo "" >&2
+    TICKET_WAS_CREATED=true
     
     # Build flags for create-jira-ticket
     dry_run_flag=""
@@ -757,6 +765,7 @@ else
     elif [ "$selection" = "NEW" ]; then
         echo -e "  ${CYAN}Creating new ticket${RESET}" >&2
         echo "" >&2
+        TICKET_WAS_CREATED=true
         
         # Build flags for create-jira-ticket
         flags=()
@@ -793,6 +802,7 @@ else
         ticket_title="${BASH_REMATCH[1]}"
         echo -e "  ${CYAN}Creating new ticket with title: ${ticket_title}${RESET}" >&2
         echo "" >&2
+        TICKET_WAS_CREATED=true
         
         # Build flags for create-jira-ticket
         dry_run_flag=""
@@ -1839,6 +1849,12 @@ else
     # known URL so it posts non-interactively, or let it prompt when none is set.
     if [ -n "$SLACK_URL" ]; then
         publish_args+=(--slack-url "$SLACK_URL")
+    fi
+    # Only let publish-changes also post the ticket link (when a Slack URL is
+    # pasted at its prompt) if THIS run created the ticket. Publishing an MR for a
+    # pre-existing ticket shouldn't announce "a ticket" in the thread.
+    if [ "$TICKET_WAS_CREATED" = true ] && [ "$HOTFIX_MODE" != true ]; then
+        publish_args+=(--ticket-created)
     fi
     mr_url=$(SKIP_PRE_PUSH_CHECKS=true "$SCRIPT_DIR/publish-changes" "${publish_args[@]}") || {
         echo -e "${RED}  ✗ publish-changes failed${RESET}" >&2
