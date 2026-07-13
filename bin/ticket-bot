@@ -107,6 +107,83 @@ STATE_DIR = Path.home() / ".cache" / "ticket-solve"
 PROC_CHECK_INTERVAL = 3  # seconds between checking running subprocess status
 
 
+# ── Routing predicates (pure; covered by --selftest) ──
+#
+# Defined and self-tested up here — before load_env / token validation /
+# auth.test below — so `ticket-bot --selftest` exercises them without a live
+# Slack token or any network access, the same way slack-react-notify does.
+
+def is_dm_channel(channel_id):
+    """Check if a channel is a DM (starts with D) vs a regular channel."""
+    return channel_id.startswith("D")
+
+
+def strip_bot_mention(text):
+    """Remove @bot mention from message text, return (stripped_text, was_mentioned).
+
+    Only the bot's OWN mention counts — a mention of some other user (e.g. a
+    teammate) leaves the text untouched and returns was_mentioned=False."""
+    mention = f"<@{BOT_USER_ID}>"
+    if mention in text:
+        return text.replace(mention, "").strip(), True
+    return text, False
+
+
+def should_engage_thread_reply(thread_ts, ts, is_dm, was_mentioned):
+    """Whether a thread reply should (re)engage the bot for feedback/resume.
+
+    True only for a genuine reply inside an existing thread (thread_ts set and
+    distinct from the reply's own ts) AND, in a channel, only when the bot was
+    explicitly @mentioned. The bot posts its status into shared human
+    discussion threads, so unaddressed chatter there ("<@teammate> looks good
+    to me") must not reactivate a completed job. A DM is 1:1 with the bot, so
+    no mention is required there."""
+    if not thread_ts or thread_ts == ts:
+        return False
+    return bool(is_dm or was_mentioned)
+
+
+def run_selftest():
+    """Pure-function unit checks for the message-routing predicates, run via
+    `ticket-bot --selftest` (see test/ticket_bot.bats). Returns 0 on success;
+    an assertion failure propagates as a nonzero exit."""
+    global BOT_USER_ID
+    BOT_USER_ID = "UBOTSELF"
+
+    # strip_bot_mention: only the bot's own mention counts.
+    assert strip_bot_mention("<@UBOTSELF> fix the button") == ("fix the button", True)
+    assert strip_bot_mention("<@UMAX999> looks pretty good to me?") == \
+        ("<@UMAX999> looks pretty good to me?", False), "a teammate mention must not count"
+    assert strip_bot_mention("looks good to me?") == ("looks good to me?", False)
+
+    # is_dm_channel: DM ids start with D; channels/groups do not.
+    assert is_dm_channel("D01ABC") is True
+    assert is_dm_channel("C01R3M51BLZ") is False
+    assert is_dm_channel("G01PRIV") is False
+
+    # should_engage_thread_reply truth table.
+    assert should_engage_thread_reply(None, "1.1", False, False) is False, "not a thread reply"
+    assert should_engage_thread_reply("1.1", "1.1", True, True) is False, "reply is the thread root"
+    assert should_engage_thread_reply("1.0", "2.0", True, False) is True, "DM needs no mention"
+    assert should_engage_thread_reply("1.0", "2.0", False, True) is True, "channel + mention engages"
+    assert should_engage_thread_reply("1.0", "2.0", False, False) is False, \
+        "channel reply without a bot mention must NOT reactivate a completed job"
+
+    # End-to-end regression for the reported bug: a channel thread reply that
+    # @mentions a teammate (not the bot) must not reactivate a completed job.
+    reply = "<@UMAX999> looks pretty good to me?"
+    _, mentioned = strip_bot_mention(reply)
+    assert should_engage_thread_reply("1783963316.420449", "1783968067.034479",
+                                      is_dm_channel("C01R3M51BLZ"), mentioned) is False
+
+    print("SELFTEST PASSED")
+    return 0
+
+
+if "--selftest" in sys.argv:
+    sys.exit(run_selftest())
+
+
 def load_env():
     if ENV_FILE.exists():
         for line in ENV_FILE.read_text().splitlines():
@@ -369,18 +446,6 @@ def load_settings():
 def save_settings(s):
     SETTINGS_PATH.write_text(json.dumps(s, indent=2))
 
-
-def is_dm_channel(channel_id):
-    """Check if a channel is a DM (starts with D) vs a regular channel."""
-    return channel_id.startswith("D")
-
-
-def strip_bot_mention(text):
-    """Remove @bot mention from message text, return (stripped_text, was_mentioned)."""
-    mention = f"<@{BOT_USER_ID}>"
-    if mention in text:
-        return text.replace(mention, "").strip(), True
-    return text, False
 
 # ── File server for diff links ──
 import http.server
@@ -2871,10 +2936,17 @@ def handle_message(channel, ts, user, text, thread_ts=None):
 
     is_dm = is_dm_channel(channel)
 
-    # Thread reply on a completed job → feedback/resume.
-    # Checked BEFORE the @mention gate: if the reply is in a thread we own,
-    # the user shouldn't need to @mention us to give feedback.
-    if thread_ts and thread_ts != ts:
+    # Does this message @mention the bot? Needed by both the thread-reply
+    # reactivation gate just below and the channel command gate further down.
+    _, was_mentioned = strip_bot_mention(text)
+
+    # Thread reply on a job we own → feedback/resume.
+    # In a channel we require an explicit @mention — the same gate as the
+    # command routing below. The bot posts its status into shared human
+    # discussion threads, so ordinary chatter there ("<@someone> looks good
+    # to me") must NOT reactivate a completed job. In a DM every message is
+    # aimed at the bot, so no mention is needed.
+    if should_engage_thread_reply(thread_ts, ts, is_dm, was_mentioned):
         state = jobs.get(thread_ts)
         resumable_solve = ("done", "clarify", "done_empty")
         resumable_ask = ("asked", "ask_failed")
@@ -3000,8 +3072,9 @@ def handle_message(channel, ts, user, text, thread_ts=None):
         # (e.g. @mention in an unrelated thread)
 
     # Always strip @mention so downstream matchers see clean text.
-    # In channels (non-DM), also require the mention as the command gate.
-    text, was_mentioned = strip_bot_mention(text)
+    # In channels (non-DM), the mention is the command gate (was_mentioned
+    # was already computed above).
+    text, _ = strip_bot_mention(text)
     if not is_dm and not was_mentioned:
         return
 
