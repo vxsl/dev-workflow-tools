@@ -97,3 +97,45 @@ get_eponymous_branch_pure() {
         echo "$wt_basename"
     fi
 }
+
+# Decide whether the worktree-mismatch prompt should be skipped for a worktree
+# whose HEAD is detached (rev-parse --abbrev-ref HEAD returned "HEAD").
+# Detached HEAD is usually transient state, not a real mismatch:
+#   - mid-rebase/bisect of the expected branch (a checkout would wreck it)
+#   - parked on an ancestor commit of the expected branch (inspecting history)
+# A rebase of a DIFFERENT branch, or detachment at a non-ancestor commit, is
+# still a genuine mismatch and should prompt.
+# Args: $1 = worktree path, $2 = expected branch
+# Output: skip reason on stdout ("rebase" or "ancestor") when skipping
+# Returns: 0 = skip the prompt, 1 = show it
+detached_mismatch_skip_reason() {
+    local wt_path="$1"
+    local branch="$2"
+    local git_dir
+    git_dir=$(git -C "$wt_path" rev-parse --absolute-git-dir 2>/dev/null)
+    [ -z "$git_dir" ] && return 1
+
+    # Rebase in progress — check which branch is being rebased
+    local head_name=""
+    if [ -f "$git_dir/rebase-merge/head-name" ]; then
+        head_name=$(< "$git_dir/rebase-merge/head-name")
+    elif [ -f "$git_dir/rebase-apply/head-name" ]; then
+        head_name=$(< "$git_dir/rebase-apply/head-name")
+    fi
+    if [ -n "$head_name" ]; then
+        if [ "${head_name#refs/heads/}" = "$branch" ]; then
+            echo "rebase"
+            return 0
+        fi
+        return 1
+    fi
+
+    # Detached at an ancestor of the expected branch (includes the tip itself,
+    # and typical bisect positions)
+    if git -C "$wt_path" merge-base --is-ancestor HEAD "refs/heads/$branch" 2>/dev/null; then
+        echo "ancestor"
+        return 0
+    fi
+
+    return 1
+}

@@ -3667,7 +3667,18 @@ if [ -n "$branch" ]; then
         wt_actual_branch=$(git -C "$wt_path" rev-parse --abbrev-ref HEAD 2>/dev/null)
         wt_basename=$(basename "$wt_path")
 
-        if [ -n "$wt_actual_branch" ] && [ "$wt_actual_branch" != "$branch" ]; then
+        # Detached HEAD mid-rebase of this branch, or parked on an ancestor
+        # commit, is transient state — navigate as-is without prompting.
+        mismatch_skip=""
+        if [ "$wt_actual_branch" = "HEAD" ]; then
+            mismatch_skip=$(detached_mismatch_skip_reason "$wt_path" "$branch")
+            case "$mismatch_skip" in
+                rebase)   echo -e "\033[2mnote: '$wt_basename' is mid-rebase of '$branch' — navigating as-is\033[0m" >&2 ;;
+                ancestor) echo -e "\033[2mnote: '$wt_basename' is detached at an ancestor of '$branch' — navigating as-is\033[0m" >&2 ;;
+            esac
+        fi
+
+        if [ -n "$wt_actual_branch" ] && [ "$wt_actual_branch" != "$branch" ] && [ -z "$mismatch_skip" ]; then
             # Worktree exists but has a different branch — prompt to switch back
             exec {_rr_saved_stdout}>&1
             exec < /dev/tty > /dev/tty 2>&1
