@@ -6,10 +6,16 @@
 #   ^X  merge-conflict files only
 #   ^T  every file in the current worktree
 #   ^A  every file under $HOME (the old behaviour)
-#   M-w pin a different worktree
+#   M-w browse worktrees on their own, most recent first
 #
-#   enter  nvim      ^O cursor    ^S tmux window here
-#   ^R     refresh   ^C copy path
+#   enter  open file / switch worktree     ^O cursor    ^S tmux window here
+#   ^R     refresh                         ^C copy path
+#
+# Worktrees are first-class rows (⊙, cyan) inlined into every mode, so switching
+# worktree and opening a file are the same gesture: type what you want. They are
+# appended after the files so a filename query never surfaces one, while a branch or
+# ticket-shaped query (TICKET-1001) does. enter dispatches on the row's type column --
+# a ⊙ row re-scopes the picker instead of opening an editor.
 #
 # Why scoping matters here: this runs in the NSP_fileedit alacritty+tmux scratchpad,
 # whose cwd is fixed, so $PWD tells us nothing. Unscoped, `fd ~/` yields ~2.04M files
@@ -37,6 +43,9 @@ mkdir -p "$STATE_DIR"
 
 # Our own tmux session, so we don't mistake it for where work is happening.
 SELF_SESSION="fileedit"
+
+# Whose worktrees to offer when we can't infer a repo at all (cold start).
+DEFAULT_REPO="$HOME/work/repos/ul"
 
 EXCLUDE_DIRS=(
     -E node_modules -E .git -E dist -E build -E .next -E .cache
@@ -81,11 +90,13 @@ resolve_scope() {
     echo "$HOME"
 }
 
-# Emit "<abspath>\t<display>". fzf gets --with-nth=2.. so it shows and matches the
-# display column while {1} still hands us an unambiguous, shell-quoted real path.
+# Emit "<type>\t<abspath>\t<display>", type being f(ile) or w(orktree). fzf gets
+# --with-nth=3.. so it shows and matches only the display column, while {1}/{2} hand
+# us the row type and an unambiguous, shell-quoted real path. The type column is what
+# lets enter mean two different things without guessing from the path.
 # $1 = root to strip from display ("" to just tilde-collapse).
 format_lines() {
-    awk -F'\t' -v home="$HOME" -v root="$1" '
+    awk -F'\t' -v home="$HOME" -v root="$1" -v wtbase="$(dirname "$DEFAULT_REPO")" '
     function colour(fn,   n, parts, ext) {
         n = split(fn, parts, ".")
         ext = (n > 1) ? parts[n] : ""
@@ -109,8 +120,22 @@ format_lines() {
         return sprintf("\033[38;5;221m%-3s\033[0m", xy)
     }
     {
-        abs = $1
-        xy  = (NF > 1) ? $2 : ""
+        type = $1
+        abs  = $2
+        xy   = (NF > 2) ? $3 : ""
+
+        if (type == "w") {
+            # Name a worktree by its path under ~/work/repos, not its basename: some
+            # are nested (repo.hotfix/example-branch) and the basename alone collides.
+            name = abs
+            if (index(name, wtbase "/") == 1) {
+                name = substr(name, length(wtbase) + 2)
+            } else if (index(name, home) == 1) {
+                name = "~" substr(name, length(home) + 1)
+            }
+            printf "%s\t%s\t\033[38;5;81m⊙ %s\033[0m  \033[2m%s\033[0m\n", type, abs, name, xy
+            next
+        }
 
         disp = abs
         if (root != "" && index(disp, root "/") == 1) {
@@ -123,7 +148,7 @@ format_lines() {
         filename = parts[n]
         dir = substr(disp, 1, length(disp) - length(filename))
 
-        printf "%s\t%s\033[2m%s\033[0m%s%s\033[0m\n", abs, badge(xy), dir, colour(filename), filename
+        printf "%s\t%s\t%s\033[2m%s\033[0m%s%s\033[0m\n", type, abs, badge(xy), dir, colour(filename), filename
     }'
 }
 
@@ -138,7 +163,7 @@ list_changed() {
             R*|C*) IFS= read -r -d '' _old ;;
         esac
         [ -f "$root/$path" ] || continue
-        printf '%s\t%s\n' "$root/$path" "$xy"
+        printf 'f\t%s\t%s\n' "$root/$path" "$xy"
     done < <(git -C "$root" status --porcelain=v1 -z --untracked-files=all 2>/dev/null)
 }
 
@@ -146,7 +171,7 @@ list_conflicts() {
     local root="$1" path
     while IFS= read -r -d '' path; do
         [ -f "$root/$path" ] || continue
-        printf '%s\t%s\n' "$root/$path" "UU"
+        printf 'f\t%s\t%s\n' "$root/$path" "UU"
     done < <(git -C "$root" diff --name-only --diff-filter=U -z 2>/dev/null)
 }
 
@@ -159,7 +184,7 @@ list_files() {
         done
         fd . "$root" --type f --follow --hidden --no-ignore-vcs "${EXCLUDE_DIRS[@]}" "${PREFERRED_EXTS[@]}"
         fd . "$root" --type f --follow --hidden --no-ignore-vcs "${EXCLUDE_DIRS[@]}"
-    } | awk '!seen[$0]++'
+    } | awk '!seen[$0]++ { print "f\t" $0 }'
 }
 
 list_home() {
@@ -173,28 +198,53 @@ list_home() {
         done
         fd . "$HOME" --type f --follow --hidden --no-ignore-vcs "${EXCLUDE_DIRS[@]}" "${PREFERRED_EXTS[@]}"
         fd . "$HOME" --type f --follow --hidden --no-ignore-vcs "${EXCLUDE_DIRS[@]}"
-    } | awk '!seen[$0]++'
+    } | awk '!seen[$0]++ { print "f\t" $0 }'
 }
 
-# Worktrees of the scope repo, most recently used first. Read the per-worktree
-# gitdir pointers instead of shelling out to git once per worktree (139 of them).
+# A worktree mid-rebase/bisect has a bare SHA in HEAD rather than a ref; printing all
+# 40 characters of it just pushes the useful part off the row.
+head_label() {
+    local head
+    head=$(cat "$1" 2>/dev/null) || return
+    case "$head" in
+        "ref: refs/heads/"*) printf '%s' "${head#ref: refs/heads/}" ;;
+        *)                   printf 'detached %.8s' "$head" ;;
+    esac
+}
+
+# Worktrees of the scope repo as "<path>\t<branch>", most recently used first.
+# Reads the per-worktree gitdir/HEAD pointers directly rather than shelling out to
+# git once per worktree -- there are 139 of them, so that would be seconds.
 list_worktrees() {
-    local root="$1" common d gd wt ts
+    local root="$1" common d gd wt ts head branch
     common=$(git -C "$root" rev-parse --git-common-dir 2>/dev/null) || return
     case "$common" in /*) ;; *) common="$(cd "$root" && cd "$(dirname "$common")" && pwd)/$(basename "$common")" ;; esac
     {
         # primary worktree
         wt=$(dirname "$common")
-        [ -d "$wt" ] && printf '%s\t%s\n' "$(stat -c %Y "$common/index" 2>/dev/null || echo 0)" "$wt"
+        if [ -d "$wt" ]; then
+            printf '%s\t%s\t%s\n' "$(stat -c %Y "$common/index" 2>/dev/null || echo 0)" \
+                "$wt" "$(head_label "$common/HEAD")"
+        fi
         for d in "$common"/worktrees/*/; do
             [ -f "$d/gitdir" ] || continue
             gd=$(cat "$d/gitdir" 2>/dev/null) || continue
             wt=$(dirname "$gd")
             [ -d "$wt" ] || continue
             ts=$(stat -c %Y "$d/index" 2>/dev/null || echo 0)
-            printf '%s\t%s\n' "$ts" "$wt"
+            printf '%s\t%s\t%s\n' "$ts" "$wt" "$(head_label "$d/HEAD")"
         done
-    } | sort -rn | cut -f2
+    } | sort -rn | cut -f2,3
+}
+
+# Worktrees as pickable rows, for inlining into whatever mode is showing. Appended
+# after the files so that a filename query never surfaces one, while a branch or
+# ticket-shaped query (TICKET-1001) does.
+list_worktree_rows() {
+    local root="$1"
+    [ "$root" = "$HOME" ] && root="$DEFAULT_REPO"
+    [ -d "$root" ] || return
+    list_worktrees "$root" | awk -F'\t' '{ printf "w\t%s\t%s\n", $1, $2 }'
 }
 
 generate_list() {
@@ -215,12 +265,18 @@ generate_list() {
     fi
     [ "$scope" = "$HOME" ] && case "$mode" in changed|conflicts|files) mode=home ;; esac
 
-    case "$mode" in
-        changed)   list_changed   "$scope" | format_lines "$scope" ;;
-        conflicts) list_conflicts "$scope" | format_lines "$scope" ;;
-        files)     list_files     "$scope" | format_lines "$scope" ;;
-        *)         list_home                | format_lines ""      ;;
-    esac
+    # Worktrees are first-class alongside files: same list, same query, but appended
+    # last so they rank below the mode's own rows. enter dispatches on the type
+    # column, so selecting one re-scopes instead of opening an editor.
+    {
+        case "$mode" in
+            changed)   list_changed   "$scope" ;;
+            conflicts) list_conflicts "$scope" ;;
+            files)     list_files     "$scope" ;;
+            *)         list_home                ;;
+        esac
+        list_worktree_rows "$scope"
+    } | format_lines "$([ "$mode" = home ] && echo "" || echo "$scope")"
 }
 
 header_line() {
@@ -236,22 +292,39 @@ header_line() {
         branch=$(git -C "$scope" rev-parse --abbrev-ref HEAD 2>/dev/null)
         [ -n "$branch" ] && label="$label  ⊙ $branch"
     fi
-    printf '%s   [%s]   ^G changed  ^X conflicts  ^T tree  ^A all  M-w worktree' "$label" "$mode"
+    printf '%s   [%s]   ^G changed  ^X conflicts  ^T tree  ^A all  M-w worktrees   (⊙ rows switch worktree)' "$label" "$mode"
+}
+
+pin_scope() {
+    printf '%s' "$1" > "$SCOPE_FILE"
+    : > "$MODE_FILE"
+}
+
+# enter means "open this file" or "switch to this worktree" depending on the row.
+open_row() {
+    local type="$1" path="$2"
+    if [ "$type" = "w" ]; then
+        pin_scope "$path"
+        return
+    fi
+    record_history "$path"
+    cd "$(root_of_file "$path")" 2>/dev/null || cd "$(dirname "$path")" || return
+    nvim "$path"
 }
 
 pick_worktree() {
     local scope choice
     scope=$(resolve_scope)
+    [ "$scope" = "$HOME" ] && scope="$DEFAULT_REPO"
     choice=$(list_worktrees "$scope" \
-        | awk -v home="$HOME" '{ d=$0; sub("^" home, "~", d); printf "%s\t%s\n", $0, d }' \
+        | awk -F'\t' -v home="$HOME" '{ d=$1; sub("^" home, "~", d); printf "%s\t%s\t%s\n", $1, d, $2 }' \
         | "$FZP_FZF" --ansi --delimiter='\t' --with-nth=2.. --height=100% --reverse \
               --prompt='worktree (most recent first) > ' \
               --preview='git -C {1} status --short --branch 2>/dev/null | head -40' \
               --preview-window=down:50%:wrap \
         | cut -f1)
     if [ -n "$choice" ] && [ -d "$choice" ]; then
-        printf '%s' "$choice" > "$SCOPE_FILE"
-        : > "$MODE_FILE"
+        pin_scope "$choice"
     fi
 }
 
@@ -262,8 +335,15 @@ record_history() {
 
 # Preview: a diff is far more useful than file contents for changed/conflicted files,
 # and for a conflicted file we want to land on the markers rather than line 1.
-preview_file() {
-    local f="$1" root
+preview_row() {
+    local type="$1" f="$2" root
+
+    if [ "$type" = "w" ]; then
+        printf '\033[38;5;81m⊙ %s\033[0m\n' "$f"
+        git -C "$f" status --short --branch 2>/dev/null | head -40
+        return
+    fi
+
     [ -f "$f" ] || { echo "not a file: $f"; return; }
     root=$(git_root_of "$(dirname "$f")")
 
@@ -306,7 +386,8 @@ case "${1:-}" in
     --generate-list) generate_list; exit 0 ;;
     --header)        header_line;   exit 0 ;;
     --pick-worktree) pick_worktree; exit 0 ;;
-    --preview)       preview_file "$2"; exit 0 ;;
+    --preview)       preview_row "$2" "$3"; exit 0 ;;
+    --open)          open_row "$2" "$3"; exit 0 ;;
     --record)        record_history "$2"; exit 0 ;;
 esac
 
@@ -331,15 +412,15 @@ mode_bind() {
 
 generate_list | fzp_run $PERSIST_MODE \
     --delimiter=$'\t' \
-    --with-nth='2..' \
+    --with-nth='3..' \
     --prompt="edit > " \
     --header="$(header_line)" \
-    --preview="$0 --preview {1}" \
+    --preview="$0 --preview {1} {2}" \
     --preview-window=down:55%:wrap \
-    --bind "enter:execute($0 --record {1}; cd \"\$($0 --rootof {1})\" && nvim {1} < /dev/tty > /dev/tty 2>&1)+$REFRESH" \
-    --bind "ctrl-o:execute-silent($0 --record {1}; cursor -r {1})" \
-    --bind "ctrl-s:execute-silent(tmux new-window -c \"\$(dirname {1})\")" \
-    --bind "ctrl-c:execute-silent(printf '%s' {1} | xclip -selection clipboard)" \
+    --bind "enter:execute($0 --open {1} {2} < /dev/tty > /dev/tty 2>&1)+$REFRESH" \
+    --bind "ctrl-o:execute-silent($0 --record {2}; cursor -r {2})" \
+    --bind "ctrl-s:execute-silent(tmux new-window -c \"\$($0 --rootof {2})\")" \
+    --bind "ctrl-c:execute-silent(printf '%s' {2} | xclip -selection clipboard)" \
     --bind "ctrl-r:$REFRESH" \
     --bind "$(mode_bind ctrl-g changed)" \
     --bind "$(mode_bind ctrl-x conflicts)" \
