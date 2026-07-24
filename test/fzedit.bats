@@ -415,7 +415,9 @@ teardown() {
     out="$(FZP_FZF="$TEST_TMPDIR/fakebin/fzfargs" "$FZEDIT" --one-shot 2>&1)"
     [[ "$out" == *"tab:execute-silent"*"--widen"* ]]
     [[ "$out" == *"btab:execute-silent"*"--narrow"* ]]
-    [[ "$out" == *"alt-w:execute"*"--pick-worktree"* ]]
+    # xmonad grabs Alt-w for NSP_slack, so the worktree browse must not be on M-w.
+    [[ "$out" == *"ctrl-t:execute"*"--pick-worktree"* ]]
+    [[ "$out" != *"alt-w:"* ]]
     [[ "$out" == *"enter:execute"*"--open"* ]]
     # the retired per-rung letter keys must not linger
     [[ "$out" != *"ctrl-g:"* ]]

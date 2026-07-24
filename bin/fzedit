@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
 # fzedit - fzf-based file editor, worktree-aware.
 #
-# Modes, switchable live:
 # Scope of the listing is a single axis, widest-last, because these sets are strictly
 # nested rather than independent toggles:
 #
 #     conflicts  ⊂  changed  ⊂  worktree  ⊂  home
 #
 #   TAB    widen one rung        S-TAB  narrow one rung
-#   M-w    browse worktrees on their own, most recent first
+#   ^T     browse worktrees on their own, most recent first
+#
+# ^T rather than M-w: xmonad grabs Alt-w for NSP_slack, so it never reaches us. ^W is
+# left alone deliberately -- it is delete-word in the query, which is worth keeping.
 #
 #   enter  open file / switch worktree     ^O cursor    ^S tmux window here
 #   ^R     refresh                         ^C copy path
@@ -347,7 +349,7 @@ header_line() {
         fi
     done
 
-    printf '%s\n%sTAB widen · S-TAB narrow ·%s%s  %s· M-w worktrees · ⊙ rows switch worktree%s\n' \
+    printf '%s\n%sTAB widen · S-TAB narrow ·%s%s  %s· ^T worktrees · ⊙ rows switch worktree%s\n' \
         "$label" "$ESC_DIM" "$ESC_OFF" "$ladder" "$ESC_DIM" "$ESC_OFF"
 }
 
@@ -493,6 +495,6 @@ generate_list | fzp_run $PERSIST_MODE \
     --bind "ctrl-r:$REFRESH" \
     --bind "tab:execute-silent($0 --widen)+$REFRESH" \
     --bind "btab:execute-silent($0 --narrow)+$REFRESH" \
-    --bind "alt-w:execute($0 --pick-worktree < /dev/tty > /dev/tty 2>&1)+$REFRESH" \
+    --bind "ctrl-t:execute($0 --pick-worktree < /dev/tty > /dev/tty 2>&1)+$REFRESH" \
     --header-lines=0 \
     --tiebreak=begin,index
