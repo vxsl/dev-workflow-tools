@@ -2,14 +2,21 @@
 # fzedit - fzf-based file editor, worktree-aware.
 #
 # Modes, switchable live:
-#   ^G  changed files in the current worktree (git status) -- the source-control tab
-#   ^X  merge-conflict files only
-#   ^T  every file in the current worktree
-#   ^A  every file under $HOME (the old behaviour)
-#   M-w browse worktrees on their own, most recent first
+# Scope of the listing is a single axis, widest-last, because these sets are strictly
+# nested rather than independent toggles:
+#
+#     conflicts  ⊂  changed  ⊂  worktree  ⊂  home
+#
+#   TAB    widen one rung        S-TAB  narrow one rung
+#   M-w    browse worktrees on their own, most recent first
 #
 #   enter  open file / switch worktree     ^O cursor    ^S tmux window here
 #   ^R     refresh                         ^C copy path
+#
+# On launch the rung is chosen automatically: the narrowest one that isn't empty, so
+# a conflicted tree opens on the conflicts and a clean one opens on the file list.
+# The choice is remembered across fzf's reloads but deliberately NOT across launches
+# -- opening the pad and landing in a rung set days ago is just confusing.
 #
 # Worktrees are first-class rows (⊙, cyan) inlined into every mode, so switching
 # worktree and opening a file are the same gesture: type what you want. They are
@@ -247,23 +254,55 @@ list_worktree_rows() {
     list_worktrees "$root" | awk -F'\t' '{ printf "w\t%s\t%s\n", $1, $2 }'
 }
 
+# The rungs, narrowest first. Index into this is the whole mode model.
+RUNGS=(conflicts changed files home)
+
+rung_index() {
+    local want="$1" i
+    for i in "${!RUNGS[@]}"; do
+        [ "${RUNGS[$i]}" = "$want" ] && { printf '%s' "$i"; return; }
+    done
+    printf '%s' -1
+}
+
+# Narrowest rung that actually has something in it. Without this you open the pad on
+# an empty "conflicts" list and have to widen manually every single time.
+auto_rung() {
+    local scope="$1"
+    [ "$scope" = "$HOME" ] && { printf 'home'; return; }
+    if [ -n "$(git -C "$scope" diff --name-only --diff-filter=U 2>/dev/null | head -1)" ]; then
+        printf 'conflicts'
+    elif [ -n "$(git -C "$scope" status --porcelain 2>/dev/null | head -1)" ]; then
+        printf 'changed'
+    else
+        printf 'files'
+    fi
+}
+
+current_rung() {
+    local scope="$1" mode
+    mode=$(cat "$MODE_FILE" 2>/dev/null)
+    [ -z "$mode" ] && mode=$(auto_rung "$scope")
+    # Outside a repo only the widest rung means anything.
+    [ "$scope" = "$HOME" ] && mode=home
+    printf '%s' "$mode"
+}
+
+# Move along the axis and clamp; wrapping would make TAB unpredictable.
+shift_rung() {
+    local delta="$1" scope i
+    scope=$(resolve_scope)
+    i=$(rung_index "$(current_rung "$scope")")
+    i=$((i + delta))
+    [ "$i" -lt 0 ] && i=0
+    [ "$i" -ge "${#RUNGS[@]}" ] && i=$(( ${#RUNGS[@]} - 1 ))
+    printf '%s' "${RUNGS[$i]}" > "$MODE_FILE"
+}
+
 generate_list() {
     local scope mode
     scope=$(resolve_scope)
-    mode=$(cat "$MODE_FILE" 2>/dev/null)
-
-    # Default: if there's uncommitted work, that's almost certainly what we came to
-    # edit. Otherwise fall back to browsing the worktree.
-    if [ -z "$mode" ]; then
-        if [ "$scope" != "$HOME" ] && [ -n "$(git -C "$scope" status --porcelain 2>/dev/null | head -1)" ]; then
-            mode=changed
-        elif [ "$scope" != "$HOME" ]; then
-            mode=files
-        else
-            mode=home
-        fi
-    fi
-    [ "$scope" = "$HOME" ] && case "$mode" in changed|conflicts|files) mode=home ;; esac
+    mode=$(current_rung "$scope")
 
     # Worktrees are first-class alongside files: same list, same query, but appended
     # last so they rank below the mode's own rows. enter dispatches on the type
@@ -279,11 +318,13 @@ generate_list() {
     } | format_lines "$([ "$mode" = home ] && echo "" || echo "$scope")"
 }
 
+# Show the whole ladder with the current rung bracketed, so where you are and where
+# TAB will take you are both visible without remembering any letters.
 header_line() {
-    local scope mode label
+    local scope mode label ladder r n
     scope=$(resolve_scope)
-    mode=$(cat "$MODE_FILE" 2>/dev/null)
-    [ -z "$mode" ] && mode="(auto)"
+    mode=$(current_rung "$scope")
+
     if [ "$scope" = "$HOME" ]; then
         label="no worktree detected — searching \$HOME"
     else
@@ -292,7 +333,33 @@ header_line() {
         branch=$(git -C "$scope" rev-parse --abbrev-ref HEAD 2>/dev/null)
         [ -n "$branch" ] && label="$label  ⊙ $branch"
     fi
-    printf '%s   [%s]   ^G changed  ^X conflicts  ^T tree  ^A all  M-w worktrees   (⊙ rows switch worktree)' "$label" "$mode"
+
+    # $'...' so these are real escape bytes; printf '%s' will not expand \033 for us.
+    local ESC_ON=$'\033[1;38;5;221m' ESC_DIM=$'\033[2m' ESC_OFF=$'\033[0m'
+    ladder=""
+    for r in "${RUNGS[@]}"; do
+        n=$(count_rung "$scope" "$r")
+        [ -n "$n" ] && n=" $n"
+        if [ "$r" = "$mode" ]; then
+            ladder="${ladder} ${ESC_ON}[${r}${n}]${ESC_OFF}"
+        else
+            ladder="${ladder} ${ESC_DIM}${r}${n}${ESC_OFF}"
+        fi
+    done
+
+    printf '%s\n%sTAB widen · S-TAB narrow ·%s%s  %s· M-w worktrees · ⊙ rows switch worktree%s\n' \
+        "$label" "$ESC_DIM" "$ESC_OFF" "$ladder" "$ESC_DIM" "$ESC_OFF"
+}
+
+# Cheap counts for the header. Bounded work: we only need "how many", and for the two
+# wide rungs an exact count would mean walking the tree on every keystroke.
+count_rung() {
+    local scope="$1" r="$2"
+    case "$r" in
+        conflicts) printf '(%s)' "$(git -C "$scope" diff --name-only --diff-filter=U 2>/dev/null | wc -l)" ;;
+        changed)   printf '(%s)' "$(git -C "$scope" status --porcelain 2>/dev/null | wc -l)" ;;
+        *)         printf '' ;;
+    esac
 }
 
 pin_scope() {
@@ -309,7 +376,8 @@ open_row() {
     fi
     record_history "$path"
     cd "$(root_of_file "$path")" 2>/dev/null || cd "$(dirname "$path")" || return
-    nvim "$path"
+    # Overridable so the test suite can assert on dispatch without spawning an editor.
+    "${FZEDIT_EDITOR:-nvim}" "$path"
 }
 
 pick_worktree() {
@@ -389,6 +457,8 @@ case "${1:-}" in
     --preview)       preview_row "$2" "$3"; exit 0 ;;
     --open)          open_row "$2" "$3"; exit 0 ;;
     --record)        record_history "$2"; exit 0 ;;
+    --widen)         shift_rung 1;  exit 0 ;;
+    --narrow)        shift_rung -1; exit 0 ;;
 esac
 
 while [[ "$#" -gt 0 ]]; do
@@ -405,10 +475,9 @@ done
 
 REFRESH="reload($0 --generate-list)+transform-header($0 --header)"
 
-# ctrl-g:execute-silent(echo changed > state)+reload(...)+transform-header(...)
-mode_bind() {
-    printf '%s:execute-silent(printf %%s %s > %s)+%s' "$1" "$2" "$MODE_FILE" "$REFRESH"
-}
+# A fresh launch always starts from the auto-chosen rung; the file only exists to
+# carry the choice across fzf's reloads within this session.
+: > "$MODE_FILE"
 
 generate_list | fzp_run $PERSIST_MODE \
     --delimiter=$'\t' \
@@ -422,9 +491,8 @@ generate_list | fzp_run $PERSIST_MODE \
     --bind "ctrl-s:execute-silent(tmux new-window -c \"\$($0 --rootof {2})\")" \
     --bind "ctrl-c:execute-silent(printf '%s' {2} | xclip -selection clipboard)" \
     --bind "ctrl-r:$REFRESH" \
-    --bind "$(mode_bind ctrl-g changed)" \
-    --bind "$(mode_bind ctrl-x conflicts)" \
-    --bind "$(mode_bind ctrl-t files)" \
-    --bind "$(mode_bind ctrl-a home)" \
+    --bind "tab:execute-silent($0 --widen)+$REFRESH" \
+    --bind "btab:execute-silent($0 --narrow)+$REFRESH" \
     --bind "alt-w:execute($0 --pick-worktree < /dev/tty > /dev/tty 2>&1)+$REFRESH" \
+    --header-lines=0 \
     --tiebreak=begin,index
