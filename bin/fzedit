@@ -1,121 +1,319 @@
 #!/usr/bin/env bash
-# ~/.local/bin/fzedit
-# fzf-based file editor - fzf stays running, uses continuous reload
+# fzedit - fzf-based file editor, worktree-aware.
+#
+# Modes, switchable live:
+#   ^G  changed files in the current worktree (git status) -- the source-control tab
+#   ^X  merge-conflict files only
+#   ^T  every file in the current worktree
+#   ^A  every file under $HOME (the old behaviour)
+#   M-w pin a different worktree
+#
+#   enter  nvim      ^O cursor    ^S tmux window here
+#   ^R     refresh   ^C copy path
+#
+# Why scoping matters here: this runs in the NSP_fileedit alacritty+tmux scratchpad,
+# whose cwd is fixed, so $PWD tells us nothing. Unscoped, `fd ~/` yields ~2.04M files
+# across 139 ul.* worktrees -- 166k .tsx files for 1080 unique names, so every search
+# returns the same file over and over. One worktree is ~12.7k files. We therefore
+# infer the worktree from the most recently active tmux pane outside this session,
+# which is where the actual work is happening.
 #
 # Usage:
-#   fzedit              # Use FZF_PERSIST_MODE env var (default: on)
-#   fzedit --persist    # Force persist mode (stays open)
-#   fzedit --one-shot   # Force one-shot mode (exits after selection)
+#   fzedit              # FZF_PERSIST_MODE env var (default: persist)
+#   fzedit --persist    # force persist mode (stays open)
+#   fzedit --one-shot   # force one-shot mode (exits after selection)
 
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$(type -P "$0" || echo "$0")")")" && pwd)"
 source "$SCRIPT_DIR/../lib/fzf-helpers"
 
 HISTORY_FILE="$HOME/.fzedit_history"
-PERSIST_MODE="--persist"  # Default to persist mode for fzedit
+STATE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/fzedit"
+SCOPE_FILE="$STATE_DIR/scope"
+MODE_FILE="$STATE_DIR/mode"
+PERSIST_MODE="--persist"
 
-# Create history file if it doesn't exist
+mkdir -p "$STATE_DIR"
 [ ! -f "$HISTORY_FILE" ] && touch "$HISTORY_FILE"
 
-# Directories to exclude
+# Our own tmux session, so we don't mistake it for where work is happening.
+SELF_SESSION="fileedit"
+
 EXCLUDE_DIRS=(
-    -E node_modules
-    -E .git
-    -E dist
-    -E build
-    -E .next
-    -E .cache
-    -E target
-    -E vendor
-    -E __pycache__
-    -E .venv
-    -E venv
+    -E node_modules -E .git -E dist -E build -E .next -E .cache
+    -E target -E vendor -E __pycache__ -E .venv -E venv
 )
 
-# Preferred directories (searched first)
 PREFERRED_DIRS=(
-    "$HOME/work/repos/client/web"
+    "$HOME/work/repos/ul/client/web"
     "$HOME/work"
     "$HOME/.config"
     "$HOME/.xmonad"
     "$HOME/bin"
 )
 
-# Preferred file extensions (prioritized)
 PREFERRED_EXTS=(-e hs -e js -e ts -e tsx -e py -e sh -e md -e yaml -e toml)
 
-# Function to generate file list with colors
-generate_list() {
+git_root_of() {
+    [ -d "$1" ] || return 1
+    git -C "$1" rev-parse --show-toplevel 2>/dev/null
+}
+
+# The worktree we're "in": an explicit pin wins, then our own cwd, then the most
+# recently active tmux pane elsewhere, then give up and use $HOME.
+resolve_scope() {
+    local pinned root path
+    pinned=$(cat "$SCOPE_FILE" 2>/dev/null)
+    if [ -n "$pinned" ] && [ -d "$pinned" ]; then
+        echo "$pinned"
+        return
+    fi
+    if root=$(git_root_of "$PWD"); then
+        echo "$root"
+        return
+    fi
+    while read -r _ path; do
+        if root=$(git_root_of "$path"); then
+            echo "$root"
+            return
+        fi
+    done < <(tmux list-panes -a -F '#{window_activity} #{pane_current_path}' \
+                 -f "#{!=:#{session_name},$SELF_SESSION}" 2>/dev/null | sort -rn)
+    echo "$HOME"
+}
+
+# Emit "<abspath>\t<display>". fzf gets --with-nth=2.. so it shows and matches the
+# display column while {1} still hands us an unambiguous, shell-quoted real path.
+# $1 = root to strip from display ("" to just tilde-collapse).
+format_lines() {
+    awk -F'\t' -v home="$HOME" -v root="$1" '
+    function colour(fn,   n, parts, ext) {
+        n = split(fn, parts, ".")
+        ext = (n > 1) ? parts[n] : ""
+        if (ext == "hs" || ext == "lhs")                              return "\033[38;5;141m"
+        if (ext == "js" || ext == "jsx" || ext == "ts" || ext == "tsx") return "\033[38;5;221m"
+        if (ext == "py")                                              return "\033[38;5;81m"
+        if (ext == "sh" || ext == "bash" || ext == "zsh")              return "\033[38;5;114m"
+        if (ext == "yaml" || ext == "yml" || ext == "toml" || ext == "json") return "\033[38;5;173m"
+        if (ext == "md" || ext == "markdown" || ext == "txt")          return "\033[38;5;250m"
+        if (ext == "rs")                                              return "\033[38;5;208m"
+        if (ext == "go")                                              return "\033[38;5;86m"
+        if (ext == "rb")                                              return "\033[38;5;204m"
+        return "\033[0m"
+    }
+    # git status two-letter code -> badge
+    function badge(xy) {
+        if (xy == "")                       return ""
+        if (xy ~ /^(U.|.U|AA|DD)$/)         return sprintf("\033[1;38;5;196m%-3s\033[0m", "!!")
+        if (xy == "??")                     return sprintf("\033[38;5;244m%-3s\033[0m", "?")
+        if (substr(xy,1,1) != " ")          return sprintf("\033[38;5;114m%-3s\033[0m", xy)
+        return sprintf("\033[38;5;221m%-3s\033[0m", xy)
+    }
     {
-        # Recently opened files (highest priority)
-        tac "$HISTORY_FILE" | while read -r f; do
-            [ -f "$f" ] && echo "$f"
-        done
-        
-        # Preferred directories with preferred extensions
-        for dir in "${PREFERRED_DIRS[@]}"; do
-            [ -d "$dir" ] && fd . "$dir" --type f --follow --hidden --no-ignore-vcs "${EXCLUDE_DIRS[@]}" "${PREFERRED_EXTS[@]}"
-        done
+        abs = $1
+        xy  = (NF > 1) ? $2 : ""
 
-        # All preferred extensions in home
-        fd . ~/ --type f --follow --hidden --no-ignore-vcs "${EXCLUDE_DIRS[@]}" "${PREFERRED_EXTS[@]}"
-
-        # Everything else (lower priority)
-        fd . ~/ --type f --follow --hidden --no-ignore-vcs "${EXCLUDE_DIRS[@]}"
-    } | awk '!seen[$0]++' | awk -v home="$HOME" '{
-        # Replace home directory with ~
-        path = $0
-        sub("^" home, "~", path)
-        
-        # Split path into directory and filename
-        n = split(path, parts, "/")
-        filename = parts[n]
-        dir = substr(path, 1, length(path) - length(filename))
-        
-        # Get file extension
-        split(filename, ext_parts, ".")
-        ext = ext_parts[length(ext_parts)]
-        
-        # Color based on file extension
-        if (ext == "hs" || ext == "lhs") {
-            color = "\033[38;5;141m"  # Purple (Haskell)
-        } else if (ext == "js" || ext == "jsx" || ext == "ts" || ext == "tsx") {
-            color = "\033[38;5;221m"  # Yellow (JavaScript/TypeScript)
-        } else if (ext == "py") {
-            color = "\033[38;5;81m"   # Cyan (Python)
-        } else if (ext == "sh" || ext == "bash" || ext == "zsh") {
-            color = "\033[38;5;114m"  # Green (Shell)
-        } else if (ext == "yaml" || ext == "yml" || ext == "toml" || ext == "json") {
-            color = "\033[38;5;173m"  # Orange (Config)
-        } else if (ext == "md" || ext == "markdown" || ext == "txt") {
-            color = "\033[38;5;250m"  # Light gray (Docs)
-        } else if (ext == "rs") {
-            color = "\033[38;5;208m"  # Orange-red (Rust)
-        } else if (ext == "go") {
-            color = "\033[38;5;86m"   # Bright cyan (Go)
-        } else {
-            color = "\033[0m"         # Default
+        disp = abs
+        if (root != "" && index(disp, root "/") == 1) {
+            disp = substr(disp, length(root) + 2)
+        } else if (index(disp, home) == 1) {
+            disp = "~" substr(disp, length(home) + 1)
         }
-        
-        # Print: dimmed directory + colored filename
-        printf "\033[2m%s\033[0m%s%s\033[0m\n", dir, color, filename
+
+        n = split(disp, parts, "/")
+        filename = parts[n]
+        dir = substr(disp, 1, length(disp) - length(filename))
+
+        printf "%s\t%s\033[2m%s\033[0m%s%s\033[0m\n", abs, badge(xy), dir, colour(filename), filename
     }'
 }
 
-# Parse command line arguments
+# Changed + untracked files. -z avoids git quoting paths with spaces; renames emit a
+# second NUL-terminated field (the old name) that we have to consume.
+list_changed() {
+    local root="$1" entry xy path
+    while IFS= read -r -d '' entry; do
+        xy=${entry:0:2}
+        path=${entry:3}
+        case "$xy" in
+            R*|C*) IFS= read -r -d '' _old ;;
+        esac
+        [ -f "$root/$path" ] || continue
+        printf '%s\t%s\n' "$root/$path" "$xy"
+    done < <(git -C "$root" status --porcelain=v1 -z --untracked-files=all 2>/dev/null)
+}
+
+list_conflicts() {
+    local root="$1" path
+    while IFS= read -r -d '' path; do
+        [ -f "$root/$path" ] || continue
+        printf '%s\t%s\n' "$root/$path" "UU"
+    done < <(git -C "$root" diff --name-only --diff-filter=U -z 2>/dev/null)
+}
+
+# History first (it's the "recently opened" prior), then everything else, deduped.
+list_files() {
+    local root="$1"
+    {
+        tac "$HISTORY_FILE" | while IFS= read -r f; do
+            case "$f" in "$root"/*) [ -f "$f" ] && echo "$f" ;; esac
+        done
+        fd . "$root" --type f --follow --hidden --no-ignore-vcs "${EXCLUDE_DIRS[@]}" "${PREFERRED_EXTS[@]}"
+        fd . "$root" --type f --follow --hidden --no-ignore-vcs "${EXCLUDE_DIRS[@]}"
+    } | awk '!seen[$0]++'
+}
+
+list_home() {
+    {
+        tac "$HISTORY_FILE" | while IFS= read -r f; do
+            [ -f "$f" ] && echo "$f"
+        done
+        local dir
+        for dir in "${PREFERRED_DIRS[@]}"; do
+            [ -d "$dir" ] && fd . "$dir" --type f --follow --hidden --no-ignore-vcs "${EXCLUDE_DIRS[@]}" "${PREFERRED_EXTS[@]}"
+        done
+        fd . "$HOME" --type f --follow --hidden --no-ignore-vcs "${EXCLUDE_DIRS[@]}" "${PREFERRED_EXTS[@]}"
+        fd . "$HOME" --type f --follow --hidden --no-ignore-vcs "${EXCLUDE_DIRS[@]}"
+    } | awk '!seen[$0]++'
+}
+
+# Worktrees of the scope repo, most recently used first. Read the per-worktree
+# gitdir pointers instead of shelling out to git once per worktree (139 of them).
+list_worktrees() {
+    local root="$1" common d gd wt ts
+    common=$(git -C "$root" rev-parse --git-common-dir 2>/dev/null) || return
+    case "$common" in /*) ;; *) common="$(cd "$root" && cd "$(dirname "$common")" && pwd)/$(basename "$common")" ;; esac
+    {
+        # primary worktree
+        wt=$(dirname "$common")
+        [ -d "$wt" ] && printf '%s\t%s\n' "$(stat -c %Y "$common/index" 2>/dev/null || echo 0)" "$wt"
+        for d in "$common"/worktrees/*/; do
+            [ -f "$d/gitdir" ] || continue
+            gd=$(cat "$d/gitdir" 2>/dev/null) || continue
+            wt=$(dirname "$gd")
+            [ -d "$wt" ] || continue
+            ts=$(stat -c %Y "$d/index" 2>/dev/null || echo 0)
+            printf '%s\t%s\n' "$ts" "$wt"
+        done
+    } | sort -rn | cut -f2
+}
+
+generate_list() {
+    local scope mode
+    scope=$(resolve_scope)
+    mode=$(cat "$MODE_FILE" 2>/dev/null)
+
+    # Default: if there's uncommitted work, that's almost certainly what we came to
+    # edit. Otherwise fall back to browsing the worktree.
+    if [ -z "$mode" ]; then
+        if [ "$scope" != "$HOME" ] && [ -n "$(git -C "$scope" status --porcelain 2>/dev/null | head -1)" ]; then
+            mode=changed
+        elif [ "$scope" != "$HOME" ]; then
+            mode=files
+        else
+            mode=home
+        fi
+    fi
+    [ "$scope" = "$HOME" ] && case "$mode" in changed|conflicts|files) mode=home ;; esac
+
+    case "$mode" in
+        changed)   list_changed   "$scope" | format_lines "$scope" ;;
+        conflicts) list_conflicts "$scope" | format_lines "$scope" ;;
+        files)     list_files     "$scope" | format_lines "$scope" ;;
+        *)         list_home                | format_lines ""      ;;
+    esac
+}
+
+header_line() {
+    local scope mode label
+    scope=$(resolve_scope)
+    mode=$(cat "$MODE_FILE" 2>/dev/null)
+    [ -z "$mode" ] && mode="(auto)"
+    if [ "$scope" = "$HOME" ]; then
+        label="no worktree detected — searching \$HOME"
+    else
+        label="$(basename "$scope")"
+        local branch
+        branch=$(git -C "$scope" rev-parse --abbrev-ref HEAD 2>/dev/null)
+        [ -n "$branch" ] && label="$label  ⊙ $branch"
+    fi
+    printf '%s   [%s]   ^G changed  ^X conflicts  ^T tree  ^A all  M-w worktree' "$label" "$mode"
+}
+
+pick_worktree() {
+    local scope choice
+    scope=$(resolve_scope)
+    choice=$(list_worktrees "$scope" \
+        | awk -v home="$HOME" '{ d=$0; sub("^" home, "~", d); printf "%s\t%s\n", $0, d }' \
+        | "$FZP_FZF" --ansi --delimiter='\t' --with-nth=2.. --height=100% --reverse \
+              --prompt='worktree (most recent first) > ' \
+              --preview='git -C {1} status --short --branch 2>/dev/null | head -40' \
+              --preview-window=down:50%:wrap \
+        | cut -f1)
+    if [ -n "$choice" ] && [ -d "$choice" ]; then
+        printf '%s' "$choice" > "$SCOPE_FILE"
+        : > "$MODE_FILE"
+    fi
+}
+
+record_history() {
+    printf '%s\n' "$1" >> "$HISTORY_FILE"
+    tail -200 "$HISTORY_FILE" > "$HISTORY_FILE.tmp" && mv "$HISTORY_FILE.tmp" "$HISTORY_FILE"
+}
+
+# Preview: a diff is far more useful than file contents for changed/conflicted files,
+# and for a conflicted file we want to land on the markers rather than line 1.
+preview_file() {
+    local f="$1" root
+    [ -f "$f" ] || { echo "not a file: $f"; return; }
+    root=$(git_root_of "$(dirname "$f")")
+
+    if [ -n "$root" ] && grep -qm1 '^<<<<<<<' "$f" 2>/dev/null; then
+        local line
+        line=$(grep -nm1 '^<<<<<<<' "$f" | cut -d: -f1)
+        echo -e "\033[1;38;5;196m── conflict at line $line ──\033[0m"
+        bat --color=always --style=numbers --highlight-line "$line" \
+            --line-range="$(( line > 8 ? line - 8 : 1 )):$(( line + 40 ))" "$f" 2>/dev/null
+        return
+    fi
+
+    if [ -n "$root" ]; then
+        local diff
+        diff=$(git -C "$root" diff --no-ext-diff HEAD -- "$f" 2>/dev/null)
+        if [ -n "$diff" ]; then
+            if command -v delta >/dev/null 2>&1; then
+                printf '%s\n' "$diff" | delta --paging=never --width="${FZF_PREVIEW_COLUMNS:-120}"
+            else
+                printf '%s\n' "$diff"
+            fi
+            return
+        fi
+    fi
+
+    bat --color=always --style=numbers --line-range=:200 "$f" 2>/dev/null || cat "$f" 2>/dev/null
+}
+
+# nvim must be launched with cwd == the repo root, not the scratchpad's fixed cwd:
+# git-conflict.nvim only activates when getcwd()/.git exists, and the eslint LSP and
+# diffview both resolve their root from cwd too.
+root_of_file() {
+    local d
+    d=$(dirname "$1")
+    git_root_of "$d" || printf '%s' "$d"
+}
+
+case "${1:-}" in
+    --rootof)        root_of_file "$2"; exit 0 ;;
+    --generate-list) generate_list; exit 0 ;;
+    --header)        header_line;   exit 0 ;;
+    --pick-worktree) pick_worktree; exit 0 ;;
+    --preview)       preview_file "$2"; exit 0 ;;
+    --record)        record_history "$2"; exit 0 ;;
+esac
+
 while [[ "$#" -gt 0 ]]; do
     case $1 in
-        --generate-list)
-            generate_list
-            exit 0
-            ;;
-        --persist)
-            PERSIST_MODE="--persist"
-            shift
-            ;;
-        --one-shot)
-            PERSIST_MODE="--one-shot"
-            shift
-            ;;
+        --persist)  PERSIST_MODE="--persist";  shift ;;
+        --one-shot) PERSIST_MODE="--one-shot"; shift ;;
         *)
             echo "Unknown option: $1" >&2
             echo "Usage: fzedit [--persist|--one-shot]" >&2
@@ -124,26 +322,28 @@ while [[ "$#" -gt 0 ]]; do
     esac
 done
 
-# fzf runs continuously and reloads after each file edit
+REFRESH="reload($0 --generate-list)+transform-header($0 --header)"
+
+# ctrl-g:execute-silent(echo changed > state)+reload(...)+transform-header(...)
+mode_bind() {
+    printf '%s:execute-silent(printf %%s %s > %s)+%s' "$1" "$2" "$MODE_FILE" "$REFRESH"
+}
+
 generate_list | fzp_run $PERSIST_MODE \
-    --prompt="Enter nvim | ^O cursor | ^S shell | ^R refresh > " \
-    --preview='f=$(echo {}); f=${f/#\~/$HOME}; bat --color=always --style=numbers --line-range=:100 "$f" 2>/dev/null || cat "$f" 2>/dev/null || echo "Preview not available"' \
-    --preview-window=down:50%:wrap \
-    --bind 'ctrl-c:execute-silent(f=$(echo {}); f=${f/#\~/$HOME}; echo -n "$f" | xclip -selection clipboard)' \
-    --bind "ctrl-r:reload($0 --generate-list)" \
-    --bind "enter:execute(
-        f=\$(echo {}); 
-        f=\${f/#\~/$HOME}; 
-        echo \"\$f\" >> $HISTORY_FILE;
-        tail -100 $HISTORY_FILE > ${HISTORY_FILE}.tmp && mv ${HISTORY_FILE}.tmp $HISTORY_FILE;
-        nvim \"\$f\" < /dev/tty > /dev/tty 2>&1
-    )+reload($0 --generate-list)" \
-    --bind "ctrl-o:execute-silent(
-        f=\$(echo {}); 
-        f=\${f/#\~/$HOME}; 
-        echo \"\$f\" >> $HISTORY_FILE;
-        tail -100 $HISTORY_FILE > ${HISTORY_FILE}.tmp && mv ${HISTORY_FILE}.tmp $HISTORY_FILE;
-        cursor -r \"\$f\"
-    )+reload($0 --generate-list)" \
-    --bind 'ctrl-s:execute-silent(f={}; f=${f/#\~/$HOME}; tmux new-window -c "$(dirname "$f")")' \
+    --delimiter=$'\t' \
+    --with-nth='2..' \
+    --prompt="edit > " \
+    --header="$(header_line)" \
+    --preview="$0 --preview {1}" \
+    --preview-window=down:55%:wrap \
+    --bind "enter:execute($0 --record {1}; cd \"\$($0 --rootof {1})\" && nvim {1} < /dev/tty > /dev/tty 2>&1)+$REFRESH" \
+    --bind "ctrl-o:execute-silent($0 --record {1}; cursor -r {1})" \
+    --bind "ctrl-s:execute-silent(tmux new-window -c \"\$(dirname {1})\")" \
+    --bind "ctrl-c:execute-silent(printf '%s' {1} | xclip -selection clipboard)" \
+    --bind "ctrl-r:$REFRESH" \
+    --bind "$(mode_bind ctrl-g changed)" \
+    --bind "$(mode_bind ctrl-x conflicts)" \
+    --bind "$(mode_bind ctrl-t files)" \
+    --bind "$(mode_bind ctrl-a home)" \
+    --bind "alt-w:execute($0 --pick-worktree < /dev/tty > /dev/tty 2>&1)+$REFRESH" \
     --tiebreak=begin,index
