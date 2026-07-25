@@ -371,15 +371,15 @@ pin_scope() {
 
 # enter means "open this file" or "switch to this worktree" depending on the row.
 open_row() {
-    local type="$1" path="$2"
+    local type="$1" path="$2" line="${3:-}"
+    # tig's main view has no %(file); don't try to open the empty string.
+    [ -n "$path" ] || return 0
     if [ "$type" = "w" ]; then
         pin_scope "$path"
         return
     fi
-    record_history "$path"
-    cd "$(root_of_file "$path")" 2>/dev/null || cd "$(dirname "$path")" || return
-    # Overridable so the test suite can assert on dispatch without spawning an editor.
-    "${FZEDIT_EDITOR:-nvim}" "$path"
+    record_history "$(abspath "$path")"
+    open_in_editor "$path" "$line"
 }
 
 pick_worktree() {
@@ -451,13 +451,95 @@ root_of_file() {
     git_root_of "$d" || printf '%s' "$d"
 }
 
+abspath() {
+    case "$1" in
+        /*) printf '%s' "$1" ;;
+        *)  printf '%s/%s' "$(cd "$(dirname "$1")" 2>/dev/null && pwd)" "$(basename "$1")" ;;
+    esac
+}
+
+# One long-lived nvim per worktree, keyed by repo root, with files arriving as tabs.
+#
+# Per-repo rather than one global server on purpose: a shared instance keeps the cwd
+# of whichever repo opened it first, and cwd is exactly what git-conflict, the eslint
+# LSP and diffview resolve their roots from. With 139 worktrees a single server would
+# silently attach the wrong repo's tooling to most files.
+# In the runtime dir, not the cache dir: sockets belong there, and AF_UNIX paths are
+# capped at 108 bytes -- a deep $XDG_CACHE_HOME silently fails to bind.
+sock_for_root() {
+    printf '%s/fzedit-nvim-%s.sock' "${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}" \
+        "$(printf '%s' "$1" | sha1sum | cut -c1-12)"
+}
+
+# tmux window names are cosmetic but must not contain separators.
+win_for_root() {
+    printf 'e:%s' "$(basename "$1" | tr -c '[:alnum:]._-' '-')"
+}
+
+nvim_server_alive() {
+    [ -S "$1" ] && nvim --server "$1" --remote-expr '1' >/dev/null 2>&1
+}
+
+# Where to put the editor window: the scratchpad session if it exists (so a hand-off
+# from elsewhere, e.g. tig, lands in the pad), else whatever session we are in.
+editor_session() {
+    if tmux has-session -t "$SELF_SESSION" 2>/dev/null; then
+        printf '%s' "$SELF_SESSION"
+        return 0
+    fi
+    [ -n "${TMUX:-}" ] && tmux display-message -p '#{session_name}' 2>/dev/null && return 0
+    return 1
+}
+
+open_in_editor() {
+    local path line root sock win sess cmd
+    path=$(abspath "$1")
+    line="${2:-}"
+    [ "$line" = "0" ] && line=""
+
+    # Test seam: assert dispatch without spawning anything.
+    if [ -n "${FZEDIT_EDITOR:-}" ]; then
+        "$FZEDIT_EDITOR" "$path"
+        return
+    fi
+
+    root=$(root_of_file "$path")
+    sock=$(sock_for_root "$root")
+    win=$(win_for_root "$root")
+
+    if nvim_server_alive "$sock"; then
+        nvim --server "$sock" --remote-tab-silent "$path" >/dev/null 2>&1
+        [ -n "$line" ] && nvim --server "$sock" --remote-send "<C-\\><C-N>:${line}<CR>zz" >/dev/null 2>&1
+        sess=$(editor_session) && tmux select-window -t "$sess:$win" 2>/dev/null
+        return
+    fi
+
+    rm -f "$sock"
+    cmd="cd $(printf '%q' "$root") && exec nvim --listen $(printf '%q' "$sock")"
+    [ -n "$line" ] && cmd="$cmd +$line"
+    cmd="$cmd -- $(printf '%q' "$path")"
+
+    if sess=$(editor_session); then
+        if tmux new-window -t "$sess:" -n "$win" "$cmd" 2>/dev/null; then
+            tmux select-window -t "$sess:$win" 2>/dev/null
+            return
+        fi
+    fi
+
+    # No tmux at all: behave like the plain wrapper it used to be.
+    cd "$root" 2>/dev/null || cd "$(dirname "$path")" || return
+    if [ -n "$line" ]; then exec nvim "+$line" -- "$path"; fi
+    exec nvim -- "$path"
+}
+
 case "${1:-}" in
     --rootof)        root_of_file "$2"; exit 0 ;;
     --generate-list) generate_list; exit 0 ;;
     --header)        header_line;   exit 0 ;;
     --pick-worktree) pick_worktree; exit 0 ;;
     --preview)       preview_row "$2" "$3"; exit 0 ;;
-    --open)          open_row "$2" "$3"; exit 0 ;;
+    --open)          open_row "$2" "$3" "${4:-}"; exit 0 ;;
+    --pin)           pin_scope "$(git_root_of "${2:-$PWD}" || abspath "${2:-$PWD}")"; exit 0 ;;
     --record)        record_history "$2"; exit 0 ;;
     --widen)         shift_rung 1;  exit 0 ;;
     --narrow)        shift_rung -1; exit 0 ;;

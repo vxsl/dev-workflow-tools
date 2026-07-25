@@ -107,3 +107,13 @@ rows_of_type() { fz --generate-list | awk -F'\t' -v t="$1" '$1 == t'; }
 
 # Displayed (third) column, ANSI stripped.
 display_col() { cut -f3- | plain; }
+
+# Ask fzedit itself for the socket it would use for a root, so the test can't drift
+# from the implementation's hashing scheme.
+sock_for_root_of() {
+    ( set -e
+      # shellcheck disable=SC1090
+      STATE_DIR="$HOME/.cache/fzedit"
+      eval "$(sed -n '/^sock_for_root() {/,/^}/p' "$FZEDIT")"
+      sock_for_root "$1" )
+}

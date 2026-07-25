@@ -423,3 +423,46 @@ teardown() {
     [[ "$out" != *"ctrl-g:"* ]]
     [[ "$out" != *"ctrl-x:"* ]]
 }
+
+# --------------------------------------------------------------------------
+# Editor hand-off (also the path tig's E binding takes)
+# --------------------------------------------------------------------------
+
+@test "--open normalises a relative path, as tig passes %(file)" {
+    cd "$WT_FEATURE"
+    FZEDIT_EDITOR=true fz --open f "src/app.ts"
+    run grep -c "^$WT_FEATURE/src/app.ts$" "$HOME/.fzedit_history"
+    [ "$output" = "1" ]
+}
+
+@test "--open with no file is a no-op, not an attempt to edit \"\"" {
+    # tig's main view has no %(file).
+    run env FZEDIT_EDITOR=true "$FZEDIT" --open f ""
+    [ "$status" -eq 0 ]
+    [ ! -s "$HOME/.fzedit_history" ]
+}
+
+@test "--pin scopes the picker to a repo root" {
+    cd "$WT_NESTED"
+    fz --pin "$WT_NESTED"
+    [ "$(cat "$HOME/.cache/fzedit/scope")" = "$WT_NESTED" ]
+}
+
+@test "--pin resolves a subdirectory up to the worktree root" {
+    fz --pin "$WT_FEATURE/src"
+    [ "$(cat "$HOME/.cache/fzedit/scope")" = "$WT_FEATURE" ]
+}
+
+@test "editor sockets are per-worktree, so tooling resolves the right repo" {
+    # A shared server would keep the cwd of whichever repo opened it first, and cwd
+    # is what git-conflict, the eslint LSP and diffview resolve their roots from.
+    a="$(sock_for_root_of "$WT_FEATURE")"
+    b="$(sock_for_root_of "$WT_NESTED")"
+    [ -n "$a" ] && [ "$a" != "$b" ]
+}
+
+@test "the editor socket path fits in AF_UNIX's 108 bytes" {
+    # A deep XDG_CACHE_HOME silently fails to bind, which looks like "tabs don't work".
+    s="$(sock_for_root_of "$WT_FEATURE")"
+    [ "${#s}" -lt 108 ] || { echo "socket path is ${#s} bytes: $s"; return 1; }
+}
