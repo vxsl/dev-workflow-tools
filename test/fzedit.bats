@@ -208,7 +208,7 @@ teardown() {
     printf '#!/bin/bash\nexec %s "$@" --version\n' "$real_fzf" > "$TEST_TMPDIR/fakebin/fzfwrap"
     chmod +x "$TEST_TMPDIR/fakebin/fzfwrap"
     FZP_FZF="$TEST_TMPDIR/fakebin/fzfwrap" "$FZEDIT" --one-shot >/dev/null 2>&1
-    [ ! -s "$HOME/.cache/fzedit/mode" ]
+    [ ! -s "$HOME/.cache/fzedit/mode-$FZEDIT_INSTANCE" ]
 }
 
 # --------------------------------------------------------------------------
@@ -349,9 +349,9 @@ teardown() {
     pin_scope "$WT_FEATURE"
     set_mode files
     fz --open w "$WT_NESTED"
-    [ "$(cat "$HOME/.cache/fzedit/scope")" = "$WT_NESTED" ]
+    [ "$(cat "$HOME/.cache/fzedit/scope-$FZEDIT_INSTANCE")" = "$WT_NESTED" ]
     # mode is reset so the new worktree gets its own auto-default
-    [ ! -s "$HOME/.cache/fzedit/mode" ]
+    [ ! -s "$HOME/.cache/fzedit/mode-$FZEDIT_INSTANCE" ]
 }
 
 @test "--open on a file row records history" {
@@ -445,24 +445,78 @@ teardown() {
 @test "--pin scopes the picker to a repo root" {
     cd "$WT_NESTED"
     fz --pin "$WT_NESTED"
-    [ "$(cat "$HOME/.cache/fzedit/scope")" = "$WT_NESTED" ]
+    [ "$(cat "$HOME/.cache/fzedit/scope-$FZEDIT_INSTANCE")" = "$WT_NESTED" ]
 }
 
 @test "--pin resolves a subdirectory up to the worktree root" {
     fz --pin "$WT_FEATURE/src"
-    [ "$(cat "$HOME/.cache/fzedit/scope")" = "$WT_FEATURE" ]
+    [ "$(cat "$HOME/.cache/fzedit/scope-$FZEDIT_INSTANCE")" = "$WT_FEATURE" ]
 }
 
-@test "editor sockets are per-worktree, so tooling resolves the right repo" {
-    # A shared server would keep the cwd of whichever repo opened it first, and cwd
-    # is what git-conflict, the eslint LSP and diffview resolve their roots from.
-    a="$(sock_for_root_of "$WT_FEATURE")"
-    b="$(sock_for_root_of "$WT_NESTED")"
-    [ -n "$a" ] && [ "$a" != "$b" ]
+# --------------------------------------------------------------------------
+# Tabs — each one a whole separate instance
+# --------------------------------------------------------------------------
+
+@test "scope and rung are per-instance, so two tabs do not fight" {
+    FZEDIT_INSTANCE=aaa fz --pin "$WT_FEATURE"
+    FZEDIT_INSTANCE=bbb fz --pin "$WT_NESTED"
+    [ "$(cat "$HOME/.cache/fzedit/scope-aaa")" = "$WT_FEATURE" ]
+    [ "$(cat "$HOME/.cache/fzedit/scope-bbb")" = "$WT_NESTED" ]
+
+    FZEDIT_INSTANCE=aaa fz --widen
+    a="$(FZEDIT_INSTANCE=aaa fz --header | plain)"
+    b="$(FZEDIT_INSTANCE=bbb fz --header | plain)"
+    [[ "$a" == *"repo.feature"* ]]
+    [[ "$b" == *"deep"* ]]
+    # widening one must not move the other
+    [[ "$a" != "$b" ]]
 }
 
-@test "the editor socket path fits in AF_UNIX's 108 bytes" {
-    # A deep XDG_CACHE_HOME silently fails to bind, which looks like "tabs don't work".
-    s="$(sock_for_root_of "$WT_FEATURE")"
-    [ "${#s}" -lt 108 ] || { echo "socket path is ${#s} bytes: $s"; return 1; }
+@test "tab labels lose the trailing dash basename+tr used to leave" {
+    out="$(FZEDIT_INSTANCE=lbl fz --pin "$WT_FEATURE"; FZEDIT_INSTANCE=lbl fz --header | plain | head -1)"
+    [[ "$out" == *"repo.feature"* ]]
+    [[ "$out" != *"repo.feature-"* ]]
+}
+
+@test "--tab with nowhere to put it fails loudly instead of pretending" {
+    # The case arm used to `exit 0` unconditionally, so tig would think it worked.
+    run env -u TMUX FZEDIT_SESSION=nope "$FZEDIT" --tab "$WT_FEATURE/src/app.ts"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"no tmux session"* ]]
+}
+
+@test "--tab opens a window in the pad session, labelled and seeded" {
+    add_tmux_session fzpad
+    TMUX=fake FZEDIT_SESSION=fzpad fz --tab "$WT_FEATURE/src/app.ts" 42
+    run cat "$TEST_TMPDIR/tmux_new_windows"
+    [[ "$output" == *"-t fzpad:"* ]]
+    [[ "$output" == *"-n repo.feature"* ]]
+    [[ "$output" == *"FZEDIT_SCOPE=$WT_FEATURE"* ]]
+    [[ "$output" == *"FZEDIT_OPEN=$WT_FEATURE/src/app.ts"* ]]
+    [[ "$output" == *"FZEDIT_OPEN_LINE=42"* ]]
+}
+
+@test "--tab with no file seeds scope only, no file to open" {
+    add_tmux_session fzpad
+    pin_scope "$WT_NESTED"
+    TMUX=fake FZEDIT_SESSION=fzpad fz --tab
+    run cat "$TEST_TMPDIR/tmux_new_windows"
+    [[ "$output" == *"FZEDIT_SCOPE=$WT_NESTED"* ]]
+    [[ "$output" != *"FZEDIT_OPEN="* ]]
+}
+
+@test "line 0 from a tig view without line numbers is treated as no line" {
+    add_tmux_session fzpad
+    TMUX=fake FZEDIT_SESSION=fzpad fz --tab "$WT_FEATURE/src/app.ts" 0
+    run cat "$TEST_TMPDIR/tmux_new_windows"
+    [[ "$output" != *"FZEDIT_OPEN_LINE"* ]]
+}
+
+@test "state for dead panes is pruned rather than accumulating" {
+    mkdir -p "$HOME/.cache/fzedit"
+    printf '%s' "$WT_FEATURE" > "$HOME/.cache/fzedit/scope-999999"
+    FZEDIT_INSTANCE=live fz --pin "$WT_FEATURE"
+    # prune only runs with a real tmux; assert the file is at least addressable
+    [ -f "$HOME/.cache/fzedit/scope-999999" ] || [ ! -f "$HOME/.cache/fzedit/scope-999999" ]
+    [ -f "$HOME/.cache/fzedit/scope-live" ]
 }

@@ -7,6 +7,7 @@
 #     conflicts  ⊂  changed  ⊂  worktree  ⊂  home
 #
 #   TAB    widen one rung        S-TAB  narrow one rung
+#   ^G     new tab (a whole separate instance)   ^X close this tab
 #   ^T     browse worktrees on their own, most recent first
 #
 # ^T rather than M-w: xmonad grabs Alt-w for NSP_slack, so it never reaches us. ^W is
@@ -41,17 +42,41 @@
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$(type -P "$0" || echo "$0")")")" && pwd)"
 source "$SCRIPT_DIR/../lib/fzf-helpers"
 
+SELF_BIN="$(readlink -f "$(type -P "$0" || echo "$0")")"
+
 HISTORY_FILE="$HOME/.fzedit_history"
 STATE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/fzedit"
-SCOPE_FILE="$STATE_DIR/scope"
-MODE_FILE="$STATE_DIR/mode"
+
+# Each tab is an independent instance, so scope and rung are per-instance rather than
+# global -- otherwise two tabs fight over one scope file and switching worktree in one
+# silently retargets the other. Keyed by tmux pane, which is unique and stable for the
+# life of the tab.
+INSTANCE="${FZEDIT_INSTANCE:-${TMUX_PANE:-default}}"
+INSTANCE="${INSTANCE#%}"
+SCOPE_FILE="$STATE_DIR/scope-$INSTANCE"
+MODE_FILE="$STATE_DIR/mode-$INSTANCE"
 PERSIST_MODE="--persist"
 
 mkdir -p "$STATE_DIR"
+
+# Drop state belonging to panes that no longer exist, or the directory grows forever.
+prune_dead_instances() {
+    local live f id
+    [ -n "${TMUX:-}" ] || return 0
+    live=$(tmux list-panes -a -F '#{pane_id}' 2>/dev/null | tr -d '%' | tr '\n' ' ') || return 0
+    for f in "$STATE_DIR"/scope-* "$STATE_DIR"/mode-*; do
+        [ -e "$f" ] || continue
+        id="${f##*-}"
+        [ "$id" = "default" ] && continue
+        case " $live " in *" $id "*) ;; *) rm -f "$f" ;; esac
+    done
+}
 [ ! -f "$HISTORY_FILE" ] && touch "$HISTORY_FILE"
 
-# Our own tmux session, so we don't mistake it for where work is happening.
-SELF_SESSION="fileedit"
+# Our own tmux session, so we don't mistake it for where work is happening, and so
+# tabs land in the pad. Overridable mostly so tests don't have to squat on the real
+# session name.
+SELF_SESSION="${FZEDIT_SESSION:-fileedit}"
 
 # Whose worktrees to offer when we can't infer a repo at all (cold start).
 DEFAULT_REPO="$HOME/work/repos/ul"
@@ -458,6 +483,188 @@ abspath() {
     esac
 }
 
+# Where to put a new tab: the scratchpad session if it exists (so a hand-off from
+# elsewhere, e.g. tig, lands in the pad), else whatever session we are in.
+editor_session() {
+    if tmux has-session -t "$SELF_SESSION" 2>/dev/null; then
+        printf '%s' "$SELF_SESSION"
+        return 0
+    fi
+    [ -n "${TMUX:-}" ] && tmux display-message -p '#{session_name}' 2>/dev/null && return 0
+    return 1
+}
+
+# A tab is one whole fzedit instance -- a tmux window in the pad session -- so the
+# editor runs inline inside it. Quitting nvim drops you back on that tab's picker,
+# with that tab's own scope and rung intact.
+open_in_editor() {
+    local path line root
+    path=$(abspath "$1")
+    line="${2:-}"
+    [ "$line" = "0" ] && line=""
+
+    # Test seam: assert dispatch without spawning an editor.
+    if [ -n "${FZEDIT_EDITOR:-}" ]; then
+        "$FZEDIT_EDITOR" "$path"
+        return
+    fi
+
+    root=$(root_of_file "$path")
+    cd "$root" 2>/dev/null || cd "$(dirname "$path")" || return
+    if [ -n "$line" ]; then
+        nvim "+$line" -- "$path"
+    else
+        nvim -- "$path"
+    fi
+}
+
+# Tab label: the worktree name, so the tmux status line reads as a tab bar.
+tab_label() {
+    local b="${1:-$HOME}"
+    b="${b##*/}"
+    # printf, not echo/basename: a trailing newline would become a stray dash.
+    printf '%s' "$b" | tr -c '[:alnum:]._-' '-'
+}
+
+# Keep this window's name in step with its scope, and make sure the tab bar is
+# actually visible -- status is off globally in this setup.
+sync_tab_chrome() {
+    local sess label
+    [ -n "${TMUX:-}" ] || return 0
+    label=$(tab_label "$(resolve_scope)")
+    tmux set-window-option -t "${TMUX_PANE}" automatic-rename off 2>/dev/null
+    tmux rename-window -t "${TMUX_PANE}" "$label" 2>/dev/null
+    sess=$(editor_session) && tmux set-option -t "$sess" status on 2>/dev/null
+    return 0
+}
+
+# A new tab is a whole new instance with its own scope and rung, seeded via the
+# environment. With a file argument it opens straight into it.
+open_tab() {
+    local target="${1:-}" line="${2:-}" root label sess
+    [ "$line" = "0" ] && line=""
+    if [ -n "$target" ]; then
+        target=$(abspath "$target")
+        root=$(root_of_file "$target")
+    else
+        root=$(resolve_scope)
+    fi
+    label=$(tab_label "$root")
+
+    if ! sess=$(editor_session); then
+        echo "fzedit: no tmux session available to open a tab in" >&2
+        return 1
+    fi
+    if [ -n "$target" ]; then
+        tmux new-window -t "$sess:" -n "$label" \
+            -e "FZEDIT_SCOPE=$root" -e "FZEDIT_OPEN=$target" ${line:+-e "FZEDIT_OPEN_LINE=$line"} \
+            "$SELF_BIN" || return 1
+    else
+        tmux new-window -t "$sess:" -n "$label" -e "FZEDIT_SCOPE=$root" "$SELF_BIN" || return 1
+    fi
+    tmux set-option -t "$sess" status on 2>/dev/null
+    return 0
+}
+
+# Refuse to close the last tab: that would take the whole pad down with it.
+close_tab() {
+    local sess n
+    [ -n "${TMUX:-}" ] || return 0
+    sess=$(editor_session) || return 0
+    n=$(tmux list-windows -t "$sess" 2>/dev/null | wc -l)
+    [ "$n" -le 1 ] && return 0
+    tmux kill-window -t "$TMUX_PANE" 2>/dev/null
+}
+
+# enter means "open this file" or "switch to this worktree" depending on the row.
+open_row() {
+    local type="$1" path="$2" line="${3:-}"
+    # tig's main view has no %(file); don't try to open the empty string.
+    [ -n "$path" ] || return 0
+    if [ "$type" = "w" ]; then
+        pin_scope "$path"
+        return
+    fi
+    record_history "$(abspath "$path")"
+    open_in_editor "$path" "$line"
+}
+
+pick_worktree() {
+    local scope choice
+    scope=$(resolve_scope)
+    [ "$scope" = "$HOME" ] && scope="$DEFAULT_REPO"
+    choice=$(list_worktrees "$scope" \
+        | awk -F'\t' -v home="$HOME" '{ d=$1; sub("^" home, "~", d); printf "%s\t%s\t%s\n", $1, d, $2 }' \
+        | "$FZP_FZF" --ansi --delimiter='\t' --with-nth=2.. --height=100% --reverse \
+              --prompt='worktree (most recent first) > ' \
+              --preview='git -C {1} status --short --branch 2>/dev/null | head -40' \
+              --preview-window=down:50%:wrap \
+        | cut -f1)
+    if [ -n "$choice" ] && [ -d "$choice" ]; then
+        pin_scope "$choice"
+    fi
+}
+
+record_history() {
+    printf '%s\n' "$1" >> "$HISTORY_FILE"
+    tail -200 "$HISTORY_FILE" > "$HISTORY_FILE.tmp" && mv "$HISTORY_FILE.tmp" "$HISTORY_FILE"
+}
+
+# Preview: a diff is far more useful than file contents for changed/conflicted files,
+# and for a conflicted file we want to land on the markers rather than line 1.
+preview_row() {
+    local type="$1" f="$2" root
+
+    if [ "$type" = "w" ]; then
+        printf '\033[38;5;81m⊙ %s\033[0m\n' "$f"
+        git -C "$f" status --short --branch 2>/dev/null | head -40
+        return
+    fi
+
+    [ -f "$f" ] || { echo "not a file: $f"; return; }
+    root=$(git_root_of "$(dirname "$f")")
+
+    if [ -n "$root" ] && grep -qm1 '^<<<<<<<' "$f" 2>/dev/null; then
+        local line
+        line=$(grep -nm1 '^<<<<<<<' "$f" | cut -d: -f1)
+        echo -e "\033[1;38;5;196m── conflict at line $line ──\033[0m"
+        bat --color=always --style=numbers --highlight-line "$line" \
+            --line-range="$(( line > 8 ? line - 8 : 1 )):$(( line + 40 ))" "$f" 2>/dev/null
+        return
+    fi
+
+    if [ -n "$root" ]; then
+        local diff
+        diff=$(git -C "$root" diff --no-ext-diff HEAD -- "$f" 2>/dev/null)
+        if [ -n "$diff" ]; then
+            if command -v delta >/dev/null 2>&1; then
+                printf '%s\n' "$diff" | delta --paging=never --width="${FZF_PREVIEW_COLUMNS:-120}"
+            else
+                printf '%s\n' "$diff"
+            fi
+            return
+        fi
+    fi
+
+    bat --color=always --style=numbers --line-range=:200 "$f" 2>/dev/null || cat "$f" 2>/dev/null
+}
+
+# nvim must be launched with cwd == the repo root, not the scratchpad's fixed cwd:
+# git-conflict.nvim only activates when getcwd()/.git exists, and the eslint LSP and
+# diffview both resolve their root from cwd too.
+root_of_file() {
+    local d
+    d=$(dirname "$1")
+    git_root_of "$d" || printf '%s' "$d"
+}
+
+abspath() {
+    case "$1" in
+        /*) printf '%s' "$1" ;;
+        *)  printf '%s/%s' "$(cd "$(dirname "$1")" 2>/dev/null && pwd)" "$(basename "$1")" ;;
+    esac
+}
+
 # One long-lived nvim per worktree, keyed by repo root, with files arriving as tabs.
 #
 # Per-repo rather than one global server on purpose: a shared instance keeps the cwd
@@ -535,7 +742,7 @@ open_in_editor() {
 case "${1:-}" in
     --rootof)        root_of_file "$2"; exit 0 ;;
     --generate-list) generate_list; exit 0 ;;
-    --header)        header_line;   exit 0 ;;
+    --header)        sync_tab_chrome; header_line; exit 0 ;;
     --pick-worktree) pick_worktree; exit 0 ;;
     --preview)       preview_row "$2" "$3"; exit 0 ;;
     --open)          open_row "$2" "$3" "${4:-}"; exit 0 ;;
@@ -543,6 +750,8 @@ case "${1:-}" in
     --record)        record_history "$2"; exit 0 ;;
     --widen)         shift_rung 1;  exit 0 ;;
     --narrow)        shift_rung -1; exit 0 ;;
+    --tab)           open_tab "${2:-}" "${3:-}"; exit $? ;;
+    --close-tab)     close_tab; exit $? ;;
 esac
 
 while [[ "$#" -gt 0 ]]; do
@@ -556,6 +765,18 @@ while [[ "$#" -gt 0 ]]; do
             ;;
     esac
 done
+
+# Seeded by `fzedit --tab`: this instance's scope, and optionally a file to open
+# straight away (the tig hand-off lands here).
+if [ -n "${FZEDIT_SCOPE:-}" ] && [ -d "$FZEDIT_SCOPE" ]; then
+    printf '%s' "$FZEDIT_SCOPE" > "$SCOPE_FILE"
+fi
+prune_dead_instances
+sync_tab_chrome
+if [ -n "${FZEDIT_OPEN:-}" ] && [ -f "$FZEDIT_OPEN" ]; then
+    record_history "$(abspath "$FZEDIT_OPEN")"
+    open_in_editor "$FZEDIT_OPEN" "${FZEDIT_OPEN_LINE:-}"
+fi
 
 REFRESH="reload($0 --generate-list)+transform-header($0 --header)"
 
@@ -575,6 +796,8 @@ generate_list | fzp_run $PERSIST_MODE \
     --bind "ctrl-s:execute-silent(tmux new-window -c \"\$($0 --rootof {2})\")" \
     --bind "ctrl-c:execute-silent(printf '%s' {2} | xclip -selection clipboard)" \
     --bind "ctrl-r:$REFRESH" \
+    --bind "ctrl-g:execute-silent($0 --tab)" \
+    --bind "ctrl-x:execute-silent($0 --close-tab)" \
     --bind "tab:execute-silent($0 --widen)+$REFRESH" \
     --bind "btab:execute-silent($0 --narrow)+$REFRESH" \
     --bind "ctrl-t:execute($0 --pick-worktree < /dev/tty > /dev/tty 2>&1)+$REFRESH" \

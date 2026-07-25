@@ -23,26 +23,56 @@ setup_fzedit_env() {
     export HOME="$TEST_TMPDIR/home"
     mkdir -p "$HOME"
 
+    # Pin the instance id: state is per-instance now, and TMUX_PANE would otherwise
+    # be inherited from whatever tmux the suite happens to run under.
+    export FZEDIT_INSTANCE=test
+
     export TEST_TMUX_PANES="$TEST_TMPDIR/tmux_panes"
     : > "$TEST_TMUX_PANES"
+    export TEST_TMUX_SESSIONS="$TEST_TMPDIR/tmux_sessions"
+    : > "$TEST_TMUX_SESSIONS"
 
     # Fake tmux, honouring the session filter fzedit passes so we can prove it
     # ignores its own scratchpad session.
     mkdir -p "$TEST_TMPDIR/fakebin"
     cat > "$TEST_TMPDIR/fakebin/tmux" <<'FAKE'
 #!/usr/bin/env bash
-filter=""
-for a in "$@"; do
-    case "$a" in *session_name*) filter="$a" ;; esac
-done
-[ -f "$TEST_TMUX_PANES" ] || exit 0
-while IFS=$'\t' read -r activity session path; do
-    [ -n "$activity" ] || continue
-    if [ -n "$filter" ] && [[ "$filter" == *",${session}}"* ]]; then
-        continue
-    fi
-    printf '%s %s\n' "$activity" "$path"
-done < "$TEST_TMUX_PANES"
+# Fake tmux. Dispatches on the subcommand so tests can distinguish "no session" from
+# "session exists" -- a fake that exits 0 for everything makes those tests vacuous.
+sub="$1"; shift
+case "$sub" in
+    list-panes)
+        filter=""
+        for a in "$@"; do case "$a" in *session_name*) filter="$a" ;; esac; done
+        [ -f "$TEST_TMUX_PANES" ] || exit 0
+        while IFS=$'\t' read -r activity session path; do
+            [ -n "$activity" ] || continue
+            if [ -n "$filter" ] && [[ "$filter" == *",${session}}"* ]]; then continue; fi
+            if [ "${1:-}" = "-a" ] && [[ " $* " == *"pane_id"* ]]; then
+                printf '%%%s\n' "$activity"
+            else
+                printf '%s %s\n' "$activity" "$path"
+            fi
+        done < "$TEST_TMUX_PANES"
+        ;;
+    has-session)
+        want=""; for a in "$@"; do [ "$a" = "-t" ] || want="$a"; done
+        # must propagate failure: the trailing `exit 0` below would otherwise make
+        # every has-session look successful, which makes the tab tests vacuous.
+        grep -qx "$want" "$TEST_TMUX_SESSIONS" 2>/dev/null || exit 1
+        ;;
+    new-window)
+        printf '%s\n' "$*" >> "$TEST_TMPDIR/tmux_new_windows"
+        ;;
+    display-message)
+        [ -f "$TEST_TMUX_SESSIONS" ] && head -1 "$TEST_TMUX_SESSIONS"
+        ;;
+    list-windows)
+        printf 'one\n'
+        ;;
+    *)  : ;;
+esac
+exit 0
 FAKE
     chmod +x "$TEST_TMPDIR/fakebin/tmux"
     export PATH="$TEST_TMPDIR/fakebin:$PATH"
@@ -92,12 +122,12 @@ setup_repo_with_worktrees() {
 
 pin_scope() {
     mkdir -p "$HOME/.cache/fzedit"
-    printf '%s' "$1" > "$HOME/.cache/fzedit/scope"
+    printf '%s' "$1" > "$HOME/.cache/fzedit/scope-$FZEDIT_INSTANCE"
 }
 
 set_mode() {
     mkdir -p "$HOME/.cache/fzedit"
-    printf '%s' "$1" > "$HOME/.cache/fzedit/mode"
+    printf '%s' "$1" > "$HOME/.cache/fzedit/mode-$FZEDIT_INSTANCE"
 }
 
 # Strip ANSI so assertions read cleanly.
@@ -117,3 +147,6 @@ sock_for_root_of() {
       eval "$(sed -n '/^sock_for_root() {/,/^}/p' "$FZEDIT")"
       sock_for_root "$1" )
 }
+
+# Pretend a tmux session exists (used for the tab tests).
+add_tmux_session() { printf '%s\n' "$1" >> "$TEST_TMUX_SESSIONS"; }
