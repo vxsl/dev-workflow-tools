@@ -7,7 +7,11 @@
 #     conflicts  ⊂  changed  ⊂  worktree  ⊂  home
 #
 #   TAB    widen one rung        S-TAB  narrow one rung
-#   ^G     new tab (a whole separate instance)   ^X close this tab
+#   ^G     new tab (a whole separate instance)
+#
+# Tab management otherwise goes through tmux, which already owns it:
+#   C-b C-x / C-b C-z  next / previous tab (repeatable)
+#   C-b c              new fzedit tab      C-b x  close tab
 #   ^T     browse worktrees on their own, most recent first
 #
 # ^T rather than M-w: xmonad grabs Alt-w for NSP_slack, so it never reaches us. ^W is
@@ -797,7 +801,6 @@ generate_list | fzp_run $PERSIST_MODE \
     --bind "ctrl-c:execute-silent(printf '%s' {2} | xclip -selection clipboard)" \
     --bind "ctrl-r:$REFRESH" \
     --bind "ctrl-g:execute-silent($0 --tab)" \
-    --bind "ctrl-x:execute-silent($0 --close-tab)" \
     --bind "tab:execute-silent($0 --widen)+$REFRESH" \
     --bind "btab:execute-silent($0 --narrow)+$REFRESH" \
     --bind "ctrl-t:execute($0 --pick-worktree < /dev/tty > /dev/tty 2>&1)+$REFRESH" \

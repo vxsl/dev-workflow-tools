@@ -419,8 +419,9 @@ teardown() {
     [[ "$out" == *"ctrl-t:execute"*"--pick-worktree"* ]]
     [[ "$out" != *"alt-w:"* ]]
     [[ "$out" == *"enter:execute"*"--open"* ]]
-    # the retired per-rung letter keys must not linger
-    [[ "$out" != *"ctrl-g:"* ]]
+    # ^G is the one-key "new tab" shortcut
+    [[ "$out" == *"ctrl-g:execute-silent"*"--tab"* ]]
+    # ...but closing is C-b x, and a bare ^X next to the C-b C-x nav combo confuses
     [[ "$out" != *"ctrl-x:"* ]]
 }
 
