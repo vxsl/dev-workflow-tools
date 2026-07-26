@@ -8,11 +8,12 @@
 #
 #   TAB    widen one rung        S-TAB  narrow one rung
 #   ^G     new tab (a whole separate instance)
-#
-# Tab management otherwise goes through tmux, which already owns it:
-#   C-b C-x / C-b C-z  next / previous tab (repeatable)
-#   C-b c              new fzedit tab      C-b x  close tab
 #   ^T     browse worktrees on their own, most recent first
+#
+# Tabs are tmux windows in the pad session, navigated with bare C-b / C-x (left /
+# right) and closed with C-M-w. That needs `prefix None` on this session, which
+# sync_tab_chrome sets: a root-table binding is shadowed by the prefix key, so with
+# the default prefix C-b would never reach its binding at all.
 #
 # ^T rather than M-w: xmonad grabs Alt-w for NSP_slack, so it never reaches us. ^W is
 # left alone deliberately -- it is delete-word in the query, which is worth keeping.
@@ -538,7 +539,13 @@ sync_tab_chrome() {
     label=$(tab_label "$(resolve_scope)")
     tmux set-window-option -t "${TMUX_PANE}" automatic-rename off 2>/dev/null
     tmux rename-window -t "${TMUX_PANE}" "$label" 2>/dev/null
-    sess=$(editor_session) && tmux set-option -t "$sess" status on 2>/dev/null
+    if sess=$(editor_session); then
+        tmux set-option -t "$sess" status on 2>/dev/null
+        # A root-table binding is shadowed by the prefix key, so bare C-b/C-x can
+        # only reach their bindings if this session has no prefix. Per-session
+        # option: every other session keeps C-b as prefix.
+        tmux set-option -t "$sess" prefix None 2>/dev/null
+    fi
     return 0
 }
 
