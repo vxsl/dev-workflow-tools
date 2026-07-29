@@ -10,10 +10,10 @@
 #   ^G     new tab (a whole separate instance)
 #   ^T     browse worktrees on their own, most recent first
 #
-# Tabs are tmux windows in the pad session, navigated with bare C-b / C-x (left /
-# right) and closed with C-M-w. That needs `prefix None` on this session, which
-# sync_tab_chrome sets: a root-table binding is shadowed by the prefix key, so with
-# the default prefix C-b would never reach its binding at all.
+# Tabs are tmux windows in the pad session: bare C-x / C-b move left / right,
+# matching their keyboard positions, and C-M-w closes one. That needs `prefix None`
+# on this session, which sync_tab_chrome sets -- a root-table binding is shadowed by
+# the prefix key, so with the default prefix C-b would never reach its binding.
 #
 # ^T rather than M-w: xmonad grabs Alt-w for NSP_slack, so it never reaches us. ^W is
 # left alone deliberately -- it is delete-word in the query, which is worth keeping.
