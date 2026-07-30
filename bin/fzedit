@@ -135,8 +135,11 @@ resolve_scope() {
 # us the row type and an unambiguous, shell-quoted real path. The type column is what
 # lets enter mean two different things without guessing from the path.
 # $1 = root to strip from display ("" to just tilde-collapse).
+# $2 = "plain" to skip per-row colouring. On the home rung that colouring costs ~9s
+# of the ~13s spent building 2.7M rows, for syntax tinting you cannot read while
+# fuzzy-searching by name anyway. Scoped rungs are ~12k rows, where it is free.
 format_lines() {
-    awk -F'\t' -v home="$HOME" -v root="$1" -v wtbase="$(dirname "$DEFAULT_REPO")" '
+    awk -F'\t' -v home="$HOME" -v root="$1" -v plain="${2:-}" -v wtbase="$(dirname "$DEFAULT_REPO")" '
     function colour(fn,   n, parts, ext) {
         n = split(fn, parts, ".")
         ext = (n > 1) ? parts[n] : ""
@@ -182,6 +185,11 @@ format_lines() {
             disp = substr(disp, length(root) + 2)
         } else if (index(disp, home) == 1) {
             disp = "~" substr(disp, length(home) + 1)
+        }
+
+        if (plain != "") {
+            printf "%s\t%s\t%s%s\n", type, abs, badge(xy), disp
+            next
         }
 
         n = split(disp, parts, "/")
@@ -236,9 +244,19 @@ list_home() {
         for dir in "${PREFERRED_DIRS[@]}"; do
             [ -d "$dir" ] && fd . "$dir" --type f --follow --hidden --no-ignore-vcs "${EXCLUDE_DIRS[@]}" "${PREFERRED_EXTS[@]}"
         done
-        fd . "$HOME" --type f --follow --hidden --no-ignore-vcs "${EXCLUDE_DIRS[@]}" "${PREFERRED_EXTS[@]}"
+        # One pass over $HOME, not two. The extra preferred-extensions sweep only
+        # reordered results that the full sweep repeats anyway, and at 2.7M files it
+        # doubled the work for ranking that the preferred dirs above already give.
+        printf '\001\n'
         fd . "$HOME" --type f --follow --hidden --no-ignore-vcs "${EXCLUDE_DIRS[@]}"
-    } | awk '!seen[$0]++ { print "f\t" $0 }'
+    } | awk '
+        # Only the prefix (history + preferred dirs) can collide with the sweep, so
+        # hash just that and membership-test the rest. Hashing all 2.7M paths costs
+        # both time and a lot of resident memory for nothing.
+        $0 == "\001" { tail = 1; next }
+        !tail        { if (!seen[$0]++) print "f\t" $0; next }
+                     { if (!($0 in seen)) print "f\t" $0 }
+    '
 }
 
 # A worktree mid-rebase/bisect has a bare SHA in HEAD rather than a ref; printing all
@@ -348,7 +366,8 @@ generate_list() {
             *)         list_home                ;;
         esac
         list_worktree_rows "$scope"
-    } | format_lines "$([ "$mode" = home ] && echo "" || echo "$scope")"
+    } | format_lines "$([ "$mode" = home ] && echo "" || echo "$scope")" \
+                     "$([ "$mode" = home ] && echo plain)"
 }
 
 # Show the whole ladder with the current rung bracketed, so where you are and where
@@ -686,6 +705,10 @@ REFRESH="reload($0 --generate-list)+transform-header($0 --header)"
 generate_list | fzp_run $PERSIST_MODE \
     --delimiter=$'\t' \
     --with-nth='3..' \
+    `# fzf-helpers sets --sync, which renders NOTHING until the whole stream ends.` \
+    `# On the home rung that is 2.7M rows and the pad just sits there blank, which` \
+    `# reads as a hung tab. Later options win, so this turns it back off for fzedit.` \
+    --no-sync \
     --prompt="edit > " \
     --header="$(header_line)" \
     --preview="$0 --preview {1} {2}" \
