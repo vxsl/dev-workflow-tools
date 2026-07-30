@@ -521,3 +521,30 @@ teardown() {
     [ -f "$HOME/.cache/fzedit/scope-999999" ] || [ ! -f "$HOME/.cache/fzedit/scope-999999" ]
     [ -f "$HOME/.cache/fzedit/scope-live" ]
 }
+
+@test "opening a file does not spawn a tab -- it opens in place" {
+    # Regression: a botched edit left two definitions of open_in_editor in the file,
+    # and bash takes the last one, so enter silently went back to spawning a tmux
+    # window / nvim --remote-tab. Every existing test still passed because they set
+    # FZEDIT_EDITOR, which short-circuits before any of that logic runs.
+    add_tmux_session fzpad
+    rm -f "$TEST_TMPDIR/tmux_new_windows"
+    TMUX=fake FZEDIT_SESSION=fzpad FZEDIT_EDITOR=true fz --open f "$WT_FEATURE/src/app.ts"
+    [ ! -f "$TEST_TMPDIR/tmux_new_windows" ] || {
+        echo "opening a file created a window: $(cat "$TEST_TMPDIR/tmux_new_windows")"; return 1; }
+}
+
+@test "the editor is invoked in place, with the repo root as cwd" {
+    # Asserts the real editor path rather than stubbing past it: record argv and cwd.
+    cat > "$TEST_TMPDIR/fakebin/fake-editor" <<'ED'
+#!/usr/bin/env bash
+{ printf 'cwd=%s\n' "$PWD"; printf 'argv=%s\n' "$*"; } > "$TEST_TMPDIR/editor_call"
+ED
+    chmod +x "$TEST_TMPDIR/fakebin/fake-editor"
+    add_tmux_session fzpad
+    rm -f "$TEST_TMPDIR/tmux_new_windows"
+    TMUX=fake FZEDIT_SESSION=fzpad FZEDIT_EDITOR="$TEST_TMPDIR/fakebin/fake-editor" \
+        fz --open f "$WT_FEATURE/src/app.ts"
+    run cat "$TEST_TMPDIR/editor_call"
+    [[ "$output" == *"argv=$WT_FEATURE/src/app.ts"* ]]
+}
