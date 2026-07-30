@@ -21,10 +21,11 @@
 #   enter  open file / switch worktree     ^O cursor    ^S tmux window here
 #   ^R     refresh                         ^C copy path
 #
-# On launch the rung is chosen automatically: the narrowest one that isn't empty, so
-# a conflicted tree opens on the conflicts and a clean one opens on the file list.
-# The choice is remembered across fzf's reloads but deliberately NOT across launches
-# -- opening the pad and landing in a rung set days ago is just confusing.
+# Launches on `home`: the pad is a general "open a file" tool first, and starting
+# narrow means the file you want is often simply not in the list. S-TAB narrows from
+# there. FZEDIT_DEFAULT_RUNG=conflicts|changed|files|home changes it. The rung is
+# remembered across fzf's reloads but deliberately NOT across launches -- opening the
+# pad and landing in a rung set days ago is just confusing.
 #
 # Worktrees are first-class rows (⊙, cyan) inlined into every mode, so switching
 # worktree and opening a file are the same gesture: type what you want. They are
@@ -297,18 +298,18 @@ rung_index() {
     printf '%s' -1
 }
 
-# Narrowest rung that actually has something in it. Without this you open the pad on
-# an empty "conflicts" list and have to widen manually every single time.
+# Default rung. `home` on purpose: the pad is a general "open a file" tool first, and
+# starting narrow means the file you want is often simply not in the list. TAB narrows
+# from here (S-TAB/TAB walk the axis in both directions).
+#
+# Override with FZEDIT_DEFAULT_RUNG=conflicts|changed|files|home to start narrower.
 auto_rung() {
-    local scope="$1"
+    local scope="$1" want="${FZEDIT_DEFAULT_RUNG:-home}"
     [ "$scope" = "$HOME" ] && { printf 'home'; return; }
-    if [ -n "$(git -C "$scope" diff --name-only --diff-filter=U 2>/dev/null | head -1)" ]; then
-        printf 'conflicts'
-    elif [ -n "$(git -C "$scope" status --porcelain 2>/dev/null | head -1)" ]; then
-        printf 'changed'
-    else
-        printf 'files'
-    fi
+    case "$want" in
+        conflicts|changed|files|home) printf '%s' "$want" ;;
+        *)                            printf 'home' ;;
+    esac
 }
 
 current_rung() {
@@ -488,6 +489,31 @@ abspath() {
     esac
 }
 
+# Showing the pad.
+#
+# The pad is an xmonad named scratchpad and this xmonad has no ServerMode/xmonadctl,
+# so the only way to ask for it is to press its key. That key is a TOGGLE, so this
+# has to check visibility first -- otherwise a hand-off from tig would *hide* a pad
+# that was already up. The same key spawns the pad when it isn't running at all.
+#
+# FZEDIT_NO_PAD exists so the test suite can never poke the real desktop.
+PAD_CLASS="${FZEDIT_PAD_CLASS:-NSP_fileedit}"
+PAD_KEY="${FZEDIT_PAD_KEY:-ctrl+alt+space}"
+
+pad_visible() {
+    [ -n "$(xdotool search --onlyvisible --class "$PAD_CLASS" 2>/dev/null)" ]
+}
+
+# 0 if we asked xmonad to show it, 1 if we couldn't or it was already up.
+show_pad() {
+    [ -z "${FZEDIT_NO_PAD:-}" ] || return 1
+    [ -n "${DISPLAY:-}" ] || return 1
+    command -v xdotool >/dev/null 2>&1 || return 1
+    pad_visible && return 1
+    xdotool key --clearmodifiers "$PAD_KEY" 2>/dev/null || return 1
+    return 0
+}
+
 # Where to put a new tab: the scratchpad session if it exists (so a hand-off from
 # elsewhere, e.g. tig, lands in the pad), else whatever session we are in.
 editor_session() {
@@ -563,8 +589,18 @@ open_tab() {
     label=$(tab_label "$root")
 
     if ! sess=$(editor_session); then
-        echo "fzedit: no tmux session available to open a tab in" >&2
-        return 1
+        # Not running at all: the pad's key spawns it. Give it a moment to come up.
+        if show_pad; then
+            local i
+            for i in $(seq 1 24); do
+                sess=$(editor_session) && break
+                sleep 0.25
+            done
+        fi
+        if [ -z "${sess:-}" ]; then
+            echo "fzedit: no tmux session available to open a tab in" >&2
+            return 1
+        fi
     fi
     if [ -n "$target" ]; then
         tmux new-window -t "$sess:" -n "$label" \
@@ -574,6 +610,9 @@ open_tab() {
         tmux new-window -t "$sess:" -n "$label" -e "FZEDIT_SCOPE=$root" "$SELF_BIN" || return 1
     fi
     tmux set-option -t "$sess" status on 2>/dev/null
+    # Bring the pad forward, so a hand-off from tig is visible rather than silently
+    # queued behind a hidden window.
+    show_pad || true
     return 0
 }
 
@@ -600,6 +639,16 @@ case "${1:-}" in
     --record)        record_history "$2"; exit 0 ;;
     --widen)         shift_rung 1;  exit 0 ;;
     --narrow)        shift_rung -1; exit 0 ;;
+    --pad-status)
+        # Report what show_pad WOULD do. Exists so this can be verified without
+        # actually pressing xmonad's toggle key and disturbing the desktop.
+        if [ -n "${FZEDIT_NO_PAD:-}" ]; then echo "disabled (FZEDIT_NO_PAD)"
+        elif [ -z "${DISPLAY:-}" ]; then echo "disabled (no DISPLAY)"
+        elif ! command -v xdotool >/dev/null 2>&1; then echo "disabled (no xdotool)"
+        elif pad_visible; then echo "already-visible (would do nothing)"
+        else echo "hidden (would press $PAD_KEY)"
+        fi
+        exit 0 ;;
     --tab)           open_tab "${2:-}" "${3:-}"; exit $? ;;
     --close-tab)     close_tab; exit $? ;;
 esac

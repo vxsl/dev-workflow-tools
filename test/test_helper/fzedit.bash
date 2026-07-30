@@ -27,6 +27,9 @@ setup_fzedit_env() {
     # be inherited from whatever tmux the suite happens to run under.
     export FZEDIT_INSTANCE=test
 
+    # Never let the suite press xmonad's scratchpad key on the real desktop.
+    export FZEDIT_NO_PAD=1
+
     export TEST_TMUX_PANES="$TEST_TMPDIR/tmux_panes"
     : > "$TEST_TMUX_PANES"
     export TEST_TMUX_SESSIONS="$TEST_TMPDIR/tmux_sessions"

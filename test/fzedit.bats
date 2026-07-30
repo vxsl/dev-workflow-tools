@@ -129,24 +129,33 @@ teardown() {
 # S-TAB narrows, and the starting rung is chosen automatically.
 # --------------------------------------------------------------------------
 
-@test "auto rung: conflicts when the tree is conflicted" {
-    make_conflict
-    pin_scope "$MAIN"
-    out="$(fz --header | plain)"
-    [[ "$out" == *"[conflicts (1)]"* ]]
-}
-
-@test "auto rung: changed when dirty but not conflicted" {
+@test "default rung is home, even when the tree is dirty" {
+    # The pad is a general "open a file" tool first; starting narrow means the file
+    # you want is often just not in the list.
     echo dirty >> "$WT_FEATURE/src/app.ts"
     pin_scope "$WT_FEATURE"
     out="$(fz --header | plain)"
+    [[ "$out" == *"[home]"* ]]
+}
+
+@test "default rung is home, even when the tree is conflicted" {
+    make_conflict
+    pin_scope "$MAIN"
+    out="$(fz --header | plain)"
+    [[ "$out" == *"[home]"* ]]
+}
+
+@test "FZEDIT_DEFAULT_RUNG overrides the default" {
+    echo dirty >> "$WT_FEATURE/src/app.ts"
+    pin_scope "$WT_FEATURE"
+    out="$(FZEDIT_DEFAULT_RUNG=changed fz --header | plain)"
     [[ "$out" == *"[changed (1)]"* ]]
 }
 
-@test "auto rung: files when the tree is clean" {
+@test "a nonsense FZEDIT_DEFAULT_RUNG falls back to home rather than breaking" {
     pin_scope "$WT_FEATURE"
-    out="$(fz --header | plain)"
-    [[ "$out" == *"[files]"* ]]
+    out="$(FZEDIT_DEFAULT_RUNG=banana fz --header | plain)"
+    [[ "$out" == *"[home]"* ]]
 }
 
 @test "auto rung: home when there is no repo at all" {
@@ -158,6 +167,8 @@ teardown() {
 @test "TAB widens one rung at a time" {
     echo dirty >> "$WT_FEATURE/src/app.ts"
     pin_scope "$WT_FEATURE"
+    set_mode conflicts
+    fz --widen
     [[ "$(fz --header | plain)" == *"[changed (1)]"* ]]
     fz --widen
     [[ "$(fz --header | plain)" == *"[files]"* ]]
@@ -547,4 +558,11 @@ ED
         fz --open f "$WT_FEATURE/src/app.ts"
     run cat "$TEST_TMPDIR/editor_call"
     [[ "$output" == *"argv=$WT_FEATURE/src/app.ts"* ]]
+}
+
+@test "the pad is never poked while tests run" {
+    # FZEDIT_NO_PAD is set by the harness; without it the suite would press xmonad's
+    # scratchpad toggle on the real desktop.
+    run fz --pad-status
+    [[ "$output" == *"disabled (FZEDIT_NO_PAD)"* ]]
 }
