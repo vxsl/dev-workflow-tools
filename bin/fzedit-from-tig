@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# Bridge from tig to fzedit: open the file you are looking at in an fzedit tab.
+#
+# Usage (from tigrc):  fzedit-from-tig "%(file)" "%(lineno)" "%(commit)"
+#
+# Why this isn't just `fzedit --tab "%(file)"`:
+#
+# tig works out the current file by parsing the diff text it *renders*, not the raw
+# git output. With `set diff-highlight = "delta"` that rendered text no longer
+# contains the `--- a/…` / `+++ b/…` lines tig looks for, so %(file) comes back empty
+# and every binding built on it silently does nothing. Measured, same commit, cursor
+# on the same diff line:
+#
+#     plain:  file=[src/app.ts]  lineno=[0]
+#     delta:  file=[]            lineno=[17]     <- 17 is a view line, not a file line
+#
+# %(commit) is unaffected, because it comes from the view's commit context rather than
+# from parsing the diff body. So when %(file) is missing we fall back to choosing among
+# the files that commit touched, which works identically with or without delta.
+#
+# %(lineno) is only honoured on the fast path: under delta it is a view line, and
+# jumping to it would land somewhere arbitrary.
+
+set -uo pipefail
+
+file="${1:-}"
+line="${2:-}"
+commit="${3:-}"
+
+FZEDIT="${FZEDIT_BIN:-$(dirname "$(readlink -f "$0")")/fzedit}"
+
+# Fast path: tig knew the file (no delta, or a view that tracks files properly).
+if [ -n "$file" ]; then
+    exec "$FZEDIT" --tab "$file" "$line"
+fi
+
+# The all-zero sha is what tig reports for uncommitted/status rows.
+if [ "$commit" = "0000000000000000000000000000000000000000" ]; then
+    commit=""
+fi
+
+# Nothing to go on: still useful, just scope a tab to this repo.
+if [ -z "$commit" ]; then
+    exec "$FZEDIT" --tab
+fi
+
+files=$(git show --pretty=format: --name-only --diff-filter=d "$commit" 2>/dev/null | sed '/^$/d' | sort -u)
+if [ -z "$files" ]; then
+    exec "$FZEDIT" --tab
+fi
+
+if [ "$(printf '%s\n' "$files" | wc -l)" -eq 1 ]; then
+    picked="$files"
+else
+    subject=$(git log -1 --format=%s "$commit" 2>/dev/null | cut -c1-60)
+    picked=$(printf '%s\n' "$files" | "${FZEDIT_FZF:-fzf}" \
+        --height=60% --reverse --ansi \
+        --prompt="open from ${subject:-$commit} > " \
+        --preview="git show --color=always $commit -- {} | head -400" \
+        --preview-window=down:60%:wrap) || exit 0
+fi
+
+[ -n "$picked" ] || exit 0
+exec "$FZEDIT" --tab "$picked"

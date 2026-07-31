@@ -154,30 +154,36 @@ get_labels() {
 
 # Function to get active sprints (returns most recent active sprint first, then "No sprint")
 get_sprints() {
-    # Get the board ID first (use Agile API)
+    # A project can be on several boards, and the first one Jira hands back is not
+    # necessarily one that has sprints — UL leads with a deprecated kanban board,
+    # which answers "The board does not support sprints" and used to leave the
+    # picker empty. Kanban boards never have sprints, so skip them and try each
+    # remaining board until one yields sprints.
     local boards=$(curl -s --max-time 10 -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
         "https://${JIRA_DOMAIN}/rest/agile/1.0/board?projectKeyOrId=${JIRA_PROJECT}" 2>&1)
-    local board_id=$(echo "$boards" | jq -r '.values[0].id' 2>/dev/null)
-    
-    if [ -z "$board_id" ] || [ "$board_id" = "null" ]; then
-        echo "0 - No sprint"
-        return
-    fi
-    
-    # Get active and future sprints
-    local sprints=$(curl -s --max-time 10 -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
-        "https://${JIRA_DOMAIN}/rest/agile/1.0/board/${board_id}/sprint?state=active,future" 2>&1)
-    
-    local sprint_list=$(echo "$sprints" | jq -r '.values[] | (.id|tostring) + " - " + .name + " (" + .state + ")"' 2>/dev/null)
-    
+    local board_ids=$(echo "$boards" | jq -r '.values[]? | select(.type != "kanban") | .id' 2>/dev/null || true)
+
+    local sprint_list=""
+    local board_id
+    for board_id in $board_ids; do
+        local sprints=$(curl -s --max-time 10 -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
+            "https://${JIRA_DOMAIN}/rest/agile/1.0/board/${board_id}/sprint?state=active,future" 2>&1)
+        sprint_list=$(echo "$sprints" | jq -r '.values[]? | (.id|tostring) + " - " + .name + " (" + .state + ")"' 2>/dev/null || true)
+        [ -n "$sprint_list" ] && break
+    done
+
     if [ -n "$sprint_list" ]; then
-        # Put active sprints first, then "No sprint"
-        echo "$sprint_list" | grep "(active)" || true
-        echo "$sprint_list" | grep -v "(active)" || true
-        echo "0 - No sprint"
-    else
-        echo "0 - No sprint"
+        # Shared boards list every project's sprints, and sprint names carry the
+        # project key ("Jul 27 - Aug 7, 2026 (UL)"). Surface this project's
+        # sprints first — the top line is what Enter takes as the default.
+        local mine="($JIRA_PROJECT)"
+        # Active before future, this project's before everyone else's.
+        echo "$sprint_list" | grep -F "$mine" | grep "(active)" || true
+        echo "$sprint_list" | grep -vF "$mine" | grep "(active)" || true
+        echo "$sprint_list" | grep -F "$mine" | grep -v "(active)" || true
+        echo "$sprint_list" | grep -vF "$mine" | grep -v "(active)" || true
     fi
+    echo "0 - No sprint"
 }
 
 # Fetch the full createmeta fields object for an issue type on the resolved
