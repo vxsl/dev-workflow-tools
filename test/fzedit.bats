@@ -22,6 +22,18 @@ make_conflict() {
     git_q "$MAIN" merge conflict-a >/dev/null 2>&1 || true
 }
 
+# Leave worktree $1 stopped mid-rebase on a conflict, the way the real thing does:
+# HEAD detached at the commit being replayed, the branch name recoverable only from
+# rebase-merge/head-name.
+start_conflicting_rebase() {
+    local wt="$1"
+    echo 'const a = "main";'   > "$MAIN/src/app.ts"
+    git_q "$MAIN" commit -qam main-change
+    echo 'const a = "branch";' > "$wt/src/app.ts"
+    git_q "$wt" commit -qam branch-change
+    git_q "$wt" rebase main >/dev/null 2>&1 || true
+}
+
 setup() {
     setup_fzedit_env
     setup_repo_with_worktrees
@@ -205,6 +217,35 @@ teardown() {
     done
 }
 
+@test "the header says the scope is mid-rebase rather than just 'HEAD'" {
+    start_conflicting_rebase "$WT_FEATURE"
+    pin_scope "$WT_FEATURE"
+
+    out="$(fz --header | plain)"
+    [[ "$out" == *"feature"* ]]
+    [[ "$out" == *"rebase"* ]]
+    # what rev-parse --abbrev-ref reports for a detached HEAD, and it tells you nothing
+    [[ "$out" != *"⊙ HEAD"* ]]
+}
+
+# "conflicts (0)" is indistinguishable from being pointed at the wrong worktree, and
+# with two branches sharing a prefix (smp-select vs feature-a-state) the scope name
+# in the header reads as correct. Name the worktree that has the rebase instead.
+@test "the header names a rebase in another worktree, so conflicts (0) is not a lie" {
+    start_conflicting_rebase "$WT_FEATURE"
+    pin_scope "$WT_NESTED"
+
+    out="$(fz --header | plain)"
+    [[ "$out" == *"conflicts (0)"* ]]
+    [[ "$out" == *"repo.feature (rebase"* ]]
+}
+
+@test "the header stays quiet when nothing is in flight elsewhere" {
+    pin_scope "$WT_FEATURE"
+    out="$(fz --header | plain)"
+    [[ "$out" != *"⚠"* ]]
+}
+
 @test "outside a repo the rung is forced to home even if one was set" {
     set_mode changed
     out="$(fz --header | plain)"
@@ -299,6 +340,17 @@ teardown() {
     [[ "$out" == *"conflict at line"* ]]
 }
 
+# A rebase leaves the same unmerged index a merge does, so this rung has to work for
+# both -- when it appears to be empty mid-rebase, the scope is wrong, not the rung.
+@test "conflicts mode lists unmerged files during a rebase, not just a merge" {
+    start_conflicting_rebase "$WT_FEATURE"
+    pin_scope "$WT_FEATURE"
+    set_mode conflicts
+
+    out="$(rows_of_type f | cut -f2)"
+    [[ "$out" == *"$WT_FEATURE/src/app.ts"* ]]
+}
+
 # --------------------------------------------------------------------------
 # Worktrees as first-class rows
 # --------------------------------------------------------------------------
@@ -343,6 +395,44 @@ teardown() {
     out="$(rows_of_type w | display_col)"
     [[ "$out" == *"feature"* ]]
     [[ "$out" == *"main"* ]]
+}
+
+# The row is how you find a worktree, and mid-rebase HEAD is a bare sha -- so labelling
+# it "detached 1a2b3c4d" hides the branch exactly when you are hunting for it, and a
+# branch-shaped query stops matching the one worktree you actually want.
+@test "a rebasing worktree still carries its branch name, so a branch query finds it" {
+    start_conflicting_rebase "$WT_FEATURE"
+    pin_scope "$MAIN"
+    set_mode files
+
+    out="$(rows_of_type w | display_col | grep repo.feature)"
+    [[ "$out" == *"feature"* ]]
+    [[ "$out" != *"detached"* ]]
+}
+
+@test "a rebasing worktree says how far through the rebase it is" {
+    start_conflicting_rebase "$WT_FEATURE"
+    pin_scope "$MAIN"
+    set_mode files
+
+    out="$(rows_of_type w | display_col | grep repo.feature)"
+    [[ "$out" =~ rebase\ [0-9]+/[0-9]+ ]]
+}
+
+@test "a worktree mid-merge says so, keeping the branch it is merging into" {
+    make_conflict
+    pin_scope "$WT_FEATURE"
+    set_mode files
+
+    out="$(rows_of_type w | display_col)"
+    [[ "$out" == *"conflict-b ⟳ merging"* ]]
+}
+
+@test "worktree preview names the rebase, which status --branch cannot" {
+    start_conflicting_rebase "$WT_FEATURE"
+    out="$(fz --preview w "$WT_FEATURE" | plain)"
+    [[ "$out" == *"feature"* ]]
+    [[ "$out" == *"rebase"* ]]
 }
 
 @test "worktree preview shows repo status rather than file contents" {

@@ -259,40 +259,85 @@ list_home() {
     '
 }
 
-# A worktree mid-rebase/bisect has a bare SHA in HEAD rather than a ref; printing all
-# 40 characters of it just pushes the useful part off the row.
-head_label() {
-    local head
-    head=$(cat "$1" 2>/dev/null) || return
-    case "$head" in
-        "ref: refs/heads/"*) printf '%s' "${head#ref: refs/heads/}" ;;
-        *)                   printf 'detached %.8s' "$head" ;;
-    esac
-}
-
-# Worktrees of the scope repo as "<path>\t<branch>", most recently used first.
-# Reads the per-worktree gitdir/HEAD pointers directly rather than shelling out to
-# git once per worktree -- there are 139 of them, so that would be seconds.
-list_worktrees() {
-    local root="$1" common d gd wt ts head branch
+# "<gitdir>\t<worktree path>" for every worktree of the scope repo, primary first.
+# Reads the per-worktree gitdir pointers directly rather than shelling out to git once
+# per worktree -- there are 139 of them, so that would be seconds.
+worktree_dirs() {
+    local root="$1" common d gd wt
     common=$(git -C "$root" rev-parse --git-common-dir 2>/dev/null) || return
     case "$common" in /*) ;; *) common="$(cd "$root" && cd "$(dirname "$common")" && pwd)/$(basename "$common")" ;; esac
-    {
-        # primary worktree
-        wt=$(dirname "$common")
-        if [ -d "$wt" ]; then
-            printf '%s\t%s\t%s\n' "$(stat -c %Y "$common/index" 2>/dev/null || echo 0)" \
-                "$wt" "$(head_label "$common/HEAD")"
+    wt=$(dirname "$common")
+    [ -d "$wt" ] && printf '%s\t%s\n' "$common" "$wt"
+    for d in "$common"/worktrees/*/; do
+        [ -f "$d/gitdir" ] || continue
+        gd=$(cat "$d/gitdir" 2>/dev/null) || continue
+        wt=$(dirname "$gd")
+        [ -d "$wt" ] || continue
+        printf '%s\t%s\n' "${d%/}" "$wt"
+    done
+}
+
+# Cheap test for "git has something half-finished here", so the caller can skip the
+# work below for the overwhelming majority of worktrees that are idle.
+wt_in_flight() {
+    [ -d "$1/rebase-merge" ] || [ -d "$1/rebase-apply" ] || [ -f "$1/MERGE_HEAD" ] \
+        || [ -f "$1/CHERRY_PICK_HEAD" ] || [ -f "$1/REVERT_HEAD" ] || [ -f "$1/BISECT_LOG" ]
+}
+# Describe a worktree from its gitdir, into WT_BRANCH / WT_OP / WT_LABEL.
+#
+# Sets globals rather than printing because this runs once per worktree and there are
+# ~140 of them: a command substitution per call costs more than the rest of the listing
+# put together. Everything here is a builtin -- `read <file`, no cat, no fork.
+#
+# A worktree mid-rebase has a bare SHA in HEAD rather than a ref, and printing all 40
+# characters of it just pushes the useful part off the row. Worse, the branch name
+# vanishes from the row entirely -- exactly when you are most likely to be hunting for
+# that worktree, and a branch-shaped query ("smp-") then fails to match it at all. So
+# prefer the branch git parked in rebase-{merge,apply}/head-name, and say what is in
+# flight: "feature-a-state ⟳ rebase 2/6", not "detached a41d6b62".
+read_wt_state() {
+    local gd="$1" head n="" end=""
+    WT_BRANCH=""; WT_OP=""; WT_LABEL=""
+    read -r head < "$gd/HEAD" 2>/dev/null || return 1
+
+    if wt_in_flight "$gd"; then
+        if [ -d "$gd/rebase-merge" ]; then
+            read -r WT_BRANCH < "$gd/rebase-merge/head-name" 2>/dev/null
+            read -r n         < "$gd/rebase-merge/msgnum"    2>/dev/null
+            read -r end       < "$gd/rebase-merge/end"       2>/dev/null
+            WT_OP="rebase"
+            [ -n "$n" ] && [ -n "$end" ] && WT_OP="rebase $n/$end"
+        elif [ -d "$gd/rebase-apply" ]; then
+            read -r WT_BRANCH < "$gd/rebase-apply/head-name" 2>/dev/null
+            read -r n         < "$gd/rebase-apply/next"      2>/dev/null
+            read -r end       < "$gd/rebase-apply/last"      2>/dev/null
+            WT_OP="rebase"
+            [ -n "$n" ] && [ -n "$end" ] && WT_OP="rebase $n/$end"
+        elif [ -f "$gd/MERGE_HEAD" ];       then WT_OP="merging"
+        elif [ -f "$gd/CHERRY_PICK_HEAD" ]; then WT_OP="cherry-pick"
+        elif [ -f "$gd/REVERT_HEAD" ];      then WT_OP="revert"
+        else                                     WT_OP="bisect"
         fi
-        for d in "$common"/worktrees/*/; do
-            [ -f "$d/gitdir" ] || continue
-            gd=$(cat "$d/gitdir" 2>/dev/null) || continue
-            wt=$(dirname "$gd")
-            [ -d "$wt" ] || continue
-            ts=$(stat -c %Y "$d/index" 2>/dev/null || echo 0)
-            printf '%s\t%s\t%s\n' "$ts" "$wt" "$(head_label "$d/HEAD")"
-        done
-    } | sort -rn | cut -f2,3
+        WT_BRANCH="${WT_BRANCH#refs/heads/}"
+    fi
+
+    if [ -z "$WT_BRANCH" ]; then
+        case "$head" in
+            "ref: refs/heads/"*) WT_BRANCH="${head#ref: refs/heads/}" ;;
+            *)                   WT_BRANCH="detached ${head:0:8}" ;;
+        esac
+    fi
+    WT_LABEL="$WT_BRANCH${WT_OP:+ ⟳ $WT_OP}"
+}
+
+# Worktrees of the scope repo as "<path>\t<label>", most recently used first.
+list_worktrees() {
+    local root="$1" gd wt ts
+    while IFS=$'\t' read -r gd wt; do
+        ts=$(stat -c %Y "$gd/index" 2>/dev/null || echo 0)
+        read_wt_state "$gd"
+        printf '%s\t%s\t%s\n' "$ts" "$wt" "$WT_LABEL"
+    done < <(worktree_dirs "$root") | sort -rn | cut -f2,3
 }
 
 # Worktrees as pickable rows, for inlining into whatever mode is showing. Appended
@@ -370,6 +415,53 @@ generate_list() {
                      "$([ "$mode" = home ] && echo plain)"
 }
 
+# Worktrees OTHER than the scope with something half-finished, as "name (rebase 2/6)".
+#
+# Why the header cares: "conflicts (0)" on a clean worktree is indistinguishable from
+# "you are pointed at the wrong worktree", and pointing at the wrong one is easy when
+# two branches share a prefix (smp-select vs feature-a-state). The scope is right
+# there in the header, but a near-identical name reads as correct. So name the worktree
+# that actually has a rebase going, rather than reporting zero and leaving it at that.
+in_flight_elsewhere() {
+    local root="$1" gd wt base name entry names=() joined
+    # Most recently touched first: with several rebases parked at once, the one you just
+    # came from is the one you meant. stat only the few that are actually in flight.
+    while IFS=$'\t' read -r _ entry; do
+        names+=("$entry")
+    done < <(
+        while IFS=$'\t' read -r gd wt; do
+            # worktree_dirs puts the primary first, so its parent is the directory all
+            # the sibling worktrees live in -- what to name them relative to.
+            [ -n "$base" ] || base="$(dirname "$wt")/"
+            [ "$wt" = "$root" ] && continue
+            wt_in_flight "$gd" || continue
+            read_wt_state "$gd" || continue
+            name=$(wt_display_name "$wt" "$base")
+            # Some branch-named worktrees are enormous; a hint is a nudge, not a target.
+            [ "${#name}" -gt 32 ] && name="${name:0:31}…"
+            printf '%s\t%s (%s)\n' "$(stat -c %Y "$gd/index" 2>/dev/null || echo 0)" \
+                "$name" "$WT_OP"
+        done < <(worktree_dirs "$root") | sort -rn
+    )
+
+    [ "${#names[@]}" -gt 0 ] || return
+    joined="${names[0]}"
+    [ "${#names[@]}" -gt 1 ] && joined="$joined, ${names[1]}"
+    [ "${#names[@]}" -gt 2 ] && joined="$joined +$(( ${#names[@]} - 2 ))"
+    printf '%s' "$joined"
+}
+
+# Name a worktree the way its row does: relative to where the worktrees live ($2), not
+# by basename, since nested ones (ul.hotfix/foo) collide on basename alone.
+wt_display_name() {
+    local p="$1" base="$2"
+    case "$p" in
+        "$base"*)  printf '%s' "${p#"$base"}" ;;
+        "$HOME"/*) printf '~%s' "${p#"$HOME"}" ;;
+        *)         printf '%s' "$p" ;;
+    esac
+}
+
 # Show the whole ladder with the current rung bracketed, so where you are and where
 # TAB will take you are both visible without remembering any letters.
 header_line() {
@@ -380,10 +472,14 @@ header_line() {
     if [ "$scope" = "$HOME" ]; then
         label="no worktree detected — searching \$HOME"
     else
+        local gd elsewhere
         label="$(basename "$scope")"
-        local branch
-        branch=$(git -C "$scope" rev-parse --abbrev-ref HEAD 2>/dev/null)
-        [ -n "$branch" ] && label="$label  ⊙ $branch"
+        gd=$(git -C "$scope" rev-parse --absolute-git-dir 2>/dev/null)
+        if [ -n "$gd" ] && read_wt_state "$gd"; then
+            label="$label  ⊙ $WT_LABEL"
+            elsewhere=$(in_flight_elsewhere "$scope")
+            [ -n "$elsewhere" ] && label="$label  $(printf '\033[38;5;214m')⚠ $elsewhere$(printf '\033[0m')"
+        fi
     fi
 
     # $'...' so these are real escape bytes; printf '%s' will not expand \033 for us.
@@ -459,7 +555,15 @@ preview_row() {
     local type="$1" f="$2" root
 
     if [ "$type" = "w" ]; then
-        printf '\033[38;5;81m⊙ %s\033[0m\n' "$f"
+        local gd
+        gd=$(git -C "$f" rev-parse --absolute-git-dir 2>/dev/null)
+        # `status --branch` says only "HEAD (no branch)" mid-rebase, so lead with the
+        # label that knows better.
+        if [ -n "$gd" ] && read_wt_state "$gd"; then
+            printf '\033[38;5;81m⊙ %s\033[0m  \033[2m%s\033[0m\n' "$f" "$WT_LABEL"
+        else
+            printf '\033[38;5;81m⊙ %s\033[0m\n' "$f"
+        fi
         git -C "$f" status --short --branch 2>/dev/null | head -40
         return
     fi
