@@ -1048,25 +1048,46 @@ carry_file() {
 #   file row  tig -- <path>, this file's history
 #   ⊙ row     tig status in that worktree, which is the review view for a whole
 #             checkout and the reason to have gone there
+# Anything that goes wrong under fzf's execute() is invisible: fzf repaints the moment
+# the child exits, so a tig that refuses to start is indistinguishable from a key that
+# did nothing -- the screen just flashes. Say what happened and wait to be dismissed.
+bail() {
+    printf '\033[38;5;214mfzedit: %s\033[0m\n' "$1" >&2
+    printf '\033[2mpress any key\033[0m' >&2
+    read -rsn1 </dev/tty 2>/dev/null || sleep 1.5
+    printf '\n' >&2
+    return 0
+}
+
 open_tig() {
-    local type="$1" path="$2" root
+    local type="$1" path="$2" root rc
     [ -n "$path" ] || return 0
     if [ -n "${FZEDIT_TIG:-}" ]; then
         "$FZEDIT_TIG" "$type" "$path"
         return
     fi
-    command -v tig >/dev/null 2>&1 || return 0
+    command -v tig >/dev/null 2>&1 || { bail "tig is not installed"; return 0; }
 
     if [ "$type" = "w" ]; then
-        [ -d "$path" ] || return 0
-        ( cd "$path" && tig status )
-        return
+        [ -d "$path" ] || { bail "not a directory: $path"; return 0; }
+        ( cd "$path" && tig status ) || rc=$?
+        [ -n "${rc:-}" ] && bail "tig status exited $rc in $(basename "$path")"
+        return 0
     fi
 
-    [ -f "$path" ] || return 0
+    [ -f "$path" ] || { bail "not a file: $path"; return 0; }
     path=$(abspath "$path")
     root=$(root_of_file "$path")
-    ( cd "$root" && tig -- "$path" )
+    # tig needs a repo, and on the home rung plenty of rows are not in one -- ~/.config
+    # files, downloads, notes. That is the most likely reason for a flash.
+    git -C "$root" rev-parse --git-dir >/dev/null 2>&1 \
+        || { bail "not in a git repository: $(dirname "$path")"; return 0; }
+
+    # Relative to the repo root: tig hands the pathspec to git, and an absolute path
+    # is fragile across worktrees that share a common gitdir.
+    ( cd "$root" && tig -- "${path#"$root"/}" ) || rc=$?
+    [ -n "${rc:-}" ] && bail "tig exited $rc"
+    return 0
 }
 
 # ---------------------------------------------------------------------------
