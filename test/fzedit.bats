@@ -1218,3 +1218,39 @@ ED
     line="$(printf '%s\n' "$out" | grep -E '^tab:')"
     [[ "$line" != *"FZEDIT_NO_CACHE"* && "$line" != *"FZEDIT_RELIST"* ]]
 }
+
+# --------------------------------------------------------------------------
+# ^L — the other half of the tig hand-off
+# --------------------------------------------------------------------------
+
+@test "^L on a file row opens that file's history" {
+    printf '#!/bin/bash\necho "$1 $2" > "$TEST_TMPDIR/tig"\n' > "$TEST_TMPDIR/fakebin/faketig"
+    chmod +x "$TEST_TMPDIR/fakebin/faketig"
+    FZEDIT_TIG="$TEST_TMPDIR/fakebin/faketig" fz --tig f "$WT_FEATURE/src/app.ts"
+    run cat "$TEST_TMPDIR/tig"
+    [ "$output" = "f $WT_FEATURE/src/app.ts" ]
+}
+
+@test "^L on a worktree row asks for that worktree, not a file" {
+    printf '#!/bin/bash\necho "$1 $2" > "$TEST_TMPDIR/tig"\n' > "$TEST_TMPDIR/fakebin/faketig"
+    chmod +x "$TEST_TMPDIR/fakebin/faketig"
+    FZEDIT_TIG="$TEST_TMPDIR/fakebin/faketig" fz --tig w "$WT_NESTED"
+    run cat "$TEST_TMPDIR/tig"
+    [ "$output" = "w $WT_NESTED" ]
+}
+
+@test "^L with no row is a no-op" {
+    printf '#!/bin/bash\necho ran > "$TEST_TMPDIR/tig"\n' > "$TEST_TMPDIR/fakebin/faketig"
+    chmod +x "$TEST_TMPDIR/fakebin/faketig"
+    run env FZEDIT_TIG="$TEST_TMPDIR/fakebin/faketig" "$FZEDIT" --tig f ""
+    [ "$status" -eq 0 ]
+    [ ! -f "$TEST_TMPDIR/tig" ]
+}
+
+@test "^L is bound, and dispatches on the row type like enter does" {
+    printf '#!/bin/bash\nprintf "%%s\\n" "$@"\n' > "$TEST_TMPDIR/fakebin/fzfargs"
+    chmod +x "$TEST_TMPDIR/fakebin/fzfargs"
+    pin_scope "$WT_FEATURE"
+    out="$(FZP_FZF="$TEST_TMPDIR/fakebin/fzfargs" "$FZEDIT" --one-shot 2>&1)"
+    [[ "$out" == *"ctrl-l:execute"*"--tig {1} {2}"* ]]
+}

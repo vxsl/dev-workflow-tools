@@ -1036,6 +1036,39 @@ carry_file() {
     fi
 }
 
+# ^L: tig, on whatever the row is.
+#
+# The other half of a hand-off that only went one way. tig's E already opens the file
+# under its cursor in a new fzedit tab, on its line (see .tigrc) -- so with this the
+# loop closes: find a file here, read how it got that way in tig, jump back into the
+# exact line that interests you. Quitting tig drops you back on the picker, the same
+# way quitting nvim does.
+#
+# Dispatches on the row type, like enter does, because the useful view differs:
+#   file row  tig -- <path>, this file's history
+#   ⊙ row     tig status in that worktree, which is the review view for a whole
+#             checkout and the reason to have gone there
+open_tig() {
+    local type="$1" path="$2" root
+    [ -n "$path" ] || return 0
+    if [ -n "${FZEDIT_TIG:-}" ]; then
+        "$FZEDIT_TIG" "$type" "$path"
+        return
+    fi
+    command -v tig >/dev/null 2>&1 || return 0
+
+    if [ "$type" = "w" ]; then
+        [ -d "$path" ] || return 0
+        ( cd "$path" && tig status )
+        return
+    fi
+
+    [ -f "$path" ] || return 0
+    path=$(abspath "$path")
+    root=$(root_of_file "$path")
+    ( cd "$root" && tig -- "$path" )
+}
+
 # ---------------------------------------------------------------------------
 # Working-tree actions
 # ---------------------------------------------------------------------------
@@ -1445,7 +1478,7 @@ close_tab() {
 help_text() {
     local B=$'\033[1;38;5;221m' D=$'\033[2m' C=$'\033[38;5;81m' O=$'\033[0m'
     cat <<EOF
-${B}fzedit${O} ${D}— the file pad. Your WM owns the key that summons it.${O}
+${B}fzedit${O} ${D}— the file pad.${O}
 
 ${B}scope — the rung ladder${O}   ${D}conflicts ⊂ changed ⊂ files ⊂ home${O}
   TAB / S-TAB    widen / narrow one rung
@@ -1473,6 +1506,8 @@ ${B}find${O}
 
 ${B}git${O}
   ^A             stage / unstage this file ${D}(the badge says which way)${O}
+  ^L             tig ${D}— this file's history, or `tig status` on a ⊙ row.${O}
+                 ${D}tig's E jumps back here, on the line, so the loop closes.${O}
   ${D}badges: M modified · A added · ?  untracked · !! conflicted${O}
   ${D}discarding is deliberately not here — do it in nvim with the diff in front${O}
   ${D}of you: <leader>gr resets a hunk, <leader>gR the buffer${O}
@@ -1521,6 +1556,7 @@ case "${1:-}" in
     --copy)          copy_text "${2:-}"; exit 0 ;;
     --copy-rel)      [ -n "${2:-}" ] && copy_text "$(rel_of "$2")"; exit 0 ;;
     --carry)         carry_file "${2:-}"; exit 0 ;;
+    --tig)           open_tig "${2:-}" "${3:-}"; exit 0 ;;
     --grep)          grep_mode; exit 0 ;;
     --grep-list)     grep_list "${2:-}" "${3:-$(resolve_scope)}"; exit 0 ;;
     --grep-preview)  grep_preview "${2:-}" "${3:-1}"; exit 0 ;;
@@ -1609,6 +1645,7 @@ generate_list | fzp_run $PERSIST_MODE \
     --bind "btab:execute-silent($0 --narrow)+$REFRESH" \
     --bind "ctrl-t:execute($0 --pick-worktree < /dev/tty > /dev/tty 2>&1)+$REFRESH_MED" \
     --bind "ctrl-k:execute($0 --carry {2} < /dev/tty > /dev/tty 2>&1)+$REFRESH_MED" \
+    --bind "ctrl-l:execute($0 --tig {1} {2} < /dev/tty > /dev/tty 2>&1)+$REFRESH_MED" \
     --bind "f1:execute($0 --help-keys < /dev/tty > /dev/tty 2>&1)" \
     --bind "esc:clear-query" \
     --bind "shift-up:preview-up" \
