@@ -123,6 +123,29 @@ setup_repo_with_worktrees() {
     export MAIN WT_FEATURE WT_NESTED WT_DETACHED
 }
 
+# The fixture above lives NEXT TO the fake $HOME, not inside it, so the home rung's
+# $HOME sweep never sees it. That is fine for every scoped rung, but the whole point
+# of the home rung is what it does and doesn't sweep out of $HOME -- so those tests
+# need a repo that is genuinely underneath it.
+#
+#   $H_MAIN      ~/work/repos/proj          (branch main)
+#   $H_SIBLING   ~/work/repos/proj.sibling  (branch side)
+# plus ~/notes.md, which is under $HOME but in no repo at all.
+setup_repo_under_home() {
+    H_MAIN="$HOME/work/repos/proj"
+    H_SIBLING="$HOME/work/repos/proj.sibling"
+    mkdir -p "$H_MAIN/src"
+    git -C "$H_MAIN" init -q -b main
+    echo 'shared' > "$H_MAIN/src/shared.ts"
+    echo 'only in main' > "$H_MAIN/src/main-only.ts"
+    git_q "$H_MAIN" add -A
+    git_q "$H_MAIN" commit -q -m initial
+    git_q "$H_MAIN" worktree add -q "$H_SIBLING" -b side
+    echo 'only in the sibling' > "$H_SIBLING/src/sibling-only.ts"
+    echo 'notes' > "$HOME/notes.md"
+    export H_MAIN H_SIBLING
+}
+
 pin_scope() {
     mkdir -p "$HOME/.cache/fzedit"
     printf '%s' "$1" > "$HOME/.cache/fzedit/scope-$FZEDIT_INSTANCE"

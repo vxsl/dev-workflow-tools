@@ -9,6 +9,8 @@
 #   TAB    widen one rung        S-TAB  narrow one rung
 #   ^G     new tab (a whole separate instance)
 #   ^T     browse worktrees on their own, most recent first
+#   ^F     search file CONTENTS (ripgrep), landing on the matching line
+#   F1     the whole keymap, without leaving the pad
 #
 # Tabs are tmux windows in the pad session: bare C-x / C-b move left / right,
 # matching their keyboard positions, and C-M-w closes one. That needs `prefix None`
@@ -17,9 +19,13 @@
 #
 # ^T rather than M-w: xmonad grabs Alt-w for NSP_slack, so it never reaches us. ^W is
 # left alone deliberately -- it is delete-word in the query, which is worth keeping.
+# Nothing here binds Alt at all: Alt is xmonad's mod key, so an Alt binding is a coin
+# flip on whether the keystroke ever reaches the terminal.
 #
 #   enter  open file / switch worktree     ^O cursor    ^S tmux window here
-#   ^R     refresh                         ^C copy path
+#   ^space mark a row    ^E open every marked row in ONE nvim
+#   ^A     stage / unstage                 esc clear the query
+#   ^R     refresh       ^C copy abs path  ^Y copy repo-relative path
 #
 # Launches on `home`: the pad is a general "open a file" tool first, and starting
 # narrow means the file you want is often simply not in the list. S-TAB narrows from
@@ -34,24 +40,38 @@
 # a ⊙ row re-scopes the picker instead of opening an editor.
 #
 # Why scoping matters here: this runs in the NSP_fileedit alacritty+tmux scratchpad,
-# whose cwd is fixed, so $PWD tells us nothing. Unscoped, `fd ~/` yields ~2.04M files
-# across 139 ul.* worktrees -- 166k .tsx files for 1080 unique names, so every search
-# returns the same file over and over. One worktree is ~12.7k files. We therefore
-# infer the worktree from the most recently active tmux pane outside this session,
-# which is where the actual work is happening.
+# whose cwd is fixed, so $PWD tells us nothing. Unscoped, `fd ~/` yields ~2.86M files,
+# 2.02M of them across 154 sibling worktrees of one repo -- 166k .tsx files for 1080
+# unique names, so every search returned the same file over and over. One worktree is
+# ~12.6k files. We therefore infer the worktree from the most recently active tmux
+# pane outside this session, which is where the actual work is happening, and the home
+# rung prunes the OTHER worktrees of that repo (see sibling_exclude_args).
 #
 # Usage:
 #   fzedit              # FZF_PERSIST_MODE env var (default: persist)
 #   fzedit --persist    # force persist mode (stays open)
 #   fzedit --one-shot   # force one-shot mode (exits after selection)
+#   fzedit --keys       # print the keymap and exit
+#
+# Config:
+#   .env                     machine-specific paths; see .env.example
+#   ~/.config/fzedit/ignore  extra fd --exclude patterns for the home sweep, seeded
+#                            on first run and meant to be edited
 
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$(type -P "$0" || echo "$0")")")" && pwd)"
 source "$SCRIPT_DIR/../lib/fzf-helpers"
+# One "which worktree did I last go to" log, shared with rr -- see the header there.
+source "$SCRIPT_DIR/../lib/worktree-access.sh"
 
 SELF_BIN="$(readlink -f "$(type -P "$0" || echo "$0")")"
 
-HISTORY_FILE="$HOME/.fzedit_history"
+# Machine-specific paths live in the repo's .env (gitignored); .env.example documents
+# them. Nothing here should hardcode a particular checkout.
+[ -f "$SCRIPT_DIR/../.env" ] && . "$SCRIPT_DIR/../.env"
+
+HISTORY_FILE="${FZEDIT_HISTORY_FILE:-$HOME/.fzedit_history}"
 STATE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/fzedit"
+IGNORE_FILE="${FZEDIT_IGNORE_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/fzedit/ignore}"
 
 # Each tab is an independent instance, so scope and rung are per-instance rather than
 # global -- otherwise two tabs fight over one scope file and switching worktree in one
@@ -84,23 +104,163 @@ prune_dead_instances() {
 # session name.
 SELF_SESSION="${FZEDIT_SESSION:-fileedit}"
 
-# Whose worktrees to offer when we can't infer a repo at all (cold start).
-DEFAULT_REPO="$HOME/work/repos/ul"
+# Whose worktrees to offer when we can't infer a repo at all (cold start), and what
+# the ⊙ rows name themselves relative to. Set FZEDIT_DEFAULT_REPO in .env; empty
+# simply means "no worktree rows until you are somewhere that resolves a repo".
+DEFAULT_REPO="${FZEDIT_DEFAULT_REPO:-}"
 
+# Structural exclusions: build output and package trees. Always on, everywhere.
+# Deliberately separate from IGNORE_FILE, which is user-editable -- emptying that file
+# should not be able to put a million node_modules paths back into every rung.
 EXCLUDE_DIRS=(
     -E node_modules -E .git -E dist -E build -E .next -E .cache
-    -E target -E vendor -E __pycache__ -E .venv -E venv
+    -E target -E vendor -E __pycache__ -E .venv -E venv -E .stack-work
 )
 
+# Swept ahead of the rest of $HOME on the home rung, so their files rank above an
+# incidental match somewhere else. FZEDIT_PREFERRED_DIRS is a colon-separated list
+# prepended to these, for whatever tree you actually work in.
 PREFERRED_DIRS=(
-    "$HOME/work/repos/ul/client/web"
     "$HOME/work"
     "$HOME/.config"
     "$HOME/.xmonad"
     "$HOME/bin"
 )
+if [ -n "${FZEDIT_PREFERRED_DIRS:-}" ]; then
+    IFS=':' read -r -a _extra_dirs <<< "$FZEDIT_PREFERRED_DIRS"
+    PREFERRED_DIRS=("${_extra_dirs[@]}" "${PREFERRED_DIRS[@]}")
+fi
 
 PREFERRED_EXTS=(-e hs -e js -e ts -e tsx -e py -e sh -e md -e yaml -e toml)
+
+# Everything under $HOME that is a file but is never a thing you open in an editor.
+# Measured on this machine: ~1.05M of the 2.86M paths a bare `fd ~/` returns, and not
+# one of them has ever been the answer to "open a file".
+#
+# Seeded rather than documented elsewhere, because the noise list is the one thing
+# here that is genuinely per-machine, and a file that already exists with comments in
+# it gets edited where a README section does not.
+DEFAULT_IGNORE='# fzedit ignore -- one fd --exclude pattern per line, "#" starts a comment.
+#
+# Applied to the $HOME sweep on the `home` rung only. A leading "/" anchors the
+# pattern to $HOME; a bare name matches a directory at any depth. Structural
+# exclusions (node_modules, .git, dist, build, target, ...) are built into fzedit and
+# are NOT listed here, so emptying this file cannot resurrect them.
+#
+# Package caches and language toolchains. .bun/install alone was 76k paths.
+/.bun
+/.npm
+/.yarn
+/.cache
+/.rustup
+/.cargo
+/.pyenv
+/.nvm
+/.antigen
+/.ghcup
+/.cabal
+/.stack
+/.deno
+/.local/share
+/.local/state
+/.local/lib
+/.gradle
+/.m2
+/snap
+/go/pkg
+# Browser and editor profile data: thousands of files, none of them yours.
+/.var
+/.mozilla
+/.thunderbird
+/.cursor
+/.vscode-server
+/.config/chromium
+/.config/chromium-pads
+/.config/firefox-pads
+/.config/mozilla
+/.config/Cursor
+/.config/Code
+/.config/obsidian
+# Claude Code keeps every session transcript and every file snapshot under here.
+/.claude/projects
+/.claude/file-history
+/.claude/plugins
+'
+
+seed_ignore_file() {
+    [ -e "$IGNORE_FILE" ] && return 0
+    mkdir -p "$(dirname "$IGNORE_FILE")" 2>/dev/null || return 0
+    printf '%s' "$DEFAULT_IGNORE" > "$IGNORE_FILE" 2>/dev/null
+    return 0
+}
+seed_ignore_file
+
+# ---------------------------------------------------------------------------
+# Caching the slow, slow-changing half of a redraw
+# ---------------------------------------------------------------------------
+#
+# TAB felt laggy, and the profile said why. One press costs a --widen (9ms, fine), a
+# --generate-list and a --header, and those last two were doing real work every time:
+#
+#   generate-list  changed 300ms · files 450ms · home 830ms
+#   header         250ms   (git status ×2, plus a walk over all 154 worktrees)
+#
+# so every TAB was half a second to a second of nothing happening. Almost all of it is
+# recomputing things that had not changed: the filesystem sweep, the worktree list,
+# and "is anything mid-rebase elsewhere".
+#
+# What is cached is chosen by how fast it goes stale, not by how slow it is:
+#
+#   the fd sweeps        30s  -- new files on disk are rare, and ^R forces a refresh
+#   the worktree rows     5s  -- branches move, but not between two TAB presses
+#   in-flight elsewhere   5s  -- ditto
+#   history               never cached; it changes on every single enter, and it is
+#                               the part that decides what sits at the top
+#   changed / conflicts   never cached; they ARE the live git state, and once the
+#                               worktree rows above are cached they are cheap anyway
+#
+# That last split is the important one. Caching the whole listing would mean a file
+# you just opened does not move to the top for 30 seconds, and a file you just staged
+# keeps its old badge -- so the cache stops at the sweep, and the volatile rows are
+# merged in live on every redraw.
+cache_key() {
+    printf '%s' "$*" | cksum | cut -d' ' -f1
+}
+
+# Two tiers, because the two things that go stale go stale for different reasons.
+#
+#   tier sweep    the fd walk of the filesystem. Only a file being CREATED or DELETED
+#                 invalidates it, which editing one does not.
+#   tier derived  everything computed on top: the formatted listing, the worktree
+#                 rows, the in-flight check. Invalidated by editing, staging,
+#                 switching worktree -- i.e. by most keys.
+#
+# So there are two strengths of refresh. Coming back from the editor rebuilds the
+# derived tier and reuses the sweep (~0.3s instead of ~1.0s, and the sweep could not
+# have changed by editing a file anyway); ^R rebuilds everything, which is what you
+# press when something DID appear on disk behind fzedit's back.
+cached() {
+    local tier="$1" key="$2" ttl="$3"; shift 3
+    local f="$STATE_DIR/cache-$key" age
+    local bypass=""
+    [ "${FZEDIT_NO_CACHE:-}" = 1 ] && bypass=1
+    [ "${FZEDIT_RELIST:-}" = 1 ] && [ "$tier" = derived ] && bypass=1
+    if [ -z "$bypass" ] && [ -s "$f" ]; then
+        age=$(( $(date +%s) - $(stat -c %Y "$f" 2>/dev/null || echo 0) ))
+        if [ "$age" -ge 0 ] && [ "$age" -lt "$ttl" ]; then
+            cat "$f"
+            return 0
+        fi
+    fi
+    # Write to a temp and rename, so a concurrent reader never sees a half-built list
+    # (fzf fires reloads faster than a sweep of $HOME completes).
+    if "$@" > "$f.$$" 2>/dev/null; then
+        mv -f "$f.$$" "$f"
+    else
+        rm -f "$f.$$"
+    fi
+    cat "$f" 2>/dev/null
+}
 
 git_root_of() {
     [ -d "$1" ] || return 1
@@ -135,11 +295,11 @@ resolve_scope() {
 # us the row type and an unambiguous, shell-quoted real path. The type column is what
 # lets enter mean two different things without guessing from the path.
 # $1 = root to strip from display ("" to just tilde-collapse).
-# $2 = "plain" to skip per-row colouring. On the home rung that colouring costs ~9s
-# of the ~13s spent building 2.7M rows, for syntax tinting you cannot read while
-# fuzzy-searching by name anyway. Scoped rungs are ~12k rows, where it is free.
+# $2 = "plain" to skip per-row colouring. On the home rung that colouring is the
+# single most expensive thing in the pipeline, for syntax tinting you cannot read
+# while fuzzy-searching by name anyway. Scoped rungs are ~12k rows, where it is free.
 format_lines() {
-    awk -F'\t' -v home="$HOME" -v root="$1" -v plain="${2:-}" -v wtbase="$(dirname "$DEFAULT_REPO")" '
+    awk -F'\t' -v home="$HOME" -v root="$1" -v plain="${2:-}" -v wtbase="${DEFAULT_REPO:+$(dirname "$DEFAULT_REPO")}" '
     function colour(fn,   n, parts, ext) {
         n = split(fn, parts, ".")
         ext = (n > 1) ? parts[n] : ""
@@ -168,10 +328,10 @@ format_lines() {
         xy   = (NF > 2) ? $3 : ""
 
         if (type == "w") {
-            # Name a worktree by its path under ~/work/repos, not its basename: some
-            # are nested (repo.hotfix/example-branch) and the basename alone collides.
+            # Name a worktree by its path under the worktree parent, not its basename:
+            # some are nested (repo.hotfix/return-400-...) and the basename collides.
             name = abs
-            if (index(name, wtbase "/") == 1) {
+            if (wtbase != "" && index(name, wtbase "/") == 1) {
                 name = substr(name, length(wtbase) + 2)
             } else if (index(name, home) == 1) {
                 name = "~" substr(name, length(home) + 1)
@@ -223,45 +383,226 @@ list_conflicts() {
     done < <(git -C "$root" diff --name-only --diff-filter=U -z 2>/dev/null)
 }
 
-# History first (it's the "recently opened" prior), then everything else, deduped.
+# ---------------------------------------------------------------------------
+# History: frecency-ranked, and portable between worktrees
+# ---------------------------------------------------------------------------
+#
+# The file is an append-only log of "<epoch>\t<abspath>", aggregated at read time.
+# Append-only because recording an open happens on every enter, and re-ranking a file
+# there would put a sort on the hot path for no benefit -- the read side has to group
+# the duplicates anyway.
+#
+# Ranked by frecency (z/fasd's weighting), not recency: a file you touch twenty times
+# a week should outrank one you opened once yesterday, and a plain tail cannot say
+# that. This ordering is what fzf's `index` tiebreak falls back on, so it decides
+# which of two equally good fuzzy matches you see first -- not just what the list
+# looks like before you type.
+#
+# Then the rows are REWRITTEN INTO THE CURRENT SCOPE. With 154 worktrees of one repo,
+# the history recorded in repo.feature-a is roughly the same twelve files you are
+# about to want in repo.feature-b: the absolute paths differ, the repo-relative paths
+# do not. So an entry under any sibling worktree scores the same relative path here.
+# That is the difference between "recently opened" meaning something and meaning
+# nothing at all, ten seconds after you switch worktree.
+HISTORY_CAP=2000
+
+record_history() {
+    printf '%s\t%s\n' "$(date +%s)" "$1" >> "$HISTORY_FILE"
+    # Trimmed amortised, so the common case is a single append.
+    local n
+    n=$(wc -l < "$HISTORY_FILE" 2>/dev/null || echo 0)
+    if [ "$n" -gt $(( HISTORY_CAP + HISTORY_CAP / 2 )) ]; then
+        tail -n "$HISTORY_CAP" "$HISTORY_FILE" > "$HISTORY_FILE.tmp" \
+            && mv "$HISTORY_FILE.tmp" "$HISTORY_FILE"
+    fi
+}
+
+# Frecent paths, best first, remapped into $1 (a worktree root, or "" for no
+# remapping). $2 is a newline-separated list of sibling worktree roots whose paths
+# should be rewritten into $1.
+history_ranked() {
+    local scope="$1" siblings="$2"
+    [ -s "$HISTORY_FILE" ] || return 0
+    printf '%s\n' "$siblings" | awk -v scope="$scope" -v now="$(date +%s)" '
+    # Phase 1 reads the sibling roots (already longest-first, so a nested worktree
+    # wins over its parent when both are prefixes of the same path).
+    NR == FNR { if ($0 != "") sib[++nsib] = $0; next }
+    function remap(p,   i, r, rel) {
+        if (scope == "") return p
+        for (i = 1; i <= nsib; i++) {
+            r = sib[i]
+            if (index(p, r "/") == 1) return scope "/" substr(p, length(r) + 2)
+        }
+        return p
+    }
+    # z/fasd frecency: a recent hit is worth more, but a hit is still a hit.
+    function weight(age) {
+        if (age < 3600)   return 4
+        if (age < 86400)  return 2
+        if (age < 604800) return 0.5
+        return 0.25
+    }
+    {
+        # Tolerate the pre-frecency format (a bare path, no timestamp column).
+        if (NF >= 2 && $1 ~ /^[0-9]+$/) { ts = $1 + 0; p = $2 }
+        else                            { ts = 0;      p = $0 }
+        if (p == "") next
+        p = remap(p)
+        score[p] += weight(now - ts)
+        if (ts > last[p]) last[p] = ts
+    }
+    END { for (p in score) printf "%.4f\t%d\t%s\n", score[p], last[p], p }
+    ' FS='\t' - "$HISTORY_FILE" \
+      | sort -t$'\t' -k1,1gr -k2,2nr \
+      | cut -f3- \
+      | while IFS= read -r f; do [ -f "$f" ] && printf '%s\n' "$f"; done
+}
+
+# ---------------------------------------------------------------------------
+# Listings
+# ---------------------------------------------------------------------------
+
+# The sibling worktree roots a history entry may be remapped from, longest first so
+# that a nested worktree (repo.nested/deep) wins over its parent.
+sibling_roots() {
+    local root="$1" wt
+    [ "$root" = "$HOME" ] && return 0
+    while IFS=$'\t' read -r _ wt; do
+        printf '%s\n' "$wt"
+    done < <(worktree_dirs "$root") | awk '{ print length, $0 }' | sort -rn | cut -d' ' -f2-
+}
+
+# The ignore file, split by how the pattern has to be applied.
+#
+# A pattern with no "/" is a bare directory name and matches at any depth, so it can
+# be handed to every sweep unchanged. A pattern with a "/" is a PATH, anchored at
+# $HOME -- and fd anchors leading-"/" patterns to whatever directory it was pointed
+# at, so those have to be resolved to absolute paths and re-anchored per search root.
+# Same machinery as the sibling worktrees, which is the point: one anchoring rule, in
+# one place, rather than a second one to get subtly wrong.
+ignore_bare() {
+    local line
+    [ -f "$IGNORE_FILE" ] || return 0
+    while IFS= read -r line; do
+        line="${line%%#*}"
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        [ -n "$line" ] || continue
+        case "$line" in */*) ;; *) printf '%s\n%s\n' -E "$line" ;; esac
+    done < "$IGNORE_FILE"
+}
+
+ignore_paths() {
+    local line
+    [ -f "$IGNORE_FILE" ] || return 0
+    while IFS= read -r line; do
+        line="${line%%#*}"
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        [ -n "$line" ] || continue
+        case "$line" in
+            /*)  printf '%s\n' "$HOME$line" ;;
+            */*) printf '%s\n' "$HOME/$line" ;;
+        esac
+    done < "$IGNORE_FILE"
+}
+
+# Every worktree of the scope's repo EXCEPT the scope itself.
+#
+# Pruning these is the single biggest thing the home rung does. They were ~2.02M of
+# the 2.86M paths under $HOME, and they are the same ~12.6k repo-relative paths over
+# and over: 166k .tsx files for 1080 distinct names. Listing them all did not make
+# more files reachable -- it made every filename query return the same file 154 times
+# with nothing on the row to tell the copies apart. The gesture for "a file in a
+# different worktree" is the ⊙ row: pick the worktree, then the file. Which is exactly
+# why worktree rows are inlined into every rung.
+#
+# Cost: ~154 --exclude patterns, measured at no detectable difference in fd's runtime,
+# against 2.86M rows / 637MB / 5.0s becoming ~207k rows / 46MB / 0.15s.
+sibling_worktrees() {
+    local scope="$1" repo="$scope" wt
+    [ "$scope" = "$HOME" ] && repo="${DEFAULT_REPO:-}"
+    [ -n "$repo" ] && [ -d "$repo" ] || return 0
+    while IFS=$'\t' read -r _ wt; do
+        [ "$wt" = "$scope" ] && continue
+        printf '%s\n' "$wt"
+    done < <(worktree_dirs "$repo")
+}
+
+# Those of $1's descendants, as fd --exclude patterns ANCHORED AT $1.
+#
+# Per search root, not once for $HOME, because fd anchors a leading-"/" pattern to the
+# directory it was pointed at. Getting this wrong is silent: the pattern simply never
+# matches, and the preferred-dirs sweep quietly puts three quarters of a million
+# sibling-worktree paths back into a listing the $HOME sweep had just pruned.
+exclude_args_under() {
+    local base="$1" wt
+    shift
+    for wt in "$@"; do
+        case "$wt" in "$base"/*) printf '%s\n%s\n' -E "${wt#"$base"}" ;; esac
+    done
+}
+
+# The filesystem half of the two wide rungs, split out so it can be cached without
+# also freezing the history rows that get merged in on top of it.
+SWEEP_TTL="${FZEDIT_SWEEP_TTL:-30}"
+
+sweep_files() {
+    local root="$1"
+    fd . "$root" --type f --follow --hidden --no-ignore-vcs "${EXCLUDE_DIRS[@]}" "${PREFERRED_EXTS[@]}"
+    fd . "$root" --type f --follow --hidden --no-ignore-vcs "${EXCLUDE_DIRS[@]}"
+}
+
+sweep_home() {
+    local scope="$1" dir
+    local -a prunable=() bare=() ex=()
+    # Everything that has to be pruned by path, in one list, re-anchored per sweep.
+    mapfile -t prunable < <(sibling_worktrees "$scope"; ignore_paths)
+    mapfile -t bare     < <(ignore_bare)
+    # The scope worktree ahead of everything else: it is where the work is, and the
+    # $HOME sweep below would otherwise bury it under whatever sorts first.
+    if [ "$scope" != "$HOME" ] && [ -d "$scope" ]; then
+        fd . "$scope" --type f --follow --hidden --no-ignore-vcs \
+            "${EXCLUDE_DIRS[@]}" "${bare[@]}"
+    fi
+    # These sweeps exist purely for RANKING -- the $HOME pass below finds everything
+    # they find. So they have to prune exactly what it prunes, or the ranking pass
+    # quietly undoes the pruning.
+    for dir in "${PREFERRED_DIRS[@]}"; do
+        [ -d "$dir" ] || continue
+        mapfile -t ex < <(exclude_args_under "$dir" "${prunable[@]}")
+        fd . "$dir" --type f --follow --hidden --no-ignore-vcs \
+            "${EXCLUDE_DIRS[@]}" "${bare[@]}" "${ex[@]}" "${PREFERRED_EXTS[@]}"
+    done
+    # One pass over $HOME, not two. The extra preferred-extensions sweep only
+    # reordered results that the full sweep repeats anyway.
+    mapfile -t ex < <(exclude_args_under "$HOME" "${prunable[@]}")
+    fd . "$HOME" --type f --follow --hidden --no-ignore-vcs \
+        "${EXCLUDE_DIRS[@]}" "${bare[@]}" "${ex[@]}"
+}
+
+# History first (it's the "recently opened" prior), then the cached sweep, deduped.
 list_files() {
     local root="$1"
     {
-        tac "$HISTORY_FILE" | while IFS= read -r f; do
-            case "$f" in "$root"/*) [ -f "$f" ] && echo "$f" ;; esac
+        history_ranked "$root" "$(sibling_roots "$root")" | while IFS= read -r f; do
+            case "$f" in "$root"/*) printf '%s\n' "$f" ;; esac
         done
-        fd . "$root" --type f --follow --hidden --no-ignore-vcs "${EXCLUDE_DIRS[@]}" "${PREFERRED_EXTS[@]}"
-        fd . "$root" --type f --follow --hidden --no-ignore-vcs "${EXCLUDE_DIRS[@]}"
+        cached sweep "files-$(cache_key "$root")" "$SWEEP_TTL" sweep_files "$root"
     } | awk '!seen[$0]++ { print "f\t" $0 }'
 }
 
 list_home() {
+    local scope="$1"
     {
-        tac "$HISTORY_FILE" | while IFS= read -r f; do
-            [ -f "$f" ] && echo "$f"
-        done
-        local dir
-        for dir in "${PREFERRED_DIRS[@]}"; do
-            [ -d "$dir" ] && fd . "$dir" --type f --follow --hidden --no-ignore-vcs "${EXCLUDE_DIRS[@]}" "${PREFERRED_EXTS[@]}"
-        done
-        # One pass over $HOME, not two. The extra preferred-extensions sweep only
-        # reordered results that the full sweep repeats anyway, and at 2.7M files it
-        # doubled the work for ranking that the preferred dirs above already give.
-        printf '\001\n'
-        fd . "$HOME" --type f --follow --hidden --no-ignore-vcs "${EXCLUDE_DIRS[@]}"
-    } | awk '
-        # Only the prefix (history + preferred dirs) can collide with the sweep, so
-        # hash just that and membership-test the rest. Hashing all 2.7M paths costs
-        # both time and a lot of resident memory for nothing.
-        $0 == "\001" { tail = 1; next }
-        !tail        { if (!seen[$0]++) print "f\t" $0; next }
-                     { if (!($0 in seen)) print "f\t" $0 }
-    '
+        history_ranked "$scope" "$(sibling_roots "$scope")"
+        cached sweep "home-$(cache_key "$scope")" "$SWEEP_TTL" sweep_home "$scope"
+    } | awk '!seen[$0]++ { print "f\t" $0 }'
 }
 
 # "<gitdir>\t<worktree path>" for every worktree of the scope repo, primary first.
 # Reads the per-worktree gitdir pointers directly rather than shelling out to git once
-# per worktree -- there are 139 of them, so that would be seconds.
+# per worktree -- there are 154 of them, so that would be seconds.
 worktree_dirs() {
     local root="$1" common d gd wt
     common=$(git -C "$root" rev-parse --git-common-dir 2>/dev/null) || return
@@ -286,7 +627,7 @@ wt_in_flight() {
 # Describe a worktree from its gitdir, into WT_BRANCH / WT_OP / WT_LABEL.
 #
 # Sets globals rather than printing because this runs once per worktree and there are
-# ~140 of them: a command substitution per call costs more than the rest of the listing
+# ~154 of them: a command substitution per call costs more than the rest of the listing
 # put together. Everything here is a builtin -- `read <file`, no cat, no fork.
 #
 # A worktree mid-rebase has a bare SHA in HEAD rather than a ref, and printing all 40
@@ -294,7 +635,7 @@ wt_in_flight() {
 # vanishes from the row entirely -- exactly when you are most likely to be hunting for
 # that worktree, and a branch-shaped query ("smp-") then fails to match it at all. So
 # prefer the branch git parked in rebase-{merge,apply}/head-name, and say what is in
-# flight: "feature-a-state ⟳ rebase 2/6", not "detached a41d6b62".
+# flight: "smp-selected-state ⟳ rebase 2/6", not "detached a41d6b62".
 read_wt_state() {
     local gd="$1" head n="" end=""
     WT_BRANCH=""; WT_OP=""; WT_LABEL=""
@@ -331,10 +672,27 @@ read_wt_state() {
 }
 
 # Worktrees of the scope repo as "<path>\t<label>", most recently used first.
+#
+# "Recently used" is the shared navigation log that rr writes (and that pin_scope
+# below writes too), falling back to the mtime of the worktree's index for one that
+# has never been navigated to. It used to be index mtime alone, which is a bad proxy
+# twice over: a background `git status` touches the index without you going anywhere,
+# and going somewhere to READ code doesn't touch it at all. So fzedit's "most recent"
+# and rr's "most recent" disagreed, and neither matched where you had actually been.
 list_worktrees() {
-    local root="$1" gd wt ts
+    local root="$1" gd wt ts nav
+    local -A navtime=()
+    while IFS=$'\t' read -r ts wt; do
+        [ -n "$wt" ] && navtime["$wt"]="$ts"
+    done < <(wta_all)
     while IFS=$'\t' read -r gd wt; do
-        ts=$(stat -c %Y "$gd/index" 2>/dev/null || echo 0)
+        nav="${navtime[$wt]:-}"
+        if [ -n "$nav" ]; then
+            # Ahead of any never-navigated worktree, whatever its index says.
+            ts=$(( nav + 10000000000 ))
+        else
+            ts=$(stat -c %Y "$gd/index" 2>/dev/null || echo 0)
+        fi
         read_wt_state "$gd"
         printf '%s\t%s\t%s\n' "$ts" "$wt" "$WT_LABEL"
     done < <(worktree_dirs "$root") | sort -rn | cut -f2,3
@@ -343,11 +701,21 @@ list_worktrees() {
 # Worktrees as pickable rows, for inlining into whatever mode is showing. Appended
 # after the files so that a filename query never surfaces one, while a branch or
 # ticket-shaped query (TICKET-1001) does.
+#
+# Cached briefly: this is 154 gitdir reads plus a stat each, ~160ms, and it runs on
+# EVERY rung -- it was most of what made even the tiny `changed` rung take 300ms to
+# redraw. Branches do not move between two TAB presses.
+WT_ROWS_TTL="${FZEDIT_WT_ROWS_TTL:-5}"
+
 list_worktree_rows() {
     local root="$1"
-    [ "$root" = "$HOME" ] && root="$DEFAULT_REPO"
-    [ -d "$root" ] || return
-    list_worktrees "$root" | awk -F'\t' '{ printf "w\t%s\t%s\n", $1, $2 }'
+    [ "$root" = "$HOME" ] && root="${DEFAULT_REPO:-}"
+    [ -n "$root" ] && [ -d "$root" ] || return
+    cached derived "wtrows-$(cache_key "$root")" "$WT_ROWS_TTL" _worktree_rows "$root"
+}
+
+_worktree_rows() {
+    list_worktrees "$1" | awk -F'\t' '{ printf "w\t%s\t%s\n", $1, $2 }'
 }
 
 # The rungs, narrowest first. Index into this is the whole mode model.
@@ -395,11 +763,8 @@ shift_rung() {
     printf '%s' "${RUNGS[$i]}" > "$MODE_FILE"
 }
 
-generate_list() {
-    local scope mode
-    scope=$(resolve_scope)
-    mode=$(current_rung "$scope")
-
+build_list() {
+    local scope="$1" mode="$2"
     # Worktrees are first-class alongside files: same list, same query, but appended
     # last so they rank below the mode's own rows. enter dispatches on the type
     # column, so selecting one re-scopes instead of opening an editor.
@@ -408,18 +773,35 @@ generate_list() {
             changed)   list_changed   "$scope" ;;
             conflicts) list_conflicts "$scope" ;;
             files)     list_files     "$scope" ;;
-            *)         list_home                ;;
+            *)         list_home      "$scope" ;;
         esac
         list_worktree_rows "$scope"
     } | format_lines "$([ "$mode" = home ] && echo "" || echo "$scope")" \
                      "$([ "$mode" = home ] && echo plain)"
 }
 
+# The finished, formatted listing is cached too, not just the sweep underneath it.
+#
+# Even served from a cached sweep, the home rung still had to push 32k rows through a
+# dedup pass and a formatting pass on every redraw -- ~0.3s, which is exactly the TAB
+# lag this is here to remove. Formatting is a pure function of the sweep, the history
+# and the git state, so it is cacheable; what makes it SAFE to cache is that every
+# binding which can change any of those three refreshes hard (FZEDIT_NO_CACHE=1) and
+# rebuilds from scratch. TAB and S-TAB, which change nothing, are the only things that
+# ever read this. So correctness comes from the mutating keys, not from the clock, and
+# the TTL is only a backstop against edits made outside the pad entirely.
+generate_list() {
+    local scope mode
+    scope=$(resolve_scope)
+    mode=$(current_rung "$scope")
+    cached derived "list-$mode-$(cache_key "$scope")" "$SWEEP_TTL" build_list "$scope" "$mode"
+}
+
 # Worktrees OTHER than the scope with something half-finished, as "name (rebase 2/6)".
 #
 # Why the header cares: "conflicts (0)" on a clean worktree is indistinguishable from
 # "you are pointed at the wrong worktree", and pointing at the wrong one is easy when
-# two branches share a prefix (smp-select vs feature-a-state). The scope is right
+# two branches share a prefix (smp-select vs smp-selected-state). The scope is right
 # there in the header, but a near-identical name reads as correct. So name the worktree
 # that actually has a rebase going, rather than reporting zero and leaving it at that.
 in_flight_elsewhere() {
@@ -452,7 +834,7 @@ in_flight_elsewhere() {
 }
 
 # Name a worktree the way its row does: relative to where the worktrees live ($2), not
-# by basename, since nested ones (ul.hotfix/foo) collide on basename alone.
+# by basename, since nested ones (repo.hotfix/foo) collide on basename alone.
 wt_display_name() {
     local p="$1" base="$2"
     case "$p" in
@@ -477,7 +859,10 @@ header_line() {
         gd=$(git -C "$scope" rev-parse --absolute-git-dir 2>/dev/null)
         if [ -n "$gd" ] && read_wt_state "$gd"; then
             label="$label  ⊙ $WT_LABEL"
-            elsewhere=$(in_flight_elsewhere "$scope")
+            # Same 154-worktree walk as the rows above, and the same reasoning for
+            # caching it: a rebase does not start and finish between two TAB presses.
+            elsewhere=$(cached derived "inflight-$(cache_key "$scope")" "$WT_ROWS_TTL" \
+                               in_flight_elsewhere "$scope")
             [ -n "$elsewhere" ] && label="$label  $(printf '\033[38;5;214m')⚠ $elsewhere$(printf '\033[0m')"
         fi
     fi
@@ -495,7 +880,7 @@ header_line() {
         fi
     done
 
-    printf '%s\n%sTAB widen · S-TAB narrow ·%s%s  %s· ^T worktrees · ⊙ rows switch worktree%s\n' \
+    printf '%s\n%sTAB widen · S-TAB narrow ·%s%s  %s· ^F grep · ^T worktrees · ^G tab · F1 keys%s\n' \
         "$label" "$ESC_DIM" "$ESC_OFF" "$ladder" "$ESC_DIM" "$ESC_OFF"
 }
 
@@ -513,6 +898,9 @@ count_rung() {
 pin_scope() {
     printf '%s' "$1" > "$SCOPE_FILE"
     : > "$MODE_FILE"
+    # Into the log rr also reads, so a switch made here shows up as "most recent"
+    # over there too, and vice versa.
+    wta_record "$1"
 }
 
 # enter means "open this file" or "switch to this worktree" depending on the row.
@@ -528,26 +916,287 @@ open_row() {
     open_in_editor "$path" "$line"
 }
 
-pick_worktree() {
-    local scope choice
-    scope=$(resolve_scope)
-    [ "$scope" = "$HOME" ] && scope="$DEFAULT_REPO"
-    choice=$(list_worktrees "$scope" \
+# ^E: every marked row in ONE editor, so the LSP starts once instead of once per file.
+# On this monorepo that is the difference between a second and most of a minute when
+# you are working through four files of a review.
+#
+# With nothing marked fzf expands {+2} to the row under the cursor, so this is also
+# just "open this file" -- there is no separate empty-selection case to handle.
+# Worktree rows are directories, and get dropped rather than opened.
+open_many() {
+    local f root
+    local -a files=()
+    for f in "$@"; do
+        [ -f "$f" ] && files+=("$(abspath "$f")")
+    done
+    [ "${#files[@]}" -gt 0 ] || return 0
+    for f in "${files[@]}"; do record_history "$f"; done
+
+    if [ -n "${FZEDIT_EDITOR:-}" ]; then
+        "$FZEDIT_EDITOR" "${files[@]}"
+        return
+    fi
+    root=$(root_of_file "${files[0]}")
+    cd "$root" 2>/dev/null || cd "$(dirname "${files[0]}")" || return
+    nvim -- "${files[@]}"
+}
+
+# The plain, fast worktree list: just the worktrees of this repo, most recent first.
+# Prints the chosen path. Used by ^K, where the question is narrow ("which checkout")
+# and rr's whole branch/ticket world would be in the way -- and as the fallback for
+# ^T when rr can't run.
+choose_worktree() {
+    local scope="$1" prompt="${2:-worktree (most recent first) > }"
+    list_worktrees "$scope" \
         | awk -F'\t' -v home="$HOME" '{ d=$1; sub("^" home, "~", d); printf "%s\t%s\t%s\n", $1, d, $2 }' \
         | "$FZP_FZF" --ansi --delimiter='\t' --with-nth=2.. --height=100% --reverse \
-              --prompt='worktree (most recent first) > ' \
+              --prompt="$prompt" \
               --preview='git -C {1} status --short --branch 2>/dev/null | head -40' \
               --preview-window=down:50%:wrap \
-        | cut -f1)
+        | cut -f1
+}
+
+# ^T: rr's picker, not a reimplementation of it.
+#
+# rr already answers "which worktree" far better than anything worth rebuilding here:
+# Jira title and status, MR state, assignee, dirty and pane indicators, branches with
+# no worktree yet, and creating one on the spot. It is also already designed to be
+# driven this way -- the UI goes to stderr and the answer comes back on stdout as
+# "RR_CD:<path>", which is exactly how the zsh wrapper consumes it. So: stdin and
+# stderr to the terminal, stdout captured.
+#
+# It runs with cwd set to the scope worktree because rr resolves its repo from $PWD,
+# and the pad's own cwd is fixed and meaningless.
+#
+# -f (--full) because the pad is a full-screen scratchpad -- rr's default sizing
+# assumes it is sharing a terminal with your shell, and here it isn't.
+#
+# FZEDIT_NO_RR=1 forces the plain picker, which is also what happens if rr is missing
+# or exits without choosing.
+RR_BIN="${FZEDIT_RR_BIN:-$SCRIPT_DIR/rr.sh}"
+RR_ARGS="${FZEDIT_RR_ARGS:--f}"
+
+pick_worktree() {
+    local scope choice out
+    scope=$(resolve_scope)
+    [ "$scope" = "$HOME" ] && scope="${DEFAULT_REPO:-$HOME}"
+    [ -d "$scope" ] || return 0
+
+    if [ -z "${FZEDIT_NO_RR:-}" ] && [ -x "$RR_BIN" ] && git -C "$scope" rev-parse --git-dir >/dev/null 2>&1; then
+        # shellcheck disable=SC2086 -- RR_ARGS is a deliberate word-split list.
+        if { : >/dev/tty; } 2>/dev/null; then
+            out=$(cd "$scope" && "$RR_BIN" $RR_ARGS </dev/tty 2>/dev/tty)
+        else
+            # No controlling terminal (a test, a pipe): rr can't draw, but it can
+            # still answer, so take the answer and drop the UI.
+            out=$(cd "$scope" && "$RR_BIN" $RR_ARGS 2>/dev/null)
+        fi
+        choice=$(printf '%s\n' "$out" | grep -m1 'RR_CD:' | sed 's/.*RR_CD://' | tr -d '\r\n')
+        # rr can also create a worktree and hand it back, so accept anything that is
+        # now a directory rather than only paths that existed when we started.
+        if [ -n "$choice" ] && [ -d "$choice" ]; then
+            pin_scope "$choice"
+        fi
+        return 0
+    fi
+
+    choice=$(choose_worktree "$scope")
     if [ -n "$choice" ] && [ -d "$choice" ]; then
         pin_scope "$choice"
     fi
 }
 
-record_history() {
-    printf '%s\n' "$1" >> "$HISTORY_FILE"
-    tail -200 "$HISTORY_FILE" > "$HISTORY_FILE.tmp" && mv "$HISTORY_FILE.tmp" "$HISTORY_FILE"
+# ^K: this file, over in a different worktree.
+#
+# The inverse of a ⊙ row, and in a 154-worktree checkout it is the gesture you want
+# more often than the forward one: you have already found the file, and what you
+# actually want is the same file on the branch you are about to work on. Switching
+# worktree first means finding the file all over again.
+carry_file() {
+    local path="$1" root rel target
+    [ -f "$path" ] || return 0
+    path=$(abspath "$path")
+    root=$(git_root_of "$(dirname "$path")") || return 0
+    rel="${path#"$root"/}"
+
+    target=$(choose_worktree "$root" "open ${rel##*/} in which worktree > ")
+    [ -n "$target" ] && [ -d "$target" ] || return 0
+    pin_scope "$target"
+
+    if [ -f "$target/$rel" ]; then
+        record_history "$target/$rel"
+        open_in_editor "$target/$rel"
+    else
+        # The path doesn't exist on that branch -- a file added since it forked, or
+        # renamed. Re-scoping is still the useful half of the gesture, so keep it
+        # rather than silently doing nothing, and say why nothing opened.
+        printf '\nfzedit: %s does not exist in %s — switched anyway\n' \
+            "$rel" "$(basename "$target")" >&2
+        sleep 1.5
+    fi
 }
+
+# ---------------------------------------------------------------------------
+# Working-tree actions
+# ---------------------------------------------------------------------------
+
+# ^A, the half of the source-control sidebar that isn't navigation. A toggle rather
+# than two keys: what you want after looking at a diff is to flip this file's
+# staged-ness, and which direction that is, is already on the row's badge.
+#
+# Nothing here discards anything. Reverting a file is one keystroke away in the editor
+# (<leader>gR resets the buffer, <leader>gr a single hunk) with the diff in front of
+# you, which is the right place to be when you throw work away -- not a fat-fingered
+# neighbour of the stage key in a fuzzy finder.
+stage_toggle() {
+    local path="$1" root rel staged
+    [ -f "$path" ] || return 0
+    path=$(abspath "$path")
+    root=$(git_root_of "$(dirname "$path")") || return 0
+    rel="${path#"$root"/}"
+    staged=$(git -C "$root" diff --cached --name-only -- "$rel" 2>/dev/null)
+    if [ -n "$staged" ]; then
+        git -C "$root" restore --staged -- "$rel" 2>/dev/null
+    else
+        git -C "$root" add -- "$rel" 2>/dev/null
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Clipboard
+# ---------------------------------------------------------------------------
+#
+# Wayland-aware because the xmonad→Hyprland migration means this has to work on both
+# for a while: under Hyprland there is no X selection for xclip to own, so ^C would
+# silently do nothing.
+copy_text() {
+    local text="$1"
+    [ -n "$text" ] || return 0
+    if [ -n "${WAYLAND_DISPLAY:-}" ] && command -v wl-copy >/dev/null 2>&1; then
+        printf '%s' "$text" | wl-copy >/dev/null 2>&1
+    elif command -v xclip >/dev/null 2>&1; then
+        printf '%s' "$text" | xclip -selection clipboard -i >/dev/null 2>&1
+    fi
+}
+
+# ^Y: the path you paste into an import, a review comment or a message -- almost never
+# the absolute one, which is what ^C stays for.
+rel_of() {
+    local f="$1" root
+    f=$(abspath "$f")
+    root=$(git_root_of "$(dirname "$f")") || { printf '%s' "$f"; return; }
+    case "$f" in
+        "$root"/*) printf '%s' "${f#"$root"/}" ;;
+        *)         printf '%s' "$f" ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# Content search
+# ---------------------------------------------------------------------------
+#
+# The one thing the pad could not do that an IDE could: find a string, not a filename.
+# ripgrep re-runs on every keystroke (fzf's --disabled plus change:reload), so the
+# query is a real regex against file contents rather than a fuzzy match over a static
+# list.
+#
+# Rows carry the line number in a column of their own, so enter lands the cursor on
+# the match instead of at the top of the file. ^E sends the whole result set to nvim's
+# quickfix list, which is the "search results panel" equivalent -- :cnext walks them.
+#
+# --field-match-separator so the split is unambiguous for a path containing a colon,
+# and the path/line/column fields are stripped of colour in awk rather than trusted to
+# come out plain. `--colors path:none` does NOT make them plain -- rg still brackets
+# each field with a reset sequence, and those bytes end up inside {2} and {3}, so the
+# preview gets "\033[0m/path/to/file\033[0m" and the relative-path rewrite below never
+# matches its own root. Strip explicitly; only the matched text keeps its highlight.
+grep_list() {
+    local query="$1" root="$2"
+    [ -n "$query" ] || return 0
+    rg --line-number --column --no-heading --smart-case --hidden --follow \
+       --color=always --field-match-separator=$'\t' \
+       --glob '!.git' --glob '!node_modules' --glob '!dist' --glob '!build' \
+       -- "$query" "$root" 2>/dev/null \
+    | awk -F'\t' -v root="$root" -v home="$HOME" '
+        function plain(s) { gsub(/\033\[[0-9;]*m/, "", s); return s }
+        NF >= 4 {
+            abs = plain($1)
+            ln  = plain($2)
+            if (abs == "" || ln !~ /^[0-9]+$/) next
+            text = $4
+            for (i = 5; i <= NF; i++) text = text "\t" $i
+            disp = abs
+            if (index(disp, root "/") == 1)  disp = substr(disp, length(root) + 2)
+            else if (index(disp, home) == 1) disp = "~" substr(disp, length(home) + 1)
+            # Trim leading indentation, so the match rather than the whitespace is
+            # what lands on screen in a deeply nested file.
+            sub(/^[ \t]+/, "", text)
+            printf "f\t%s\t%s\t\033[2m%s\033[0m\033[38;5;244m:%s:\033[0m %s\n", abs, ln, disp, ln, text
+        }'
+}
+
+grep_preview() {
+    local f="$1" line="${2:-1}" from to
+    [ -f "$f" ] || { echo "not a file: $f"; return; }
+    case "$line" in ''|*[!0-9]*) line=1 ;; esac
+    from=$(( line > 12 ? line - 12 : 1 ))
+    to=$(( line + 40 ))
+    bat --color=always --style=numbers --highlight-line "$line" \
+        --line-range="$from:$to" "$f" 2>/dev/null || sed -n "$from,${to}p" "$f"
+}
+
+# Every match for the query as a quickfix file nvim can read with -q: the default
+# errorformat already understands "path:line:col: text".
+grep_quickfix() {
+    local query="$1" root="$2" qf
+    [ -n "$query" ] || return 0
+    qf="$STATE_DIR/quickfix-$INSTANCE"
+    rg --line-number --column --no-heading --smart-case --hidden --follow --color=never \
+       --glob '!.git' --glob '!node_modules' --glob '!dist' --glob '!build' \
+       -- "$query" "$root" 2>/dev/null | head -5000 > "$qf"
+    [ -s "$qf" ] || return 0
+    if [ -n "${FZEDIT_EDITOR:-}" ]; then
+        "$FZEDIT_EDITOR" "$qf"
+        return
+    fi
+    cd "$root" 2>/dev/null || true
+    nvim -q "$qf" +copen
+}
+
+grep_mode() {
+    local scope selected type path line qscope
+    scope=$(resolve_scope)
+    qscope=$(printf '%q' "$scope")
+
+    # --disabled: the query belongs to ripgrep, not to fzf. ^F swaps that round,
+    # freezing the current result set and fuzzy-filtering it instead -- the two-stage
+    # search you want when a common identifier matches four hundred lines.
+    selected=$("$FZP_FZF" --ansi --disabled --height=100% --reverse --info=inline \
+        --delimiter=$'\t' --with-nth='4..' \
+        --prompt="rg [$(basename "$scope")] > " \
+        --header=$'^F fuzzy-filter these results · ^E all matches → quickfix · esc back' \
+        --bind "start:reload:$SELF_BIN --grep-list {q} $qscope" \
+        --bind "change:reload:sleep 0.15; $SELF_BIN --grep-list {q} $qscope || true" \
+        --bind "ctrl-f:unbind(change)+change-prompt(filter > )+enable-search+clear-query+first" \
+        --bind "ctrl-e:execute($SELF_BIN --grep-qf {q} $qscope < /dev/tty > /dev/tty 2>&1)+abort" \
+        --bind 'ctrl-/:toggle-preview' \
+        --bind 'ctrl-n:down' --bind 'ctrl-p:up' \
+        --bind 'ctrl-d:half-page-down' --bind 'ctrl-u:half-page-up' \
+        --bind 'shift-up:preview-up' --bind 'shift-down:preview-down' \
+        --preview "$SELF_BIN --grep-preview {2} {3}" \
+        --preview-window=down:60%:wrap \
+        --tiebreak=begin,index)
+
+    [ -n "$selected" ] || return 0
+    IFS=$'\t' read -r type path line _ <<< "$selected"
+    [ -n "$path" ] || return 0
+    record_history "$path"
+    open_in_editor "$path" "$line"
+}
+
+# ---------------------------------------------------------------------------
+# Preview
+# ---------------------------------------------------------------------------
 
 # Preview: a diff is far more useful than file contents for changed/conflicted files,
 # and for a conflicted file we want to land on the markers rather than line 1.
@@ -596,6 +1245,10 @@ preview_row() {
     bat --color=always --style=numbers --line-range=:200 "$f" 2>/dev/null || cat "$f" 2>/dev/null
 }
 
+# ---------------------------------------------------------------------------
+# Editor and tabs
+# ---------------------------------------------------------------------------
+
 # nvim must be launched with cwd == the repo root, not the scratchpad's fixed cwd:
 # git-conflict.nvim only activates when getcwd()/.git exists, and the eslint LSP and
 # diffview both resolve their root from cwd too.
@@ -612,24 +1265,57 @@ abspath() {
     esac
 }
 
-# Showing the pad.
+# Raising the pad.
 #
-# The pad is an xmonad named scratchpad and this xmonad has no ServerMode/xmonadctl,
-# so the only way to ask for it is to press its key. That key is a TOGGLE, so this
-# has to check visibility first -- otherwise a hand-off from tig would *hide* a pad
-# that was already up. The same key spawns the pad when it isn't running at all.
+# Which key summons the pad is the window manager's business, not fzedit's, and fzedit
+# does not define it. What fzedit needs is narrower: when tig hands a file over, the
+# pad has to come to the FRONT, or the new tab is silently queued behind a hidden
+# window. That is a request to the WM, and each WM takes it differently:
+#
+#   Hyprland  pad.sh toggle <name> -- a real command, which is the right shape.
+#   xmonad    this xmonad has no ServerMode/xmonadctl, so there is no command to
+#             call and the only channel available is to synthesise the keystroke the
+#             user has bound. FZEDIT_PAD_KEY says which one that is; it is a mirror
+#             of the WM's config, not a decision taken here, and nothing else in
+#             fzedit refers to it. Set it in .env if you rebind the pad.
+#
+# Either way the request is a TOGGLE, so visibility is checked first -- otherwise a
+# hand-off from tig would *hide* a pad that was already up.
+#
+# Both backends are here because the xmonad→Hyprland migration is in progress and this
+# script has to keep working under whichever session is booted.
 #
 # FZEDIT_NO_PAD exists so the test suite can never poke the real desktop.
 PAD_CLASS="${FZEDIT_PAD_CLASS:-NSP_fileedit}"
 PAD_KEY="${FZEDIT_PAD_KEY:-ctrl+alt+space}"
+HYPR_PAD="${FZEDIT_HYPR_PAD:-$HOME/.config/hypr/scripts/pad.sh}"
+
+on_hyprland() {
+    [ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" ] && [ -x "$HYPR_PAD" ]
+}
 
 pad_visible() {
+    if on_hyprland; then
+        # Dismissed pads are parked on special:padhidden rather than closed, so
+        # "does a window exist" is not the question -- "is it somewhere you can see"
+        # is.
+        hyprctl clients -j 2>/dev/null \
+            | jq -e --arg c "$PAD_CLASS" \
+                'any(.[]; (.class == $c or .initialClass == $c)
+                          and (.workspace.name // "") != "special:padhidden")' >/dev/null 2>&1
+        return $?
+    fi
     [ -n "$(xdotool search --onlyvisible --class "$PAD_CLASS" 2>/dev/null)" ]
 }
 
-# 0 if we asked xmonad to show it, 1 if we couldn't or it was already up.
+# 0 if we asked the WM to show it, 1 if we couldn't or it was already up.
 show_pad() {
     [ -z "${FZEDIT_NO_PAD:-}" ] || return 1
+    if on_hyprland; then
+        pad_visible && return 1
+        "$HYPR_PAD" toggle "$PAD_CLASS" >/dev/null 2>&1 || return 1
+        return 0
+    fi
     [ -n "${DISPLAY:-}" ] || return 1
     command -v xdotool >/dev/null 2>&1 || return 1
     pad_visible && return 1
@@ -749,7 +1435,75 @@ close_tab() {
     tmux kill-window -t "$TMUX_PANE" 2>/dev/null
 }
 
-# enter means "open this file" or "switch to this worktree" depending on the row.
+# ---------------------------------------------------------------------------
+# Help
+# ---------------------------------------------------------------------------
+#
+# On F1 rather than `?`, which is an ordinary character in a fuzzy query and cannot be
+# stolen without breaking search. This exists for the same reason which-key is on in
+# the editor half: a keymap you cannot recall is a keymap you do not use.
+help_text() {
+    local B=$'\033[1;38;5;221m' D=$'\033[2m' C=$'\033[38;5;81m' O=$'\033[0m'
+    cat <<EOF
+${B}fzedit${O} ${D}— the file pad. Your WM owns the key that summons it.${O}
+
+${B}scope — the rung ladder${O}   ${D}conflicts ⊂ changed ⊂ files ⊂ home${O}
+  TAB / S-TAB    widen / narrow one rung
+  ${C}⊙ rows${O}         switch worktree — type a branch or a ticket id
+  ^T             the full rr picker: tickets, MR state, dirty flags, and
+                 ${D}branches with no worktree yet (it can create one)${O}
+  ^K             ${C}this file, over in another worktree${O} — pick the checkout,
+                 ${D}land on the same path there. The inverse of a ⊙ row, and${O}
+                 ${D}the one you want once you have already found the file.${O}
+
+${B}open${O}
+  enter          open the file  ${D}(or switch to the ⊙ worktree)${O}
+  ^space         mark a row     ${D}(marks accumulate)${O}
+  ^E             open every marked row in ONE nvim ${D}— one LSP start, not N${O}
+  ^O             open in cursor
+  ^S             new tmux window at this file's repo root
+
+${B}find${O}
+  type           fuzzy-match the path
+  ^F             ripgrep file CONTENTS; enter lands on the matching line
+                 ${D}in grep: ^F freezes the results and fuzzy-filters them,${O}
+                 ${D}^E sends every match to nvim's quickfix list (:cn / :cp)${O}
+  esc            clear the query
+  ^R             refresh
+
+${B}git${O}
+  ^A             stage / unstage this file ${D}(the badge says which way)${O}
+  ${D}badges: M modified · A added · ?  untracked · !! conflicted${O}
+  ${D}discarding is deliberately not here — do it in nvim with the diff in front${O}
+  ${D}of you: <leader>gr resets a hunk, <leader>gR the buffer${O}
+
+${B}tabs${O}  ${D}(a tab is a whole fzedit instance, with its own scope and rung)${O}
+  ^G             new tab
+  ^X / ^B        previous / next tab
+  ^M-w           close this tab ${D}(refuses to close the last one)${O}
+  ${D}from tig: E opens the file under the cursor in a new tab, on its line${O}
+
+${B}misc${O}
+  ^C / ^Y        copy absolute / repo-relative path
+  ^/             toggle the preview
+  S-up / S-down  scroll the preview
+  ^N / ^P        down / up      ${D}(^D / ^U for half a page)${O}
+  ^R             refresh, ignoring every cache below
+  F1             this page
+
+${D}config: .env (paths) · ~/.config/fzedit/ignore (home-sweep noise)${O}
+${D}the fd sweeps are cached ${SWEEP_TTL}s and the worktree list ${WT_ROWS_TTL}s, so TAB is instant;${O}
+${D}history, changed and conflicts are never cached and are always live.${O}
+EOF
+}
+
+show_help() {
+    help_text | ${PAGER:-less} -R 2>/dev/null || help_text
+}
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
 case "${1:-}" in
     --rootof)        root_of_file "$2"; exit 0 ;;
@@ -758,14 +1512,28 @@ case "${1:-}" in
     --pick-worktree) pick_worktree; exit 0 ;;
     --preview)       preview_row "$2" "$3"; exit 0 ;;
     --open)          open_row "$2" "$3" "${4:-}"; exit 0 ;;
+    --open-many)     shift; open_many "$@"; exit 0 ;;
     --pin)           pin_scope "$(git_root_of "${2:-$PWD}" || abspath "${2:-$PWD}")"; exit 0 ;;
     --record)        record_history "$2"; exit 0 ;;
     --widen)         shift_rung 1;  exit 0 ;;
     --narrow)        shift_rung -1; exit 0 ;;
+    --stage)         stage_toggle "${2:-}"; exit 0 ;;
+    --copy)          copy_text "${2:-}"; exit 0 ;;
+    --copy-rel)      [ -n "${2:-}" ] && copy_text "$(rel_of "$2")"; exit 0 ;;
+    --carry)         carry_file "${2:-}"; exit 0 ;;
+    --grep)          grep_mode; exit 0 ;;
+    --grep-list)     grep_list "${2:-}" "${3:-$(resolve_scope)}"; exit 0 ;;
+    --grep-preview)  grep_preview "${2:-}" "${3:-1}"; exit 0 ;;
+    --grep-qf)       grep_quickfix "${2:-}" "${3:-$(resolve_scope)}"; exit 0 ;;
+    --help-keys)     show_help; exit 0 ;;
+    --keys)          help_text; exit 0 ;;
     --pad-status)
         # Report what show_pad WOULD do. Exists so this can be verified without
-        # actually pressing xmonad's toggle key and disturbing the desktop.
+        # actually poking the WM and disturbing the desktop.
         if [ -n "${FZEDIT_NO_PAD:-}" ]; then echo "disabled (FZEDIT_NO_PAD)"
+        elif on_hyprland; then
+            if pad_visible; then echo "already-visible (would do nothing)"
+            else echo "hidden (would run $HYPR_PAD toggle $PAD_CLASS)"; fi
         elif [ -z "${DISPLAY:-}" ]; then echo "disabled (no DISPLAY)"
         elif ! command -v xdotool >/dev/null 2>&1; then echo "disabled (no xdotool)"
         elif pad_visible; then echo "already-visible (would do nothing)"
@@ -782,7 +1550,7 @@ while [[ "$#" -gt 0 ]]; do
         --one-shot) PERSIST_MODE="--one-shot"; shift ;;
         *)
             echo "Unknown option: $1" >&2
-            echo "Usage: fzedit [--persist|--one-shot]" >&2
+            echo "Usage: fzedit [--persist|--one-shot|--keys]" >&2
             exit 1
             ;;
     esac
@@ -801,6 +1569,10 @@ if [ -n "${FZEDIT_OPEN:-}" ] && [ -f "$FZEDIT_OPEN" ]; then
 fi
 
 REFRESH="reload($0 --generate-list)+transform-header($0 --header)"
+# ^R is the escape hatch from every TTL above: regenerate, do not serve a cache.
+REFRESH_MED="reload(FZEDIT_RELIST=1 $0 --generate-list)+transform-header(FZEDIT_RELIST=1 $0 --header)"
+# ^R only: rebuild the filesystem sweep too, for when a file appeared behind us.
+REFRESH_HARD="reload(FZEDIT_NO_CACHE=1 $0 --generate-list)+transform-header(FZEDIT_NO_CACHE=1 $0 --header)"
 
 # A fresh launch always starts from the auto-chosen rung; the file only exists to
 # carry the choice across fzf's reloads within this session.
@@ -810,21 +1582,36 @@ generate_list | fzp_run $PERSIST_MODE \
     --delimiter=$'\t' \
     --with-nth='3..' \
     `# fzf-helpers sets --sync, which renders NOTHING until the whole stream ends.` \
-    `# On the home rung that is 2.7M rows and the pad just sits there blank, which` \
-    `# reads as a hung tab. Later options win, so this turns it back off for fzedit.` \
+    `# The home rung is far smaller than it used to be but is still ~207k rows, and` \
+    `# a blank pad reads as a hung tab. Later options win, so this turns it back off.` \
     --no-sync \
+    `# These are paths, not arbitrary strings: --scheme=path puts the bonus on the` \
+    `# character after a "/", so a query that matches a basename beats the same` \
+    `# characters scattered through a long directory prefix.` \
+    --scheme=path \
+    --multi \
     --prompt="edit > " \
     --header="$(header_line)" \
     --preview="$0 --preview {1} {2}" \
     --preview-window=down:55%:wrap \
-    --bind "enter:execute($0 --open {1} {2} < /dev/tty > /dev/tty 2>&1)+$REFRESH" \
+    --bind "enter:execute($0 --open {1} {2} < /dev/tty > /dev/tty 2>&1)+$REFRESH_MED" \
+    --bind "ctrl-e:execute($0 --open-many {+2} < /dev/tty > /dev/tty 2>&1)+deselect-all+$REFRESH_MED" \
+    --bind "ctrl-space:toggle+down" \
     --bind "ctrl-o:execute-silent($0 --record {2}; cursor -r {2})" \
     --bind "ctrl-s:execute-silent(tmux new-window -c \"\$($0 --rootof {2})\")" \
-    --bind "ctrl-c:execute-silent(printf '%s' {2} | xclip -selection clipboard)" \
-    --bind "ctrl-r:$REFRESH" \
+    --bind "ctrl-c:execute-silent($0 --copy {2})" \
+    --bind "ctrl-y:execute-silent($0 --copy-rel {2})" \
+    --bind "ctrl-a:execute-silent($0 --stage {2})+$REFRESH_MED" \
+    --bind "ctrl-f:execute($0 --grep < /dev/tty > /dev/tty 2>&1)+$REFRESH_MED" \
+    --bind "ctrl-r:$REFRESH_HARD" \
     --bind "ctrl-g:execute-silent($0 --tab)" \
     --bind "tab:execute-silent($0 --widen)+$REFRESH" \
     --bind "btab:execute-silent($0 --narrow)+$REFRESH" \
-    --bind "ctrl-t:execute($0 --pick-worktree < /dev/tty > /dev/tty 2>&1)+$REFRESH" \
+    --bind "ctrl-t:execute($0 --pick-worktree < /dev/tty > /dev/tty 2>&1)+$REFRESH_MED" \
+    --bind "ctrl-k:execute($0 --carry {2} < /dev/tty > /dev/tty 2>&1)+$REFRESH_MED" \
+    --bind "f1:execute($0 --help-keys < /dev/tty > /dev/tty 2>&1)" \
+    --bind "esc:clear-query" \
+    --bind "shift-up:preview-up" \
+    --bind "shift-down:preview-down" \
     --header-lines=0 \
     --tiebreak=begin,index
