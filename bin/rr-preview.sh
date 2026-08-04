@@ -25,7 +25,7 @@ branch="${full_branch#REMOTE:}"
 branch="${branch#TICKET:}"
 
 # Extract JIRA ticket number
-ticket=$(echo "$branch" | grep -oiE "${JIRA_PROJECT_REGEX}-[0-9]\+" | tr '[:lower:]' '[:upper:]' | head -1)
+ticket=$(echo "$branch" | grep -oiE "${JIRA_PROJECT_REGEX}-[0-9]+" | tr '[:lower:]' '[:upper:]' | head -1)
 
 jira_url=""
 [ -n "$ticket" ] && [ -n "$JIRA_DOMAIN" ] && jira_url="https://${JIRA_DOMAIN}/browse/${ticket}"

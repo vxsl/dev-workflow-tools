@@ -10,7 +10,7 @@ REPO_ROOT="$(cd "$(dirname "$BATS_TEST_FILENAME")/.." && pwd)"
 # Setup: create a repo with a worktree that has a mismatched branch
 setup_displaced_worktree() {
     setup_git_repo
-    export JIRA_PROJECT="TEST"
+    export JIRA_PROJECT="TEST" JIRA_PROJECT_REGEX="TEST"
 
     # Create the ticket branch
     create_branch_at_time "TEST-100" "1770000000"
@@ -71,7 +71,7 @@ teardown() {
 
 @test "build_worktree_map: no extra displaced mapping when branch matches (title-suffixed dir)" {
     setup_git_repo
-    export JIRA_PROJECT="TEST"
+    export JIRA_PROJECT="TEST" JIRA_PROJECT_REGEX="TEST"
 
     # Create branch and worktree where eponymous starts with actual (normal case)
     create_branch_at_time "TEST-200" "1770000000"
@@ -98,7 +98,7 @@ teardown() {
 
 @test "build_worktree_map: no displaced mapping when ticket branch does not exist" {
     setup_git_repo
-    export JIRA_PROJECT="TEST"
+    export JIRA_PROJECT="TEST" JIRA_PROJECT_REGEX="TEST"
 
     # Create a worktree with a branch that has no matching ticket branch
     cd "$TEST_GIT_REPO"
@@ -152,7 +152,7 @@ teardown() {
 
     cd "$TEST_GIT_REPO"
     export GIT_ROOT="$TEST_GIT_REPO"
-    export JIRA_PROJECT="TEST"
+    export JIRA_PROJECT="TEST" JIRA_PROJECT_REGEX="TEST"
     export BRANCH_MAX_LENGTH=40
 
     declare -A WORKTREE_MAP=()
