@@ -368,6 +368,110 @@ tmux_pane_exists() {
     tmux list-panes -a -F "#{session_name}:#{window_index}.#{pane_index}" 2>/dev/null | grep -q "^${pane_id}$"
 }
 
+# Foreground commands that mean "this pane is back at its own prompt".
+# Anything else still owns the tty, and bytes we send land in THAT program.
+IDLE_PANE_SHELLS="zsh bash fish sh dash ksh"
+
+pane_foreground_command() {
+    tmux display-message -p -t "$1" '#{pane_current_command}' 2>/dev/null
+}
+
+pane_is_at_prompt() {
+    local cmd="${1#-}"   # login shells report as -zsh
+    case " $IDLE_PANE_SHELLS " in
+        *" $cmd "*) return 0 ;;
+    esac
+    return 1
+}
+
+# The foreground process group on a pane's controlling terminal — the thing that
+# is actually reading the keys we send, whether that's the shell or a child.
+pane_foreground_pgid() {
+    local pane_pid tpgid
+
+    pane_pid=$(tmux display-message -p -t "$1" '#{pane_pid}' 2>/dev/null) || return 1
+    [ -n "$pane_pid" ] || return 1
+
+    tpgid=$(ps -o tpgid= -p "$pane_pid" 2>/dev/null | tr -d ' ')
+    case "$tpgid" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    [ "$tpgid" -gt 1 ] || return 1
+
+    echo "$tpgid"
+}
+
+# Signal a pane's foreground process group for real.
+#
+# `send-keys C-c` only writes the byte 0x03, which is a keystroke and nothing
+# more. A program holding stdin in raw mode — every dev server that binds
+# single-letter shortcuts does — reads it as data and never sees SIGINT, so it
+# keeps the terminal and keeps eating everything we type at it. And at a zsh
+# prompt a vi-mode keymap can have 0x03 bound to something that inserts it
+# literally instead of breaking the line. A signal bypasses both.
+signal_pane_foreground() {
+    local pane_id="$1"
+    local sig="$2"
+    local pgid
+
+    pgid=$(pane_foreground_pgid "$pane_id") || return 1
+    kill -"$sig" "-$pgid" 2>/dev/null
+}
+
+wait_for_pane_prompt() {
+    local pane_id="$1"
+    local polls="$2"
+
+    while [ "$polls" -gt 0 ]; do
+        pane_is_at_prompt "$(pane_foreground_command "$pane_id")" && return 0
+        sleep 0.1
+        polls=$((polls - 1))
+    done
+    return 1
+}
+
+# Get a pane back to its shell prompt, escalating until it actually is.
+#
+# A fixed sleep cannot do this job: node needs well over half a second to unwind,
+# and until it does it still owns the tty. Anything typed into that window lands
+# in the dying dev server, and whatever fragment reaches zle afterwards gets read
+# as key bindings rather than text — which is how `cd "/path"` shows up in the
+# pane as `ea "/path"`, sitting there unexecuted.
+reclaim_pane() {
+    local pane_id="$1"
+
+    # send-keys into a pane sitting in copy mode drives copy mode, not the shell
+    if [ "$(tmux display-message -p -t "$pane_id" '#{pane_in_mode}' 2>/dev/null)" = "1" ]; then
+        tmux send-keys -t "$pane_id" -X cancel 2>/dev/null || true
+    fi
+
+    tmux send-keys -t "$pane_id" C-c 2>/dev/null || true
+    wait_for_pane_prompt "$pane_id" 12 && return 0
+
+    # SIGINT to the foreground group is exactly what ^C would have done, so
+    # escalating early costs a well-behaved program nothing
+    signal_pane_foreground "$pane_id" INT
+    wait_for_pane_prompt "$pane_id" 25 && return 0
+
+    signal_pane_foreground "$pane_id" TERM
+    wait_for_pane_prompt "$pane_id" 20
+}
+
+# Type a command line into a pane as one bracketed paste plus one Enter.
+#
+# zle inserts a bracketed paste in a single widget call, so no character of it
+# can be read as a key binding — which is what shredded these lines when they
+# were sent character by character into a line editor left in vi command mode.
+# tmux falls back to a plain paste if the pane never asked for bracketed mode.
+send_pane_command() {
+    local pane_id="$1"
+    local line="$2"
+
+    tmux set-buffer -b rr-pane-cmd -- "$line" 2>/dev/null || return 1
+    tmux paste-buffer -d -p -b rr-pane-cmd -t "$pane_id" 2>/dev/null || return 1
+    tmux send-keys -t "$pane_id" C-m 2>/dev/null || return 1
+}
+
 # Send commands to a tmux pane to switch to a new worktree
 switch_pane_target() {
     local pane_type="$1"
@@ -398,25 +502,32 @@ switch_pane_target() {
         fi
     fi
 
-    # Kill current process in the pane (send Ctrl-C)
-    tmux send-keys -t "$pane_id" C-c 2>/dev/null || true
-    sleep 0.5
+    # Stop whatever is running and wait for the shell to actually come back.
+    # Typing before that point is how the pane ends up with a mangled command
+    # sitting unexecuted in its line editor.
+    if ! reclaim_pane "$pane_id"; then
+        echo "✗ Pane '$pane_id' is still busy — refusing to type into it" >&2
+        echo "  '$(pane_foreground_command "$pane_id")' is holding the terminal; stop it and retry" >&2
+        return 1
+    fi
+    sleep 0.2   # let zle finish drawing its prompt
 
-    # Clear the pane
-    tmux send-keys -t "$pane_id" "clear" C-m 2>/dev/null || true
-    sleep 0.2
+    # Discard anything the outgoing program left in the line editor. This has to
+    # be a signal: `send-keys C-c` at a prompt is measurably a no-op here — zle
+    # takes 0x03 as a keystroke and the junk survives to be prefixed onto ours.
+    signal_pane_foreground "$pane_id" INT
+    sleep 0.15
 
-    # Change directory to target with error checking
-    tmux send-keys -t "$pane_id" "cd \"$target_dir\" 2>/dev/null || echo '✗ Failed to cd to $target_dir'" C-m 2>/dev/null || true
-    sleep 0.3
+    # clear + cd + pwd + the pane command as ONE paste and ONE Enter. Every
+    # extra write is another chance to land mid-command; a single multi-line
+    # buffer cannot interleave with itself.
+    local pane_line="clear; if cd \"$target_dir\" 2>/dev/null; then pwd; else echo '✗ Failed to cd to $target_dir'; fi"
+    [ -n "$command" ] && pane_line="$pane_line
+$command"
 
-    # Verify the directory change worked by checking PWD
-    tmux send-keys -t "$pane_id" "pwd" C-m 2>/dev/null || true
-    sleep 0.1
-
-    # Run the command if provided
-    if [ -n "$command" ]; then
-        tmux send-keys -t "$pane_id" "$command" C-m 2>/dev/null || true
+    if ! send_pane_command "$pane_id" "$pane_line"; then
+        echo "✗ Failed to send keys to pane '$pane_id'" >&2
+        return 1
     fi
 
     local display_path="$wt_path"

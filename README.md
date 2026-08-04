@@ -225,9 +225,9 @@ RR_TSC_WATCH_COMMAND="yarn tsc-watch"
 2. Press `F4` to set it as the dev server target
 3. Press `F5` to set it as the tsc-watch target
 4. The script will automatically:
-   - Kill the current process in the pane (Ctrl-C)
-   - cd to the selected worktree
-   - Run the configured command
+   - Stop the current process in the pane (Ctrl-C, escalating to SIGINT then SIGTERM for anything that holds stdin in raw mode and ignores a bare `^C`)
+   - Wait for the pane's own shell prompt to come back — it will refuse rather than type into a program that is still holding the terminal
+   - cd to the selected worktree and run the configured command, sent as a single bracketed paste so no character of it can be read as a key binding
 
 **Visual Indicators:**
 - `▶` (green) - This worktree is running the dev server
