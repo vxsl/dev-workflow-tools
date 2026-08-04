@@ -285,6 +285,9 @@ tools agree on "most recent" and each updates it.
 
 `bats test/fzedit.bats` — 125 end-to-end tests.
 
+See [WORKFLOW.md](WORKFLOW.md) for the whole loop — fzedit, nvim, tig and rr
+together — including the nvim keymaps worth internalising.
+
 ### `restage`
 Unstage two WIP commits, keeping oldest staged.
 
