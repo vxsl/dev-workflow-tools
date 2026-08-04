@@ -8,7 +8,7 @@
 #
 #   TAB    widen one rung        S-TAB  narrow one rung
 #   ^G     new tab (a whole separate instance)
-#   ^T     browse worktrees on their own, most recent first
+#   ^R     browse worktrees on their own, most recent first (r for rr)
 #   ^F     search file CONTENTS (ripgrep), landing on the matching line
 #   F1     the whole keymap, without leaving the pad
 #
@@ -17,15 +17,18 @@
 # on this session, which sync_tab_chrome sets -- a root-table binding is shadowed by
 # the prefix key, so with the default prefix C-b would never reach its binding.
 #
-# ^T rather than M-w: xmonad grabs Alt-w for NSP_slack, so it never reaches us. ^W is
+# ^R for the rr picker, and refresh pushed out to F5: r is the letter this tool is
+# named after, and reaching for the rr key is a hundred times more frequent here than
+# reaching for a refresh -- everything that can change the listing already rebuilds it,
+# so ^R-as-refresh was only ever for a file that appeared behind the pad's back. Not M-w
+# (nor any Alt key): Alt is the WM's mod key, xmonad grabs Alt-w for NSP_slack, and an
+# Alt binding is a coin flip on whether the keystroke reaches the terminal at all. ^W is
 # left alone deliberately -- it is delete-word in the query, which is worth keeping.
-# Nothing here binds Alt at all: Alt is xmonad's mod key, so an Alt binding is a coin
-# flip on whether the keystroke ever reaches the terminal.
 #
 #   enter  open file / switch worktree     ^O cursor    ^S tmux window here
 #   ^space mark a row    ^E open every marked row in ONE nvim
 #   ^A     stage / unstage                 esc clear the query
-#   ^R     refresh       ^C copy abs path  ^Y copy repo-relative path
+#   F5     refresh       ^C copy abs path  ^Y copy repo-relative path
 #
 # Launches on `home`: the pad is a general "open a file" tool first, and starting
 # narrow means the file you want is often simply not in the list. S-TAB narrows from
@@ -347,8 +350,15 @@ format_lines() {
             } else if (index(name, home) == 1) {
                 name = "~" substr(name, length(home) + 1)
             }
-            printf "%s\t%s\t\033[38;5;%sm⊙ %s\033[0m  \033[2m%s\033[0m\n", \
-                   type, abs, (wcol == "" ? "81" : wcol), name, xy
+            # A filled block, the same one the header and the p10k prompt segment draw,
+            # rather than a tinted glyph: on a list this long a foreground tint reads as
+            # "some syntax colour" and a block reads as "this is a checkout". No block at
+            # all on the primary, which is how it says so everywhere else.
+            if (wcol == "")
+                printf "%s\t%s\t\033[1m⊙ %s\033[0m  \033[2m%s\033[0m\n", type, abs, name, xy
+            else
+                printf "%s\t%s\t\033[48;5;%sm\033[30m⊙ %s\033[0m  \033[2m%s\033[0m\n", \
+                       type, abs, wcol, name, xy
             next
         }
 
@@ -961,7 +971,7 @@ header_line() {
         fi
     done
 
-    printf '%s\n%sTAB widen · S-TAB narrow ·%s%s  %s· ^F grep · ^T worktrees · ^G tab · F1 keys%s\n' \
+    printf '%s\n%sTAB widen · S-TAB narrow ·%s%s  %s· ^F grep · ^R rr · ^G tab · F1 keys%s\n' \
         "$label" "$ESC_DIM" "$ESC_OFF" "$ladder" "$ESC_DIM" "$ESC_OFF"
 }
 
@@ -1032,9 +1042,9 @@ choose_worktree() {
         | awk -F'\t' -v home="$HOME" "$WTC_AWK"'{
               d = $1; sub("^" home, "~", d)
               c = wtc_colour($3)
-              # Same tint as the ⊙ rows and the prompt, so the plain picker is not the
+              # Same block as the ⊙ rows and the prompt, so the plain picker is not the
               # one place in the loop where a worktree loses its colour.
-              if (c != "") d = "\033[38;5;" c "m" d "\033[0m"
+              if (c != "") d = "\033[48;5;" c "m\033[30m" d "\033[0m"
               printf "%s\t%s\t%s\n", $1, d, $2
           }' \
         | "$FZP_FZF" --ansi --delimiter='\t' --with-nth=2.. --height=100% --reverse \
@@ -1352,10 +1362,14 @@ preview_row() {
         # label that knows better.
         if [ -n "$gd" ] && read_wt_state "$gd"; then
             wtc_colour "$WT_KEY"
-            printf '\033[38;5;%sm⊙ %s\033[0m  \033[2m%s\033[0m\n' \
-                   "${WTC_COLOUR:-81}" "$f" "$WT_LABEL"
+            if [ -n "$WTC_COLOUR" ]; then
+                printf '\033[48;5;%sm\033[30m⊙ %s\033[0m  \033[2m%s\033[0m\n' \
+                       "$WTC_COLOUR" "$f" "$WT_LABEL"
+            else
+                printf '\033[1m⊙ %s\033[0m  \033[2m%s\033[0m\n' "$f" "$WT_LABEL"
+            fi
         else
-            printf '\033[38;5;81m⊙ %s\033[0m\n' "$f"
+            printf '\033[1m⊙ %s\033[0m\n' "$f"
         fi
         git -C "$f" status --short --branch 2>/dev/null | head -40
         return
@@ -1605,7 +1619,7 @@ ${B}scope — the rung ladder${O}   ${D}conflicts ⊂ changed ⊂ files ⊂ home
   ${C}⊙ rows${O}         switch worktree — type a branch or a ticket id
                  ${D}each checkout has its own colour, the same one the p10k${O}
                  ${D}prompt segment gives it, so it is recognisable on sight${O}
-  ^T             the full rr picker: tickets, MR state, dirty flags, and
+  ^R             the full rr picker: tickets, MR state, dirty flags, and
                  ${D}branches with no worktree yet (it can create one)${O}
   ^K             ${C}this file, over in another worktree${O} — pick the checkout,
                  ${D}land on the same path there. The inverse of a ⊙ row, and${O}
@@ -1624,7 +1638,7 @@ ${B}find${O}
                  ${D}in grep: ^F freezes the results and fuzzy-filters them,${O}
                  ${D}^E sends every match to nvim's quickfix list (:cn / :cp)${O}
   esc            clear the query
-  ^R             refresh
+  F5             refresh
 
 ${B}git${O}
   ^A             stage / unstage this file ${D}(the badge says which way)${O}
@@ -1645,7 +1659,7 @@ ${B}misc${O}
   ^/             toggle the preview
   S-up / S-down  scroll the preview
   ^N / ^P        down / up      ${D}(^D / ^U for half a page)${O}
-  ^R             refresh, ignoring every cache below
+  F5             refresh, ignoring every cache below
   F1             this page
 
 ${D}config: .env (paths) · ~/.config/fzedit/ignore (home-sweep noise)${O}
@@ -1761,11 +1775,11 @@ generate_list | fzp_run $PERSIST_MODE \
     --bind "ctrl-y:execute-silent($0 --copy-rel {2})" \
     --bind "ctrl-a:execute-silent($0 --stage {2})+$REFRESH_MED" \
     --bind "ctrl-f:execute($0 --grep < /dev/tty > /dev/tty 2>&1)+$REFRESH_MED" \
-    --bind "ctrl-r:$REFRESH_HARD" \
+    --bind "f5:$REFRESH_HARD" \
     --bind "ctrl-g:execute-silent($0 --tab)" \
     --bind "tab:execute-silent($0 --widen)+$REFRESH" \
     --bind "btab:execute-silent($0 --narrow)+$REFRESH" \
-    --bind "ctrl-t:execute($0 --pick-worktree < /dev/tty > /dev/tty 2>&1)+$REFRESH_MED" \
+    --bind "ctrl-r:execute($0 --pick-worktree < /dev/tty > /dev/tty 2>&1)+$REFRESH_MED" \
     --bind "ctrl-k:execute($0 --carry {2} < /dev/tty > /dev/tty 2>&1)+$REFRESH_MED" \
     --bind "ctrl-l:execute($0 --tig {1} {2} < /dev/tty > /dev/tty 2>&1)+$REFRESH_MED" \
     --bind "f1:execute($0 --help-keys < /dev/tty > /dev/tty 2>&1)" \

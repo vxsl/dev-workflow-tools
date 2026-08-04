@@ -397,19 +397,21 @@ teardown() {
     [[ "$out" == *"main"* ]]
 }
 
-# The tint is the same one the p10k prompt segment gives that checkout, from the same
-# palette and the same hash (lib/worktree-colour.sh). Asserted against the library rather
-# than against a hardcoded colour, because a hardcoded number would still pass if the
-# prompt and the picker drifted apart, which is the only failure that matters here.
-@test "worktree rows are tinted with the colour the prompt segment would use" {
+# A filled block, in the colour the p10k prompt segment gives that same checkout, from the
+# same palette and the same hash (lib/worktree-colour.sh). Asserted against the library
+# rather than a hardcoded number, because a literal would still pass if the prompt and the
+# picker drifted apart — the only failure that actually matters here.
+@test "worktree rows are blocks in the colour the prompt segment would use" {
     source "$FZEDIT_REPO_ROOT/lib/worktree-colour.sh"
     pin_scope "$WT_FEATURE"
     set_mode files
     wtc_colour "$(basename "$(git -C "$WT_FEATURE" rev-parse --absolute-git-dir)")"
     [ -n "$WTC_COLOUR" ]
     out="$(rows_of_type w | awk -F'\t' -v p="$WT_FEATURE" '$2 == p { print $3 }')"
-    [[ "$out" == *$'\033'"[38;5;${WTC_COLOUR}m⊙"* ]] \
-        || { echo "row: $out (wanted 38;5;$WTC_COLOUR)"; return 1; }
+    # background + black text, not a foreground tint: on a list this long a tint reads as
+    # syntax colour, and a block reads as "this row is a checkout"
+    [[ "$out" == *$'\033'"[48;5;${WTC_COLOUR}m"$'\033'"[30m⊙"* ]] \
+        || { echo "row: $out (wanted 48;5;$WTC_COLOUR)"; return 1; }
 }
 
 # Colour by git's name for the worktree — the directory under .git/worktrees — not by the
@@ -422,20 +424,20 @@ teardown() {
     set_mode files
     wtc_colour "$(basename "$(git -C "$WT_NESTED" rev-parse --absolute-git-dir)")"
     out="$(rows_of_type w | awk -F'\t' -v p="$WT_NESTED" '$2 == p { print $3 }')"
-    [[ "$out" == *$'\033'"[38;5;${WTC_COLOUR}m⊙"* ]] \
-        || { echo "row: $out (wanted 38;5;$WTC_COLOUR)"; return 1; }
+    [[ "$out" == *$'\033'"[48;5;${WTC_COLOUR}m"$'\033'"[30m⊙"* ]] \
+        || { echo "row: $out (wanted 48;5;$WTC_COLOUR)"; return 1; }
 }
 
-# The primary worktree has no entry under .git/worktrees, so it has no key and gets the
-# flat fallback rather than a hash of something incidental. "Untinted" is the signal that
-# you are on the main checkout. (81 is also a palette entry — the assertion is on the
-# observable colour, since the fallback is what the row is actually meant to show.)
-@test "the primary worktree row is left untinted" {
+# The primary worktree has no entry under .git/worktrees, so it has no key and gets no
+# block — the same nothing the prompt segment draws there. Asserted as the ABSENCE of a
+# background, which is the actual signal, rather than as some particular fallback colour.
+@test "the primary worktree row gets no block" {
     pin_scope "$WT_FEATURE"
     set_mode files
     out="$(rows_of_type w | awk -F'\t' -v p="$MAIN" '$2 == p { print $3 }')"
     [ -n "$out" ]
-    [[ "$out" == *$'\033'"[38;5;81m⊙"* ]] || { echo "row: $out"; return 1; }
+    [[ "$out" == *"⊙"* ]]
+    [[ "$out" != *$'\033'"[48;5;"* ]] || { echo "row: $out"; return 1; }
 }
 
 # --------------------------------------------------------------------------
@@ -466,7 +468,7 @@ teardown() {
 }
 
 # No block at all on the primary, matching the prompt segment, which draws nothing there.
-# "No block" has to keep meaning "you are on main" in both windows or it means nothing.
+# "No block" has to keep meaning "you are on main" everywhere or it means nothing.
 @test "the primary checkout gets no block in the header either" {
     pin_scope "$MAIN"
     out="$(fz --header)"
@@ -638,7 +640,7 @@ teardown() {
     [[ "$out" == *"tab:execute-silent"*"--widen"* ]]
     [[ "$out" == *"btab:execute-silent"*"--narrow"* ]]
     # xmonad grabs Alt-w for NSP_slack, so the worktree browse must not be on M-w.
-    [[ "$out" == *"ctrl-t:execute"*"--pick-worktree"* ]]
+    [[ "$out" == *"ctrl-r:execute"*"--pick-worktree"* ]]
     [[ "$out" != *"alt-w:"* ]]
     [[ "$out" == *"enter:execute"*"--open"* ]]
     # ^G is the one-key "new tab" shortcut
@@ -1127,12 +1129,13 @@ ED
         esac
         caret="^$(printf '%s' "${key#ctrl-}" | tr '[:lower:]' '[:upper:]')"
         [ "$key" = "ctrl-space" ] && caret="^space"
-        [ "$key" = "f1" ] && caret="F1"
+        # function keys are written as themselves, not with a caret
+        case "$key" in f[0-9]*) caret="${key^^}" ;; esac
         if [[ "$help" != *"$caret"* ]]; then
             echo "bound but undocumented: $key (looked for '$caret')"
             return 1
         fi
-    done < <(printf '%s\n' "$args" | grep -oE '^(ctrl|alt)-[a-z]+|^f1' | sort -u)
+    done < <(printf '%s\n' "$args" | grep -oE '^(ctrl|alt)-[a-z]+|^f[0-9]+' | sort -u)
 }
 
 @test "--keys works standalone, for when the pad is not even running" {
@@ -1327,11 +1330,11 @@ ED
     out="$(FZP_FZF="$TEST_TMPDIR/fakebin/fzfargs" "$FZEDIT" --one-shot 2>&1)"
     # The whole point of the cache: only the two rung keys may read it.
     [[ "$out" == *"tab:execute-silent"*"--widen"* ]]
-    for bind in enter ctrl-e ctrl-a ctrl-f ctrl-t ctrl-k; do
+    for bind in enter ctrl-e ctrl-a ctrl-f ctrl-r ctrl-k; do
         line="$(printf '%s\n' "$out" | grep -E "^${bind}:")"
         [[ "$line" == *"FZEDIT_RELIST=1"* ]] || { echo "$bind does not rebuild: $line"; return 1; }
     done
-    line="$(printf '%s\n' "$out" | grep -E '^ctrl-r:')"
+    line="$(printf '%s\n' "$out" | grep -E '^f5:')"
     [[ "$line" == *"FZEDIT_NO_CACHE=1"* ]]
     # ...and the rung keys must NOT, or TAB is slow again.
     line="$(printf '%s\n' "$out" | grep -E '^tab:')"

@@ -195,8 +195,12 @@ If auto-clear is unavailable, the summary will show installation instructions or
 - **Gray (no symbol)** - Other branches (not assigned to you)
 
 **Visual Indicators:**
-- `⚡` Worktree exists
-- `⌘` Worktree status (green=clean, orange=dirty)
+- `⊙` on a filled block — this branch has a worktree, and the block is *that worktree's*
+  colour, the same one the p10k prompt segment and fzedit give it (see
+  `lib/worktree-colour.sh`). The block runs across the branch name too, so the whole cell
+  reads as one segment. The primary checkout is deliberately left unblocked.
+- `!` after the block — the worktree is dirty
+- `⊙≠` — a different branch is checked out in that worktree
 
 #### Tmux Pane Management (Optional)
 
@@ -285,13 +289,13 @@ reading.
 | `^space` / `^E` | mark rows / open every marked row in **one** nvim |
 | `^F` | ripgrep file *contents*, landing on the matching line |
 | `^K` | this file, over in another worktree |
-| `^T` | worktree picker — hands off to `rr`, so you get tickets, MR state, dirty flags |
+| `^R` | worktree picker — hands off to `rr`, so you get tickets, MR state, dirty flags |
 | `^L` | tig: this file's history, or `tig status` on a `⊙` row |
 | `^A` | stage / unstage |
 | `^O` `^S` | open in cursor / new tmux window at the repo root |
 | `^C` `^Y` | copy absolute / repo-relative path |
 | `^G` `^X` `^B` | new tab / previous / next  (a tab is a whole fzedit instance) |
-| `esc` `^R` | clear the query / refresh, ignoring caches |
+| `esc` `F5` | clear the query / refresh, ignoring caches |
 
 Inside `^F`: `^F` again freezes the results and fuzzy-filters them, `^E` sends every
 match to nvim's quickfix list.

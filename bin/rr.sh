@@ -2354,10 +2354,11 @@ format_current_branch_as_row() {
             local wt_path="$PWD"
 
             if ! git diff-index --quiet HEAD 2>/dev/null; then
-                wt_display=$(printf ' \033[38;5;250m⊙\033[38;5;214m !\033[0m')
+                render_wt_indicator "$wt_path" "" dirty
             else
-                wt_display=$(printf ' \033[38;5;250m⊙\033[0m  ')
+                render_wt_indicator "$wt_path" "" ""
             fi
+            wt_display="$WT_INDICATOR_DISPLAY"
             # " ⊙ !" or " ⊙  " = space(1) + ⊙(1) + space(1) + !(1) or space(1) = 4 visual cols
             wt_visual_width=4
 
@@ -2780,17 +2781,15 @@ if [ "$GENERATE_MORE_MODE" = true ]; then
         # Pad branch for display (with star/dot/spaces and worktree indicator)
         # Worktree indicator: ⊙  (clean), ⊙! (dirty), ⊙≠ (mismatch - different branch checked out)
         wt_display=""
+        WT_BRANCH_SGR=""
         branch_width=$((BRANCH_MAX_LENGTH-2))
         _wt_mismatch_branch=""
         [[ "$wt_indicator" == "WT_MISMATCH:"* ]] && _wt_mismatch_branch="${wt_indicator#WT_MISMATCH:}"
         if [ "$wt_indicator" = "WT" ] || [ -n "$_wt_mismatch_branch" ]; then
-            if [ -n "$_wt_mismatch_branch" ]; then
-                wt_display=$(printf ' \033[38;5;214m⊙≠\033[0m ')
-            elif [ "$wt_status" = "DIRTY" ]; then
-                wt_display=$(printf ' \033[38;5;250m⊙\033[38;5;214m !\033[0m')
-            else
-                wt_display=$(printf ' \033[38;5;250m⊙\033[0m  ')
-            fi
+            _wt_dirty=""
+            [ "$wt_status" = "DIRTY" ] && _wt_dirty=dirty
+            render_wt_indicator "$wt_path" "$_wt_mismatch_branch" "$_wt_dirty"
+            wt_display="$WT_INDICATOR_DISPLAY"
             # " ⊙≠ " / " ⊙ !" / " ⊙  " = 4 visual cols each
             wt_visual_width=4
 
@@ -2861,18 +2860,18 @@ if [ "$GENERATE_MORE_MODE" = true ]; then
         elif [ -n "$JIRA_ME" ] && [ "$assignee_lower" = "$jira_me_lower" ]; then
             if [ "$is_authoritative" = true ]; then
                 # Authoritative branch assigned to me - full star, bright purple
-                display_branch=$(printf "\033[38;5;141m★ %-${branch_width}s\033[0m%s" "$branch_display" "$wt_display")
+                display_branch=$(printf "\033[38;5;141m★ %s%-${branch_width}s\033[0m%s" "$WT_BRANCH_SGR" "$branch_display" "$wt_display")
                 printf "%s │ \033[38;5;141m%s\033[0m │ %s │ \033[38;5;109m%s\033[0m │ \033[2;37m%-26s\033[0m │ \033[2;37m%-${COMMIT_MAX_LENGTH}s\033[0m │ %s │ %s\n" \
                     "$display_branch" "$title_column" "$display_status" "$display_assignee" "$time_info" "$commit_info" "$full_branch" "$title"
             else
                 # Variant branch assigned to me - dim dot, grayed purple (103)
-                display_branch=$(printf "\033[38;5;244m· \033[38;5;103m%-${branch_width}s\033[0m%s" "$branch_display" "$wt_display")
+                display_branch=$(printf "\033[38;5;244m· \033[38;5;103m%s%-${branch_width}s\033[0m%s" "$WT_BRANCH_SGR" "$branch_display" "$wt_display")
                 printf "%s │ \033[38;5;103m%s\033[0m │ %s │ \033[38;5;244m%s\033[0m │ \033[2;37m%-26s\033[0m │ \033[2;37m%-${COMMIT_MAX_LENGTH}s\033[0m │ %s │ %s\n" \
                     "$display_branch" "$title_column" "$display_status" "$display_assignee" "$time_info" "$commit_info" "$full_branch" "$title"
             fi
         else
             # Normal formatting with 2-space indent for alignment
-            display_branch=$(printf "  \033[38;5;250m%-${branch_width}s\033[0m%s" "$branch_display" "$wt_display")
+            display_branch=$(printf "  \033[38;5;250m%s%-${branch_width}s\033[0m%s" "$WT_BRANCH_SGR" "$branch_display" "$wt_display")
             printf "%s │ \033[38;5;109m%s\033[0m │ %s │ \033[38;5;244m%s\033[0m │ \033[2;37m%-26s\033[0m │ \033[2;37m%-${COMMIT_MAX_LENGTH}s\033[0m │ %s │ %s\n" \
                 "$display_branch" "$title_column" "$display_status" "$display_assignee" "$time_info" "$commit_info" "$full_branch" "$title"
         fi
@@ -2989,17 +2988,15 @@ mkfifo "$_data_fifo"
             # Pad branch for display (with star/dot/spaces and worktree indicator)
             # Worktree indicator: ⊙  (clean), ⊙! (dirty), ⊙≠ (mismatch - different branch checked out)
             wt_display=""
+            WT_BRANCH_SGR=""
             branch_width=$((BRANCH_MAX_LENGTH-2))
             _wt_mismatch_branch=""
             [[ "$wt_indicator" == "WT_MISMATCH:"* ]] && _wt_mismatch_branch="${wt_indicator#WT_MISMATCH:}"
             if [ "$wt_indicator" = "WT" ] || [ -n "$_wt_mismatch_branch" ]; then
-                if [ -n "$_wt_mismatch_branch" ]; then
-                    wt_display=$(printf ' \033[38;5;214m⊙≠\033[0m ')
-                elif [ "$wt_status" = "DIRTY" ]; then
-                    wt_display=$(printf ' \033[38;5;250m⊙\033[38;5;214m !\033[0m')
-                else
-                    wt_display=$(printf ' \033[38;5;250m⊙\033[0m  ')
-                fi
+                _wt_dirty=""
+                [ "$wt_status" = "DIRTY" ] && _wt_dirty=dirty
+                render_wt_indicator "$wt_path" "$_wt_mismatch_branch" "$_wt_dirty"
+                wt_display="$WT_INDICATOR_DISPLAY"
                 # " ⊙≠ " / " ⊙ !" / " ⊙  " = 4 visual cols each
                 wt_visual_width=4
 
@@ -3065,18 +3062,18 @@ mkfifo "$_data_fifo"
             elif [ -n "$JIRA_ME" ] && [ "$assignee_lower" = "$_jira_me_lower" ]; then
                 if [ "$is_authoritative" = true ]; then
                     # Authoritative branch assigned to me - full star, bright purple
-                    display_branch=$(printf "\033[38;5;141m★ %-${branch_width}s\033[0m%s" "$branch_display" "$wt_display")
+                    display_branch=$(printf "\033[38;5;141m★ %s%-${branch_width}s\033[0m%s" "$WT_BRANCH_SGR" "$branch_display" "$wt_display")
                     printf "%s │ \033[38;5;141m%s\033[0m │ %s │ \033[38;5;109m%s\033[0m │ \033[2;37m%-26s\033[0m │ \033[2;37m%-${COMMIT_MAX_LENGTH}s\033[0m │ %s │ %s\n" \
                         "$display_branch" "$display_title" "$display_status" "$display_assignee" "$time_info" "$commit_info" "$full_branch" "$title"
                 else
                     # Variant branch assigned to me - dim dot, grayed purple (103)
-                    display_branch=$(printf "\033[38;5;244m· \033[38;5;103m%-${branch_width}s\033[0m%s" "$branch_display" "$wt_display")
+                    display_branch=$(printf "\033[38;5;244m· \033[38;5;103m%s%-${branch_width}s\033[0m%s" "$WT_BRANCH_SGR" "$branch_display" "$wt_display")
                     printf "%s │ \033[38;5;103m%s\033[0m │ %s │ \033[38;5;244m%s\033[0m │ \033[2;37m%-26s\033[0m │ \033[2;37m%-${COMMIT_MAX_LENGTH}s\033[0m │ %s │ %s\n" \
                         "$display_branch" "$display_title" "$display_status" "$display_assignee" "$time_info" "$commit_info" "$full_branch" "$title"
                 fi
             else
                 # Normal formatting with 2-space indent for alignment
-                display_branch=$(printf "  \033[38;5;250m%-${branch_width}s\033[0m%s" "$branch_display" "$wt_display")
+                display_branch=$(printf "  \033[38;5;250m%s%-${branch_width}s\033[0m%s" "$WT_BRANCH_SGR" "$branch_display" "$wt_display")
                 printf "%s │ \033[38;5;109m%s\033[0m │ %s │ \033[38;5;244m%s\033[0m │ \033[2;37m%-26s\033[0m │ \033[2;37m%-${COMMIT_MAX_LENGTH}s\033[0m │ %s │ %s\n" \
                     "$display_branch" "$display_title" "$display_status" "$display_assignee" "$time_info" "$commit_info" "$full_branch" "$title"
             fi

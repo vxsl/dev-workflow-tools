@@ -155,3 +155,93 @@ load test_helper/common
 
     teardown_temp_dir
 }
+
+# --- worktree_colour_key / render_wt_indicator ---
+#
+# The ⊙ badge is a filled block in the worktree's own colour, and the block runs across the
+# branch name as well, so the cell reads as one segment the way a p10k prompt does. Two
+# things about it are load-bearing rather than cosmetic:
+#
+#   * the colour must be the one the p10k prompt segment and fzedit give the same
+#     checkout, which means the same key and the same palette (lib/worktree-colour.sh);
+#   * the badge must stay EXACTLY 4 visual columns, because rr aligns the whole table by
+#     hand against that number and one extra column shears every row below it.
+
+setup_wt_for_badge() {
+    setup_git_repo
+    cd "$TEST_GIT_REPO"
+    echo x > f.txt
+    git add f.txt
+    git -c user.email=t@t -c user.name=t commit -q -m init
+    git branch TEST-1
+    WT="$TEST_TMPDIR/repo.TEST-1"
+    git worktree add -q "$WT" TEST-1
+}
+
+visual_len() { printf '%s' "$1" | sed 's/\x1b\[[0-9;]*m//g' | wc -m; }
+
+@test "worktree_colour_key: git's own name for a linked worktree" {
+    setup_wt_for_badge
+    run worktree_colour_key "$WT"
+    [ "$status" -eq 0 ]
+    worktree_colour_key "$WT"
+    [ "$WTC_KEY" = "repo.TEST-1" ]
+    teardown_temp_dir
+}
+
+# The primary checkout has a .git DIRECTORY and no name under worktrees/, so it has no key
+# and therefore no colour — which is what makes "no block" mean "you are on main".
+@test "worktree_colour_key: nothing for the primary checkout" {
+    setup_wt_for_badge
+    worktree_colour_key "$TEST_GIT_REPO"
+    [ -z "$WTC_KEY" ]
+    teardown_temp_dir
+}
+
+@test "render_wt_indicator: a filled block in the worktree's own colour" {
+    setup_wt_for_badge
+    worktree_colour_key "$WT"
+    wtc_colour "$WTC_KEY"
+    want="$WTC_COLOUR"
+    [ -n "$want" ]
+
+    render_wt_indicator "$WT" "" ""
+    [[ "$WT_INDICATOR_DISPLAY" == *$'\033'"[48;5;${want}m"$'\033'"[30m"* ]] \
+        || { echo "badge: $WT_INDICATOR_DISPLAY"; return 1; }
+    # and the same block is handed back for the branch name, so the cell is one segment
+    [ "$WT_BRANCH_SGR" = $'\033'"[48;5;${want}m"$'\033'"[30m" ]
+    teardown_temp_dir
+}
+
+@test "render_wt_indicator: the primary checkout gets no block and no branch tint" {
+    setup_wt_for_badge
+    render_wt_indicator "$TEST_GIT_REPO" "" ""
+    [[ "$WT_INDICATOR_DISPLAY" != *"48;5;"* ]] || { echo "badge: $WT_INDICATOR_DISPLAY"; return 1; }
+    [ -z "$WT_BRANCH_SGR" ]
+    teardown_temp_dir
+}
+
+@test "render_wt_indicator: still exactly 4 visual columns in every state" {
+    setup_wt_for_badge
+    for args in ":" ":dirty" "other-branch:"; do
+        mismatch="${args%%:*}"; dirty="${args#*:}"
+        [ "$mismatch" = ":" ] && mismatch=""
+        render_wt_indicator "$WT" "$mismatch" "$dirty"
+        n=$(visual_len "$WT_INDICATOR_DISPLAY")
+        [ "$n" -eq 4 ] || { echo "[$args] width $n: $WT_INDICATOR_DISPLAY"; return 1; }
+        # and the primary's flat fallback has to match it column for column
+        render_wt_indicator "$TEST_GIT_REPO" "$mismatch" "$dirty"
+        n=$(visual_len "$WT_INDICATOR_DISPLAY")
+        [ "$n" -eq 4 ] || { echo "[$args primary] width $n: $WT_INDICATOR_DISPLAY"; return 1; }
+    done
+    teardown_temp_dir
+}
+
+@test "render_wt_indicator: dirty flags itself, a displaced branch says so" {
+    setup_wt_for_badge
+    render_wt_indicator "$WT" "" dirty
+    [[ "$WT_INDICATOR_DISPLAY" == *"!"* ]]
+    render_wt_indicator "$WT" other-branch ""
+    [[ "$WT_INDICATOR_DISPLAY" == *"⊙≠"* ]]
+    teardown_temp_dir
+}

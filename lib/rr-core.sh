@@ -6,6 +6,53 @@
 # prompt segment, and all three have to answer it the same way — see the header of
 # worktree-mismatch.sh. Self-locating so the test suite and rr.sh both get it.
 source "$(dirname "${BASH_SOURCE[0]}")/worktree-mismatch.sh"
+# Likewise "which worktree is this": one palette, shared with the prompt and fzedit.
+source "$(dirname "${BASH_SOURCE[0]}")/worktree-colour.sh"
+
+# The ⊙ indicator for a worktree row, as a filled block in that worktree's own colour —
+# the same block the p10k prompt segment and fzedit's header draw, so a checkout is
+# recognisable on sight in all three places rather than in one of them.
+#
+# EXACTLY 4 visual columns, as before: only SGR codes are added, never characters. rr
+# aligns the whole table by hand against that number (wt_visual_width), so a block that
+# was one column wider would shear every row below it.
+#
+# Sets WT_INDICATOR_DISPLAY rather than printing, because this runs once per row on a path
+# that goes out of its way to avoid subshells — the $(printf ...) it replaces was a fork
+# per row.
+#
+# Also sets WT_BRANCH_SGR: the escape that extends the block back across the branch name
+# itself, so the whole cell is one segment rather than a coloured pip next to plain text.
+# Empty when there is no colour, and the callers put it AFTER whatever foreground they
+# were going to use, so a row with no worktree keeps exactly the colour it had.
+#
+# $1 = worktree path, $2 = non-empty if a different branch is checked out, $3 = non-empty
+# if the worktree is dirty.
+render_wt_indicator() {
+    local wt_path="$1" mismatch="$2" dirty="$3"
+    local off=$'\033[0m' warn=$'\033[38;5;214m' flat=$'\033[38;5;250m'
+    worktree_colour_key "$wt_path"
+    wtc_colour "$WTC_KEY"
+    WT_BRANCH_SGR=""
+
+    if [ -z "$WTC_COLOUR" ]; then
+        # No worktree name, so this is the primary checkout — which the prompt segment
+        # also leaves untinted. "No block" means "you are on the main checkout", and it
+        # has to keep meaning that everywhere.
+        if   [ -n "$mismatch" ]; then WT_INDICATOR_DISPLAY=" ${warn}⊙≠${off} "
+        elif [ -n "$dirty" ];    then WT_INDICATOR_DISPLAY=" ${flat}⊙${warn} !${off}"
+        else                          WT_INDICATOR_DISPLAY=" ${flat}⊙${off}  "
+        fi
+        return
+    fi
+
+    local block=$'\033[48;5;'"$WTC_COLOUR"$'m\033[30m'
+    WT_BRANCH_SGR="$block"
+    if   [ -n "$mismatch" ]; then WT_INDICATOR_DISPLAY="${block} ⊙≠${off} "
+    elif [ -n "$dirty" ];    then WT_INDICATOR_DISPLAY="${block} ⊙ ${off}${warn}!${off}"
+    else                          WT_INDICATOR_DISPLAY="${block} ⊙ ${off} "
+    fi
+}
 
 # Compute the sort timestamp for a worktree path.
 # Returns the maximum of: navigation log time, HEAD mtime, or now (if PWD matches).

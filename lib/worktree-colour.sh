@@ -102,6 +102,30 @@ wtc_colour() {
     done
 }
 
+# Sets WTC_KEY to the colour key for a worktree given only its path: git's own name for
+# it, which is the basename of the gitdir the worktree's .git file points at. Empty for the
+# primary checkout, whose .git is a directory and which therefore has no worktree name.
+#
+# For callers that already hold a gitdir (fzedit's read_wt_state reads one anyway) this is
+# just "${gitdir##*/}" and not worth a call. This exists for the ones that only have the
+# path -- rr, once per row -- which is also why it reads the file with `read` instead of
+# `grep | cut`: two forks per row is two too many there.
+worktree_colour_key() {
+    local wt_path="$1" line
+    WTC_KEY=""
+    [ -f "$wt_path/.git" ] || return 0
+    while IFS= read -r line; do
+        case "$line" in
+            gitdir:*)
+                line="${line#gitdir:}"
+                line="${line# }"
+                WTC_KEY="${line##*/}"
+                return 0
+                ;;
+        esac
+    done < "$wt_path/.git"
+}
+
 # The same hash, for a caller that is already inside awk. Prepend it to an awk program:
 #
 #     awk -F'\t' "$WTC_AWK"'{ print wtc_colour($3) }'
