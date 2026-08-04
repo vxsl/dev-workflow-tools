@@ -2,6 +2,11 @@
 # rr-core.sh — Extracted testable functions from rr.sh
 # Sourced by both rr.sh and the test suite.
 
+# "Is this the branch I asked for" is also asked by fzedit's header and by the p10k
+# prompt segment, and all three have to answer it the same way — see the header of
+# worktree-mismatch.sh. Self-locating so the test suite and rr.sh both get it.
+source "$(dirname "${BASH_SOURCE[0]}")/worktree-mismatch.sh"
+
 # Compute the sort timestamp for a worktree path.
 # Returns the maximum of: navigation log time, HEAD mtime, or now (if PWD matches).
 # Globals read: WORKTREE_NAV_TIMES (associative array), PWD
@@ -87,6 +92,33 @@ get_worktree_gitdir() {
     fi
 }
 
+# The branch git has parked while a worktree is mid-rebase, or nothing.
+#
+# `git worktree list --porcelain` reports a rebasing worktree as `detached` with no branch
+# line at all, because HEAD genuinely is a bare sha. Taking that at face value loses the
+# branch at the worst possible moment: everything downstream falls back to inferring one
+# from the directory name, which for a namespaced branch is not the branch. A worktree for
+# `hotfix/fix-the-thing` lives at `repo.hotfix/fix-the-thing` (see create-wt), so the
+# basename is `fix-the-thing` and the `hotfix/` is simply gone -- and navigating there
+# reported a worktree mismatch against a branch that does not exist.
+#
+# rebase-{merge,apply}/head-name is where git keeps the real branch. NB in the worktree's
+# OWN gitdir: `$wt/.git` is a *file* in a linked worktree, not a directory, so the
+# `$wt/.git/rebase-merge/...` this replaces could never match for any worktree except the
+# primary one -- which is the last place a rebase needs recovering from.
+worktree_parked_branch() {
+    local wt_path="$1" gitdir head_name=""
+    gitdir=$(get_worktree_gitdir "$wt_path")
+    [ -n "$gitdir" ] || return 1
+    if [ -f "$gitdir/rebase-merge/head-name" ]; then
+        head_name=$(< "$gitdir/rebase-merge/head-name")
+    elif [ -f "$gitdir/rebase-apply/head-name" ]; then
+        head_name=$(< "$gitdir/rebase-apply/head-name")
+    fi
+    [ -n "$head_name" ] || return 1
+    printf '%s\n' "${head_name#refs/heads/}"
+}
+
 get_eponymous_branch_pure() {
     local wt_path="$1"
     local wt_basename
@@ -111,24 +143,38 @@ get_eponymous_branch_pure() {
 detached_mismatch_skip_reason() {
     local wt_path="$1"
     local branch="$2"
-    local git_dir
-    git_dir=$(git -C "$wt_path" rev-parse --absolute-git-dir 2>/dev/null)
-    [ -z "$git_dir" ] && return 1
 
     # Rebase in progress — check which branch is being rebased
-    local head_name=""
-    if [ -f "$git_dir/rebase-merge/head-name" ]; then
-        head_name=$(< "$git_dir/rebase-merge/head-name")
-    elif [ -f "$git_dir/rebase-apply/head-name" ]; then
-        head_name=$(< "$git_dir/rebase-apply/head-name")
-    fi
+    local head_name
+    head_name=$(worktree_parked_branch "$wt_path")
     if [ -n "$head_name" ]; then
-        if [ "${head_name#refs/heads/}" = "$branch" ]; then
+        # Not an exact comparison: the branch we were asked for often comes from a
+        # worktree directory name, which abbreviates it (repo.UB-6709 holding
+        # UB-6709-add-custom-trimet-layer). Comparing exactly reported a mismatch
+        # against the very branch being rebased, and then showed "Actual HEAD" as the
+        # evidence -- which is not a branch anyone has ever checked out on purpose.
+        if wtm_same_branch "${head_name}" "$branch"; then
             echo "rebase"
             return 0
         fi
+        # A namespaced branch is named by PATH, not by basename: hotfix/fix-x lives at
+        # repo.hotfix/fix-x (see create-wt), so an eponymous name derived from the
+        # basename has lost the "hotfix/" and no prefix rule can put it back. The path
+        # can -- if the directory is literally named after the branch being rebased, that
+        # branch is what this worktree is for.
+        #
+        # Only when $branch is that basename-derived alias, though. Any other name we
+        # were handed -- a displaced ticket id, say -- is a real question about what this
+        # worktree is busy with, and deserves the prompt.
+        if [ "$branch" = "$(get_eponymous_branch_pure "$wt_path")" ]; then
+            case "$wt_path" in *".$head_name") echo "rebase"; return 0 ;; esac
+        fi
         return 1
     fi
+
+    local git_dir
+    git_dir=$(git -C "$wt_path" rev-parse --absolute-git-dir 2>/dev/null)
+    [ -z "$git_dir" ] && return 1
 
     # Detached at an ancestor of the expected branch (includes the tip itself,
     # and typical bisect positions)

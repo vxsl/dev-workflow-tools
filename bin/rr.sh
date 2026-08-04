@@ -200,18 +200,9 @@ build_worktree_map() {
             # Handle detached HEAD (e.g., during rebase)
             # Try to determine the branch name from rebase metadata or worktree path
 
-            # Check for rebase metadata
-            if [ -f "$current_wt_path/.git/rebase-merge/head-name" ]; then
-                local head_name=$(cat "$current_wt_path/.git/rebase-merge/head-name" 2>/dev/null)
-                if [[ "$head_name" =~ refs/heads/(.+)$ ]]; then
-                    current_branch="${BASH_REMATCH[1]}"
-                fi
-            elif [ -f "$current_wt_path/.git/rebase-apply/head-name" ]; then
-                local head_name=$(cat "$current_wt_path/.git/rebase-apply/head-name" 2>/dev/null)
-                if [[ "$head_name" =~ refs/heads/(.+)$ ]]; then
-                    current_branch="${BASH_REMATCH[1]}"
-                fi
-            fi
+            # Rebase metadata, from the worktree's real gitdir — see
+            # worktree_parked_branch, which is also why this used to find nothing.
+            current_branch=$(worktree_parked_branch "$current_wt_path") || current_branch=""
 
             # Fall back to inferring from worktree directory name
             # Pattern: repo.BRANCH-NAME or just BRANCH-NAME
@@ -1290,6 +1281,13 @@ generate_worktree_data() {
             current_is_bare=false
         elif [[ "$line" =~ ^branch[[:space:]]refs/heads/(.+)$ ]]; then
             current_actual_branch="${BASH_REMATCH[1]}"
+        elif [[ "$line" == "detached" ]]; then
+            # A rebasing worktree is reported detached with no branch line, so without
+            # this its row falls back to a branch guessed from the directory name --
+            # which for hotfix/foo in repo.hotfix/foo is not a branch at all, and then
+            # navigating to the row prompts about a mismatch that isn't one. Same
+            # recovery build_worktree_map does, so the row and the map agree.
+            current_actual_branch=$(worktree_parked_branch "$current_wt") || current_actual_branch=""
         elif [[ "$line" == "bare" ]]; then
             current_is_bare=true
         fi

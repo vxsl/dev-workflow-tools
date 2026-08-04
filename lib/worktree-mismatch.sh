@@ -46,9 +46,23 @@ wtm_check() {
     [ -n "$actual" ] || return 0
     [ "$actual" = "HEAD" ] && return 0
 
-    case "$actual" in "$WTM_EXPECTED"*) return 0 ;; esac
-    case "$WTM_EXPECTED" in "$actual"*) return 0 ;; esac
+    wtm_same_branch "$actual" "$WTM_EXPECTED" && return 0
     WTM_MISMATCH="$actual"
+}
+
+# Do two branch names name the same intended branch? A prefix either way counts, for the
+# reason in the header: a worktree named after a ticket holds the whole branch, and one
+# named after a long branch is usually holding a shortened version of it.
+#
+# Separate from wtm_check because rr asks the same question from the other end -- it
+# already knows which branch it expects and wants to know whether the one git parked
+# mid-rebase is that branch or a different one.
+wtm_same_branch() {
+    [ "$1" = "$2" ] && return 0
+    [ -n "$1" ] && [ -n "$2" ] || return 1
+    case "$1" in "$2"*) return 0 ;; esac
+    case "$2" in "$1"*) return 0 ;; esac
+    return 1
 }
 
 # Sets WTM_TICKET to the ticket id leading a branch name (UB-6709 out of
