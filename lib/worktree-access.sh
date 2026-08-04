@@ -8,10 +8,17 @@
 # code somewhere. So the two tools offered you different "most recent" worktrees, and
 # neither reflected the switches you made in the other.
 #
-# One log, written by whoever switches. Format is rr's, unchanged, so an existing log
-# keeps working: "<epoch>\t<worktree path>", one line per worktree, rewritten in place
-# rather than appended to (the file stays as long as your worktree list, not as long
-# as your history).
+# One log, written by whoever switches. Format and path are rr's, unchanged, so an
+# existing log keeps working: "<epoch>\t<worktree path>", one line per worktree,
+# rewritten in place rather than appended to (so the file stays as long as your
+# worktree list, not as long as your history).
+#
+# NB rr still has its own copy of these two functions -- they interoperate because they
+# agree on the file and the format, not because rr sources this. Deliberate: rr is
+# ~4000 lines that a lot depends on, and rewriting its internals to prove a point about
+# code sharing is a poor trade. If rr is being touched anyway, delegating
+# record_worktree_access / get_worktree_navigation_time to wta_record / wta_time is a
+# safe two-line change.
 
 WTA_LOG="${WTA_LOG:-$HOME/.cache/rr/worktree_access.log}"
 

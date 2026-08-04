@@ -280,8 +280,8 @@ gets it to ~32k rows in 0.6s.
 
 **Config.** Machine paths in `.env` (`FZEDIT_DEFAULT_REPO`, `FZEDIT_PREFERRED_DIRS`);
 home-sweep noise in `~/.config/fzedit/ignore`, seeded on first run and meant to be
-edited. Worktree recency is shared with `rr` via `lib/worktree-access.sh`, so both
-tools agree on "most recent" and each updates it.
+edited. Worktree recency is shared with `rr` — same log, same format — so both tools
+agree on "most recent" and each updates it.
 
 `bats test/fzedit.bats` — 125 end-to-end tests.
 
