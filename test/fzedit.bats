@@ -1254,3 +1254,27 @@ ED
     out="$(FZP_FZF="$TEST_TMPDIR/fakebin/fzfargs" "$FZEDIT" --one-shot 2>&1)"
     [[ "$out" == *"ctrl-l:execute"*"--tig {1} {2}"* ]]
 }
+
+# --------------------------------------------------------------------------
+# Closing a tab must not close the pad
+# --------------------------------------------------------------------------
+
+@test "--close-tab refuses to close the last tab" {
+    # tmux.conf used to bind C-M-w straight to kill-pane, which killed the last
+    # window, took the session with it, and closed the whole scratchpad.
+    add_tmux_session fileedit
+    run fz --close-tab '%7'
+    [ "$status" -eq 0 ]
+    [ ! -f "$TEST_TMPDIR/tmux_killed" ]
+}
+
+@test "--close-tab takes the pane it was given, not the ambient one" {
+    add_tmux_session fileedit
+    # Two windows, so closing is allowed.
+    printf '#!/usr/bin/env bash\ncase "$1" in\n  list-windows) printf "one\\ntwo\\n" ;;\n  has-session) exit 0 ;;\n  kill-window) shift; echo "$*" > "$TEST_TMPDIR/killed" ;;\nesac\nexit 0\n' \
+        > "$TEST_TMPDIR/fakebin/tmux"
+    chmod +x "$TEST_TMPDIR/fakebin/tmux"
+    TMUX=fake fz --close-tab '%42'
+    run cat "$TEST_TMPDIR/killed"
+    [[ "$output" == *"%42"* ]]
+}
