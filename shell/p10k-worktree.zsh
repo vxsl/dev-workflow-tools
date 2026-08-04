@@ -1,42 +1,28 @@
 # Inject worktree segment into p10k
-# Source this AFTER .p10k.zsh in your .zshrc
+#
+# Source this AFTER .p10k.zsh in your .zshrc -- and make sure nothing sources .p10k.zsh
+# again afterwards. It assigns POWERLEVEL9K_LEFT_PROMPT_ELEMENTS wholesale, so a second
+# source silently drops the element injected below and the segment never appears. (The
+# stock p10k footer line at the bottom of a generated .zshrc is exactly that second
+# source; delete it if the config is already sourced further up.)
 
-# Color palette for worktrees (vibrant, distinct colors)
-typeset -g -a WORKTREE_COLORS=(
-    220  # Yellow/Orange
-    81   # Bright Cyan
-    141  # Purple
-    114  # Green
-    167  # Red/Pink
-    214  # Orange
-    109  # Blue
-    173  # Brown/Orange
-    117  # Light Blue
-    205  # Pink
-)
+# Palette, key and hash are shared with fzedit's ⊙ worktree rows, so a worktree is the
+# same colour in the prompt as it is in the picker. See lib/worktree-colour.sh for why
+# that sharing is worth a file of its own.
+source "${0:A:h}/../lib/worktree-colour.sh"
 
-# Define colors for each state (p10k requires these to be set globally)
-# Normal worktree colors (COLOR0-COLOR9): vibrant background, black foreground
-typeset -g POWERLEVEL9K_WORKTREE_COLOR0_FOREGROUND=0
-typeset -g POWERLEVEL9K_WORKTREE_COLOR0_BACKGROUND=220
-typeset -g POWERLEVEL9K_WORKTREE_COLOR1_FOREGROUND=0
-typeset -g POWERLEVEL9K_WORKTREE_COLOR1_BACKGROUND=81
-typeset -g POWERLEVEL9K_WORKTREE_COLOR2_FOREGROUND=0
-typeset -g POWERLEVEL9K_WORKTREE_COLOR2_BACKGROUND=141
-typeset -g POWERLEVEL9K_WORKTREE_COLOR3_FOREGROUND=0
-typeset -g POWERLEVEL9K_WORKTREE_COLOR3_BACKGROUND=114
-typeset -g POWERLEVEL9K_WORKTREE_COLOR4_FOREGROUND=0
-typeset -g POWERLEVEL9K_WORKTREE_COLOR4_BACKGROUND=167
-typeset -g POWERLEVEL9K_WORKTREE_COLOR5_FOREGROUND=0
-typeset -g POWERLEVEL9K_WORKTREE_COLOR5_BACKGROUND=214
-typeset -g POWERLEVEL9K_WORKTREE_COLOR6_FOREGROUND=0
-typeset -g POWERLEVEL9K_WORKTREE_COLOR6_BACKGROUND=109
-typeset -g POWERLEVEL9K_WORKTREE_COLOR7_FOREGROUND=0
-typeset -g POWERLEVEL9K_WORKTREE_COLOR7_BACKGROUND=173
-typeset -g POWERLEVEL9K_WORKTREE_COLOR8_FOREGROUND=0
-typeset -g POWERLEVEL9K_WORKTREE_COLOR8_BACKGROUND=117
-typeset -g POWERLEVEL9K_WORKTREE_COLOR9_FOREGROUND=0
-typeset -g POWERLEVEL9K_WORKTREE_COLOR9_BACKGROUND=205
+# p10k wants a named style per colour, resolved before it initialises, so unroll the
+# palette into one COLOR<n> style each. Black text on every one of them: the palette is
+# deliberately all light colours so that it can also be used as a foreground tint.
+() {
+    local -i i=0
+    local c
+    for c in ${=WTC_PALETTE}; do
+        typeset -g "POWERLEVEL9K_WORKTREE_COLOR${i}_FOREGROUND=0"
+        typeset -g "POWERLEVEL9K_WORKTREE_COLOR${i}_BACKGROUND=$c"
+        (( i++ ))
+    done
+}
 
 # Mismatch worktree state: bright white on bold red — impossible to miss
 typeset -g POWERLEVEL9K_WORKTREE_MISMATCH_FOREGROUND=255
@@ -47,12 +33,10 @@ function prompt_worktree() {
     local git_dir=$(git rev-parse --git-dir 2>/dev/null) || return
 
     if [[ "$git_dir" == *"/worktrees/"* ]]; then
-        # Extract worktree name from git directory path
-        local wt_name=$(basename "$git_dir")
-
-        # Hash the worktree name to get a consistent color index (0-9)
-        local hash=$(( $(printf "%s" "$wt_name" | cksum | cut -d' ' -f1) ))
-        local color_index=$(( hash % ${#WORKTREE_COLORS[@]} ))
+        # git's own name for this worktree -- the directory under .git/worktrees -- which
+        # is also the colour key fzedit uses. See lib/worktree-colour.sh.
+        local wt_name=${git_dir:t}
+        wtc_colour "$wt_name"
 
         # Detect mismatch: extract expected branch from worktree dir name,
         # compare with actually checked-out branch
@@ -86,7 +70,7 @@ function prompt_worktree() {
         fi
 
         # Normal — no mismatch
-        p10k segment -s "COLOR$color_index" -t "⊙ $display"
+        p10k segment -s "COLOR$WTC_SLOT" -t "⊙ $display"
     fi
 }
 

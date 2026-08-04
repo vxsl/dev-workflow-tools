@@ -397,6 +397,56 @@ teardown() {
     [[ "$out" == *"main"* ]]
 }
 
+# The tint is the same one the p10k prompt segment gives that checkout, from the same
+# palette and the same hash (lib/worktree-colour.sh). Asserted against the library rather
+# than against a hardcoded colour, because a hardcoded number would still pass if the
+# prompt and the picker drifted apart, which is the only failure that matters here.
+@test "worktree rows are tinted with the colour the prompt segment would use" {
+    source "$FZEDIT_REPO_ROOT/lib/worktree-colour.sh"
+    pin_scope "$WT_FEATURE"
+    set_mode files
+    wtc_colour "$(basename "$(git -C "$WT_FEATURE" rev-parse --absolute-git-dir)")"
+    [ -n "$WTC_COLOUR" ]
+    out="$(rows_of_type w | awk -F'\t' -v p="$WT_FEATURE" '$2 == p { print $3 }')"
+    [[ "$out" == *$'\033'"[38;5;${WTC_COLOUR}m⊙"* ]] \
+        || { echo "row: $out (wanted 38;5;$WTC_COLOUR)"; return 1; }
+}
+
+# Colour by git's name for the worktree — the directory under .git/worktrees — not by the
+# checkout's basename. The nested fixture is called "deep", and so would every other
+# repo.<anything>/deep: hashing basenames would hand a whole family of unrelated
+# worktrees one colour, in the one situation where telling them apart is hardest.
+@test "a nested worktree is tinted by its git name, not its colliding basename" {
+    source "$FZEDIT_REPO_ROOT/lib/worktree-colour.sh"
+    pin_scope "$WT_FEATURE"
+    set_mode files
+    wtc_colour "$(basename "$(git -C "$WT_NESTED" rev-parse --absolute-git-dir)")"
+    out="$(rows_of_type w | awk -F'\t' -v p="$WT_NESTED" '$2 == p { print $3 }')"
+    [[ "$out" == *$'\033'"[38;5;${WTC_COLOUR}m⊙"* ]] \
+        || { echo "row: $out (wanted 38;5;$WTC_COLOUR)"; return 1; }
+}
+
+# The primary worktree has no entry under .git/worktrees, so it has no key and gets the
+# flat fallback rather than a hash of something incidental. "Untinted" is the signal that
+# you are on the main checkout. (81 is also a palette entry — the assertion is on the
+# observable colour, since the fallback is what the row is actually meant to show.)
+@test "the primary worktree row is left untinted" {
+    pin_scope "$WT_FEATURE"
+    set_mode files
+    out="$(rows_of_type w | awk -F'\t' -v p="$MAIN" '$2 == p { print $3 }')"
+    [ -n "$out" ]
+    [[ "$out" == *$'\033'"[38;5;81m⊙"* ]] || { echo "row: $out"; return 1; }
+}
+
+@test "the header tints the worktree it is scoped to" {
+    source "$FZEDIT_REPO_ROOT/lib/worktree-colour.sh"
+    pin_scope "$WT_FEATURE"
+    wtc_colour "$(basename "$(git -C "$WT_FEATURE" rev-parse --absolute-git-dir)")"
+    out="$(fz --header)"
+    [[ "$out" == *$'\033'"[38;5;${WTC_COLOUR}m⊙"* ]] \
+        || { echo "header: $out (wanted 38;5;$WTC_COLOUR)"; return 1; }
+}
+
 # The row is how you find a worktree, and mid-rebase HEAD is a bare sha -- so labelling
 # it "detached 1a2b3c4d" hides the branch exactly when you are hunting for it, and a
 # branch-shaped query stops matching the one worktree you actually want.

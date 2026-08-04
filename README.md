@@ -248,9 +248,16 @@ conflicts  ⊂  changed  ⊂  worktree  ⊂  home
 `TAB` widens, `S-TAB` narrows, and the whole ladder is in the header with counts, so
 where you are and where TAB goes are both visible without remembering letters.
 
-Worktrees are rows in every rung (`⊙`, cyan), appended after the files — so a filename
+Worktrees are rows in every rung (`⊙`), appended after the files — so a filename
 query never surfaces one, while a branch or ticket-shaped query does. Switching
 worktree and opening a file are the same gesture: type what you want.
+
+Each checkout gets its own colour, and it is the *same* colour the p10k prompt segment
+(`shell/p10k-worktree.zsh`) gives it — palette, key and hash all live in
+`lib/worktree-colour.sh` so the two cannot drift. With 150-odd worktrees of one repo,
+several of them sharing a branch-name prefix, "am I in the right checkout" wants to be
+answerable by colour rather than by reading. The primary worktree is deliberately
+untinted: no colour is itself the signal that you are on `main`.
 
 **Keys** — `F1` in the pad prints all of them.
 

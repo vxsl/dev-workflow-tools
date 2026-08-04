@@ -33,7 +33,7 @@
 # remembered across fzf's reloads but deliberately NOT across launches -- opening the
 # pad and landing in a rung set days ago is just confusing.
 #
-# Worktrees are first-class rows (⊙, cyan) inlined into every mode, so switching
+# Worktrees are first-class rows (⊙, tinted per worktree) inlined into every mode, so switching
 # worktree and opening a file are the same gesture: type what you want. They are
 # appended after the files so a filename query never surfaces one, while a branch or
 # ticket-shaped query (TICKET-1001) does. enter dispatches on the row's type column --
@@ -62,6 +62,10 @@ SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$(type -P "$0" || echo "$0")")")" &&
 source "$SCRIPT_DIR/../lib/fzf-helpers"
 # One "which worktree did I last go to" log, shared with rr -- see the header there.
 source "$SCRIPT_DIR/../lib/worktree-access.sh"
+# One palette and one hash for "which worktree is this", shared with the p10k prompt
+# segment, so a checkout is the same colour here and in the prompt -- see the header
+# there for why that is worth sharing rather than reimplementing.
+source "$SCRIPT_DIR/../lib/worktree-colour.sh"
 
 SELF_BIN="$(readlink -f "$(type -P "$0" || echo "$0")")"
 
@@ -326,6 +330,10 @@ format_lines() {
         type = $1
         abs  = $2
         xy   = (NF > 2) ? $3 : ""
+        # Only worktree rows carry a 4th column: the xterm colour this checkout is
+        # tinted with, the same one the p10k prompt segment uses. Empty for the primary
+        # worktree, which is deliberately untinted.
+        wcol = (NF > 3) ? $4 : ""
 
         if (type == "w") {
             # Name a worktree by its path under the worktree parent, not its basename:
@@ -336,7 +344,8 @@ format_lines() {
             } else if (index(name, home) == 1) {
                 name = "~" substr(name, length(home) + 1)
             }
-            printf "%s\t%s\t\033[38;5;81m⊙ %s\033[0m  \033[2m%s\033[0m\n", type, abs, name, xy
+            printf "%s\t%s\t\033[38;5;%sm⊙ %s\033[0m  \033[2m%s\033[0m\n", \
+                   type, abs, (wcol == "" ? "81" : wcol), name, xy
             next
         }
 
@@ -624,7 +633,7 @@ wt_in_flight() {
     [ -d "$1/rebase-merge" ] || [ -d "$1/rebase-apply" ] || [ -f "$1/MERGE_HEAD" ] \
         || [ -f "$1/CHERRY_PICK_HEAD" ] || [ -f "$1/REVERT_HEAD" ] || [ -f "$1/BISECT_LOG" ]
 }
-# Describe a worktree from its gitdir, into WT_BRANCH / WT_OP / WT_LABEL.
+# Describe a worktree from its gitdir, into WT_BRANCH / WT_OP / WT_LABEL / WT_KEY.
 #
 # Sets globals rather than printing because this runs once per worktree and there are
 # ~154 of them: a command substitution per call costs more than the rest of the listing
@@ -638,7 +647,12 @@ wt_in_flight() {
 # flight: "smp-selected-state ⟳ rebase 2/6", not "detached a41d6b62".
 read_wt_state() {
     local gd="$1" head n="" end=""
-    WT_BRANCH=""; WT_OP=""; WT_LABEL=""
+    WT_BRANCH=""; WT_OP=""; WT_LABEL=""; WT_KEY=""
+    # The colour key: git's own name for this worktree, i.e. the directory under
+    # .git/worktrees. Set before the HEAD read so a worktree we cannot describe is still
+    # tinted. The primary worktree's gitdir is the common dir itself and has no such
+    # name, so it gets no key and no tint -- see lib/worktree-colour.sh.
+    case "$gd" in */worktrees/*) WT_KEY="${gd##*/}" ;; esac
     read -r head < "$gd/HEAD" 2>/dev/null || return 1
 
     if wt_in_flight "$gd"; then
@@ -671,7 +685,8 @@ read_wt_state() {
     WT_LABEL="$WT_BRANCH${WT_OP:+ ⟳ $WT_OP}"
 }
 
-# Worktrees of the scope repo as "<path>\t<label>", most recently used first.
+# Worktrees of the scope repo as "<path>\t<label>\t<colour key>", most recently used
+# first.
 #
 # "Recently used" is the shared navigation log that rr writes (and that pin_scope
 # below writes too), falling back to the mtime of the worktree's index for one that
@@ -694,8 +709,8 @@ list_worktrees() {
             ts=$(stat -c %Y "$gd/index" 2>/dev/null || echo 0)
         fi
         read_wt_state "$gd"
-        printf '%s\t%s\t%s\n' "$ts" "$wt" "$WT_LABEL"
-    done < <(worktree_dirs "$root") | sort -rn | cut -f2,3
+        printf '%s\t%s\t%s\t%s\n' "$ts" "$wt" "$WT_LABEL" "$WT_KEY"
+    done < <(worktree_dirs "$root") | sort -rn | cut -f2,3,4
 }
 
 # Worktrees as pickable rows, for inlining into whatever mode is showing. Appended
@@ -714,8 +729,11 @@ list_worktree_rows() {
     cached derived "wtrows-$(cache_key "$root")" "$WT_ROWS_TTL" _worktree_rows "$root"
 }
 
+# The tint is resolved here, in the one awk pass that already exists, rather than by
+# calling into the shell per row: there are ~154 rows and that would be ~154 forks on
+# the redraw path everything above works to keep cheap.
 _worktree_rows() {
-    list_worktrees "$1" | awk -F'\t' '{ printf "w\t%s\t%s\n", $1, $2 }'
+    list_worktrees "$1" | awk -F'\t' "$WTC_AWK"'{ printf "w\t%s\t%s\t%s\n", $1, $2, wtc_colour($3) }'
 }
 
 # The rungs, narrowest first. Index into this is the whole mode model.
@@ -858,7 +876,11 @@ header_line() {
         label="$(basename "$scope")"
         gd=$(git -C "$scope" rev-parse --absolute-git-dir 2>/dev/null)
         if [ -n "$gd" ] && read_wt_state "$gd"; then
-            label="$label  ⊙ $WT_LABEL"
+            # Tinted like the row you picked it from, and like the prompt in the shell
+            # you came from: "am I pointed at the right checkout" should be answerable
+            # by colour alone, since near-identical branch names read as correct.
+            wtc_colour "$WT_KEY"
+            label="$label  $(printf '\033[38;5;%sm' "${WTC_COLOUR:-81}")⊙ $WT_LABEL$(printf '\033[0m')"
             # Same 154-worktree walk as the rows above, and the same reasoning for
             # caching it: a rebase does not start and finish between two TAB presses.
             elsewhere=$(cached derived "inflight-$(cache_key "$scope")" "$WT_ROWS_TTL" \
@@ -948,7 +970,14 @@ open_many() {
 choose_worktree() {
     local scope="$1" prompt="${2:-worktree (most recent first) > }"
     list_worktrees "$scope" \
-        | awk -F'\t' -v home="$HOME" '{ d=$1; sub("^" home, "~", d); printf "%s\t%s\t%s\n", $1, d, $2 }' \
+        | awk -F'\t' -v home="$HOME" "$WTC_AWK"'{
+              d = $1; sub("^" home, "~", d)
+              c = wtc_colour($3)
+              # Same tint as the ⊙ rows and the prompt, so the plain picker is not the
+              # one place in the loop where a worktree loses its colour.
+              if (c != "") d = "\033[38;5;" c "m" d "\033[0m"
+              printf "%s\t%s\t%s\n", $1, d, $2
+          }' \
         | "$FZP_FZF" --ansi --delimiter='\t' --with-nth=2.. --height=100% --reverse \
               --prompt="$prompt" \
               --preview='git -C {1} status --short --branch 2>/dev/null | head -40' \
@@ -1263,7 +1292,9 @@ preview_row() {
         # `status --branch` says only "HEAD (no branch)" mid-rebase, so lead with the
         # label that knows better.
         if [ -n "$gd" ] && read_wt_state "$gd"; then
-            printf '\033[38;5;81m⊙ %s\033[0m  \033[2m%s\033[0m\n' "$f" "$WT_LABEL"
+            wtc_colour "$WT_KEY"
+            printf '\033[38;5;%sm⊙ %s\033[0m  \033[2m%s\033[0m\n' \
+                   "${WTC_COLOUR:-81}" "$f" "$WT_LABEL"
         else
             printf '\033[38;5;81m⊙ %s\033[0m\n' "$f"
         fi
@@ -1510,6 +1541,8 @@ ${B}fzedit${O} ${D}— the file pad.${O}
 ${B}scope — the rung ladder${O}   ${D}conflicts ⊂ changed ⊂ files ⊂ home${O}
   TAB / S-TAB    widen / narrow one rung
   ${C}⊙ rows${O}         switch worktree — type a branch or a ticket id
+                 ${D}each checkout has its own colour, the same one the p10k${O}
+                 ${D}prompt segment gives it, so it is recognisable on sight${O}
   ^T             the full rr picker: tickets, MR state, dirty flags, and
                  ${D}branches with no worktree yet (it can create one)${O}
   ^K             ${C}this file, over in another worktree${O} — pick the checkout,
