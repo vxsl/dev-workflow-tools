@@ -7,9 +7,10 @@
 # source; delete it if the config is already sourced further up.)
 
 # Palette, key and hash are shared with fzedit's ⊙ worktree rows, so a worktree is the
-# same colour in the prompt as it is in the picker. See lib/worktree-colour.sh for why
-# that sharing is worth a file of its own.
+# same colour in the prompt as it is in the picker. The wrong-branch rule is shared with
+# fzedit's header for the same reason. See the headers of those two files.
 source "${0:A:h}/../lib/worktree-colour.sh"
+source "${0:A:h}/../lib/worktree-mismatch.sh"
 
 # p10k wants a named style per colour, resolved before it initialises, so unroll the
 # palette into one COLOR<n> style each. Black text on every one of them: the palette is
@@ -38,36 +39,23 @@ function prompt_worktree() {
         local wt_name=${git_dir:t}
         wtc_colour "$wt_name"
 
-        # Detect mismatch: extract expected branch from worktree dir name,
-        # compare with actually checked-out branch
+        # Is this checkout on the branch its directory name promises? The rule lives in
+        # lib/worktree-mismatch.sh, shared with fzedit's header.
         local toplevel=$(git rev-parse --show-toplevel 2>/dev/null)
-        local wt_basename=${toplevel:t}
-        local expected_branch=""
-        if [[ "$wt_basename" == *.* ]]; then
-            expected_branch="${wt_basename##*.}"
-        fi
+        local actual_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+        wtm_check "${toplevel:t}" "$actual_branch"
 
-        if [[ -n "$expected_branch" ]]; then
-            local actual_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
-            # Skip mismatch check during rebase/bisect/etc (detached HEAD)
-            if [[ "$actual_branch" == "HEAD" ]]; then
-                :  # detached HEAD — not a mismatch, just a transient state
-            elif [[ -n "$actual_branch" && "$actual_branch" != "$expected_branch"* && "$expected_branch" != "$actual_branch"* ]]; then
-                local expected_display="$expected_branch"
-                [[ "$expected_branch" =~ ^([A-Z]+-[0-9]+) ]] && expected_display="${match[1]}"
-                p10k segment -s "MISMATCH" -t "⚠ WRONG BRANCH: $actual_branch (expected $expected_display)"
-                return
-            fi
+        if [[ -n "$WTM_MISMATCH" ]]; then
+            wtm_ticket "$WTM_EXPECTED"
+            p10k segment -s "MISMATCH" \
+                -t "⚠ WRONG BRANCH: $WTM_MISMATCH (expected ${WTM_TICKET:-$WTM_EXPECTED})"
+            return
         fi
 
         # Show just the ticket ID if present (full path is already in the dir segment)
         local display="$wt_name"
-        if [[ -n "$expected_branch" ]]; then
-            # Extract ticket ID (e.g., UB-6709 from UB-6709-add-custom-trimet-...)
-            local ticket_id=""
-            [[ "$expected_branch" =~ ^([A-Z]+-[0-9]+) ]] && ticket_id="${match[1]}"
-            [[ -n "$ticket_id" ]] && display="$ticket_id"
-        fi
+        wtm_ticket "$WTM_EXPECTED"
+        [[ -n "$WTM_TICKET" ]] && display="$WTM_TICKET"
 
         # Normal — no mismatch
         p10k segment -s "COLOR$WTC_SLOT" -t "⊙ $display"

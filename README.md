@@ -259,6 +259,24 @@ several of them sharing a branch-name prefix, "am I in the right checkout" wants
 answerable by colour rather than by reading. The primary worktree is deliberately
 untinted: no colour is itself the signal that you are on `main`.
 
+**Which worktree am I in** is the header's first line, drawn as a filled block in that
+worktree's colour — the same shape, and literally the same escape bytes, as the prompt
+segment:
+
+```
+⊙ ul.UB-6709   UB-6709-add-custom-trimet-layer      ⚠ ul.hotfix (rebase 2/6)
+└ block, in this worktree's colour                  └ something parked elsewhere
+```
+
+The pad is a fixed-cwd full-screen scratchpad, so unlike every other window it has no
+ambient clue about which checkout you are about to edit — a block is the one thing on the
+line you cannot miss. It turns white-on-red and says `⚠ WRONG BRANCH: <branch>` when the
+checkout is not on the branch its `<repo>.<branch>` name promises, which is the same alarm
+the prompt raises, from the same rule in `lib/worktree-mismatch.sh`. Prefix matches count
+as matches (`ul.UB-6709` holding `UB-6709-add-custom-trimet-layer` is fine) and anything
+mid-rebase is left alone — an alarm that fires every time you rebase is one you stop
+reading.
+
 **Keys** — `F1` in the pad prints all of them.
 
 | | |

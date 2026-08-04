@@ -438,13 +438,82 @@ teardown() {
     [[ "$out" == *$'\033'"[38;5;81m⊙"* ]] || { echo "row: $out"; return 1; }
 }
 
-@test "the header tints the worktree it is scoped to" {
+# --------------------------------------------------------------------------
+# The header's scope banner — a p10k-style block, because the pad has no other clue
+# --------------------------------------------------------------------------
+#
+# The pad is a fixed-cwd full-screen scratchpad: unlike every other window it cannot tell
+# you which of ~154 checkouts you are about to edit from its surroundings. So the block is
+# not decoration, it is the answer to the header's only real question, and the bytes are
+# p10k's own (SGR 48;5;<c> background, plain 30 for black text) so that it reads as the
+# same indicator as the prompt rather than a coincidence.
+
+@test "the header announces the scope as a filled block in the worktree's colour" {
     source "$FZEDIT_REPO_ROOT/lib/worktree-colour.sh"
     pin_scope "$WT_FEATURE"
     wtc_colour "$(basename "$(git -C "$WT_FEATURE" rev-parse --absolute-git-dir)")"
+    [ -n "$WTC_COLOUR" ]
     out="$(fz --header)"
-    [[ "$out" == *$'\033'"[38;5;${WTC_COLOUR}m⊙"* ]] \
-        || { echo "header: $out (wanted 38;5;$WTC_COLOUR)"; return 1; }
+    # background, not a foreground tint: a block is what makes it unmissable
+    [[ "$out" == *$'\033'"[48;5;${WTC_COLOUR}m"$'\033'"[30m⊙ repo.feature"* ]] \
+        || { echo "header: $out (wanted 48;5;$WTC_COLOUR)"; return 1; }
+}
+
+@test "the header block carries the checkout's own name, which is what you navigate by" {
+    pin_scope "$WT_NESTED"
+    out="$(fz --header | plain)"
+    [[ "$out" == *"⊙ deep"* ]]
+}
+
+# No block at all on the primary, matching the prompt segment, which draws nothing there.
+# "No block" has to keep meaning "you are on main" in both windows or it means nothing.
+@test "the primary checkout gets no block in the header either" {
+    pin_scope "$MAIN"
+    out="$(fz --header)"
+    [[ "$out" == *"⊙ repo"* ]]
+    [[ "$out" != *$'\033'"[48;5;"* ]] || { echo "header: $out"; return 1; }
+}
+
+# Same rule and same alarm as the prompt (lib/worktree-mismatch.sh): about to open files
+# is exactly when "this worktree is not on the branch its name promises" matters, and
+# ul.smp vs ul.smp-select is not a difference you catch by reading.
+@test "the header shouts when the checkout is not on the branch its name promises" {
+    git_q "$MAIN" branch elsewhere
+    git_q "$WT_FEATURE" checkout -q elsewhere
+    pin_scope "$WT_FEATURE"
+    out="$(fz --header)"
+    [[ "$out" == *$'\033'"[48;5;196m"* ]] || { echo "not the alarm colour: $out"; return 1; }
+    [[ "$(printf '%s' "$out" | plain)" == *"WRONG BRANCH: elsewhere (expected feature)"* ]]
+}
+
+@test "the wrong-branch alarm shortens a ticket branch to its ticket id" {
+    git_q "$MAIN" branch UB-6709-add-custom-trimet-layer
+    local wt="$TEST_TMPDIR/repos/repo.UB-6709"
+    git_q "$MAIN" worktree add -q "$wt" UB-6709-add-custom-trimet-layer
+    # the directory promises UB-6709, which its branch satisfies by prefix...
+    pin_scope "$wt"
+    [[ "$(fz --header | plain)" != *"WRONG BRANCH"* ]]
+    # ...until it doesn't, and then the alarm stays short enough to read at a glance
+    git_q "$MAIN" branch elsewhere
+    git_q "$wt" checkout -q elsewhere
+    [[ "$(fz --header | plain)" == *"WRONG BRANCH: elsewhere (expected UB-6709)"* ]]
+}
+
+@test "a detached worktree is not reported as the wrong branch" {
+    pin_scope "$WT_DETACHED"
+    out="$(fz --header | plain)"
+    [[ "$out" != *"WRONG BRANCH"* ]] || { echo "header: $out"; return 1; }
+}
+
+# A worktree stopped mid-rebase is on a transient branch, not a misfiled one, and the
+# header already says "⟳ rebase n/m" beside the block. An alarm that fires on every
+# rebase is an alarm you stop reading.
+@test "a worktree mid-rebase is not reported as the wrong branch" {
+    start_conflicting_rebase "$WT_FEATURE"
+    pin_scope "$WT_FEATURE"
+    out="$(fz --header | plain)"
+    [[ "$out" != *"WRONG BRANCH"* ]] || { echo "header: $out"; return 1; }
+    [[ "$out" == *"rebase"* ]]
 }
 
 # The row is how you find a worktree, and mid-rebase HEAD is a bare sha -- so labelling
