@@ -236,9 +236,54 @@ tmux list-panes -a -F "#{session_name}:#{window_index}.#{pane_index} - #{pane_ti
 ```
 
 ### `fzedit`
-Interactive file finder/editor.
+The file pad: a worktree-aware fuzzy finder that fronts nvim, tig and rr. Lives in a
+scratchpad terminal, so it is always one keystroke away and never in your way.
 
-**Keys:** `<CR>` nvim | `^o` cursor | `^s` shell | `^r` refresh | `^c` copy path
+Scope is a single axis, widest-last, because the sets nest rather than toggle:
+
+```
+conflicts  ⊂  changed  ⊂  worktree  ⊂  home
+```
+
+`TAB` widens, `S-TAB` narrows, and the whole ladder is in the header with counts, so
+where you are and where TAB goes are both visible without remembering letters.
+
+Worktrees are rows in every rung (`⊙`, cyan), appended after the files — so a filename
+query never surfaces one, while a branch or ticket-shaped query does. Switching
+worktree and opening a file are the same gesture: type what you want.
+
+**Keys** — `F1` in the pad prints all of them.
+
+| | |
+|---|---|
+| `enter` | open the file, or switch to the `⊙` worktree |
+| `^space` / `^E` | mark rows / open every marked row in **one** nvim |
+| `^F` | ripgrep file *contents*, landing on the matching line |
+| `^K` | this file, over in another worktree |
+| `^T` | worktree picker — hands off to `rr`, so you get tickets, MR state, dirty flags |
+| `^L` | tig: this file's history, or `tig status` on a `⊙` row |
+| `^A` | stage / unstage |
+| `^O` `^S` | open in cursor / new tmux window at the repo root |
+| `^C` `^Y` | copy absolute / repo-relative path |
+| `^G` `^X` `^B` | new tab / previous / next  (a tab is a whole fzedit instance) |
+| `esc` `^R` | clear the query / refresh, ignoring caches |
+
+Inside `^F`: `^F` again freezes the results and fuzzy-filters them, `^E` sends every
+match to nvim's quickfix list.
+
+**Why it is scoped.** The pad's cwd is fixed, so `$PWD` says nothing; the worktree is
+inferred from your most recently active tmux pane. Unscoped, `fd ~/` was 2.86M rows and
+5s — 2.02M of them the same ~12.6k repo-relative paths repeated once per sibling
+worktree, so a filename query returned the same file 154 times with no way to tell the
+copies apart. The home rung prunes sibling worktrees and the noise list below, which
+gets it to ~32k rows in 0.6s.
+
+**Config.** Machine paths in `.env` (`FZEDIT_DEFAULT_REPO`, `FZEDIT_PREFERRED_DIRS`);
+home-sweep noise in `~/.config/fzedit/ignore`, seeded on first run and meant to be
+edited. Worktree recency is shared with `rr` via `lib/worktree-access.sh`, so both
+tools agree on "most recent" and each updates it.
+
+`bats test/fzedit.bats` — 125 end-to-end tests.
 
 ### `restage`
 Unstage two WIP commits, keeping oldest staged.
