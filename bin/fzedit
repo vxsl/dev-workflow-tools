@@ -1313,12 +1313,15 @@ open_many() {
 #
 # read -e with cwd at the worktree root, so readline's own filename completion works on
 # what is in the box -- TAB completes the directories, which is the half of a path in
-# this monorepo that you least want to type. Empty line or ^C backs out.
+# this monorepo that you least want to type. ^C backs out.
+#
+# Pressing enter without naming anything -- the box as it arrives, or an empty one -- is a
+# scratchpad instead: see the case below.
 #
 # The file is NOT created, only its parent directory: nvim writes it if you save, so
-# changing your mind leaves nothing behind. The mkdir is the point -- it is what nvim
-# will not do for you, and losing a buffer to "E212: Can't open file for writing" is the
-# failure this key exists to prevent.
+# changing your mind leaves nothing behind, scratchpad included. The mkdir is the point --
+# it is what nvim will not do for you, and losing a buffer to "E212: Can't open file for
+# writing" is the failure this key exists to prevent.
 #
 
 # Where a new file is relative TO: the row's own repo, not the scope.
@@ -1380,40 +1383,37 @@ new_file() {
     # -r so a backslash in a path survives. readline only when there is a terminal to
     # drive it -- under fzf's execute() there always is; in the suite there is not.
     if [ -t 0 ]; then
-        read -e -r -p "new file in $where (blank = scratch) > " -i "$prefill" path || return 0
+        read -e -r -p "new file in $where (no name = scratch) > " -i "$prefill" path || return 0
     else
         read -r path || return 0
     fi
 
-    if [ -z "$path" ]; then
-        # A blank box means "I have not decided", and that is a legitimate thing to want:
-        # sometimes it is a scratchpad, and the name is a decision better made after
-        # writing the thing -- or never made at all. So it gets a real file with the clock
-        # for a name, and you rename it with :saveas if it turns out to matter.
-        #
-        # Under $HOME rather than in $STATE_DIR, because ~/.cache is the first thing the
-        # home sweep ignores: a scratchpad you cannot find again from the pad is a
-        # scratchpad you have lost. And NOT inside the scope -- it is not part of that
-        # repo, and it would sit in `changed` as untracked noise until you dealt with it.
-        target="$SCRATCH_DIR/$(date +%Y%m%d-%H%M%S).$SCRATCH_EXT"
-    else
-        case "$path" in
-            "~/"*) target="$HOME/${path#\~/}" ;;
-            /*)    target="$path" ;;
-            *)     target="$base/$path" ;;
-        esac
-    fi
+    # NO FILENAME TYPED -- an empty box, or a path that stops at a directory -- means "I
+    # have not decided", and that is a legitimate thing to want: sometimes it is a
+    # scratchpad, and the name is a decision better made after writing the thing, or never
+    # made at all. So it gets a real file with the clock for a name, and :saveas renames it
+    # if it turns out to matter.
+    #
+    # Both cases and not just the empty one, because the box arrives pre-filled with a
+    # directory: "blank" would have meant clearing a 40-character path first, which is a
+    # worse tax than typing a name. Pressing enter on the box as it comes is the gesture
+    # that means "just let me write something", and it used to do nothing at all.
+    #
+    # Under $HOME rather than in $STATE_DIR, because ~/.cache is the first thing the home
+    # sweep ignores: a scratchpad you cannot find again from the pad is one you have lost.
+    # And NOT in the directory you were looking at -- it is not part of that repo, and it
+    # would sit in `changed` as untracked noise until you dealt with it.
+    case "$path" in
+        ""|*/) target="$SCRATCH_DIR/$(date +%Y%m%d-%H%M%S).$SCRATCH_EXT" ;;
+        "~/"*) target="$HOME/${path#\~/}" ;;
+        /*)    target="$path" ;;
+        *)     target="$base/$path" ;;
+    esac
 
-    # A trailing slash is the OTHER quiet one, and it has to be: the prefill is a
-    # directory, so it always ends in one, which makes "enter on the untouched box" the
-    # likeliest keystroke here. That is not an error, it is "I have not typed the filename
-    # yet" -- the same thing as cancelling, and it gets the same silence. Scolding for it
-    # (with a "press any key", no less) was worse than the silence it replaced.
-    case "$target" in */) return 0 ;; esac
-
-    # Every refusal you actually NAMED something for says so, though. Under fzf's
-    # execute() a silent return is invisible -- fzf repaints the moment we exit, so "I
-    # declined" and "the key did nothing" look identical.
+    # Refusals you NAMED something for say so. Under fzf's execute() a silent return is
+    # invisible -- fzf repaints the moment we exit, so "I declined" and "the key did
+    # nothing" look identical. Backing out with ^C is the only quiet one left, and it can
+    # be: you know what you just did.
     if [ -d "$target" ]; then
         bail "already a directory: ${target/#$HOME/~}"
         return 0
@@ -2174,9 +2174,9 @@ ${B}open${O}
                  ${D}directory of the row you are on, in that row's repo (or at${O}
                  ${D}your query, if you typed a path); TAB completes directories.${O}
                  ${D}Parent dirs are made for you, the file itself only on :w.${O}
-                 ${C}blank box${O} ${D}= a scratchpad in ~/scratch named for the clock —${O}
-                 ${D}naming it is a decision for after you have written the thing,${O}
-                 ${D}with :saveas, or never. ^C backs out of the box.${O}
+                 ${C}no name typed${O} ${D}(the box as it comes, or empty) = a scratchpad in${O}
+                 ${D}~/scratch named for the clock. Naming it is a decision for after${O}
+                 ${D}you have written the thing, with :saveas, or never. ^C backs out.${O}
   ^O             open in cursor
   ^S             new tmux window at this file's repo root
 

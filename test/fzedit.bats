@@ -940,14 +940,16 @@ ED
 # Under fzf's execute() a silent return is invisible: fzf repaints the moment we exit, so
 # "I declined" and "the key did nothing" look identical -- which is how you end up
 # pressing it three times.
-# The prefill is a directory, so it always ends in "/", which makes enter on the untouched
-# box the likeliest keystroke here. That is "I have not typed the filename yet" -- the same
-# thing as cancelling, and it gets the same silence.
-@test "^T is quiet when you have not finished typing" {
+# The box arrives pre-filled with a directory, so "blank" would have meant clearing a
+# 40-character path first -- a worse tax than typing a name. Enter on the box as it comes
+# is the gesture that means "just let me write something".
+@test "^T with a directory and no filename is a scratchpad too, not a no-op" {
     pin_scope "$WT_FEATURE"
-    run bash -c "printf 'src/\n' | '$FZEDIT' --new '$WT_FEATURE/src/app.ts' ''"
-    [ -z "$output" ]
-    [ "$status" -eq 0 ]
+    export FZEDIT_SCRATCH_DIR="$HOME/scratch"
+    run bash -c "printf 'src/\n' | FZEDIT_EDITOR=echo '$FZEDIT' --new '$WT_FEATURE/src/app.ts' ''"
+    [[ "$output" == *"$HOME/scratch/"* ]] || { echo "$output"; return 1; }
+    # And not inside the directory that was in the box.
+    [ -z "$(ls "$WT_FEATURE/src" | grep -v app.ts)" ]
 }
 
 @test "^T says why when it refuses something you did name" {
