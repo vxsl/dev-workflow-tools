@@ -234,16 +234,46 @@ teardown() {
 @test "the header names a rebase in another worktree, so conflicts (0) is not a lie" {
     start_conflicting_rebase "$WT_FEATURE"
     pin_scope "$WT_NESTED"
+    set_mode conflicts
 
     out="$(fz --header | plain)"
     [[ "$out" == *"conflicts (0)"* ]]
-    [[ "$out" == *"repo.feature (rebase"* ]]
+    [[ "$out" == *"repo.feature ⟳ rebase"* ]]
+}
+
+# On the wide rungs the worktree rows are in the list carrying their own ⟳, so the
+# same sentence at the top is a second copy competing with the scope banner.
+@test "the in-flight hint is only on the rungs whose count could mislead" {
+    start_conflicting_rebase "$WT_FEATURE"
+    pin_scope "$WT_NESTED"
+    for mode in files home; do
+        set_mode "$mode"
+        out="$(fz --header | plain)"
+        [[ "$out" != *"⚠"* ]] || { echo "hint leaked onto $mode: $out"; return 1; }
+    done
 }
 
 @test "the header stays quiet when nothing is in flight elsewhere" {
     pin_scope "$WT_FEATURE"
+    set_mode conflicts
     out="$(fz --header | plain)"
     [[ "$out" != *"⚠"* ]]
+}
+
+# ⊙ repo.feature  feature is two thirds of the line spent saying one thing, and it is
+# the common case. The branch earns its width when it is a surprise, or mid-rebase.
+@test "the scope banner drops a branch the worktree name already implies" {
+    pin_scope "$WT_FEATURE"
+    out="$(fz --header | plain | head -1)"
+    [[ "$out" == *"⊙ repo.feature"* ]]
+    [[ "$(echo "$out" | grep -o feature | wc -l)" -eq 1 ]]
+}
+
+@test "the scope banner keeps a branch the name does not imply" {
+    git -C "$WT_FEATURE" checkout -q -b surprise-branch
+    pin_scope "$WT_FEATURE"
+    out="$(fz --header | plain | head -1)"
+    [[ "$out" == *"surprise-branch"* ]]
 }
 
 @test "outside a repo the rung is forced to home even if one was set" {
@@ -355,19 +385,29 @@ teardown() {
 # Worktrees as first-class rows
 # --------------------------------------------------------------------------
 
-@test "worktree rows appear in every mode" {
+@test "worktree rows appear on the wide rungs" {
     echo dirty >> "$WT_FEATURE/src/app.ts"
     pin_scope "$WT_FEATURE"
-    for mode in changed files; do
+    for mode in files home; do
         set_mode "$mode"
         [ "$(rows_of_type w | wc -l)" -ge 4 ]
     done
 }
 
-@test "worktree rows rank after file rows" {
+# conflicts and changed count THIS checkout's git state. Appending 154 worktrees under
+# a header that reads "conflicts (0)" says the opposite of what the rung just promised.
+@test "worktree rows stay off the rungs that count this checkout's git state" {
     echo dirty >> "$WT_FEATURE/src/app.ts"
     pin_scope "$WT_FEATURE"
-    set_mode changed
+    for mode in conflicts changed; do
+        set_mode "$mode"
+        [ "$(rows_of_type w | wc -l)" -eq 0 ] || { echo "worktrees on $mode"; return 1; }
+    done
+}
+
+@test "worktree rows rank after file rows" {
+    pin_scope "$WT_FEATURE"
+    set_mode files
     out="$(fz --generate-list | cut -f1 | uniq | tr '\n' ' ')"
     [ "$out" = "f w " ]
 }
@@ -821,6 +861,65 @@ ED
     # its own copy of main-only.ts, because `git worktree add` checks out the same
     # commit. The row that must be gone is the one under $H_MAIN.
     [[ "$out" != *"$H_MAIN/"* ]]
+}
+
+# ~/work/repos/<worktree>/ is the longest and least informative part of every row that
+# matters most on this rung, and it is the same 25 characters every time. The block
+# says it once, in the colour the header and the prompt already use for this checkout.
+@test "home rung shows the current checkout as its block, not its path prefix" {
+    setup_repo_under_home
+    pin_scope "$H_MAIN"
+    out="$(rows_of_type f | grep main-only | display_col)"
+    [[ "$out" == *"⊙ proj"* ]]
+    [[ "$out" == *"src/main-only.ts"* ]]
+    [[ "$out" != *"work/repos/proj/src"* ]]
+}
+
+@test "rows outside the current checkout keep their tilde path" {
+    setup_repo_under_home
+    pin_scope "$H_MAIN"
+    out="$(rows_of_type f | grep notes.md | display_col)"
+    [[ "$out" == *"~/notes.md"* ]]
+    [[ "$out" != *"⊙"* ]]
+}
+
+# The block is a background colour on text that is still there, so the worktree name
+# goes on matching -- otherwise compressing the prefix would cost you the query that
+# uses it.
+@test "the block leaves the worktree name matchable" {
+    setup_repo_under_home
+    pin_scope "$H_MAIN"
+    out="$(rows_of_type f | grep main-only | cut -f3-)"
+    [[ "$(printf '%s' "$out" | plain)" == *"proj"* ]]
+}
+
+# The query that found the worktree is a query about worktree names, and it matches
+# almost nothing inside the one you just switched to.
+@test "switching worktree tells fzf to clear the query" {
+    pin_scope "$WT_NESTED"
+    fz --open w "$WT_FEATURE"
+    [ "$(fz --switched)" = "clear-query" ]
+}
+
+@test "the flag is one-shot, so opening a file afterwards keeps the query" {
+    pin_scope "$WT_FEATURE"
+    fz --open w "$WT_NESTED"
+    fz --switched >/dev/null
+    [ -z "$(fz --switched)" ]
+}
+
+@test "opening a file does not clear the query" {
+    pin_scope "$WT_FEATURE"
+    FZEDIT_EDITOR=true fz --open f "$WT_FEATURE/src/app.ts"
+    [ -z "$(fz --switched)" ]
+}
+
+@test "every binding that can switch worktree is chained to the check" {
+    grep -q 'SWITCHED="transform(.*--switched)"' "$FZEDIT"
+    for key in enter ctrl-r ctrl-k; do
+        grep -q -- "--bind \"$key:.*\$SWITCHED" "$FZEDIT" ||
+            { echo "$key not chained to \$SWITCHED"; return 1; }
+    done
 }
 
 @test "the ignore file is seeded on first run" {

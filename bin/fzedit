@@ -83,6 +83,22 @@ HISTORY_FILE="${FZEDIT_HISTORY_FILE:-$HOME/.fzedit_history}"
 STATE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/fzedit"
 IGNORE_FILE="${FZEDIT_IGNORE_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/fzedit/ignore}"
 
+# The picker draws as an inset panel rather than filling the pad window.
+#
+# The window is a scratchpad at 80% of the screen with a 24pt font, and a picker that
+# paints all of it reads as an application you are now inside rather than a thing you
+# summoned to answer one question. The inset is the whole difference, and it is free
+# where it would have cost something: fzf's execute() hands the terminal to the child,
+# so nvim, tig and the pager still get the full window. Sizing the WINDOW smaller
+# cannot do this -- the editor opens inline in this same tmux window, so a smaller pad
+# is a smaller editor too.
+#
+# Set FZEDIT_MARGIN= (empty) to go back to filling the window.
+FZEDIT_MARGIN="${FZEDIT_MARGIN:-1,8%}"
+FZEDIT_BORDER="${FZEDIT_BORDER:-rounded}"
+FZEDIT_PANEL=()
+[ -n "$FZEDIT_MARGIN" ] && FZEDIT_PANEL=(--margin="$FZEDIT_MARGIN" --border="$FZEDIT_BORDER")
+
 # Each tab is an independent instance, so scope and rung are per-instance rather than
 # global -- otherwise two tabs fight over one scope file and switching worktree in one
 # silently retargets the other. Keyed by tmux pane, which is unique and stable for the
@@ -91,6 +107,10 @@ INSTANCE="${FZEDIT_INSTANCE:-${TMUX_PANE:-default}}"
 INSTANCE="${INSTANCE#%}"
 SCOPE_FILE="$STATE_DIR/scope-$INSTANCE"
 MODE_FILE="$STATE_DIR/mode-$INSTANCE"
+# Set by pin_scope, read and cleared by --switched. A one-shot flag rather than a
+# return code because the key bindings that can switch worktree all run us under fzf's
+# execute(), which hands the child the terminal and throws its exit status away.
+SWITCHED_FILE="$STATE_DIR/switched-$INSTANCE"
 PERSIST_MODE="--persist"
 
 mkdir -p "$STATE_DIR"
@@ -100,7 +120,7 @@ prune_dead_instances() {
     local live f id
     [ -n "${TMUX:-}" ] || return 0
     live=$(tmux list-panes -a -F '#{pane_id}' 2>/dev/null | tr -d '%' | tr '\n' ' ') || return 0
-    for f in "$STATE_DIR"/scope-* "$STATE_DIR"/mode-*; do
+    for f in "$STATE_DIR"/scope-* "$STATE_DIR"/mode-* "$STATE_DIR"/switched-*; do
         [ -e "$f" ] || continue
         id="${f##*-}"
         [ "$id" = "default" ] && continue
@@ -304,26 +324,21 @@ resolve_scope() {
 # --with-nth=3.. so it shows and matches only the display column, while {1}/{2} hand
 # us the row type and an unambiguous, shell-quoted real path. The type column is what
 # lets enter mean two different things without guessing from the path.
+#
 # $1 = root to strip from display ("" to just tilde-collapse).
-# $2 = "plain" to skip per-row colouring. On the home rung that colouring is the
-# single most expensive thing in the pipeline, for syntax tinting you cannot read
-# while fuzzy-searching by name anyway. Scoped rungs are ~12k rows, where it is free.
+# $2..$4 = the current worktree's root, display name and tint, for the block below.
+#
+# Every row is styled, including the home rung's ~50k. The whole formatted listing is
+# cached (see generate_list), so this runs on a cold build and on the mutating keys,
+# not on a redraw -- and the styling is what makes a wall of near-identical paths
+# scannable at all, which is the pad's entire job. Both splits and the extension
+# lookup are why it is a table and an index() rather than a chain of string compares:
+# that shape costs ~60ms over emitting the paths raw, where the old if-ladder cost
+# ~100ms and was skipped on `home` for it.
 format_lines() {
-    awk -F'\t' -v home="$HOME" -v root="$1" -v plain="${2:-}" -v wtbase="${DEFAULT_REPO:+$(dirname "$DEFAULT_REPO")}" '
-    function colour(fn,   n, parts, ext) {
-        n = split(fn, parts, ".")
-        ext = (n > 1) ? parts[n] : ""
-        if (ext == "hs" || ext == "lhs")                              return "\033[38;5;141m"
-        if (ext == "js" || ext == "jsx" || ext == "ts" || ext == "tsx") return "\033[38;5;221m"
-        if (ext == "py")                                              return "\033[38;5;81m"
-        if (ext == "sh" || ext == "bash" || ext == "zsh")              return "\033[38;5;114m"
-        if (ext == "yaml" || ext == "yml" || ext == "toml" || ext == "json") return "\033[38;5;173m"
-        if (ext == "md" || ext == "markdown" || ext == "txt")          return "\033[38;5;250m"
-        if (ext == "rs")                                              return "\033[38;5;208m"
-        if (ext == "go")                                              return "\033[38;5;86m"
-        if (ext == "rb")                                              return "\033[38;5;204m"
-        return "\033[0m"
-    }
+    awk -F'\t' -v home="$HOME" -v root="$1" \
+        -v curroot="$2" -v curname="$3" -v curcol="$4" \
+        -v wtbase="${DEFAULT_REPO:+$(dirname "$DEFAULT_REPO")}" '
     # git status two-letter code -> badge
     function badge(xy) {
         if (xy == "")                       return ""
@@ -331,6 +346,24 @@ format_lines() {
         if (xy == "??")                     return sprintf("\033[38;5;244m%-3s\033[0m", "?")
         if (substr(xy,1,1) != " ")          return sprintf("\033[38;5;114m%-3s\033[0m", xy)
         return sprintf("\033[38;5;221m%-3s\033[0m", xy)
+    }
+    BEGIN {
+        DIM = "\033[2m"; OFF = "\033[0m"
+        split("hs 141 lhs 141 js 221 jsx 221 ts 221 tsx 221 py 81 sh 114 bash 114" \
+              " zsh 114 yaml 173 yml 173 toml 173 json 173 md 250 markdown 250" \
+              " txt 250 rs 208 go 86 rb 204", K, " ")
+        for (i = 1; i in K; i += 2) TINT[K[i]] = "\033[38;5;" K[i+1] "m"
+
+        # The current checkout gets its block instead of its path prefix: on the home
+        # rung ~/work/repos/<worktree>/ is the longest and least informative part of
+        # every row that matters most, and it is the same 25 characters every time. The
+        # block says the same thing in one glance, in the colour the header and the p10k
+        # prompt already use for this checkout, and leaves the row to say which file.
+        # Still matchable by worktree name, since the name is in the display text.
+        if (curroot != "")
+            block = (curcol != "") \
+                ? "\033[48;5;" curcol "m\033[30m⊙ " curname OFF " " \
+                : "\033[1m⊙ " curname OFF " "
     }
     {
         type = $1
@@ -350,35 +383,48 @@ format_lines() {
             } else if (index(name, home) == 1) {
                 name = "~" substr(name, length(home) + 1)
             }
+            # The label is "<branch> ⟳ <op>", and for most worktrees the branch is
+            # already the directory name -- ul.UL-1671 / UL-1671 printed side by side,
+            # twice the width to say one thing. Drop the branch when the name implies
+            # it and keep whatever is in flight, which the name never says.
+            lbl = xy
+            opi = index(lbl, " ⟳ ")
+            br  = opi ? substr(lbl, 1, opi - 1) : lbl
+            if (br != "" && length(name) >= length(br) &&
+                substr(name, length(name) - length(br) + 1) == br)
+                lbl = opi ? substr(lbl, opi + 1) : ""
             # A filled block, the same one the header and the p10k prompt segment draw,
             # rather than a tinted glyph: on a list this long a foreground tint reads as
             # "some syntax colour" and a block reads as "this is a checkout". No block at
             # all on the primary, which is how it says so everywhere else.
             if (wcol == "")
-                printf "%s\t%s\t\033[1m⊙ %s\033[0m  \033[2m%s\033[0m\n", type, abs, name, xy
+                printf "%s\t%s\t\033[1m⊙ %s" OFF "%s\n", type, abs, name,
+                       (lbl == "" ? "" : "  " DIM lbl OFF)
             else
-                printf "%s\t%s\t\033[48;5;%sm\033[30m⊙ %s\033[0m  \033[2m%s\033[0m\n", \
-                       type, abs, wcol, name, xy
+                printf "%s\t%s\t\033[48;5;%sm\033[30m⊙ %s" OFF "%s\n", type, abs, wcol, name,
+                       (lbl == "" ? "" : "  " DIM lbl OFF)
             next
         }
 
         disp = abs
+        pre  = ""
         if (root != "" && index(disp, root "/") == 1) {
             disp = substr(disp, length(root) + 2)
+        } else if (curroot != "" && index(disp, curroot "/") == 1) {
+            disp = substr(disp, length(curroot) + 2)
+            pre  = block
         } else if (index(disp, home) == 1) {
             disp = "~" substr(disp, length(home) + 1)
         }
 
-        if (plain != "") {
-            printf "%s\t%s\t%s%s\n", type, abs, badge(xy), disp
-            next
-        }
-
-        n = split(disp, parts, "/")
-        filename = parts[n]
-        dir = substr(disp, 1, length(disp) - length(filename))
-
-        printf "%s\t%s\t%s\033[2m%s\033[0m%s%s\033[0m\n", type, abs, badge(xy), dir, colour(filename), filename
+        # Dim directory, lit basename: the query is nearly always a basename, so the
+        # part being matched is the part that should carry the ink.
+        n  = split(disp, P, "/")
+        fn = P[n]
+        m  = split(fn, E, ".")
+        printf "%s\t%s\t%s%s%s%s%s%s%s%s\n", type, abs, badge(xy), pre,
+               DIM, substr(disp, 1, length(disp) - length(fn)), OFF,
+               (m > 1 ? TINT[E[m]] : ""), fn, OFF
     }'
 }
 
@@ -795,20 +841,38 @@ shift_rung() {
 }
 
 build_list() {
-    local scope="$1" mode="$2"
+    local scope="$1" mode="$2" curname="" curcol=""
     # Worktrees are first-class alongside files: same list, same query, but appended
     # last so they rank below the mode's own rows. enter dispatches on the type
     # column, so selecting one re-scopes instead of opening an editor.
+    #
+    # Only on the wide rungs, though. `conflicts` and `changed` are counts of THIS
+    # checkout's git state, and appending 154 worktrees under a header that reads
+    # "conflicts (0)" says the opposite of what it means -- a screen of worktrees where
+    # the rung just promised there was nothing. Where the rung is "find me anything",
+    # a worktree is one of the things you might be looking for; where it is "show me
+    # what is broken here", it is 154 rows of noise. ^R is the switcher either way.
     {
         case "$mode" in
             changed)   list_changed   "$scope" ;;
             conflicts) list_conflicts "$scope" ;;
-            files)     list_files     "$scope" ;;
-            *)         list_home      "$scope" ;;
+            files)     list_files     "$scope"; list_worktree_rows "$scope" ;;
+            *)         list_home      "$scope"; list_worktree_rows "$scope" ;;
         esac
-        list_worktree_rows "$scope"
-    } | format_lines "$([ "$mode" = home ] && echo "" || echo "$scope")" \
-                     "$([ "$mode" = home ] && echo plain)"
+    } | {
+        # The block that replaces the current checkout's path prefix. Resolved once
+        # here rather than per row: it is two file reads and a hash, and format_lines
+        # is the one pass that must stay cheap.
+        if [ "$mode" = home ] && [ "$scope" != "$HOME" ]; then
+            curname="${scope##*/}"
+            worktree_colour_key "$scope"
+            wtc_colour "$WTC_KEY"
+            curcol="$WTC_COLOUR"
+            format_lines "" "$scope" "$curname" "$curcol"
+        else
+            format_lines "$([ "$mode" = home ] && echo "" || echo "$scope")"
+        fi
+    }
 }
 
 # The finished, formatted listing is cached too, not just the sweep underneath it.
@@ -852,15 +916,18 @@ in_flight_elsewhere() {
             name=$(wt_display_name "$wt" "$base")
             # Some branch-named worktrees are enormous; a hint is a nudge, not a target.
             [ "${#name}" -gt 32 ] && name="${name:0:31}…"
-            printf '%s\t%s (%s)\n' "$(stat -c %Y "$gd/index" 2>/dev/null || echo 0)" \
+            printf '%s\t%s ⟳ %s\n' "$(stat -c %Y "$gd/index" 2>/dev/null || echo 0)" \
                 "$name" "$WT_OP"
         done < <(worktree_dirs "$root") | sort -rn
     )
 
+    # One name, not a list. Two comma-separated worktree names with their counters in
+    # brackets is wider than the scope banner it sits beside, and reads as a report on
+    # other people's checkouts; the question it answers is only ever "am I pointed at
+    # the wrong one", which the most recently touched candidate answers by itself.
     [ "${#names[@]}" -gt 0 ] || return
     joined="${names[0]}"
-    [ "${#names[@]}" -gt 1 ] && joined="$joined, ${names[1]}"
-    [ "${#names[@]}" -gt 2 ] && joined="$joined +$(( ${#names[@]} - 2 ))"
+    [ "${#names[@]}" -gt 1 ] && joined="$joined +$(( ${#names[@]} - 1 ))"
     printf '%s' "$joined"
 }
 
@@ -917,18 +984,23 @@ scope_banner() {
         fi
     fi
 
-    # The block names the checkout; the branch goes beside it, dimmed, because it is
-    # usually implied by the name and occasionally isn't -- and because it is where
-    # "⟳ rebase 2/6" shows up.
+    # The block names the checkout; the branch goes beside it, dimmed, and only when the
+    # directory name does not already say it. "⊙ ul.UL-1671  UL-1671" is two thirds of
+    # the line spent saying one thing, and it is the common case -- the branch is worth
+    # the width exactly when it is a surprise (a hotfix parked in a slack-* checkout),
+    # or when it is carrying "⟳ rebase 2/6".
+    local side="$WT_LABEL" D=$'\033[2m' O=$'\033[0m'
+    case "$name" in *"$WT_BRANCH") side="${WT_OP:+⟳ $WT_OP}" ;; esac
+    side="${side:+  $D$side$O}"
+
     wtc_colour "$WT_KEY"
     if [ -z "$WTC_COLOUR" ]; then
         # The primary checkout, which the prompt gives no segment at all. No block here
         # either, so "no block" keeps meaning "you are on main" in both windows.
-        printf '\033[1m⊙ %s\033[0m  \033[2m%s\033[0m' "$name" "$WT_LABEL"
+        printf '\033[1m⊙ %s\033[0m%s' "$name" "$side"
         return
     fi
-    printf '\033[48;5;%sm\033[30m⊙ %s\033[0m  \033[2m%s\033[0m' \
-           "$WTC_COLOUR" "$name" "$WT_LABEL"
+    printf '\033[48;5;%sm\033[30m⊙ %s\033[0m%s' "$WTC_COLOUR" "$name" "$side"
 }
 
 # Show the whole ladder with the current rung bracketed, so where you are and where
@@ -952,11 +1024,23 @@ header_line() {
         gd=$(git -C "$scope" rev-parse --absolute-git-dir 2>/dev/null)
         if [ -n "$gd" ] && read_wt_state "$gd"; then
             label="$(scope_banner "$scope")"
-            # Same 154-worktree walk as the rows above, and the same reasoning for
-            # caching it: a rebase does not start and finish between two TAB presses.
-            elsewhere=$(cached derived "inflight-$(cache_key "$scope")" "$WT_ROWS_TTL" \
-                               in_flight_elsewhere "$scope")
-            [ -n "$elsewhere" ] && label="$label  ${ESC_WARN}⚠ $elsewhere${ESC_OFF}"
+            # Only on the rungs that count this checkout's git state. There the hint is
+            # the answer to a question the rung has just raised -- "conflicts (0), so is
+            # it clean or am I in the wrong checkout?" -- and it is the only thing on
+            # screen that can answer it. On `files` and `home` the worktree rows are
+            # right there in the list carrying their own ⟳, so the same sentence at the
+            # top is a second copy competing with the one line that says where you are.
+            case "$mode" in
+                conflicts|changed)
+                    # Same 154-worktree walk as the rows above, and the same reasoning
+                    # for caching it: a rebase does not start and finish between two TAB
+                    # presses.
+                    elsewhere=$(cached derived "inflight-$(cache_key "$scope")" \
+                                       "$WT_ROWS_TTL" in_flight_elsewhere "$scope")
+                    [ -n "$elsewhere" ] &&
+                        label="$label  ${ESC_WARN}⚠ also $elsewhere${ESC_OFF}"
+                    ;;
+            esac
         fi
     fi
 
@@ -971,8 +1055,11 @@ header_line() {
         fi
     done
 
-    printf '%s\n%sTAB widen · S-TAB narrow ·%s%s  %s· ^F grep · ^R rr · ^G tab · F1 keys%s\n' \
-        "$label" "$ESC_DIM" "$ESC_OFF" "$ladder" "$ESC_DIM" "$ESC_OFF"
+    # No "TAB widen · S-TAB narrow" spelled out: the bracket around the current rung
+    # already says the ladder is walkable, F1 says how, and this line is two rows of the
+    # list that the list is not getting.
+    printf '%s\n%s %s· ^F grep · ^R rr · ^G tab · F1 keys%s\n' \
+        "$label" "$ladder" "$ESC_DIM" "$ESC_OFF"
 }
 
 # Cheap counts for the header. Bounded work: we only need "how many", and for the two
@@ -989,9 +1076,26 @@ count_rung() {
 pin_scope() {
     printf '%s' "$1" > "$SCOPE_FILE"
     : > "$MODE_FILE"
+    # The query that found the worktree is nearly never a query about its contents --
+    # you type "1633" to get to ul.UL-1633, and then every file in it is filtered by
+    # "1633", which matches almost none of them. Switching scope is arriving somewhere
+    # new, so the picker should look like it does on arrival. See --switched.
+    : > "$SWITCHED_FILE"
     # Into the log rr also reads, so a switch made here shows up as "most recent"
     # over there too, and vice versa.
     wta_record "$1"
+}
+
+# Consume the flag pin_scope leaves, printing the actions fzf should run as a result.
+#
+# fzf's transform() takes the command's stdout as an action list, which is the only way
+# a binding can decide at press time whether it is opening a file or arriving in a new
+# worktree -- enter is bound once and means both. Printing nothing is a valid empty
+# action list, so the file case costs one fork and changes nothing.
+took_switch() {
+    [ -f "$SWITCHED_FILE" ] || return 0
+    rm -f "$SWITCHED_FILE"
+    printf 'clear-query'
 }
 
 # enter means "open this file" or "switch to this worktree" depending on the row.
@@ -1048,6 +1152,7 @@ choose_worktree() {
               printf "%s\t%s\t%s\n", $1, d, $2
           }' \
         | "$FZP_FZF" --ansi --delimiter='\t' --with-nth=2.. --height=100% --reverse \
+              "${FZEDIT_PANEL[@]}" \
               --prompt="$prompt" \
               --preview='git -C {1} status --short --branch 2>/dev/null | head -40' \
               --preview-window=down:50%:wrap \
@@ -1324,6 +1429,7 @@ grep_mode() {
     # freezing the current result set and fuzzy-filtering it instead -- the two-stage
     # search you want when a common identifier matches four hundred lines.
     selected=$("$FZP_FZF" --ansi --disabled --height=100% --reverse --info=inline \
+        "${FZEDIT_PANEL[@]}" \
         --delimiter=$'\t' --with-nth='4..' \
         --prompt="rg [$(basename "$scope")] > " \
         --header=$'^F fuzzy-filter these results · ^E all matches → quickfix · esc back' \
@@ -1534,6 +1640,11 @@ sync_tab_chrome() {
     tmux rename-window -t "${TMUX_PANE}" "$label" 2>/dev/null
     if sess=$(editor_session); then
         tmux set-option -t "$sess" status on 2>/dev/null
+        # Tabs above the picker, not below it. They are a tab BAR -- the one thing on
+        # screen that says how many fzedits are open and which one this is -- and at the
+        # bottom they sit under fzf's prompt and preview, which is where the eye is
+        # already busy. Per-session, like the prefix below.
+        tmux set-option -t "$sess" status-position top 2>/dev/null
         # A root-table binding is shadowed by the prefix key, so bare C-b/C-x can
         # only reach their bindings if this session has no prefix. Per-session
         # option: every other session keeps C-b as prefix.
@@ -1662,7 +1773,7 @@ ${B}misc${O}
   F5             refresh, ignoring every cache below
   F1             this page
 
-${D}config: .env (paths) · ~/.config/fzedit/ignore (home-sweep noise)${O}
+${D}config: .env (paths, FZEDIT_MARGIN) · ~/.config/fzedit/ignore (home-sweep noise)${O}
 ${D}the fd sweeps are cached ${SWEEP_TTL}s and the worktree list ${WT_ROWS_TTL}s, so TAB is instant;${O}
 ${D}history, changed and conflicts are never cached and are always live.${O}
 EOF
@@ -1685,6 +1796,7 @@ case "${1:-}" in
     --open)          open_row "$2" "$3" "${4:-}"; exit 0 ;;
     --open-many)     shift; open_many "$@"; exit 0 ;;
     --pin)           pin_scope "$(git_root_of "${2:-$PWD}" || abspath "${2:-$PWD}")"; exit 0 ;;
+    --switched)      took_switch; exit 0 ;;
     --record)        record_history "$2"; exit 0 ;;
     --widen)         shift_rung 1;  exit 0 ;;
     --narrow)        shift_rung -1; exit 0 ;;
@@ -1745,12 +1857,16 @@ REFRESH="reload($0 --generate-list)+transform-header($0 --header)"
 REFRESH_MED="reload(FZEDIT_RELIST=1 $0 --generate-list)+transform-header(FZEDIT_RELIST=1 $0 --header)"
 # ^R only: rebuild the filesystem sweep too, for when a file appeared behind us.
 REFRESH_HARD="reload(FZEDIT_NO_CACHE=1 $0 --generate-list)+transform-header(FZEDIT_NO_CACHE=1 $0 --header)"
+# Chained after every binding that can land you in a different worktree: clears the
+# query if it did, and is a no-op if it did not. See took_switch.
+SWITCHED="transform($0 --switched)"
 
 # A fresh launch always starts from the auto-chosen rung; the file only exists to
 # carry the choice across fzf's reloads within this session.
 : > "$MODE_FILE"
 
 generate_list | fzp_run $PERSIST_MODE \
+    "${FZEDIT_PANEL[@]}" \
     --delimiter=$'\t' \
     --with-nth='3..' \
     `# fzf-helpers sets --sync, which renders NOTHING until the whole stream ends.` \
@@ -1766,7 +1882,7 @@ generate_list | fzp_run $PERSIST_MODE \
     --header="$(header_line)" \
     --preview="$0 --preview {1} {2}" \
     --preview-window=down:55%:wrap \
-    --bind "enter:execute($0 --open {1} {2} < /dev/tty > /dev/tty 2>&1)+$REFRESH_MED" \
+    --bind "enter:execute($0 --open {1} {2} < /dev/tty > /dev/tty 2>&1)+$SWITCHED+$REFRESH_MED" \
     --bind "ctrl-e:execute($0 --open-many {+2} < /dev/tty > /dev/tty 2>&1)+deselect-all+$REFRESH_MED" \
     --bind "ctrl-space:toggle+down" \
     --bind "ctrl-o:execute-silent($0 --record {2}; cursor -r {2})" \
@@ -1779,8 +1895,8 @@ generate_list | fzp_run $PERSIST_MODE \
     --bind "ctrl-g:execute-silent($0 --tab)" \
     --bind "tab:execute-silent($0 --widen)+$REFRESH" \
     --bind "btab:execute-silent($0 --narrow)+$REFRESH" \
-    --bind "ctrl-r:execute($0 --pick-worktree < /dev/tty > /dev/tty 2>&1)+$REFRESH_MED" \
-    --bind "ctrl-k:execute($0 --carry {2} < /dev/tty > /dev/tty 2>&1)+$REFRESH_MED" \
+    --bind "ctrl-r:execute($0 --pick-worktree < /dev/tty > /dev/tty 2>&1)+$SWITCHED+$REFRESH_MED" \
+    --bind "ctrl-k:execute($0 --carry {2} < /dev/tty > /dev/tty 2>&1)+$SWITCHED+$REFRESH_MED" \
     --bind "ctrl-l:execute($0 --tig {1} {2} < /dev/tty > /dev/tty 2>&1)+$REFRESH_MED" \
     --bind "f1:execute($0 --help-keys < /dev/tty > /dev/tty 2>&1)" \
     --bind "esc:clear-query" \
