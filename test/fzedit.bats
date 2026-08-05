@@ -1168,50 +1168,44 @@ ED
 
 @test "^A never stages anything itself" {
     echo dirty >> "$WT_FEATURE/src/app.ts"
-    FZEDIT_TIG=true fz --status f "$WT_FEATURE/src/app.ts"
+    pin_scope "$WT_FEATURE"
+    FZEDIT_TIG=true fz --status
     run git -C "$WT_FEATURE" status --porcelain src/app.ts
     # Still unstaged: worktree-modified, index clean.
     [[ "$output" == " M"* ]]
 }
 
-@test "^A opens tig status at the row's checkout" {
-    fake_tig
-    fz --status f "$WT_NESTED/src/app.ts"
-    run cat "$TEST_TMPDIR/tig_call"
-    [[ "$output" == "w $WT_NESTED" ]]
-}
-
-# On the home rung the row can be in a checkout other than the scope, and staging the
-# wrong worktree is not a mistake worth allowing.
-@test "^A follows the row rather than the scope when they disagree" {
+@test "^A opens tig status for the scope" {
     pin_scope "$WT_FEATURE"
     fake_tig
-    fz --status f "$WT_NESTED/src/app.ts"
-    run cat "$TEST_TMPDIR/tig_call"
-    [[ "$output" != *"$WT_FEATURE"* ]]
-}
-
-# "conflicts (0)" is an empty list, and an empty list is when you most want to look at
-# the working tree -- so this cannot need a row.
-@test "^A with no row falls back to the scope" {
-    pin_scope "$WT_FEATURE"
-    fake_tig
-    fz --status f ''
+    fz --status
     run cat "$TEST_TMPDIR/tig_call"
     [[ "$output" == "w $WT_FEATURE" ]]
 }
 
-@test "^A on a ⊙ row shows that checkout" {
+# The header block, the rung counts and this key have to mean the same checkout, or they
+# cannot be read together -- and a target that follows the cursor is a target you cannot
+# see. ^L is the row's key; this one is the checkout's.
+@test "^A ignores the row entirely, so its target is never a surprise" {
     pin_scope "$WT_FEATURE"
     fake_tig
-    fz --status w "$WT_NESTED"
+    fz --status "$WT_NESTED/src/app.ts"
     run cat "$TEST_TMPDIR/tig_call"
-    [[ "$output" == "w $WT_NESTED" ]]
+    [[ "$output" == "w $WT_FEATURE" ]]
+}
+
+# "conflicts (0)" is an empty list, and an empty list is when you most want to look at
+# the working tree -- so this cannot need a row.
+@test "^A works with no row at all" {
+    pin_scope "$WT_FEATURE"
+    fake_tig
+    fz --status
+    [ -f "$TEST_TMPDIR/tig_call" ]
 }
 
 @test "^A outside a repo says so instead of flashing" {
-    echo loose > "$TEST_TMPDIR/loose.txt"
-    run fz --status f "$TEST_TMPDIR/loose.txt"
+    # No worktree resolves, so the scope is $HOME, which is not a checkout.
+    run fz --status
     [ "$status" -eq 0 ]
     [[ "$output" == *"not in a git repository"* ]]
 }
@@ -1597,6 +1591,30 @@ ED
     fz --tig w "$WT_NESTED"
     run cat "$TEST_TMPDIR/tig_call"
     [ "$output" = "w $WT_NESTED" ]
+}
+
+# From the pad, tig is a modal overlay, and an overlay closes with the key that opened it
+# -- q is tig's own way out, one view at a time, and a keypress you have to know.
+@test "the pad's tig closes with the keys that opened it, and with esc" {
+    rc="$(fz --tigrc)"
+    for bind in '<Ctrl-A> quit' '<Ctrl-L> quit' '<Esc> quit'; do
+        grep -qF "bind generic $bind" "$rc" || { echo "missing: $bind"; return 1; }
+    done
+}
+
+# TIGRC_USER replaces the user config rather than adding to it, so losing Kyle's own tig
+# bindings is the failure mode to guard against.
+@test "the pad's tigrc sources the real one rather than replacing it" {
+    printf 'bind main T :toggle date\n' > "$HOME/.tigrc"
+    rc="$(fz --tigrc)"
+    grep -qF "source $HOME/.tigrc" "$rc"
+}
+
+@test "the pad's tigrc copes with no user tigrc at all" {
+    rm -f "$HOME/.tigrc"
+    rc="$(fz --tigrc)"
+    [ -s "$rc" ]
+    ! grep -q "^source" "$rc"
 }
 
 # ^L is the row's key, ^A is the checkout's -- so unlike ^A, this one has nothing to do

@@ -10,7 +10,7 @@
 #   ^G     new tab (a whole separate instance)
 #   ^R     browse worktrees on their own, most recent first (r for rr)
 #   ^F     search file CONTENTS (ripgrep), landing on the matching line
-#   F1     the whole keymap, without leaving the pad
+#   F1     the whole keymap, without leaving the pad (q or esc closes it)
 #
 # Tabs are tmux windows in the pad session: bare C-x / C-b move left / right,
 # matching their keyboard positions, and C-M-w closes one. That needs `prefix None`
@@ -1342,14 +1342,42 @@ bail() {
     return 0
 }
 
+#
+# From the pad, tig is a modal overlay, and an overlay closes with the key that opened it
+# or with esc. tig's own way out is q -- one view at a time, and a keypress you have to
+# know -- so the pad's tig gets ^A, ^L and esc as well, all of them "back to the picker".
+#
+# TIGRC_USER REPLACES the user config rather than adding to it, so the generated file
+# sources the real one first. Rewritten on every launch instead of cached: it is three
+# lines, and a cached copy would need a reason to believe ~/.tigrc had not moved. tig run
+# from a shell is untouched -- these bindings exist because the pad opened it, and ^L in
+# particular is redraw-the-screen in an ordinary tig.
+tig_rc() {
+    local rc="$STATE_DIR/tigrc" user
+    for user in "${XDG_CONFIG_HOME:-$HOME/.config}/tig/config" "$HOME/.tigrc"; do
+        [ -f "$user" ] && break
+        user=""
+    done
+    {
+        [ -n "$user" ] && printf 'source %s\n' "$user"
+        printf 'bind generic <Ctrl-A> quit\n'
+        printf 'bind generic <Ctrl-L> quit\n'
+        printf 'bind generic <Esc> quit\n'
+    } > "$rc" 2>/dev/null || return 1
+    printf '%s' "$rc"
+}
+
 open_tig() {
-    local type="$1" path="$2" root rc
+    local type="$1" path="$2" root rc tigrc
     [ -n "$path" ] || return 0
     if [ -n "${FZEDIT_TIG:-}" ]; then
         "$FZEDIT_TIG" "$type" "$path"
         return
     fi
     command -v tig >/dev/null 2>&1 || { bail "tig is not installed"; return 0; }
+    # Only on success: an empty TIGRC_USER would mean "no user config at all", which is a
+    # worse outcome than not having the extra bindings.
+    tigrc=$(tig_rc) && export TIGRC_USER="$tigrc"
 
     if [ "$type" = "w" ]; then
         [ -d "$path" ] || { bail "not a directory: $path"; return 0; }
@@ -1394,23 +1422,25 @@ open_tig() {
 # diff is (<leader>gr resets a hunk). Staging needs the diff just as much, so it goes the
 # same way and hands you tig, where u stages, ! discards and enter shows you the change.
 #
-# Scope-level, not row-level, which is why it is its own key rather than more ^L: `tig
-# status` is a view of a whole CHECKOUT (^L on a ⊙ row is already exactly this), while
-# ^L on a file row is that file's history. Needing no row is the point -- "conflicts (0)"
-# is an empty list, and an empty list is when you most want to look at the working tree.
+# ALWAYS the scope, and never the row. That is what makes it a different key from ^L
+# rather than a second one:
 #
-# The row still chooses the repo when it is a file, because on the home rung the row may
-# be in a checkout other than the scope, and staging the wrong worktree is not a mistake
-# worth allowing.
+#   ^L  the row's git   -- a file's history, or a ⊙ row's checkout
+#   ^A  my git          -- the status of the checkout I am in
+#
+# Following the cursor would make ^A's target invisible: you could not tell what it was
+# about to show you without first inspecting whichever row the cursor happened to be
+# parked on, and on the home rung that is routinely something incidental -- the top row
+# after a search is as likely to be ~/.config/dev-workflow/current.env as anything, and
+# ^A would answer with a "not in a git repository" for a key you pressed to look at your
+# own working tree. The header block, the rung counts and this key now all mean the same
+# checkout, which is the only way they can be read together.
+#
+# Needing no row at all is the other half: "conflicts (0)" is an empty list, and an empty
+# list is exactly when you want to look at the working tree.
 open_tig_status() {
-    local type="${1:-}" path="${2:-}" root=""
-    if [ "$type" = f ] && [ -n "$path" ] && [ -f "$path" ]; then
-        root=$(root_of_file "$(abspath "$path")")
-    elif [ "$type" = w ] && [ -d "$path" ]; then
-        root="$path"
-    else
-        root=$(resolve_scope)
-    fi
+    local root
+    root=$(resolve_scope)
     [ -d "$root" ] || { bail "no worktree to show the status of"; return 0; }
     git -C "$root" rev-parse --git-dir >/dev/null 2>&1 \
         || { bail "not in a git repository: ${root/#$HOME/~}"; return 0; }
@@ -1916,12 +1946,14 @@ ${B}find${O}
   F5             refresh
 
 ${B}git${O}
-  ^A             ${C}stage / discard / diff${O} ${D}— \`tig status\` for this row's checkout${O}
-                 ${D}(the scope's, if the row is not a file). u stages, ! discards,${O}
-                 ${D}enter shows you the change. Wants no row, so it works on an${O}
-                 ${D}empty "conflicts (0)" — which is when you most want to look.${O}
-  ^L             tig ${D}— this file's history, or \`tig status\` on a ⊙ row.${O}
-                 ${D}tig's E jumps back here, on the line, so the loop closes.${O}
+  ^A             ${C}stage / discard / diff${O} ${D}— \`tig status\` for the checkout in the${O}
+                 ${D}header, whatever row you are on. u stages, ! discards, enter${O}
+                 ${D}shows you the change. Needs no row, so it works on an empty${O}
+                 ${D}"conflicts (0)" — which is when you most want to look.${O}
+  ^L             tig ${D}— the ROW's git: a file's history, or \`tig status\` on a ⊙${O}
+                 ${D}row. tig's E jumps back here, on the line, so the loop closes.${O}
+  ${D}in either tig: ^A, ^L or esc comes back here — it is an overlay, and closes${O}
+  ${D}with the key that opened it. q still works, one view at a time, as tig's own.${O}
   ${D}badges: M modified · A added · ?  untracked · !! conflicted — a read-out,${O}
   ${D}not a button. Nothing here does a git action with no diff in front of it:${O}
   ${D}staging is ^A's tig, and discarding is nvim's, where the diff already is${O}
@@ -1939,7 +1971,7 @@ ${B}misc${O}
   S-up / S-down  scroll the preview
   ^N / ^P        down / up      ${D}(^D / ^U for half a page)${O}
   F5             refresh, ignoring every cache below
-  F1             this page
+  F1             this page ${D}— q or esc closes it${O}
 
 ${D}config: .env (paths, FZEDIT_MARGIN) · ~/.config/fzedit/ignore (home-sweep noise)${O}
 ${D}the fd sweeps are cached ${SWEEP_TTL}s and the worktree list ${WT_ROWS_TTL}s, so TAB is instant;${O}
@@ -1947,8 +1979,39 @@ ${D}history, changed and conflicts are never cached and are always live.${O}
 EOF
 }
 
+# F1, in the same box the picker draws in, and carrying its own way out.
+#
+# This went through less, which got two things wrong. It filled the window the picker had
+# just stopped filling, so the one screen in the pad that is pure reading was also the
+# widest. And the way out was "press q" -- knowledge you either have or are stuck with a
+# full-screen pager over your file list, which is a poor reward for pressing the help key.
+#
+# fzf is the pager instead: same margin and border as everything else for free, scrolling
+# for free, and a header that says how to leave. --disabled because there is nothing to
+# search here, which is also what frees q / j / k / g / G to be pager keys. --wrap so a
+# line of prose is never quietly cut off at the border.
+#
+# FZEDIT_PAGER overrides it, for a caller that would rather have the plain text -- the
+# tests use it, and `fzedit --keys` prints the text with no pager at all.
 show_help() {
-    help_text | ${PAGER:-less} -R 2>/dev/null || help_text
+    if [ -n "${FZEDIT_PAGER:-}" ]; then
+        # shellcheck disable=SC2086 -- a deliberate word-split command line.
+        help_text | ${FZEDIT_PAGER}
+        return 0
+    fi
+    help_text | "$FZP_FZF" --ansi --disabled --no-sort --layout=reverse --wrap \
+        "${FZEDIT_PANEL[@]}" \
+        `# pointer, marker and gutter all blanked: this is prose, and a column of ▌ down` \
+        `# the left of it reads as "these are rows you can pick one of".` \
+        --info=hidden --prompt='' --pointer=' ' --marker=' ' --gutter=' ' \
+        --color='fg+:-1,bg+:-1,hl+:-1,gutter:-1' --no-scrollbar \
+        --header=$'q or esc to close · ^D / ^U scroll · j / k line · g / G ends' \
+        --header-first \
+        --bind 'q:abort' --bind 'esc:abort' --bind 'ctrl-c:abort' \
+        --bind 'j:down' --bind 'k:up' --bind 'g:first' --bind 'G:last' \
+        --bind 'ctrl-d:half-page-down' --bind 'ctrl-u:half-page-up' \
+        >/dev/null 2>&1
+    return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -1970,11 +2033,12 @@ case "${1:-}" in
     --record)        record_history "$2"; exit 0 ;;
     --widen)         shift_rung 1;  exit 0 ;;
     --narrow)        shift_rung -1; exit 0 ;;
-    --status)        open_tig_status "${2:-}" "${3:-}"; exit 0 ;;
+    --status)        open_tig_status; exit 0 ;;
     --copy)          copy_text "${2:-}"; exit 0 ;;
     --copy-rel)      [ -n "${2:-}" ] && copy_text "$(rel_of "$2")"; exit 0 ;;
     --carry)         carry_file "${2:-}"; exit 0 ;;
     --tig)           open_tig "${2:-}" "${3:-}"; exit 0 ;;
+    --tigrc)         tig_rc; exit $? ;;
     --grep)          grep_mode; exit 0 ;;
     --grep-list)     grep_list "${2:-}" "${3:-$(resolve_scope)}"; exit 0 ;;
     --grep-preview)  grep_preview "${2:-}" "${3:-1}"; exit 0 ;;
@@ -2062,7 +2126,7 @@ generate_list | fzp_run $PERSIST_MODE \
     --bind "ctrl-s:execute-silent(tmux new-window -c \"\$($0 --rootof {2})\")" \
     --bind "ctrl-c:execute-silent($0 --copy {2})" \
     --bind "ctrl-y:execute-silent($0 --copy-rel {2})" \
-    --bind "ctrl-a:execute($0 --status {1} {2} < /dev/tty > /dev/tty 2>&1)+$REFRESH_MED" \
+    --bind "ctrl-a:execute($0 --status < /dev/tty > /dev/tty 2>&1)+$REFRESH_MED" \
     --bind "ctrl-f:execute($0 --grep < /dev/tty > /dev/tty 2>&1)+$REFRESH_MED" \
     --bind "f5:$REFRESH_HARD" \
     --bind "ctrl-g:execute-silent($0 --tab)" \
