@@ -167,6 +167,16 @@ display_col() { cut -f3- | plain; }
 # Pretend a tmux session exists (used for the tab tests).
 add_tmux_session() { printf '%s\n' "$1" >> "$TEST_TMUX_SESSIONS"; }
 
+# A tig that records how it was called instead of drawing one, via the FZEDIT_TIG seam
+# open_tig already has. Writes "<type> <path>" to $TEST_TMPDIR/tig_call, and leaves no
+# file at all when tig was never reached.
+fake_tig() {
+    printf '#!/bin/bash\necho "$1 $2" > "%s/tig_call"\n' "$TEST_TMPDIR" \
+        > "$TEST_TMPDIR/fakebin/faketig"
+    chmod +x "$TEST_TMPDIR/fakebin/faketig"
+    export FZEDIT_TIG="$TEST_TMPDIR/fakebin/faketig"
+}
+
 # A tmux with $1 windows open, so both of tab_step's branches are reachable, recording
 # which one it took. Everything else lands in $TEST_TMPDIR/tmux_calls verbatim:
 # sync_tab_chrome sends its options as one ';'-separated command list, so there is one

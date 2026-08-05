@@ -1159,40 +1159,61 @@ ED
 }
 
 # --------------------------------------------------------------------------
-# ^A — staging from the picker
+# ^A — the staging VIEW
+#
+# It used to `git add` the row outright: the one place in the pad that did a git action
+# with no diff in front of it. Discarding was already kept out for that reason, so
+# staging goes the same way and hands you tig.
 # --------------------------------------------------------------------------
 
-@test "--stage stages an unstaged file" {
+@test "^A never stages anything itself" {
     echo dirty >> "$WT_FEATURE/src/app.ts"
-    fz --stage "$WT_FEATURE/src/app.ts"
+    FZEDIT_TIG=true fz --status f "$WT_FEATURE/src/app.ts"
     run git -C "$WT_FEATURE" status --porcelain src/app.ts
-    [[ "$output" == "M "* ]]
-}
-
-@test "--stage toggles: a staged file is unstaged again" {
-    echo dirty >> "$WT_FEATURE/src/app.ts"
-    git_q "$WT_FEATURE" add src/app.ts
-    fz --stage "$WT_FEATURE/src/app.ts"
-    run git -C "$WT_FEATURE" status --porcelain src/app.ts
+    # Still unstaged: worktree-modified, index clean.
     [[ "$output" == " M"* ]]
 }
 
-@test "--stage on an untracked file adds it" {
-    echo new > "$WT_FEATURE/src/brand-new.ts"
-    fz --stage "$WT_FEATURE/src/brand-new.ts"
-    run git -C "$WT_FEATURE" status --porcelain src/brand-new.ts
-    [[ "$output" == "A "* ]]
+@test "^A opens tig status at the row's checkout" {
+    fake_tig
+    fz --status f "$WT_NESTED/src/app.ts"
+    run cat "$TEST_TMPDIR/tig_call"
+    [[ "$output" == "w $WT_NESTED" ]]
 }
 
-@test "--stage outside a repo is a no-op rather than an error" {
+# On the home rung the row can be in a checkout other than the scope, and staging the
+# wrong worktree is not a mistake worth allowing.
+@test "^A follows the row rather than the scope when they disagree" {
+    pin_scope "$WT_FEATURE"
+    fake_tig
+    fz --status f "$WT_NESTED/src/app.ts"
+    run cat "$TEST_TMPDIR/tig_call"
+    [[ "$output" != *"$WT_FEATURE"* ]]
+}
+
+# "conflicts (0)" is an empty list, and an empty list is when you most want to look at
+# the working tree -- so this cannot need a row.
+@test "^A with no row falls back to the scope" {
+    pin_scope "$WT_FEATURE"
+    fake_tig
+    fz --status f ''
+    run cat "$TEST_TMPDIR/tig_call"
+    [[ "$output" == "w $WT_FEATURE" ]]
+}
+
+@test "^A on a ⊙ row shows that checkout" {
+    pin_scope "$WT_FEATURE"
+    fake_tig
+    fz --status w "$WT_NESTED"
+    run cat "$TEST_TMPDIR/tig_call"
+    [[ "$output" == "w $WT_NESTED" ]]
+}
+
+@test "^A outside a repo says so instead of flashing" {
     echo loose > "$TEST_TMPDIR/loose.txt"
-    run fz --stage "$TEST_TMPDIR/loose.txt"
+    run fz --status f "$TEST_TMPDIR/loose.txt"
     [ "$status" -eq 0 ]
-}
-
-@test "--stage on a path that is not a file is a no-op" {
-    run fz --stage "$WT_FEATURE"
-    [ "$status" -eq 0 ]
+    [[ "$output" == *"not in a git repository"* ]]
 }
 
 # --------------------------------------------------------------------------
@@ -1299,7 +1320,8 @@ ED
     out="$(FZP_FZF="$TEST_TMPDIR/fakebin/fzfargs" "$FZEDIT" --one-shot 2>&1)"
     [[ "$out" == *"ctrl-f:execute"*"--grep"* ]]
     [[ "$out" == *"ctrl-e:execute"*"--open-many"* ]]
-    [[ "$out" == *"ctrl-a:execute-silent"*"--stage"* ]]
+    [[ "$out" == *"ctrl-a:execute"*"--status"* ]]
+    [[ "$out" == *"ctrl-t:execute"*"--new"* ]]
     [[ "$out" == *"ctrl-y:execute-silent"*"--copy-rel"* ]]
     [[ "$out" == *"ctrl-space:toggle"* ]]
     [[ "$out" == *"f1:execute"*"--help-keys"* ]]
@@ -1345,6 +1367,15 @@ ED
             return 1
         fi
     done < <(printf '%s\n' "$args" | grep -oE '^(ctrl|alt)-[a-z]+|^f[0-9]+' | sort -u)
+}
+
+# The help is an unquoted heredoc, so it needs ${B}/${D} to expand -- which means
+# backticks expand too. `tig status` in the text was really LAUNCHING tig, four times,
+# every time you pressed F1, and the words vanished from the page it was documenting.
+@test "the help text does not run the commands it mentions" {
+    run fz --keys
+    [[ "$output" == *'`tig status`'* ]]
+    [[ "$output" != *"Failed to open tty"* ]]
 }
 
 @test "--keys works standalone, for when the pad is not even running" {
@@ -1555,27 +1586,26 @@ ED
 # --------------------------------------------------------------------------
 
 @test "^L on a file row opens that file's history" {
-    printf '#!/bin/bash\necho "$1 $2" > "$TEST_TMPDIR/tig"\n' > "$TEST_TMPDIR/fakebin/faketig"
-    chmod +x "$TEST_TMPDIR/fakebin/faketig"
-    FZEDIT_TIG="$TEST_TMPDIR/fakebin/faketig" fz --tig f "$WT_FEATURE/src/app.ts"
-    run cat "$TEST_TMPDIR/tig"
+    fake_tig
+    fz --tig f "$WT_FEATURE/src/app.ts"
+    run cat "$TEST_TMPDIR/tig_call"
     [ "$output" = "f $WT_FEATURE/src/app.ts" ]
 }
 
 @test "^L on a worktree row asks for that worktree, not a file" {
-    printf '#!/bin/bash\necho "$1 $2" > "$TEST_TMPDIR/tig"\n' > "$TEST_TMPDIR/fakebin/faketig"
-    chmod +x "$TEST_TMPDIR/fakebin/faketig"
-    FZEDIT_TIG="$TEST_TMPDIR/fakebin/faketig" fz --tig w "$WT_NESTED"
-    run cat "$TEST_TMPDIR/tig"
+    fake_tig
+    fz --tig w "$WT_NESTED"
+    run cat "$TEST_TMPDIR/tig_call"
     [ "$output" = "w $WT_NESTED" ]
 }
 
+# ^L is the row's key, ^A is the checkout's -- so unlike ^A, this one has nothing to do
+# without a row rather than falling back to the scope.
 @test "^L with no row is a no-op" {
-    printf '#!/bin/bash\necho ran > "$TEST_TMPDIR/tig"\n' > "$TEST_TMPDIR/fakebin/faketig"
-    chmod +x "$TEST_TMPDIR/fakebin/faketig"
-    run env FZEDIT_TIG="$TEST_TMPDIR/fakebin/faketig" "$FZEDIT" --tig f ""
+    fake_tig
+    run fz --tig f ""
     [ "$status" -eq 0 ]
-    [ ! -f "$TEST_TMPDIR/tig" ]
+    [ ! -f "$TEST_TMPDIR/tig_call" ]
 }
 
 @test "^L is bound, and dispatches on the row type like enter does" {

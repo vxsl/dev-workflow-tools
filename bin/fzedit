@@ -28,7 +28,7 @@
 #   enter  open file / switch worktree     ^O cursor    ^S tmux window here
 #   ^space mark a row    ^E open every marked row in ONE nvim
 #   ^T     new file, starting at the directory of the row you are on
-#   ^A     stage / unstage                 esc clear the query
+#   ^A     tig status here (stage/discard)  esc clear the query
 #   F5     refresh       ^C copy abs path  ^Y copy repo-relative path
 #
 # Launches on `home`: the pad is a general "open a file" tool first, and starting
@@ -1385,18 +1385,36 @@ open_tig() {
 # (<leader>gR resets the buffer, <leader>gr a single hunk) with the diff in front of
 # you, which is the right place to be when you throw work away -- not a fat-fingered
 # neighbour of the stage key in a fuzzy finder.
-stage_toggle() {
-    local path="$1" root rel staged
-    [ -f "$path" ] || return 0
-    path=$(abspath "$path")
-    root=$(git_root_of "$(dirname "$path")") || return 0
-    rel="${path#"$root"/}"
-    staged=$(git -C "$root" diff --cached --name-only -- "$rel" 2>/dev/null)
-    if [ -n "$staged" ]; then
-        git -C "$root" restore --staged -- "$rel" 2>/dev/null
+# ^A: the staging VIEW, not a staging button.
+#
+# This used to `git add` the row outright, which was the one place in the pad that did a
+# git action with no diff in front of it -- staging blind off a two-letter badge, with no
+# hunks, no unstage-a-hunk and nothing to look at. The pad had already made this call
+# elsewhere: discarding is not a key here either, because it belongs in nvim where the
+# diff is (<leader>gr resets a hunk). Staging needs the diff just as much, so it goes the
+# same way and hands you tig, where u stages, ! discards and enter shows you the change.
+#
+# Scope-level, not row-level, which is why it is its own key rather than more ^L: `tig
+# status` is a view of a whole CHECKOUT (^L on a ⊙ row is already exactly this), while
+# ^L on a file row is that file's history. Needing no row is the point -- "conflicts (0)"
+# is an empty list, and an empty list is when you most want to look at the working tree.
+#
+# The row still chooses the repo when it is a file, because on the home rung the row may
+# be in a checkout other than the scope, and staging the wrong worktree is not a mistake
+# worth allowing.
+open_tig_status() {
+    local type="${1:-}" path="${2:-}" root=""
+    if [ "$type" = f ] && [ -n "$path" ] && [ -f "$path" ]; then
+        root=$(root_of_file "$(abspath "$path")")
+    elif [ "$type" = w ] && [ -d "$path" ]; then
+        root="$path"
     else
-        git -C "$root" add -- "$rel" 2>/dev/null
+        root=$(resolve_scope)
     fi
+    [ -d "$root" ] || { bail "no worktree to show the status of"; return 0; }
+    git -C "$root" rev-parse --git-dir >/dev/null 2>&1 \
+        || { bail "not in a git repository: ${root/#$HOME/~}"; return 0; }
+    open_tig w "$root"
 }
 
 # ---------------------------------------------------------------------------
@@ -1898,12 +1916,16 @@ ${B}find${O}
   F5             refresh
 
 ${B}git${O}
-  ^A             stage / unstage this file ${D}(the badge says which way)${O}
-  ^L             tig ${D}— this file's history, or `tig status` on a ⊙ row.${O}
+  ^A             ${C}stage / discard / diff${O} ${D}— \`tig status\` for this row's checkout${O}
+                 ${D}(the scope's, if the row is not a file). u stages, ! discards,${O}
+                 ${D}enter shows you the change. Wants no row, so it works on an${O}
+                 ${D}empty "conflicts (0)" — which is when you most want to look.${O}
+  ^L             tig ${D}— this file's history, or \`tig status\` on a ⊙ row.${O}
                  ${D}tig's E jumps back here, on the line, so the loop closes.${O}
-  ${D}badges: M modified · A added · ?  untracked · !! conflicted${O}
-  ${D}discarding is deliberately not here — do it in nvim with the diff in front${O}
-  ${D}of you: <leader>gr resets a hunk, <leader>gR the buffer${O}
+  ${D}badges: M modified · A added · ?  untracked · !! conflicted — a read-out,${O}
+  ${D}not a button. Nothing here does a git action with no diff in front of it:${O}
+  ${D}staging is ^A's tig, and discarding is nvim's, where the diff already is${O}
+  ${D}(<leader>gr resets a hunk, <leader>gR the buffer).${O}
 
 ${B}tabs${O}  ${D}(a tab is a whole fzedit instance, with its own scope and rung)${O}
   ^G             new tab
@@ -1948,7 +1970,7 @@ case "${1:-}" in
     --record)        record_history "$2"; exit 0 ;;
     --widen)         shift_rung 1;  exit 0 ;;
     --narrow)        shift_rung -1; exit 0 ;;
-    --stage)         stage_toggle "${2:-}"; exit 0 ;;
+    --status)        open_tig_status "${2:-}" "${3:-}"; exit 0 ;;
     --copy)          copy_text "${2:-}"; exit 0 ;;
     --copy-rel)      [ -n "${2:-}" ] && copy_text "$(rel_of "$2")"; exit 0 ;;
     --carry)         carry_file "${2:-}"; exit 0 ;;
@@ -2040,7 +2062,7 @@ generate_list | fzp_run $PERSIST_MODE \
     --bind "ctrl-s:execute-silent(tmux new-window -c \"\$($0 --rootof {2})\")" \
     --bind "ctrl-c:execute-silent($0 --copy {2})" \
     --bind "ctrl-y:execute-silent($0 --copy-rel {2})" \
-    --bind "ctrl-a:execute-silent($0 --stage {2})+$REFRESH_MED" \
+    --bind "ctrl-a:execute($0 --status {1} {2} < /dev/tty > /dev/tty 2>&1)+$REFRESH_MED" \
     --bind "ctrl-f:execute($0 --grep < /dev/tty > /dev/tty 2>&1)+$REFRESH_MED" \
     --bind "f5:$REFRESH_HARD" \
     --bind "ctrl-g:execute-silent($0 --tab)" \
