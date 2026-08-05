@@ -771,23 +771,29 @@ teardown() {
     [[ "$output" != *"FZEDIT_OPEN="* ]]
 }
 
-# next-window wraps, which with two tabs is indistinguishable from C-x and makes "keep
-# going right" inexpressible. Past the last tab, forward means a new one.
-@test "--next-tab at the end of the row opens a tab instead of wrapping" {
+# With one tab there is nowhere to step to, and tmux says "No next window" -- a complaint
+# in place of an action, for a key you only pressed because you wanted a different tab.
+@test "stepping with only one tab open makes a second one" {
     pin_scope "$WT_FEATURE"
     fake_tmux_tabs 1
-    TMUX=fake FZEDIT_SESSION=fzpad fz --next-tab '%test'
-    [ ! -f "$TEST_TMPDIR/nexted" ] || { echo "wrapped instead of opening"; return 1; }
-    run cat "$TEST_TMPDIR/tmux_new_windows"
-    [[ "$output" == *"FZEDIT_SCOPE=$WT_FEATURE"* ]]
+    for dir in next prev; do
+        rm -f "$TEST_TMPDIR/tmux_new_windows"
+        TMUX=fake FZEDIT_SESSION=fzpad fz --$dir-tab '%test'
+        run cat "$TEST_TMPDIR/tmux_new_windows"
+        [[ "$output" == *"FZEDIT_SCOPE=$WT_FEATURE"* ]] || { echo "--$dir-tab: $output"; return 1; }
+    done
+    [ ! -f "$TEST_TMPDIR/stepped-next" ] && [ ! -f "$TEST_TMPDIR/stepped-prev" ]
 }
 
-@test "--next-tab anywhere else just moves to the next tab" {
+# With more than one it is ordinary tmux, wrapping included.
+@test "stepping with tabs to step to just steps, and does not open one" {
     pin_scope "$WT_FEATURE"
-    fake_tmux_tabs 0
+    fake_tmux_tabs 3
     TMUX=fake FZEDIT_SESSION=fzpad fz --next-tab '%test'
-    [ -f "$TEST_TMPDIR/nexted" ]
-    [ ! -f "$TEST_TMPDIR/tmux_new_windows" ] || { echo "opened a tab mid-row"; return 1; }
+    TMUX=fake FZEDIT_SESSION=fzpad fz --prev-tab '%test'
+    [ -f "$TEST_TMPDIR/stepped-next" ]
+    [ -f "$TEST_TMPDIR/stepped-prev" ]
+    [ ! -f "$TEST_TMPDIR/tmux_new_windows" ] || { echo "opened a tab with 3 open"; return 1; }
 }
 
 @test "line 0 from a tig view without line numbers is treated as no line" {
@@ -1506,7 +1512,7 @@ ED
     pin_scope "$WT_FEATURE"
     colour=$(fz --header | grep -o '48;5;[0-9]*' | head -1 | cut -d';' -f3)
     [ -n "$colour" ]
-    fake_tmux_tabs 0
+    fake_tmux_tabs 2
     TMUX=fake TMUX_PANE='%test' FZEDIT_SESSION=fzpad fz --header >/dev/null
     run cat "$TEST_TMPDIR/tmux_calls"
     [[ "$output" == *"window-status-current-style bg=colour$colour"* ]]
@@ -1516,7 +1522,7 @@ ED
 
 @test "the pad's tab bar does not inherit the global white status style" {
     pin_scope "$WT_FEATURE"
-    fake_tmux_tabs 0
+    fake_tmux_tabs 2
     TMUX=fake TMUX_PANE='%test' FZEDIT_SESSION=fzpad fz --header >/dev/null
     run cat "$TEST_TMPDIR/tmux_calls"
     [[ "$output" == *"status-style bg=default"* ]]
@@ -1527,7 +1533,7 @@ ED
 # redraw's budget spent restating options that were already correct.
 @test "the tab chrome is one tmux invocation, not one per option" {
     pin_scope "$WT_FEATURE"
-    fake_tmux_tabs 0
+    fake_tmux_tabs 2
     TMUX=fake TMUX_PANE='%test' FZEDIT_SESSION=fzpad fz --header >/dev/null
     [ "$(wc -l < "$TEST_TMPDIR/tmux_calls")" -eq 1 ]
 }

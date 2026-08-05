@@ -1696,22 +1696,24 @@ sync_tab_chrome() {
     return 0
 }
 
-# C-b is "forward through the tabs", and past the last tab forward means a new one.
+# C-b / C-x step through the tabs, wrapping round the way tmux does. The one case tmux
+# has no answer for is a single tab, where it has nowhere to step to and says so ("No
+# next window") -- a complaint in place of an action, for a key you only pressed because
+# you wanted a different tab than this one. So: make one.
 #
-# tmux's next-window wraps, which is the wrong answer twice over: with two tabs it is
-# indistinguishable from C-x, and "keep going right until I have the tab I want"
-# becomes inexpressible. Opening one instead is what every tabbed thing does.
-#
-# $1 is the pane, for the same reason close_tab takes one -- run-shell does not
-# reliably export TMUX_PANE. The re-exec is how the new tab inherits the scope of the
-# tab you asked from: instance state is keyed by pane, so handing FZEDIT_INSTANCE the
-# calling pane makes resolve_scope inside --tab read that tab's scope file.
-next_tab_or_new() {
-    local pane="${1:-${TMUX_PANE:-}}"
+# $1 is the direction, $2 the pane -- for the same reason close_tab takes one, run-shell
+# does not reliably export TMUX_PANE. The re-exec is how the new tab inherits the scope
+# of the tab you asked from: instance state is keyed by pane, so handing FZEDIT_INSTANCE
+# the calling pane makes resolve_scope inside --tab read that tab's scope file.
+tab_step() {
+    local dir="$1" pane="${2:-${TMUX_PANE:-}}" n
     [ -n "${TMUX:-}" ] || return 0
     [ -n "$pane" ] || return 0
-    if [ "$(tmux display-message -p -t "$pane" '#{window_end_flag}' 2>/dev/null)" = 1 ]; then
+    n=$(tmux list-windows -t "$pane" 2>/dev/null | wc -l)
+    if [ "$n" -le 1 ]; then
         FZEDIT_INSTANCE="${pane#%}" "$SELF_BIN" --tab
+    elif [ "$dir" = prev ]; then
+        tmux previous-window -t "$pane" 2>/dev/null
     else
         tmux next-window -t "$pane" 2>/dev/null
     fi
@@ -1890,7 +1892,8 @@ case "${1:-}" in
         exit 0 ;;
     --tab)           open_tab "${2:-}" "${3:-}"; exit $? ;;
     --close-tab)     close_tab "${2:-}"; exit $? ;;
-    --next-tab)      next_tab_or_new "${2:-}"; exit $? ;;
+    --next-tab)      tab_step next "${2:-}"; exit $? ;;
+    --prev-tab)      tab_step prev "${2:-}"; exit $? ;;
 esac
 
 while [[ "$#" -gt 0 ]]; do
