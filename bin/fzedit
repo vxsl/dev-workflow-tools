@@ -78,7 +78,12 @@ SELF_BIN="$(readlink -f "$(type -P "$0" || echo "$0")")"
 
 # Machine-specific paths live in the repo's .env (gitignored); .env.example documents
 # them. Nothing here should hardcode a particular checkout.
-[ -f "$SCRIPT_DIR/../.env" ] && . "$SCRIPT_DIR/../.env"
+#
+# FZEDIT_ENV overrides which file, and the suite points it at /dev/null: sourcing the real
+# .env made every test depend on one developer's machine config, and it assigns
+# unconditionally, so a test could not even override what it set.
+FZEDIT_ENV="${FZEDIT_ENV:-$SCRIPT_DIR/../.env}"
+[ -f "$FZEDIT_ENV" ] && . "$FZEDIT_ENV"
 
 HISTORY_FILE="${FZEDIT_HISTORY_FILE:-$HOME/.fzedit_history}"
 STATE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/fzedit"
@@ -609,14 +614,32 @@ ignore_paths() {
 #
 # Cost: ~154 --exclude patterns, measured at no detectable difference in fd's runtime,
 # against 2.86M rows / 637MB / 5.0s becoming ~207k rows / 46MB / 0.15s.
+# Which worktrees the home sweep prunes: all of them except the one you are pointed at.
+#
+# Keyed off DEFAULT_REPO and not off the scope, because the reason for pruning does not
+# depend on where you happen to be pointed -- 2.02M of the 2.86M paths under $HOME are the
+# same repo-relative paths repeated once per sibling checkout, whatever the scope is. Using
+# the scope's own family meant that pointing anywhere OUTSIDE the monorepo (at
+# ~/bin/dev-workflow-tools, or at nothing at all) pruned none of them and the home rung
+# went from 34k rows to 2.07M.
 sibling_worktrees() {
-    local scope="$1" repo="$scope" wt
-    [ "$scope" = "$HOME" ] && repo="${DEFAULT_REPO:-}"
-    [ -n "$repo" ] && [ -d "$repo" ] || return 0
-    while IFS=$'\t' read -r _ wt; do
+    local scope="$1" wt
+    local repo="${DEFAULT_REPO:-}"
+    # A scope in some other repo family still prunes its own siblings, if it has any.
+    [ -n "$repo" ] && [ -d "$repo" ] || repo="$scope"
+    [ -n "$repo" ] && [ -d "$repo" ] && [ "$repo" != "$HOME" ] || return 0
+    {
+        worktree_dirs "$repo"
+        # And the scope's own family too when it is a different one, so pointing at a repo
+        # with worktrees of its own still prunes those.
+        case "$scope" in
+            "$repo"|"$repo"/*) ;;
+            *) [ -d "$scope" ] && [ "$scope" != "$HOME" ] && worktree_dirs "$scope" ;;
+        esac
+    } | while IFS=$'\t' read -r _ wt; do
         [ "$wt" = "$scope" ] && continue
         printf '%s\n' "$wt"
-    done < <(worktree_dirs "$repo")
+    done
 }
 
 # Those of $1's descendants, as fd --exclude patterns ANCHORED AT $1.
@@ -809,14 +832,29 @@ list_worktree_rows() {
     cached derived "wtrows-$(cache_key "${root:-none}")" "$WT_ROWS_TTL" _worktree_rows_all "$root"
 }
 
-# The scope repo's own worktrees, then every OTHER repo you work in.
+# The scope repo's own worktrees, the monorepo's, then every OTHER repo you work in.
 #
-# Dedup on the path, first occurrence winning, so a repo that is both a worktree of the
-# scope and in your history keeps the worktree row -- that one carries the tint.
+# The monorepo's go in even when the scope is somewhere else entirely, because they are
+# how you get BACK. Scoping to ~/bin/dev-workflow-tools was otherwise a one-way door: its
+# own worktree list is just itself, ^R hands rr the scope so rr offered that repo instead,
+# and the only ⊙ rows left were whichever repos happened to be in your history. Now the ⊙
+# list is the same list wherever you are pointed, so "type the checkout name and press
+# enter" is the way home from anywhere, exactly as it is the way out.
+#
+# Guarded by a grep rather than a path test because the scope is usually IN that family,
+# and walking 169 worktrees twice to print them once would double the cost of every rung.
+#
+# Dedup on the path, first occurrence winning, so a repo that is both a worktree and in
+# your history keeps the worktree row -- that one carries the tint and the family naming.
 _worktree_rows_all() {
-    local root="$1"
+    local root="$1" mine=""
+    [ -n "$root" ] && [ -d "$root" ] && mine=$(_worktree_rows "$root")
     {
-        [ -n "$root" ] && [ -d "$root" ] && _worktree_rows "$root"
+        [ -n "$mine" ] && printf '%s\n' "$mine"
+        if [ -n "${DEFAULT_REPO:-}" ] && [ -d "$DEFAULT_REPO" ] &&
+           ! printf '%s' "$mine" | grep -qF "	$DEFAULT_REPO	"; then
+            _worktree_rows "$DEFAULT_REPO"
+        fi
         other_repo_rows
     } | awk -F'\t' '!seen[$2]++'
 }
@@ -1149,8 +1187,13 @@ header_line() {
     # No "TAB widen · S-TAB narrow" spelled out: the bracket around the current rung
     # already says the ladder is walkable, F1 says how, and this line is two rows of the
     # list that the list is not getting.
-    printf '%s\n%s %s· ^F grep · ^R rr · ^G tab · F1 keys%s\n' \
-        "$label" "$ladder" "$ESC_DIM" "$ESC_OFF"
+    #
+    # F2 advertises itself only while there is a pin to drop, so the escape hatch is on
+    # screen exactly in the state you might want out of, and nowhere else.
+    local unpin=""
+    scope_pinned && unpin=" · F2 unpin"
+    printf '%s\n%s %s· ^F grep · ^R rr · ^G tab · F1 keys%s%s\n' \
+        "$label" "$ladder" "$ESC_DIM" "$unpin" "$ESC_OFF"
 }
 
 # Cheap counts for the header. Bounded work: we only need "how many", and for the two
@@ -1175,6 +1218,30 @@ pin_scope() {
     # Into the log rr also reads, so a switch made here shows up as "most recent"
     # over there too, and vice versa.
     wta_record "$1"
+}
+
+# F2: stop pinning. The way out of a checkout you picked on purpose.
+#
+# A ⊙ row was a door with no handle on the inside. Every way out of a scope was another
+# scope, so the pad's OWN default -- no pin at all, infer the worktree from the shell you
+# were last working in -- became unreachable the moment you used the feature once.
+#
+# Truncating the file is what "no pin" means, and resolve_scope goes back to inferring:
+# the live version of unscoped rather than a frozen one, which is the state you were in
+# before you ever pressed a ⊙ row. The rung goes with it -- a rung is a statement about a
+# checkout, and there is no longer one being made.
+unpin_scope() {
+    : > "$SCOPE_FILE"
+    : > "$MODE_FILE"
+    # Arriving somewhere new, same as pin_scope: the query that got you out is not a query
+    # about wherever you have landed.
+    : > "$SWITCHED_FILE"
+}
+
+# Is a scope pinned, as opposed to inferred? The header uses it to advertise F2 only where
+# F2 does something.
+scope_pinned() {
+    [ -s "$SCOPE_FILE" ]
 }
 
 # Consume the flag pin_scope leaves, printing the actions fzf should run as a result.
@@ -1320,12 +1387,16 @@ new_file() {
         *)     target="$base/$path" ;;
     esac
 
-    # Every other refusal SAYS SO. Under fzf's execute() a silent return is invisible --
-    # fzf repaints the moment we exit, so "I declined" and "the key did nothing" look
-    # identical, which is how you end up pressing it three times.
-    case "$target" in
-        */) bail "that is a directory, not a file in it: ${path}"; return 0 ;;
-    esac
+    # A trailing slash is the OTHER quiet one, and it has to be: the prefill is a
+    # directory, so it always ends in one, which makes "enter on the untouched box" the
+    # likeliest keystroke here. That is not an error, it is "I have not typed the filename
+    # yet" -- the same thing as cancelling, and it gets the same silence. Scolding for it
+    # (with a "press any key", no less) was worse than the silence it replaced.
+    case "$target" in */) return 0 ;; esac
+
+    # Every refusal you actually NAMED something for says so, though. Under fzf's
+    # execute() a silent return is invisible -- fzf repaints the moment we exit, so "I
+    # declined" and "the key did nothing" look identical.
     if [ -d "$target" ]; then
         bail "already a directory: ${target/#$HOME/~}"
         return 0
@@ -2068,6 +2139,10 @@ ${B}scope — the rung ladder${O}   ${D}conflicts ⊂ changed ⊂ files ⊂ home
   ${C}⊙ rows${O}         switch worktree — type a branch or a ticket id
                  ${D}each checkout has its own colour, the same one the p10k${O}
                  ${D}prompt segment gives it, so it is recognisable on sight${O}
+  F2             ${C}stop pinning${O} ${D}— back to no checkout of your choosing, and to${O}
+                 ${D}inferring one from the shell you last worked in, which is what${O}
+                 ${D}the pad does until you pick a ⊙ row. Only offered in the header${O}
+                 ${D}while there is a pin to drop.${O}
   ^R             the full rr picker: tickets, MR state, dirty flags, and
                  ${D}branches with no worktree yet (it can create one)${O}
   ^K             ${C}this file, over in another worktree${O} — pick the checkout,
@@ -2179,6 +2254,7 @@ case "${1:-}" in
     --new-base)      new_file_base "${2:-}" "${3:-}"; exit 0 ;;
     --pin)           pin_scope "$(git_root_of "${2:-$PWD}" || abspath "${2:-$PWD}")"; exit 0 ;;
     --switched)      took_switch; exit 0 ;;
+    --unpin)         unpin_scope; exit 0 ;;
     --record)        record_history "$2"; exit 0 ;;
     --widen)         shift_rung 1;  exit 0 ;;
     --narrow)        shift_rung -1; exit 0 ;;
@@ -2277,6 +2353,7 @@ generate_list | fzp_run $PERSIST_MODE \
     --bind "ctrl-y:execute-silent($0 --copy-rel {2})" \
     --bind "ctrl-a:execute($0 --status < /dev/tty > /dev/tty 2>&1)+$REFRESH_MED" \
     --bind "ctrl-f:execute($0 --grep < /dev/tty > /dev/tty 2>&1)+$REFRESH_MED" \
+    --bind "f2:execute-silent($0 --unpin)+$SWITCHED+$REFRESH_MED" \
     --bind "f5:$REFRESH_HARD" \
     --bind "ctrl-g:execute-silent($0 --tab)" \
     --bind "tab:execute-silent($0 --widen)+$REFRESH" \

@@ -30,6 +30,11 @@ setup_fzedit_env() {
     # Never let the suite press xmonad's scratchpad key on the real desktop.
     export FZEDIT_NO_PAD=1
 
+    # Do not source the developer's real .env: it assigns unconditionally, so it both
+    # made these tests depend on one machine's config and stopped a test from setting
+    # FZEDIT_DEFAULT_REPO for itself.
+    export FZEDIT_ENV=/dev/null
+
     export TEST_TMUX_PANES="$TEST_TMPDIR/tmux_panes"
     : > "$TEST_TMUX_PANES"
     export TEST_TMUX_SESSIONS="$TEST_TMPDIR/tmux_sessions"

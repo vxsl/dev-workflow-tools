@@ -940,10 +940,18 @@ ED
 # Under fzf's execute() a silent return is invisible: fzf repaints the moment we exit, so
 # "I declined" and "the key did nothing" look identical -- which is how you end up
 # pressing it three times.
-@test "^T says why when it refuses, rather than looking like a dead key" {
+# The prefill is a directory, so it always ends in "/", which makes enter on the untouched
+# box the likeliest keystroke here. That is "I have not typed the filename yet" -- the same
+# thing as cancelling, and it gets the same silence.
+@test "^T is quiet when you have not finished typing" {
     pin_scope "$WT_FEATURE"
     run bash -c "printf 'src/\n' | '$FZEDIT' --new '$WT_FEATURE/src/app.ts' ''"
-    [[ "$output" == *"directory"* ]]
+    [ -z "$output" ]
+    [ "$status" -eq 0 ]
+}
+
+@test "^T says why when it refuses something you did name" {
+    pin_scope "$WT_FEATURE"
     run bash -c "printf 'src\n' | '$FZEDIT' --new '$WT_FEATURE/src/app.ts' ''"
     [[ "$output" == *"already a directory"* ]]
 }
@@ -1788,4 +1796,98 @@ ED
     [[ "$output" == *"not in a git repository"* ]]
     run fz --carry "$WT_FEATURE"
     [[ "$output" == *"not one"* ]]
+}
+
+# Scoping to a repo of its own used to be a one-way door: its own worktree list is just
+# itself, and ^R hands rr the scope, so rr offered that repo too. The monorepo's checkouts
+# are in the ⊙ rows wherever you are pointed, so they are always the way home.
+@test "the monorepo's checkouts are still offered from a repo of its own" {
+    other="$TEST_TMPDIR/elsewhere/tool"
+    mkdir -p "$other"
+    git -C "$other" init -q -b main
+    echo x > "$other/thing.sh"
+    git_q "$other" add -A
+    git_q "$other" commit -q -m init
+    pin_scope "$other"
+    set_mode files
+    export FZEDIT_DEFAULT_REPO="$MAIN"
+    out="$(rows_of_type w | cut -f2)"
+    [[ "$out" == *"$WT_FEATURE"* ]] || { echo "no way home: $out"; return 1; }
+    [[ "$out" == *"$MAIN"* ]]
+}
+
+@test "and they are not walked twice when the scope is already in that family" {
+    pin_scope "$WT_FEATURE"
+    set_mode files
+    export FZEDIT_DEFAULT_REPO="$MAIN"
+    out="$(rows_of_type w | cut -f2 | sort | uniq -d)"
+    [ -z "$out" ] || { echo "duplicate ⊙ rows: $out"; return 1; }
+}
+
+# --------------------------------------------------------------------------
+# F2 — the way out of a scope you picked
+#
+# A ⊙ row was a door with no handle on the inside: every way out of a scope was another
+# scope, so the pad's own default (no pin, infer from the shell) became unreachable the
+# moment you used the feature once.
+# --------------------------------------------------------------------------
+
+@test "F2 drops the pin and goes back to inferring" {
+    add_tmux_pane 200 other "$WT_NESTED"
+    pin_scope "$WT_FEATURE"
+    [ "$(fz --header | plain | head -1)" != "" ]
+    fz --unpin
+    # Inference takes over again: the most recently active pane, not the old pin.
+    out="$(fz --header | plain | head -1)"
+    [[ "$out" == *"deep"* ]] || { echo "did not fall back to inference: $out"; return 1; }
+}
+
+@test "F2 also drops the rung, which was a statement about that checkout" {
+    pin_scope "$WT_FEATURE"
+    set_mode conflicts
+    fz --unpin
+    [ ! -s "$HOME/.cache/fzedit/mode-$FZEDIT_INSTANCE" ]
+}
+
+@test "F2 clears the query, like every other arrival" {
+    pin_scope "$WT_FEATURE"
+    fz --unpin
+    [ "$(fz --switched)" = "clear-query" ]
+}
+
+# The escape hatch advertises itself in the state you might want out of, and nowhere else.
+@test "the header offers F2 only while something is pinned" {
+    add_tmux_pane 200 other "$WT_NESTED"
+    pin_scope "$WT_FEATURE"
+    [[ "$(fz --header | plain)" == *"F2 unpin"* ]]
+    fz --unpin
+    [[ "$(fz --header | plain)" != *"F2 unpin"* ]]
+}
+
+# The reason for pruning does not depend on where you are pointed: 2.02M of the 2.86M paths
+# under $HOME are the same repo-relative paths repeated once per sibling checkout. Keying
+# the prune off the SCOPE's family meant that pointing anywhere outside the monorepo pruned
+# none of them, and the home rung went from 34k rows to 2.07M.
+@test "the home rung prunes sibling worktrees even from a repo of its own" {
+    setup_repo_under_home
+    other="$HOME/tool"
+    mkdir -p "$other"
+    git -C "$other" init -q -b main
+    echo x > "$other/thing.sh"
+    git_q "$other" add -A
+    git_q "$other" commit -q -m init
+    export FZEDIT_DEFAULT_REPO="$H_MAIN"
+    pin_scope "$other"
+    out="$(rows_of_type f | cut -f2)"
+    [[ "$out" == *"$other/thing.sh"* ]]
+    [[ "$out" != *"sibling-only.ts"* ]] || { echo "siblings not pruned"; return 1; }
+}
+
+@test "and it still keeps the scope's own files when the scope IS a sibling" {
+    setup_repo_under_home
+    export FZEDIT_DEFAULT_REPO="$H_MAIN"
+    pin_scope "$H_SIBLING"
+    out="$(rows_of_type f | cut -f2)"
+    [[ "$out" == *"$H_SIBLING/src/sibling-only.ts"* ]]
+    [[ "$out" != *"$H_MAIN/"* ]]
 }
