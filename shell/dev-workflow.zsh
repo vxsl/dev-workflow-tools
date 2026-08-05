@@ -344,8 +344,26 @@ fzref-widget() {
     zle reset-prompt
 }
 zle -N fzref-widget
-bindkey -M viins '^B' fzref-widget
-bindkey -M vicmd '^B' fzref-widget
+
+# Bound twice, on purpose.
+#
+# zsh-vi-mode rebuilds part of the viins keymap during its own init, which happens after
+# this file is sourced, and ^B is one of the keys it takes back (to backward-char, the
+# emacs reading of it). So the direct bindkey below is live immediately — which is what
+# makes re-sourcing this file in a running shell work — and the zvm_after_init_commands
+# entry rebinds it on the far side of that rebuild. Without the second one, ^B silently
+# reverts to moving the cursor left, which is not a failure anyone would think to report
+# as "the ref picker is not installed".
+#
+# ^G (gcm-widget, above) happens not to need this; zvm reclaims a specific set of keys
+# rather than wiping the keymap, and ^G is not in it. Not a reason to trust that for a new
+# key.
+_fzref_bind_keys() {
+    bindkey -M viins '^B' fzref-widget
+    bindkey -M vicmd '^B' fzref-widget
+}
+_fzref_bind_keys
+zvm_after_init_commands+=(_fzref_bind_keys)
 
 # Does the command being typed want a ref where the cursor is?
 # Sets REPLY to "only" (take Tab over outright) or "maybe" (only if the word already looks

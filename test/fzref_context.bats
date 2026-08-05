@@ -254,6 +254,30 @@ splice() {
     [ "$(printf '%s\n' "$output" | grep -c fzref-widget)" = "2" ]
 }
 
+@test "ctrl-b is also registered to be rebound after zsh-vi-mode's init" {
+    # zvm rebuilds part of the viins keymap after this file is sourced and takes ^B back to
+    # backward-char. The direct bindkey above cannot survive that on its own, and the
+    # symptom — ^B moving the cursor left — reads as "never installed" rather than as a bug,
+    # so the hook registration is worth asserting separately from the binding.
+    show_hook() { ZSNIPPET='print -r -- "hook:${(j:,:)zvm_after_init_commands}"' zrun; }
+    run show_hook
+    [[ "$output" == *"_fzref_bind_keys"* ]]
+}
+
+@test "the after-init rebinder actually rebinds, from a keymap zvm has reclaimed" {
+    # Simulates what zvm does to ^B, then runs only the hook, and checks it comes back.
+    replay() {
+        ZSNIPPET='
+            bindkey -M viins "^B" backward-char
+            bindkey -M vicmd "^B" undefined-key
+            for cmd in $zvm_after_init_commands; do eval $cmd; done
+            bindkey -M viins "^B"; bindkey -M vicmd "^B"
+        ' zrun
+    }
+    run replay
+    [ "$(printf '%s\n' "$output" | grep -c fzref-widget)" = "2" ]
+}
+
 @test "the tab hook declines outside a git repository" {
     mkdir -p "$TEST_TMPDIR/not-a-repo"
     cd "$TEST_TMPDIR/not-a-repo"

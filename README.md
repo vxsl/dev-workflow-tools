@@ -377,7 +377,7 @@ wrong. The Jira columns come from `rr`'s caches because those are the only slow 
 that is a `git status` per worktree, and it is not information that helps you choose the
 *name* of a ref.
 
-`bats test/fzref.bats test/fzref_context.bats` — 49 tests.
+`bats test/fzref.bats test/fzref_context.bats` — 51 tests.
 
 ### `restage`
 Unstage two WIP commits, keeping oldest staged.
