@@ -1891,3 +1891,41 @@ ED
     [[ "$out" == *"$H_SIBLING/src/sibling-only.ts"* ]]
     [[ "$out" != *"$H_MAIN/"* ]]
 }
+
+# "I should not have to pick a name before editing": sometimes it is a scratchpad, and the
+# name is a decision better made after writing the thing, or never made at all.
+@test "^T with a blank box opens a scratchpad named for the clock" {
+    pin_scope "$WT_FEATURE"
+    export FZEDIT_SCRATCH_DIR="$HOME/scratch"
+    cat > "$TEST_TMPDIR/fakebin/fake-editor" <<'ED'
+#!/usr/bin/env bash
+printf 'argv=%s\n' "$*" > "$TEST_TMPDIR/editor_call"
+ED
+    chmod +x "$TEST_TMPDIR/fakebin/fake-editor"
+    printf '\n' | FZEDIT_EDITOR="$TEST_TMPDIR/fakebin/fake-editor" fz --new '' ''
+    run cat "$TEST_TMPDIR/editor_call"
+    [[ "$output" =~ argv=$HOME/scratch/[0-9]{8}-[0-9]{6}\.md ]] || { echo "$output"; return 1; }
+    [ -d "$HOME/scratch" ]
+}
+
+# ~/.cache is the first thing the home sweep ignores, so a scratchpad in $STATE_DIR would
+# be one you could never find again from the pad.
+@test "the scratchpad lands somewhere the home rung can see" {
+    setup_repo_under_home
+    export FZEDIT_SCRATCH_DIR="$HOME/scratch"
+    mkdir -p "$HOME/scratch"
+    echo note > "$HOME/scratch/20260805-120433.md"
+    pin_scope "$H_MAIN"
+    out="$(rows_of_type f | cut -f2)"
+    [[ "$out" == *"$HOME/scratch/20260805-120433.md"* ]]
+}
+
+# It is not part of the repo you happen to be pointed at, and would sit in `changed` as
+# untracked noise if it were.
+@test "the scratchpad is not created inside the scope" {
+    pin_scope "$WT_FEATURE"
+    export FZEDIT_SCRATCH_DIR="$HOME/scratch"
+    printf '\n' | FZEDIT_EDITOR=true fz --new "$WT_FEATURE/src/app.ts" ''
+    run git -C "$WT_FEATURE" status --porcelain
+    [ -z "$output" ]
+}

@@ -27,7 +27,7 @@
 #
 #   enter  open file / switch worktree     ^O cursor    ^S tmux window here
 #   ^space mark a row    ^E open every marked row in ONE nvim
-#   ^T     new file, starting at the directory of the row you are on
+#   ^T     new file at the row's directory; blank box = a ~/scratch scratchpad
 #   ^A     tig status here (stage/discard)  esc clear the query
 #   F5     refresh       ^C copy abs path  ^Y copy repo-relative path
 #
@@ -84,6 +84,12 @@ SELF_BIN="$(readlink -f "$(type -P "$0" || echo "$0")")"
 # unconditionally, so a test could not even override what it set.
 FZEDIT_ENV="${FZEDIT_ENV:-$SCRIPT_DIR/../.env}"
 [ -f "$FZEDIT_ENV" ] && . "$FZEDIT_ENV"
+
+# Where a ^T with a blank box goes, and what filetype it gets. Under $HOME on purpose:
+# see new_file. md because a scratchpad is prose until proven otherwise, and because it is
+# what nvim will do something useful with.
+SCRATCH_DIR="${FZEDIT_SCRATCH_DIR:-$HOME/scratch}"
+SCRATCH_EXT="${FZEDIT_SCRATCH_EXT:-md}"
 
 HISTORY_FILE="${FZEDIT_HISTORY_FILE:-$HOME/.fzedit_history}"
 STATE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/fzedit"
@@ -1374,18 +1380,29 @@ new_file() {
     # -r so a backslash in a path survives. readline only when there is a terminal to
     # drive it -- under fzf's execute() there always is; in the suite there is not.
     if [ -t 0 ]; then
-        read -e -r -p "new file in $where > " -i "$prefill" path || return 0
+        read -e -r -p "new file in $where (blank = scratch) > " -i "$prefill" path || return 0
     else
         read -r path || return 0
     fi
-    # Cancelling is the one refusal that says nothing: you know what you just did.
-    [ -n "$path" ] || return 0
 
-    case "$path" in
-        "~/"*) target="$HOME/${path#\~/}" ;;
-        /*)    target="$path" ;;
-        *)     target="$base/$path" ;;
-    esac
+    if [ -z "$path" ]; then
+        # A blank box means "I have not decided", and that is a legitimate thing to want:
+        # sometimes it is a scratchpad, and the name is a decision better made after
+        # writing the thing -- or never made at all. So it gets a real file with the clock
+        # for a name, and you rename it with :saveas if it turns out to matter.
+        #
+        # Under $HOME rather than in $STATE_DIR, because ~/.cache is the first thing the
+        # home sweep ignores: a scratchpad you cannot find again from the pad is a
+        # scratchpad you have lost. And NOT inside the scope -- it is not part of that
+        # repo, and it would sit in `changed` as untracked noise until you dealt with it.
+        target="$SCRATCH_DIR/$(date +%Y%m%d-%H%M%S).$SCRATCH_EXT"
+    else
+        case "$path" in
+            "~/"*) target="$HOME/${path#\~/}" ;;
+            /*)    target="$path" ;;
+            *)     target="$base/$path" ;;
+        esac
+    fi
 
     # A trailing slash is the OTHER quiet one, and it has to be: the prefill is a
     # directory, so it always ends in one, which makes "enter on the untouched box" the
@@ -2154,9 +2171,12 @@ ${B}open${O}
   ^space         mark a row     ${D}(marks accumulate)${O}
   ^E             open every marked row in ONE nvim ${D}— one LSP start, not N${O}
   ^T             ${C}a file that does not exist yet.${O} ${D}The box starts at the${O}
-                 ${D}directory of the row you are on (or at your query, if you${O}
-                 ${D}typed a path); TAB completes directories. Parent dirs are${O}
-                 ${D}made for you, the file itself only when you save.${O}
+                 ${D}directory of the row you are on, in that row's repo (or at${O}
+                 ${D}your query, if you typed a path); TAB completes directories.${O}
+                 ${D}Parent dirs are made for you, the file itself only on :w.${O}
+                 ${C}blank box${O} ${D}= a scratchpad in ~/scratch named for the clock —${O}
+                 ${D}naming it is a decision for after you have written the thing,${O}
+                 ${D}with :saveas, or never. ^C backs out of the box.${O}
   ^O             open in cursor
   ^S             new tmux window at this file's repo root
 
