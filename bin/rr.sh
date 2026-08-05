@@ -965,6 +965,13 @@ show_help() {
 FORCE_REFRESH=false
 GENERATE_MORE_MODE=false
 FULL_HEIGHT=false
+
+# An inset panel, for a caller that draws itself as one and wants rr to match instead of
+# painting the whole window over the top of it -- fzedit's pad hands its own FZEDIT_MARGIN
+# through as RR_MARGIN so the ^R picker lands in the same box the file picker was in.
+# fzf --margin syntax; unset means "fill whatever -f/--full gave you", as before.
+RR_PANEL=""
+[ -n "${RR_MARGIN:-}" ] && RR_PANEL="--margin='$RR_MARGIN' --border='${RR_BORDER:-rounded}'"
 while [[ "$#" -gt 0 ]]; do
     case $1 in
         -c|--commit-sort) SORT_BY_COMMIT=true ;;
@@ -3213,6 +3220,7 @@ selected_line=$(
             --no-sort \
             --reverse \
             --height=$($FULL_HEIGHT && echo "100%" || echo $((DISPLAY_COUNT + 7))) \
+            $RR_PANEL \
             --bind 'ctrl-d:half-page-down,ctrl-u:half-page-up' \
             --bind \"ctrl-l:reload($0 --generate-more $REFLOG_COUNT${JIRA_ME:+ -m \\\"$JIRA_ME\\\"})\" \
             --bind \"ctrl-r:reload($0 --reload-refresh${JIRA_ME:+ -m \\\"$JIRA_ME\\\"})\" \

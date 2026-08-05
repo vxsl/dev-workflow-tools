@@ -1171,13 +1171,17 @@ choose_worktree() {
 # It runs with cwd set to the scope worktree because rr resolves its repo from $PWD,
 # and the pad's own cwd is fixed and meaningless.
 #
-# -f (--full) because the pad is a full-screen scratchpad -- rr's default sizing
-# assumes it is sharing a terminal with your shell, and here it isn't.
+# -f (--full) because the pad is a full-screen scratchpad -- rr's default sizing assumes
+# it is sharing a terminal with your shell, and here it isn't. Full height, but the same
+# inset as the file picker: ^R should land in the box you were already looking at, not
+# repaint the whole pad. RR_MARGIN is rr's knob for that, and it is this one.
 #
 # FZEDIT_NO_RR=1 forces the plain picker, which is also what happens if rr is missing
 # or exits without choosing.
 RR_BIN="${FZEDIT_RR_BIN:-$SCRIPT_DIR/rr.sh}"
 RR_ARGS="${FZEDIT_RR_ARGS:--f}"
+export RR_MARGIN="${RR_MARGIN:-$FZEDIT_MARGIN}"
+export RR_BORDER="${RR_BORDER:-$FZEDIT_BORDER}"
 
 pick_worktree() {
     local scope choice out
@@ -1632,25 +1636,85 @@ tab_label() {
 
 # Keep this window's name in step with its scope, and make sure the tab bar is
 # actually visible -- status is off globally in this setup.
+#
+# One tmux invocation, not fifteen. This runs on every header refresh, i.e. on every
+# enter and every TAB, and a tmux client is a process spawn rather than a cheap IPC --
+# fifteen of them is most of a redraw's budget spent restating options that were already
+# correct. tmux takes a whole command list in one go, with ';' as its own argument.
 sync_tab_chrome() {
-    local sess label
+    local sess scope label cur oth
+    local -a t=()
     [ -n "${TMUX:-}" ] || return 0
-    label=$(tab_label "$(resolve_scope)")
-    tmux set-window-option -t "${TMUX_PANE}" automatic-rename off 2>/dev/null
-    tmux rename-window -t "${TMUX_PANE}" "$label" 2>/dev/null
+    scope=$(resolve_scope)
+    label=$(tab_label "$scope")
+
+    # Each tab in its own checkout's colour, so the bar answers "which checkouts do I
+    # have open" in the vocabulary the rest of the pad already uses: ⊙ means a checkout,
+    # the block means the one you are on, a tint means one you are not. Set per WINDOW,
+    # which is the only way a tab can carry its own colour -- the formats are session
+    # options, the styles are window options, and every tab runs this for itself.
+    worktree_colour_key "$scope"
+    wtc_colour "$WTC_KEY"
+    if [ -n "$WTC_COLOUR" ]; then
+        cur="bg=colour$WTC_COLOUR,fg=colour232,bold"
+        oth="fg=colour$WTC_COLOUR"
+    else
+        # The primary checkout, which gets no colour in the prompt or the rows either.
+        cur="bg=colour250,fg=colour232,bold"
+        oth="fg=colour245"
+    fi
+
+    t+=(set-window-option -t "${TMUX_PANE}" automatic-rename off)
+    t+=(';' rename-window -t "${TMUX_PANE}" "$label")
+    t+=(';' set-window-option -t "${TMUX_PANE}" window-status-current-style "$cur")
+    t+=(';' set-window-option -t "${TMUX_PANE}" window-status-style "$oth")
+
     if sess=$(editor_session); then
-        tmux set-option -t "$sess" status on 2>/dev/null
+        t+=(';' set-option -t "$sess" status on)
         # Tabs above the picker, not below it. They are a tab BAR -- the one thing on
         # screen that says how many fzedits are open and which one this is -- and at the
         # bottom they sit under fzf's prompt and preview, which is where the eye is
         # already busy. Per-session, like the prefix below.
-        tmux set-option -t "$sess" status-position top 2>/dev/null
+        t+=(';' set-option -t "$sess" status-position top)
+        # The bar is bg=white globally, which over the pad is a slab of daylight above a
+        # dark window, and it drowns the tab colours. Transparent bar, no clock, no
+        # session name: the tabs ARE the bar, and everything they need to say they say
+        # in their own colour.
+        t+=(';' set-option -t "$sess" status-style 'bg=default,fg=colour244')
+        t+=(';' set-option -t "$sess" status-justify left)
+        t+=(';' set-option -t "$sess" status-left '')
+        t+=(';' set-option -t "$sess" status-right '')
+        t+=(';' set-option -t "$sess" window-status-separator '')
+        t+=(';' set-option -t "$sess" window-status-format ' ⊙ #W ')
+        t+=(';' set-option -t "$sess" window-status-current-format ' ⊙ #W ')
         # A root-table binding is shadowed by the prefix key, so bare C-b/C-x can
         # only reach their bindings if this session has no prefix. Per-session
         # option: every other session keeps C-b as prefix.
-        tmux set-option -t "$sess" prefix None 2>/dev/null
+        t+=(';' set-option -t "$sess" prefix None)
     fi
+    tmux "${t[@]}" 2>/dev/null
     return 0
+}
+
+# C-b is "forward through the tabs", and past the last tab forward means a new one.
+#
+# tmux's next-window wraps, which is the wrong answer twice over: with two tabs it is
+# indistinguishable from C-x, and "keep going right until I have the tab I want"
+# becomes inexpressible. Opening one instead is what every tabbed thing does.
+#
+# $1 is the pane, for the same reason close_tab takes one -- run-shell does not
+# reliably export TMUX_PANE. The re-exec is how the new tab inherits the scope of the
+# tab you asked from: instance state is keyed by pane, so handing FZEDIT_INSTANCE the
+# calling pane makes resolve_scope inside --tab read that tab's scope file.
+next_tab_or_new() {
+    local pane="${1:-${TMUX_PANE:-}}"
+    [ -n "${TMUX:-}" ] || return 0
+    [ -n "$pane" ] || return 0
+    if [ "$(tmux display-message -p -t "$pane" '#{window_end_flag}' 2>/dev/null)" = 1 ]; then
+        FZEDIT_INSTANCE="${pane#%}" "$SELF_BIN" --tab
+    else
+        tmux next-window -t "$pane" 2>/dev/null
+    fi
 }
 
 # A new tab is a whole new instance with its own scope and rung, seeded via the
@@ -1826,6 +1890,7 @@ case "${1:-}" in
         exit 0 ;;
     --tab)           open_tab "${2:-}" "${3:-}"; exit $? ;;
     --close-tab)     close_tab "${2:-}"; exit $? ;;
+    --next-tab)      next_tab_or_new "${2:-}"; exit $? ;;
 esac
 
 while [[ "$#" -gt 0 ]]; do

@@ -771,6 +771,25 @@ teardown() {
     [[ "$output" != *"FZEDIT_OPEN="* ]]
 }
 
+# next-window wraps, which with two tabs is indistinguishable from C-x and makes "keep
+# going right" inexpressible. Past the last tab, forward means a new one.
+@test "--next-tab at the end of the row opens a tab instead of wrapping" {
+    pin_scope "$WT_FEATURE"
+    fake_tmux_tabs 1
+    TMUX=fake FZEDIT_SESSION=fzpad fz --next-tab '%test'
+    [ ! -f "$TEST_TMPDIR/nexted" ] || { echo "wrapped instead of opening"; return 1; }
+    run cat "$TEST_TMPDIR/tmux_new_windows"
+    [[ "$output" == *"FZEDIT_SCOPE=$WT_FEATURE"* ]]
+}
+
+@test "--next-tab anywhere else just moves to the next tab" {
+    pin_scope "$WT_FEATURE"
+    fake_tmux_tabs 0
+    TMUX=fake FZEDIT_SESSION=fzpad fz --next-tab '%test'
+    [ -f "$TEST_TMPDIR/nexted" ]
+    [ ! -f "$TEST_TMPDIR/tmux_new_windows" ] || { echo "opened a tab mid-row"; return 1; }
+}
+
 @test "line 0 from a tig view without line numbers is treated as no line" {
     add_tmux_session fzpad
     TMUX=fake FZEDIT_SESSION=fzpad fz --tab "$WT_FEATURE/src/app.ts" 0
@@ -1479,6 +1498,39 @@ ED
 # --------------------------------------------------------------------------
 # Closing a tab must not close the pad
 # --------------------------------------------------------------------------
+
+# The bar is the only thing on screen that says which checkouts are open, and it says it
+# in the same colour the ⊙ block and the p10k prompt use -- one vocabulary, or it is just
+# a second thing that happens to be coloured.
+@test "the current tab wears the same colour as the scope block" {
+    pin_scope "$WT_FEATURE"
+    colour=$(fz --header | grep -o '48;5;[0-9]*' | head -1 | cut -d';' -f3)
+    [ -n "$colour" ]
+    fake_tmux_tabs 0
+    TMUX=fake TMUX_PANE='%test' FZEDIT_SESSION=fzpad fz --header >/dev/null
+    run cat "$TEST_TMPDIR/tmux_calls"
+    [[ "$output" == *"window-status-current-style bg=colour$colour"* ]]
+    # And the tabs you are NOT on wear it as a tint, the way a ⊙ row does.
+    [[ "$output" == *"window-status-style fg=colour$colour"* ]]
+}
+
+@test "the pad's tab bar does not inherit the global white status style" {
+    pin_scope "$WT_FEATURE"
+    fake_tmux_tabs 0
+    TMUX=fake TMUX_PANE='%test' FZEDIT_SESSION=fzpad fz --header >/dev/null
+    run cat "$TEST_TMPDIR/tmux_calls"
+    [[ "$output" == *"status-style bg=default"* ]]
+    [[ "$output" == *"status-position top"* ]]
+}
+
+# Fifteen tmux clients on a path that runs on every enter and every TAB is most of a
+# redraw's budget spent restating options that were already correct.
+@test "the tab chrome is one tmux invocation, not one per option" {
+    pin_scope "$WT_FEATURE"
+    fake_tmux_tabs 0
+    TMUX=fake TMUX_PANE='%test' FZEDIT_SESSION=fzpad fz --header >/dev/null
+    [ "$(wc -l < "$TEST_TMPDIR/tmux_calls")" -eq 1 ]
+}
 
 @test "--close-tab refuses to close the last tab" {
     # tmux.conf used to bind C-M-w straight to kill-pane, which killed the last

@@ -166,3 +166,24 @@ display_col() { cut -f3- | plain; }
 
 # Pretend a tmux session exists (used for the tab tests).
 add_tmux_session() { printf '%s\n' "$1" >> "$TEST_TMUX_SESSIONS"; }
+
+# A tmux that answers #{window_end_flag} with $1, so --next-tab's two branches are both
+# reachable, and records which branch it took. Everything else lands in $TEST_TMPDIR/
+# tmux_calls verbatim: sync_tab_chrome sends its options as one ';'-separated command
+# list, so there is one invocation to inspect rather than one per option.
+fake_tmux_tabs() {
+    local end="$1"
+    add_tmux_session fzpad
+    cat > "$TEST_TMPDIR/fakebin/tmux" <<FAKE
+#!/usr/bin/env bash
+case "\$1" in
+    display-message) echo $end ;;
+    has-session)     exit 0 ;;
+    next-window)     shift; echo "\$*" > "$TEST_TMPDIR/nexted" ;;
+    new-window)      shift; echo "\$*" >> "$TEST_TMPDIR/tmux_new_windows" ;;
+    *)               echo "\$*" >> "$TEST_TMPDIR/tmux_calls" ;;
+esac
+exit 0
+FAKE
+    chmod +x "$TEST_TMPDIR/fakebin/tmux"
+}
