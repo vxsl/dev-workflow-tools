@@ -374,12 +374,33 @@ format_lines() {
         # tinted with, the same one the p10k prompt segment uses. Empty for the primary
         # worktree, which is deliberately untinted.
         wcol = (NF > 3) ? $4 : ""
+        # And a 5th, on the rows that are a repo of their own rather than a worktree of
+        # the scope repo -- see the naming below.
+        own  = (NF > 4) ? $5 : ""
 
         if (type == "w") {
             # Name a worktree by its path under the worktree parent, not its basename:
             # some are nested (repo.hotfix/return-400-...) and the basename collides.
             name = abs
-            if (wtbase != "" && index(name, wtbase "/") == 1) {
+            where = ""
+            if (own != "") {
+                # A repo of its own rather than a worktree of the scope repo (the 5th
+                # column says which). Named by its own basename, with the parent beside
+                # it instead of in front of it, and with a LEADING SLASH.
+                #
+                # The slash is not decoration, it is the whole reason this row is
+                # reachable. Its files are ordinary $HOME files -- unlike sibling
+                # worktrees, which the home sweep prunes -- so every one of them competes
+                # with it on its own name. fzf scores a match after "/" higher than one
+                # after a space (--scheme=path), and --tiebreak=begin then prefers
+                # whichever starts earliest, which the "⊙ " prefix loses by two columns.
+                # Measured on the real list, query "dev-workflow-tools": rank 852 without
+                # the slash, rank 1 with it.
+                nn = split(name, PP, "/")
+                where = substr(name, 1, length(name) - length(PP[nn]) - 1)
+                name  = "/" PP[nn]
+                if (index(where, home) == 1) where = "~" substr(where, length(home) + 1)
+            } else if (wtbase != "" && index(name, wtbase "/") == 1) {
                 name = substr(name, length(wtbase) + 2)
             } else if (index(name, home) == 1) {
                 name = "~" substr(name, length(home) + 1)
@@ -398,12 +419,12 @@ format_lines() {
             # rather than a tinted glyph: on a list this long a foreground tint reads as
             # "some syntax colour" and a block reads as "this is a checkout". No block at
             # all on the primary, which is how it says so everywhere else.
+            side = (where == "" ? "" : "  " DIM where OFF) \
+                   (lbl   == "" ? "" : "  " DIM lbl   OFF)
             if (wcol == "")
-                printf "%s\t%s\t\033[1m⊙ %s" OFF "%s\n", type, abs, name,
-                       (lbl == "" ? "" : "  " DIM lbl OFF)
+                printf "%s\t%s\t\033[1m⊙ %s" OFF "%s\n", type, abs, name, side
             else
-                printf "%s\t%s\t\033[48;5;%sm\033[30m⊙ %s" OFF "%s\n", type, abs, wcol, name,
-                       (lbl == "" ? "" : "  " DIM lbl OFF)
+                printf "%s\t%s\t\033[48;5;%sm\033[30m⊙ %s" OFF "%s\n", type, abs, wcol, name, side
             next
         }
 
@@ -785,8 +806,19 @@ WT_ROWS_TTL="${FZEDIT_WT_ROWS_TTL:-5}"
 list_worktree_rows() {
     local root="$1"
     [ "$root" = "$HOME" ] && root="${DEFAULT_REPO:-}"
-    [ -n "$root" ] && [ -d "$root" ] || return
-    cached derived "wtrows-$(cache_key "$root")" "$WT_ROWS_TTL" _worktree_rows "$root"
+    cached derived "wtrows-$(cache_key "${root:-none}")" "$WT_ROWS_TTL" _worktree_rows_all "$root"
+}
+
+# The scope repo's own worktrees, then every OTHER repo you work in.
+#
+# Dedup on the path, first occurrence winning, so a repo that is both a worktree of the
+# scope and in your history keeps the worktree row -- that one carries the tint.
+_worktree_rows_all() {
+    local root="$1"
+    {
+        [ -n "$root" ] && [ -d "$root" ] && _worktree_rows "$root"
+        other_repo_rows
+    } | awk -F'\t' '!seen[$2]++'
 }
 
 # The tint is resolved here, in the one awk pass that already exists, rather than by
@@ -794,6 +826,64 @@ list_worktree_rows() {
 # the redraw path everything above works to keep cheap.
 _worktree_rows() {
     list_worktrees "$1" | awk -F'\t' "$WTC_AWK"'{ printf "w\t%s\t%s\t%s\n", $1, $2, wtc_colour($3) }'
+}
+
+# The gitdir for a repo root, without asking git: a directory for a primary checkout, a
+# "gitdir: ..." pointer file for a linked worktree. Same read worktree_colour_key does,
+# and for the same reason -- this runs once per candidate repo and a fork each would show.
+gitdir_of() {
+    local root="$1" line
+    if [ -d "$root/.git" ]; then printf '%s' "$root/.git"; return 0; fi
+    [ -f "$root/.git" ] || return 1
+    while IFS= read -r line; do
+        case "$line" in
+            gitdir:*) line="${line#gitdir:}"; printf '%s' "${line# }"; return 0 ;;
+        esac
+    done < "$root/.git"
+    return 1
+}
+
+# Every OTHER repo you work in, as ⊙ rows -- so the pad can scope to ~/bin/dev-workflow-
+# tools, ~/.dotfiles or anything else, not only to worktrees of the one monorepo.
+#
+# Until this, the pad could OPEN a file in another repo (the home rung sweeps all of
+# $HOME) but could not point at it: the three narrow rungs, the header's branch and ^A's
+# tig status are all functions of the scope, and the scope could only ever be a worktree
+# of DEFAULT_REPO. So you could edit a repo from here all day and never once see its git
+# state -- and having gone there, there was no ⊙ row to get back from either.
+#
+# The candidates are the git roots of your history, because "repos I work in" is exactly
+# what the frecency log already knows. No configuration, no sweep, no list to maintain: a
+# repo appears the first time you open a file in it, ranked by how much you use it, and
+# leaves when you stop. history_ranked with no remapping is the input, so its own "does
+# this file still exist" filter applies here too.
+#
+# The upward walk is builtin-only. git_root_of is a fork per directory and a 2000-line
+# history holds hundreds of distinct ones; `[ -e $d/.git ]` up the chain is a few thousand
+# stats and no processes at all.
+other_repo_rows() {
+    local f d root gd
+    local -A dirseen=() rootseen=()
+    while IFS= read -r f; do
+        d="${f%/*}"
+        [ -n "$d" ] || continue
+        [ -n "${dirseen[$d]:-}" ] && continue
+        dirseen[$d]=1
+        root="$d"
+        while [ -n "$root" ] && [ "$root" != "$HOME" ]; do
+            [ -e "$root/.git" ] && break
+            root="${root%/*}"
+        done
+        [ -n "$root" ] && [ "$root" != "$HOME" ] && [ -e "$root/.git" ] || continue
+        [ -n "${rootseen[$root]:-}" ] && continue
+        rootseen[$root]=1
+        gd=$(gitdir_of "$root") || continue
+        read_wt_state "$gd" || continue
+        wtc_colour "$WT_KEY"
+        # The 5th column marks it as a repo of its own, which is what tells format_lines
+        # to name it by its basename rather than by a path under the monorepo.
+        printf 'w\t%s\t%s\t%s\town\n' "$root" "$WT_LABEL" "$WTC_COLOUR"
+    done < <(history_ranked "" "")
 }
 
 # The rungs, narrowest first. Index into this is the whole mode model.
@@ -1157,8 +1247,35 @@ open_many() {
 # will not do for you, and losing a buffer to "E212: Can't open file for writing" is the
 # failure this key exists to prevent.
 #
-# The prefill is its own arm (--new-prefill) because readline needs a terminal, so the
-# only way to hold this half honest in the suite is to be able to ask for it directly.
+
+# Where a new file is relative TO: the row's own repo, not the scope.
+#
+# Following the cursor is right here and wrong for ^A, and the difference is disclosure:
+# ^A acts on the checkout the instant you press it, so an invisible target is a trap,
+# while ^T shows you the whole path in an editable box before anything happens. The
+# prefill IS the disclosure.
+#
+# It also has to work this way or the prompt lies. "new file in ul >" over a prefill of
+# ~/bin/dev-workflow-tools/ is two different answers to "where", and the one in the label
+# is the wrong one.
+new_file_base() {
+    local row="${1:-}" query="${2:-}" dir
+    # A query with a slash in it is a path typed against the SCOPE -- you were looking at
+    # this checkout's files when you typed it.
+    if [ -n "$query" ] && [ "${query%/*}" != "$query" ]; then
+        resolve_scope
+        return 0
+    fi
+    if [ -n "$row" ] && [ -f "$row" ]; then
+        dir=$(dirname "$(abspath "$row")")
+        git_root_of "$dir" || printf '%s' "$dir"
+        return 0
+    fi
+    resolve_scope
+}
+
+# The prefill and the base are their own arms (--new-prefill, --new-base) because readline
+# needs a terminal, so this is the only way to hold that half honest in the suite.
 new_file_prefill() {
     local row="${1:-}" query="${2:-}" base="${3:-$HOME}" dir
     # "Has a slash" and not "exists": the whole point is a path that does not exist yet.
@@ -1177,16 +1294,15 @@ new_file_prefill() {
 }
 
 new_file() {
-    local row="${1:-}" query="${2:-}" base prefill path target
-    base=$(resolve_scope)
+    local row="${1:-}" query="${2:-}" base prefill path target where
+    base=$(new_file_base "$row" "$query")
     [ -d "$base" ] || base="$HOME"
     prefill=$(new_file_prefill "$row" "$query" "$base")
 
     cd "$base" 2>/dev/null || return 0
-    # Named, not spelled out: the prompt says what the path is relative to, and the whole
-    # absolute path of the checkout is both too wide for a prompt and already in the
-    # header block two lines above.
-    local where="${base##*/}"
+    # Named, not spelled out: the label says what the path is relative to, and the whole
+    # absolute path is both too wide for a prompt and already on screen above.
+    where="${base##*/}"
     [ "$base" = "$HOME" ] && where="~"
     # -r so a backslash in a path survives. readline only when there is a terminal to
     # drive it -- under fzf's execute() there always is; in the suite there is not.
@@ -1195,6 +1311,7 @@ new_file() {
     else
         read -r path || return 0
     fi
+    # Cancelling is the one refusal that says nothing: you know what you just did.
     [ -n "$path" ] || return 0
 
     case "$path" in
@@ -1202,12 +1319,21 @@ new_file() {
         /*)    target="$path" ;;
         *)     target="$base/$path" ;;
     esac
-    # A directory is not a file: bailing beats creating "foo/" as a filename, and beats
-    # opening nvim on a directory and getting netrw.
-    case "$target" in */) return 0 ;; esac
-    [ -d "$target" ] && return 0
 
-    mkdir -p "$(dirname "$target")" || return 0
+    # Every other refusal SAYS SO. Under fzf's execute() a silent return is invisible --
+    # fzf repaints the moment we exit, so "I declined" and "the key did nothing" look
+    # identical, which is how you end up pressing it three times.
+    case "$target" in
+        */) bail "that is a directory, not a file in it: ${path}"; return 0 ;;
+    esac
+    if [ -d "$target" ]; then
+        bail "already a directory: ${target/#$HOME/~}"
+        return 0
+    fi
+    if ! mkdir -p "$(dirname "$target")" 2>/dev/null; then
+        bail "cannot create $(dirname "${target/#$HOME/~}")"
+        return 0
+    fi
     record_history "$target"
     open_in_editor "$target"
 }
@@ -1295,15 +1421,31 @@ pick_worktree() {
 # more often than the forward one: you have already found the file, and what you
 # actually want is the same file on the branch you are about to work on. Switching
 # worktree first means finding the file all over again.
+#
+# Both refusals SAY SO, for the reason ^T's do: under fzf's execute() a silent return is
+# invisible, so "this row cannot be carried" and "^K is broken" look identical. And they
+# are easy to hit -- the home rung is full of rows that are in no repo at all (~/.zshrc,
+# ~/mr-docs/*.md), and a ⊙ row is not a file to carry anywhere.
 carry_file() {
     local path="$1" root rel target
-    [ -f "$path" ] || return 0
+    if [ ! -f "$path" ]; then
+        bail "^K carries a FILE to another checkout; this row is not one"
+        return 0
+    fi
     path=$(abspath "$path")
-    root=$(git_root_of "$(dirname "$path")") || return 0
+    if ! root=$(git_root_of "$(dirname "$path")") || [ -z "$root" ]; then
+        bail "not in a git repository, so there is nowhere to carry it: ${path/#$HOME/~}"
+        return 0
+    fi
     rel="${path#"$root"/}"
 
     target=$(choose_worktree "$root" "open ${rel##*/} in which worktree > ")
+    # Backing out of the picker is the one refusal that stays quiet: you just did it.
     [ -n "$target" ] && [ -d "$target" ] || return 0
+    if [ "$target" = "$root" ]; then
+        bail "${root##*/} is the checkout it is already in"
+        return 0
+    fi
     pin_scope "$target"
 
     if [ -f "$target/$rel" ]; then
@@ -1378,6 +1520,12 @@ open_tig() {
     # Only on success: an empty TIGRC_USER would mean "no user config at all", which is a
     # worse outcome than not having the extra bindings.
     tigrc=$(tig_rc) && export TIGRC_USER="$tigrc"
+    # Why esc out of tig used to take a whole second: ncurses waits ESCDELAY ms after an
+    # esc to see whether it was really the start of an arrow key, and its default is 1000.
+    # Measured here: 1016ms before, 67ms after. 50 is imperceptible and still far longer
+    # than a local terminal needs to deliver the rest of "\033[B" -- the whole sequence
+    # arrives in a single read, so there is nothing to wait for.
+    export ESCDELAY="${FZEDIT_ESCDELAY:-50}"
 
     if [ "$type" = "w" ]; then
         [ -d "$path" ] || { bail "not a directory: $path"; return 0; }
@@ -2027,7 +2175,8 @@ case "${1:-}" in
     --open)          open_row "$2" "$3" "${4:-}"; exit 0 ;;
     --open-many)     shift; open_many "$@"; exit 0 ;;
     --new)           new_file "${2:-}" "${3:-}"; exit 0 ;;
-    --new-prefill)   new_file_prefill "${2:-}" "${3:-}" "$(resolve_scope)"; exit 0 ;;
+    --new-prefill)   new_file_prefill "${2:-}" "${3:-}" "$(new_file_base "${2:-}" "${3:-}")"; exit 0 ;;
+    --new-base)      new_file_base "${2:-}" "${3:-}"; exit 0 ;;
     --pin)           pin_scope "$(git_root_of "${2:-$PWD}" || abspath "${2:-$PWD}")"; exit 0 ;;
     --switched)      took_switch; exit 0 ;;
     --record)        record_history "$2"; exit 0 ;;

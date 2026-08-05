@@ -266,6 +266,200 @@ _cw_completion() {
 compdef _cw_completion cw
 
 # ============================================================================
+# Ref Picker (Ctrl+B, and Tab where a ref is the only sensible argument)
+# ============================================================================
+# `git rebase <TAB>` is the case this exists for. Git's own completion offers 370
+# alphabetised branch names, which is the wrong index entirely: what you remember is the
+# ticket ("the AOI fill one"), and the branch name is the thing you are trying to look up.
+# bin/fzref answers the question the other way round — see its header for the row format
+# and for why the accept key, not the tool, decides which of a ref's three names you get.
+#
+# Two ways in, because they fail differently:
+#   Ctrl+B  always opens the picker and replaces the word at the cursor. Predictable.
+#   Tab     opens it only where a ref is the *only* thing that could go there, and falls
+#           through to normal completion everywhere else.
+
+# Git subcommands whose arguments are refs and cannot be anything else. Tab takes over
+# unconditionally here, even on an empty word.
+_FZREF_REF_ONLY=(rebase merge switch cherry-pick revert)
+
+# Subcommands that take a ref OR a path. Tab only takes over when the partial word already
+# looks like a ref (i.e. some ref starts with it) — otherwise `git diff src/<TAB>` would
+# stop completing filenames, which is a much worse trade than not helping at all.
+_FZREF_REF_OR_PATH=(checkout diff log show reset restore bisect)
+
+# Global git options that swallow the word after them. Without this, `git -C /elsewhere
+# rebase` looks like the subcommand is "/elsewhere".
+_FZREF_GIT_OPTS_WITH_VALUE=(-C -c --git-dir --work-tree --namespace --exec-path --config-env)
+
+# Flags that turn `git branch` from "name a branch to create" into "name one that exists".
+_FZREF_BRANCH_REF_FLAGS=(-d -D --delete -m -M --move -c -C --copy -f --force --set-upstream-to --edit-description)
+
+# The word the cursor is in, and the offsets that delimit it, so a replacement can put
+# back exactly that span. Sets REPLY / _fzref_from / _fzref_to.
+_fzref_word_at_cursor() {
+    local left="${LBUFFER##* }" right="${RBUFFER%% *}"
+    # A newline is as much a word boundary as a space, and a multi-line buffer is normal
+    # once a command has a `\` continuation in it.
+    left="${left##*$'\n'}"; right="${right%%$'\n'*}"
+    _fzref_from=$(( ${#LBUFFER} - ${#left} ))
+    _fzref_to=$(( ${#LBUFFER} + ${#right} ))
+    REPLY="$left$right"
+}
+
+# Splice a token into the buffer in place of the word at the cursor, leaving the cursor
+# just after it plus a space — so the next argument can be typed without reaching for
+# anything. Quoted only when it has to be: a branch name with a slash in it needs no
+# quoting, and `git rebase 'origin/main'` in your history is noise.
+_fzref_replace_word() {
+    local token="$1"
+    [[ "$token" == *[\ \'\"\$\`\(\)\|\&\;\<\>]* ]] && token="${(q)token}"
+    BUFFER="${BUFFER[1,_fzref_from]}${token}${BUFFER[_fzref_to+1,-1]}"
+    CURSOR=$(( _fzref_from + ${#token} ))
+    # Only add the trailing space if we are at the end of the line; mid-line it would be
+    # inserting a space someone did not ask for.
+    if (( CURSOR == ${#BUFFER} )); then
+        BUFFER="$BUFFER "
+        CURSOR=$(( CURSOR + 1 ))
+    fi
+}
+
+# Run the picker with the partial word as its query and splice the result in.
+# Returns non-zero when nothing was picked, so callers can decide whether to fall back.
+_fzref_pick_into_buffer() {
+    local word token
+    _fzref_word_at_cursor
+    word="$REPLY"
+
+    token=$("$DEV_WORKFLOW_TOOLS_DIR/bin/fzref" --query "$word" --width "$COLUMNS" 2>/dev/null)
+    if [[ -n "$token" ]]; then
+        _fzref_replace_word "$token"
+        return 0
+    fi
+    return 1
+}
+
+fzref-widget() {
+    _fzref_pick_into_buffer
+    zle reset-prompt
+}
+zle -N fzref-widget
+bindkey -M viins '^B' fzref-widget
+bindkey -M vicmd '^B' fzref-widget
+
+# Does the command being typed want a ref where the cursor is?
+# Sets REPLY to "only" (take Tab over outright) or "maybe" (only if the word already looks
+# like a ref); returns 1 when a ref is not on the table at all.
+#
+# Reads the words BEFORE the cursor only, and keys off the subcommand rather than the
+# argument index wherever it can — that way `git rebase --onto main <TAB>` still works
+# without this file having to know every option git has.
+_fzref_tab_context() {
+    local -a words
+    words=(${(z)LBUFFER})
+    (( ${#words} )) || return 1
+
+    # Drop the partial word the cursor is inside — it is the thing being completed, not
+    # context. Only when the cursor is mid-word: a trailing space means a fresh argument.
+    #
+    # `("${(@)words[1,-2]}")` and not `("${words[1,-2]}")`: the second joins the whole
+    # slice into ONE word, so every mid-word Tab saw a one-element array and fell through.
+    if [[ "$LBUFFER" != *' ' && "$LBUFFER" != *$'\n' ]]; then
+        words=("${(@)words[1,-2]}")
+    fi
+    (( ${#words} )) || return 1
+
+    local cmd="${words[1]}" w skip_next=0
+    # The words that are neither options nor option values, in order — so bare[2] is the
+    # subcommand and bare[3..] are its positional arguments.
+    local -a bare=() flags=()
+    for w in "${words[@]}"; do
+        if (( skip_next )); then skip_next=0; continue; fi
+        if [[ "$w" == -* ]]; then
+            flags+=("$w")
+            (( ${_FZREF_GIT_OPTS_WITH_VALUE[(Ie)$w]} )) && skip_next=1
+            continue
+        fi
+        bare+=("$w")
+    done
+
+    case "$cmd" in
+        git|g) ;;
+        # create-wt takes a ticket or branch and nothing else.
+        create-wt) REPLY=only; return 0 ;;
+        *) return 1 ;;
+    esac
+
+    (( ${#bare} >= 2 )) || return 1
+    local sub="${bare[2]}"
+    # Positional arguments to the subcommand already typed, cursor's own word excluded.
+    local argn=$(( ${#bare} - 2 ))
+
+    (( ${_FZREF_REF_ONLY[(Ie)$sub]} ))    && { REPLY=only;  return 0 }
+    (( ${_FZREF_REF_OR_PATH[(Ie)$sub]} )) && { REPLY=maybe; return 0 }
+
+    case "$sub" in
+        # Bare `git branch <TAB>` is naming a branch to CREATE — hijacking that would be
+        # actively wrong. With -d/-m/-f it is naming one that exists.
+        branch)
+            for w in "${flags[@]}"; do
+                (( ${_FZREF_BRANCH_REF_FLAGS[(Ie)$w]} )) && { REPLY=only; return 0 }
+            done
+            return 1
+            ;;
+        # `git worktree add <path> <ref>`: the first positional is a path, the second is
+        # the ref. Anything else under worktree names a path.
+        worktree)
+            [[ "${bare[3]:-}" == add ]] && (( argn >= 2 )) && { REPLY=only; return 0 }
+            return 1
+            ;;
+        # First positional is the remote; the refspecs come after it. argn counts what is
+        # already typed, so argn==1 means "the remote is in, the cursor is on the refspec".
+        push|pull|fetch)
+            (( argn >= 1 )) && { REPLY=only; return 0 }
+            return 1
+            ;;
+    esac
+    return 1
+}
+
+# Is there any ref starting with this word? The gate for the ref-or-path commands, and
+# for-each-ref with a glob rather than fzref's full pipeline because the answer is needed
+# before deciding to spend anything.
+_fzref_word_is_reflike() {
+    local word="$1"
+    [[ -n "$word" ]] || return 1
+    # An existing file wins: you meant the file.
+    [[ -e "$word" ]] && return 1
+    # Four patterns, because a partial ref can be any of four shapes: a branch prefix, an
+    # already-remote-qualified name (`origin/UL-17`), the tail of a namespaced branch
+    # (`aoi-filter` for fix/aoi-filter-cancellation), and the same on a remote.
+    local hit
+    hit=$(git for-each-ref --count=1 --format='%(refname:short)' \
+            "refs/heads/${word}*" "refs/heads/*/${word}*" \
+            "refs/remotes/${word}*" "refs/remotes/*/${word}*" 2>/dev/null)
+    [[ -n "$hit" ]]
+}
+
+# The Tab hook. Returns 0 if it handled the key, 1 to let normal completion run.
+# Called from the Tab dispatcher in ~/.zshrc, guarded there by $+functions so that file
+# keeps working with this one unsourced.
+_fzref_tab_try() {
+    git rev-parse --git-dir >/dev/null 2>&1 || return 1
+    _fzref_tab_context || return 1
+    local want="$REPLY"
+
+    if [[ "$want" == maybe ]]; then
+        _fzref_word_at_cursor
+        _fzref_word_is_reflike "$REPLY" || return 1
+    fi
+
+    _fzref_pick_into_buffer
+    zle reset-prompt
+    return 0
+}
+
+# ============================================================================
 # Completion
 # ============================================================================
 # Add completion for our custom commands (if needed in future)

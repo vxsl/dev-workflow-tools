@@ -1,0 +1,501 @@
+#!/usr/bin/env bash
+# fzref - pick a ref by its identity, and get back whichever spelling the command wants.
+#
+# `git rebase <TAB>` is the motivating case. Around here a piece of work has three names
+# that are all the same name: UL-1633 is a Jira ticket, a branch, and a worktree at
+# repo.UL-1633. Git's completion knows about exactly one of those and sorts them
+# alphabetically, so picking a branch means already remembering which of 370 branches you
+# meant -- which is the part that is actually hard. rr solves this for *navigation*; this
+# solves it for the argument to a command you are already typing.
+#
+# So the rows are keyed on the work, not on the ref: the ticket title from rr's Jira
+# cache, the ticket status, and the ⊙ block in the worktree's own colour (the same block
+# the p10k segment and fzedit draw -- see lib/worktree-colour.sh, one palette or none).
+# And the accept key chooses the spelling, because "which of UL-1633's three names do you
+# want" depends entirely on the verb in front of it:
+#
+#   enter      UL-1633                        git rebase / merge / switch
+#   alt-enter  /home/kyle/.../repo.UL-1633    cd / ls / anything taking a path
+#   ctrl-r     origin/UL-1633                 git rebase onto the remote
+#   ctrl-t     UL-1633                        the bare ticket id, for ticket-ask etc
+#
+# Everything is computed live -- for-each-ref and worktree list are ~8ms each on a repo
+# this size, so a cache would only ever be a way to be wrong. The Jira columns come from
+# rr's caches (~/.jira_cache and friends) because those are the only slow part, and rr
+# already keeps them warm.
+#
+# Deliberately does NOT report dirty worktrees, unlike rr's rows: that is a `git status`
+# per worktree, ~150 of them, and it is not information that helps you choose the *name*
+# of a ref. Pick the name here, and rr will tell you about the state when you go there.
+
+set -uo pipefail
+
+FZREF_SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+FZREF_TOOLS_DIR="$(dirname "$FZREF_SELF_DIR")"
+
+# worktree-colour.sh tests its load guard unquoted-and-unset-tolerant for POSIX sh, which
+# is not the same thing as `set -u`-tolerant. Declaring it here costs nothing and keeps
+# that file free of a bash-ism it deliberately doesn't have.
+: "${WTC_LOADED:=}"
+# shellcheck source=../lib/worktree-colour.sh
+source "$FZREF_TOOLS_DIR/lib/worktree-colour.sh"
+
+# .env is where JIRA_PROJECTS lives; without it the ticket columns just stay empty, which
+# is a perfectly good degraded mode (you still get branches, worktrees and commit
+# subjects), so a missing .env is not an error.
+if [ -f "$FZREF_TOOLS_DIR/.env" ]; then
+    set -a
+    # shellcheck disable=SC1091
+    source "$FZREF_TOOLS_DIR/.env"
+    set +a
+elif [ -f "$FZREF_TOOLS_DIR/../.env" ]; then
+    set -a
+    # shellcheck disable=SC1091
+    source "$FZREF_TOOLS_DIR/../.env"
+    set +a
+fi
+# shellcheck source=../lib/jira-projects.sh
+source "$FZREF_TOOLS_DIR/lib/jira-projects.sh"
+
+FZREF_TICKET_RE="${JIRA_PROJECT_REGEX:-}"
+[ -n "$FZREF_TICKET_RE" ] && FZREF_TICKET_RE="${FZREF_TICKET_RE}-[0-9]+"
+
+FZREF_FZF="${FZP_FZF:-}"
+if [ -z "$FZREF_FZF" ]; then
+    if [ -x "$HOME/.zsh/fzf/bin/fzf" ]; then FZREF_FZF="$HOME/.zsh/fzf/bin/fzf"
+    else FZREF_FZF="fzf"; fi
+fi
+
+FZREF_WTA_LOG="${WTA_LOG:-$HOME/.cache/rr/worktree_access.log}"
+FZREF_JIRA_TITLES="${FZREF_JIRA_TITLES:-$HOME/.jira_cache}"
+FZREF_JIRA_STATUSES="${FZREF_JIRA_STATUSES:-$HOME/.jira_status_cache}"
+
+# Remote-only branches older than this are noise, not options. Same knob rr uses, so
+# raising it raises it in both places.
+FZREF_REMOTE_MAX_AGE_DAYS="${RR_REMOTE_MAX_AGE_DAYS:-90}"
+
+# ============================================================================
+# Gathering
+# ============================================================================
+
+# The branch git parked while a worktree is mid-rebase.
+#
+# `git worktree list --porcelain` reports a rebasing worktree as `detached` with no branch
+# line, because HEAD genuinely is a bare sha -- so the worktree for the branch you are
+# most likely to be typing a `git rebase --continue`-adjacent command about is the one
+# that would silently lose its ⊙. rebase-{merge,apply}/head-name is where the real branch
+# is, in the worktree's OWN gitdir (a linked worktree's .git is a file, not a directory).
+# Same reasoning, and same two files, as rr-core.sh's worktree_parked_branch.
+_fzref_parked_branch() {
+    local wt_path="$1" gitdir="" head_name="" line
+    if [ -f "$wt_path/.git" ]; then
+        while IFS= read -r line; do
+            case "$line" in
+                gitdir:*) line="${line#gitdir:}"; gitdir="${line# }"; break ;;
+            esac
+        done < "$wt_path/.git"
+    elif [ -d "$wt_path/.git" ]; then
+        gitdir="$wt_path/.git"
+    fi
+    [ -n "$gitdir" ] || return 1
+    if   [ -f "$gitdir/rebase-merge/head-name" ]; then head_name=$(< "$gitdir/rebase-merge/head-name")
+    elif [ -f "$gitdir/rebase-apply/head-name" ]; then head_name=$(< "$gitdir/rebase-apply/head-name")
+    fi
+    [ -n "$head_name" ] || return 1
+    printf '%s\n' "${head_name#refs/heads/}"
+}
+
+# Emit one TSV line per candidate ref:
+#
+#   sort_ts \t kind \t wt_key \t branch \t remote \t wt_path \t ticket \t desc \t status \t age \t here
+#
+# kind is "local" or "remote"; wt_key is git's own name for the worktree (the colour key,
+# empty for the primary checkout or for a branch with no worktree); here is non-empty for
+# the branch checked out in the worktree we are being run from.
+fzref_gather() {
+    git rev-parse --git-dir >/dev/null 2>&1 || { echo "fzref: not a git repository" >&2; return 1; }
+
+    local now; now=$(date +%s)
+
+    # ---- worktrees ---------------------------------------------------------
+    local -A wt_path_of_branch=() wt_key_of_path=()
+    local line wt_path="" br
+    while IFS= read -r line; do
+        case "$line" in
+            "worktree "*)          wt_path="${line#worktree }" ;;
+            "branch refs/heads/"*) wt_path_of_branch["${line#branch refs/heads/}"]="$wt_path" ;;
+            "detached")
+                br=$(_fzref_parked_branch "$wt_path") || br=""
+                [ -n "$br" ] && wt_path_of_branch["$br"]="$wt_path"
+                ;;
+        esac
+    done < <(git worktree list --porcelain 2>/dev/null)
+
+    local p
+    for p in "${wt_path_of_branch[@]}"; do
+        [ -n "${wt_key_of_path[$p]+set}" ] && continue
+        worktree_colour_key "$p"
+        wt_key_of_path["$p"]="$WTC_KEY"
+    done
+
+    # ---- worktree recency --------------------------------------------------
+    # A branch you were reading code in ten minutes ago is a likelier argument than one
+    # whose tip commit happens to be newer, so the sort key is the later of the two.
+    local -A wta=()
+    if [ -f "$FZREF_WTA_LOG" ]; then
+        local ts
+        while IFS=$'\t' read -r ts p; do
+            [ -n "$p" ] || continue
+            [[ "$ts" =~ ^[0-9]+$ ]] || continue
+            [ "$ts" -gt "${wta[$p]:-0}" ] && wta["$p"]="$ts"
+        done < "$FZREF_WTA_LOG"
+    fi
+
+    # ---- Jira ---------------------------------------------------------------
+    local -A jtitle=() jstatus=()
+    local k v
+    if [ -f "$FZREF_JIRA_TITLES" ]; then
+        while IFS=: read -r k v; do [ -n "$k" ] && jtitle["$k"]="$v"; done < "$FZREF_JIRA_TITLES"
+    fi
+    if [ -f "$FZREF_JIRA_STATUSES" ]; then
+        while IFS=: read -r k v; do [ -n "$k" ] && jstatus["$k"]="$v"; done < "$FZREF_JIRA_STATUSES"
+    fi
+
+    # ---- remote ref names, for the ctrl-r spelling --------------------------
+    local -A remote_exists=()
+    local rname
+    while IFS= read -r rname; do
+        [ -n "$rname" ] && remote_exists["$rname"]=1
+    done < <(git for-each-ref refs/remotes/ --format='%(refname:short)' 2>/dev/null)
+
+    local here_branch
+    here_branch=$(git symbolic-ref --quiet --short HEAD 2>/dev/null) || here_branch=""
+    # Mid-rebase in this very checkout: HEAD is detached, but the branch being rebased is
+    # still "where you are", and marking it is the whole point of the marker.
+    if [ -z "$here_branch" ]; then
+        here_branch=$(_fzref_parked_branch "$(git rev-parse --show-toplevel 2>/dev/null)") || here_branch=""
+    fi
+
+    # US (0x1f), not a tab, between for-each-ref's fields. `read` splits on IFS, and a tab
+    # is IFS *whitespace* — so a run of them collapses to one delimiter, and a branch with
+    # no upstream silently shifted its commit subject into the upstream column. 0x1f is not
+    # whitespace, so an empty field stays an empty field.
+    #
+    # As a real byte via $'...', not git's %xNN: for-each-ref doesn't take those (that is
+    # `git log --pretty`), and emits the literal text "%x1f" instead — which parses as one
+    # enormous field and looks exactly like it worked until you read a row.
+    local -A local_exists=()
+    local name cts crel subj upstream ticket desc status wtp wtk sort_ts remote here
+    while IFS=$'\x1f' read -r name cts crel upstream subj; do
+        [ -n "$name" ] || continue
+        local_exists["$name"]=1
+
+        wtp="${wt_path_of_branch[$name]:-}"
+        wtk=""
+        [ -n "$wtp" ] && wtk="${wt_key_of_path[$wtp]:-}"
+
+        sort_ts="${cts:-0}"
+        if [ -n "$wtp" ] && [ "${wta[$wtp]:-0}" -gt "$sort_ts" ]; then sort_ts="${wta[$wtp]}"; fi
+
+        ticket=""
+        if [ -n "$FZREF_TICKET_RE" ] && [[ "$name" =~ $FZREF_TICKET_RE ]]; then
+            ticket="${BASH_REMATCH[0]}"
+        fi
+
+        # The ticket title is the description that survives a branch rename; the commit
+        # subject is the fallback for the branches that aren't tickets at all.
+        desc=""; status=""
+        if [ -n "$ticket" ]; then
+            desc="${jtitle[$ticket]:-}"
+            status="${jstatus[$ticket]:-}"
+        fi
+        [ -n "$desc" ] || desc="${subj:-}"
+
+        remote="${upstream:-}"
+        [ -n "$remote" ] || { [ -n "${remote_exists[origin/$name]:-}" ] && remote="origin/$name"; }
+
+        here=""
+        [ -n "$here_branch" ] && [ "$name" = "$here_branch" ] && here="1"
+
+        printf '%s\tlocal\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$sort_ts" "$wtk" "$name" "$remote" "$wtp" "$ticket" \
+            "${desc//	/ }" "$status" "${crel:-}" "$here"
+    done < <(git for-each-ref refs/heads/ \
+        --format=$'%(refname:short)\x1f%(committerdate:unix)\x1f%(committerdate:relative)\x1f%(upstream:short)\x1f%(contents:subject)' 2>/dev/null)
+
+    # ---- remote-only branches ----------------------------------------------
+    # Only the ones with no local counterpart: `origin/main` is reachable from `main`'s row
+    # via ctrl-r, and listing both spellings of every branch would double a 370-row list
+    # to say nothing new.
+    local cutoff=0
+    [ "$FZREF_REMOTE_MAX_AGE_DAYS" -gt 0 ] 2>/dev/null && cutoff=$(( now - FZREF_REMOTE_MAX_AGE_DAYS * 86400 ))
+    local short full
+    while IFS=$'\x1f' read -r full name cts crel subj; do
+        [ -n "$name" ] || continue
+        # Tested on the full refname, because `refname:short` abbreviates
+        # refs/remotes/origin/HEAD all the way down to plain "origin" — which matches no
+        # */HEAD pattern and showed up as a row called "origin".
+        case "$full" in */HEAD) continue ;; esac
+        short="${name#*/}"
+        # Membership out of the set the local pass already built, not `git show-ref` per
+        # ref: this loop runs over every remote-tracking branch in the repo, and a fork
+        # each turned a 120ms tool into a 1.7s one.
+        [ -n "${local_exists[$short]:-}" ] && continue
+        [ "$cutoff" -gt 0 ] && [ "${cts:-0}" -lt "$cutoff" ] && continue
+
+        ticket=""
+        if [ -n "$FZREF_TICKET_RE" ] && [[ "$short" =~ $FZREF_TICKET_RE ]]; then
+            ticket="${BASH_REMATCH[0]}"
+        fi
+        desc=""; status=""
+        if [ -n "$ticket" ]; then
+            desc="${jtitle[$ticket]:-}"
+            status="${jstatus[$ticket]:-}"
+        fi
+        [ -n "$desc" ] || desc="${subj:-}"
+
+        printf '%s\tremote\t\t%s\t%s\t\t%s\t%s\t%s\t%s\t\n' \
+            "${cts:-0}" "$name" "$name" "$ticket" \
+            "${desc//	/ }" "$status" "${crel:-}"
+    done < <(git for-each-ref refs/remotes/ \
+        --format=$'%(refname)\x1f%(refname:short)\x1f%(committerdate:unix)\x1f%(committerdate:relative)\x1f%(contents:subject)' 2>/dev/null)
+}
+
+# ============================================================================
+# Rendering
+# ============================================================================
+
+# One awk pass for the whole table, for the reason lib/worktree-colour.sh spells out: a
+# shell call per row to colour 400 rows is 400 forks on the only path that has to feel
+# instant. Emits
+#
+#   display \t branch \t remote \t wt_path \t ticket
+#
+# so fzf can show field 1 (--with-nth=1) and hand the payload fields back on accept.
+fzref_render() {
+    local width="${1:-0}"
+    if [ "$width" -le 0 ]; then
+        width=$(tput cols 2>/dev/null) || width=120
+        [ "$width" -gt 0 ] || width=120
+    fi
+
+    sort -t$'\t' -k1,1nr | awk -F'\t' -v total="$width" -v now="$(date +%s)" "$WTC_AWK"'
+function pad(s, n) { return (length(s) < n) ? s sprintf("%" (n - length(s)) "s", "") : s }
+function cut(s, n) { return (length(s) <= n) ? s : substr(s, 1, n - 1) "…" }
+function cell(s, n) { return pad(cut(s, n), n) }
+
+# rrs format_status, in awk. The point of matching it is that a status means the same
+# colour in rr and here; drifting would make the colour worse than no colour.
+function status_sgr(s,   l) {
+    l = tolower(s)
+    if (s == "")                                         return ""
+    if (l ~ /abandon|cancel|won.?t do/)                  return "2;38;5;244"
+    if (l ~ /done|closed|resolved/)                      return "38;5;114"
+    if (l ~ /passed qa|qa passed/)                       return "38;5;81"
+    if (l ~ /qa|testing|test/)                           return "38;5;109"
+    if (l ~ /progress|dev/)                              return "38;5;221"
+    if (l ~ /mr|review|pull request|pr/)                 return "38;5;81"
+    if (l ~ /paused|hold/)                               return "38;5;173"
+    if (l ~ /blocked|impediment/)                        return "38;5;167"
+    if (l ~ /todo|to do|backlog|open|new/)               return "38;5;250"
+    return "38;5;244"
+}
+function status_icon(s,   l) {
+    l = tolower(s)
+    if (s == "")                                         return " "
+    if (l ~ /abandon|cancel|won.?t do/)                  return "✓"
+    if (l ~ /done|closed|resolved/)                      return "✓"
+    if (l ~ /passed qa|qa passed/)                       return "◆"
+    if (l ~ /qa|testing|test/)                           return "◇"
+    if (l ~ /progress|dev/)                              return "●"
+    if (l ~ /mr|review|pull request|pr/)                 return "⬡"
+    if (l ~ /paused|hold/)                               return "◐"
+    if (l ~ /blocked|impediment/)                        return "✗"
+    if (l ~ /todo|to do|backlog|open|new/)               return "○"
+    return "·"
+}
+function age_sgr(rel) {
+    if (rel ~ /second|minute/)     return "38;5;114"
+    if (rel ~ /hour/)              return "38;5;108"
+    if (rel ~ /^[0-9] days?/)      return "38;5;144"
+    if (rel ~ /day/)               return "38;5;101"
+    if (rel ~ /week/)              return "38;5;242"
+    return "38;5;239"
+}
+BEGIN {
+    off  = "\033[0m"
+    BW   = 32; SW = 11; AW = 15; HW = 2; IW = 4
+    DW   = total - (IW + HW + BW + SW + AW + 3) - 2
+    if (DW < 12) DW = 12
+}
+{
+    kind = $2; wtkey = $3; branch = $4; remote = $5; wtpath = $6
+    ticket = $7; desc = $8; status = $9; age = $10; here = $11
+
+    # ---- the worktree cell: exactly IW visual columns, always. rr aligns by hand
+    # against that number too -- a cell one column wider shears every row below it.
+    if (wtpath == "") {
+        ind = "    "
+        branch_sgr = ""
+    } else if (wtkey == "") {
+        # No key means the primary checkout, which the prompt segment also leaves
+        # untinted. "No block" has to keep meaning "the main repo" everywhere.
+        ind = " \033[38;5;250m⊙" off "  "
+        branch_sgr = ""
+    } else {
+        col = wtc_colour(wtkey)
+        block = "\033[48;5;" col "m\033[30m"
+        ind = block " ⊙ " off " "
+        branch_sgr = block
+    }
+
+    head = (here != "") ? "\033[38;5;214m➤" off " " : "  "
+
+    if (kind == "remote") {
+        bsgr = "\033[38;5;146m"
+    } else if (desc != "" && ticket != "") {
+        bsgr = "\033[38;5;252m"
+    } else {
+        bsgr = "\033[38;5;249m"
+    }
+
+    bcell = cell(branch, BW)
+    scell = (status == "") ? pad("", SW) \
+          : "\033[" status_sgr(status) "m" status_icon(status) " " cut(toupper(status), SW - 2) off \
+            pad("", SW - 2 - length(cut(toupper(status), SW - 2)))
+
+    display = ind head bsgr branch_sgr bcell off " " \
+              "\033[38;5;245m" cell(desc, DW) off " " \
+              scell " " \
+              "\033[" age_sgr(age) "m" pad(cut(age, AW), AW) off
+
+    print display "\t" branch "\t" remote "\t" wtpath "\t" ticket
+}'
+}
+
+# ============================================================================
+# Preview
+# ============================================================================
+
+# What you want to know before naming a ref as an argument is how it sits relative to
+# where you are: how far ahead, how far behind, and what the commits actually are. Not
+# `git log branch`, which for a branch off main is a hundred commits you already have.
+fzref_preview() {
+    local branch="${1:-}" wtpath="${2:-}"
+    [ -n "$branch" ] || return 0
+    local off=$'\033[0m' dim=$'\033[38;5;244m' hi=$'\033[38;5;214m'
+
+    if [ -n "$wtpath" ]; then
+        printf '%s⊙ %s%s\n' "$hi" "$wtpath" "$off"
+    fi
+
+    local head_name ahead behind
+    head_name=$(git symbolic-ref --quiet --short HEAD 2>/dev/null) || head_name="HEAD"
+    if read -r behind ahead < <(git rev-list --left-right --count "HEAD...$branch" 2>/dev/null); then
+        printf '%s%s%s is %s+%s%s ahead / %s-%s%s behind %s%s%s\n\n' \
+            "$hi" "$branch" "$off" $'\033[38;5;114m' "$ahead" "$off" \
+            $'\033[38;5;167m' "$behind" "$off" "$dim" "$head_name" "$off"
+    else
+        printf '\n'
+    fi
+
+    # The divergent commits are the interesting ones — but a ref that is wholly behind you
+    # (an ancestor, which every already-merged branch is) has none, and an empty pane says
+    # nothing about what the ref *is*. Fall back to its own tip commits there.
+    local log
+    log=$(git log --color=always --oneline --no-decorate -15 "HEAD..$branch" 2>/dev/null)
+    if [ -n "$log" ]; then
+        printf '%s── on %s, not in %s ──%s\n%s\n' "$dim" "$branch" "$head_name" "$off" "$log"
+    else
+        printf '%s── %s is an ancestor of %s; its tip ──%s\n' "$dim" "$branch" "$head_name" "$off"
+        git log --color=always --oneline --no-decorate -10 "$branch" 2>/dev/null
+    fi
+}
+
+# ============================================================================
+# Entry point
+# ============================================================================
+
+fzref_usage() {
+    cat >&2 <<'EOF'
+fzref - pick a branch / worktree / ticket and print the spelling you asked for
+
+  fzref [-q QUERY] [-w WIDTH]   interactive; prints the chosen token on stdout
+  fzref --list                  raw TSV rows (sorted), for tests and scripts
+  fzref --render [WIDTH]        rendered fzf lines, reads TSV on stdin
+  fzref --preview BRANCH [WT]   the preview pane for one row
+
+Accept keys: enter=branch  alt-enter=worktree path  ctrl-r=remote  ctrl-t=ticket
+EOF
+}
+
+main() {
+    local query="" width=0
+
+    case "${1:-}" in
+        --list)    fzref_gather | sort -t$'\t' -k1,1nr; return ;;
+        --render)  fzref_render "${2:-0}"; return ;;
+        --preview) shift; fzref_preview "$@"; return ;;
+        -h|--help) fzref_usage; return 0 ;;
+    esac
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -q|--query) query="${2:-}"; shift 2 ;;
+            -w|--width) width="${2:-0}"; shift 2 ;;
+            *) fzref_usage; return 2 ;;
+        esac
+    done
+
+    local rows
+    rows=$(fzref_gather | fzref_render "$width") || return 1
+    [ -n "$rows" ] || { echo "fzref: no refs" >&2; return 1; }
+
+    local self="$FZREF_SELF_DIR/fzref"
+    local out key line
+    out=$(printf '%s\n' "$rows" | "$FZREF_FZF" \
+        --ansi \
+        --delimiter=$'\t' \
+        --with-nth=1 \
+        --nth=1 \
+        --height=70% \
+        --min-height=15 \
+        --reverse \
+        --info=inline \
+        --pointer='▶' \
+        --no-multi \
+        --query="$query" \
+        --expect='alt-enter,ctrl-r,ctrl-t' \
+        --header=$'\e[38;5;244menter\e[0m branch  \e[38;5;244malt-enter\e[0m path  \e[38;5;244mctrl-r\e[0m remote  \e[38;5;244mctrl-t\e[0m ticket  \e[38;5;244mctrl-/\e[0m preview' \
+        --preview="$self --preview {2} {4}" \
+        --preview-window='down,45%,border-top' \
+        --bind='ctrl-d:half-page-down,ctrl-u:half-page-up' \
+        --bind='ctrl-/:toggle-preview' \
+        --bind='change:first') || return 1
+    # Deliberately no `</dev/tty` here, tempting as it looks from inside a zle widget: the
+    # rows arrive on stdin, so redirecting it hands fzf the terminal as its candidate list
+    # and an empty pipe as its keyboard. fzf opens the tty itself for the UI — that is what
+    # makes `cmd | fzf` work at all, and it works the same from a widget.
+
+    key=$(printf '%s' "$out" | sed -n '1p')
+    line=$(printf '%s' "$out" | sed -n '2p')
+    [ -n "$line" ] || return 1
+
+    # Tab-to-newline then mapfile, not `IFS=$'\t' read`: a tab is IFS whitespace, so `read`
+    # collapses the run of them a row with no remote and no worktree produces, and the
+    # ticket would arrive in the branch's place. Same trap as the for-each-ref split above.
+    local -a f=()
+    mapfile -t f < <(printf '%s\n' "${line//$'\t'/$'\n'}")
+
+    local branch="${f[1]:-}" remote="${f[2]:-}" wtpath="${f[3]:-}" ticket="${f[4]:-}"
+    [ -n "$branch" ] || return 1
+
+    case "$key" in
+        alt-enter) printf '%s\n' "${wtpath:-$branch}" ;;
+        ctrl-r)    printf '%s\n' "${remote:-$branch}" ;;
+        ctrl-t)    printf '%s\n' "${ticket:-$branch}" ;;
+        *)         printf '%s\n' "$branch" ;;
+    esac
+}
+
+main "$@"

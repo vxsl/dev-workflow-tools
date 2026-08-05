@@ -167,6 +167,9 @@ display_col() { cut -f3- | plain; }
 # Pretend a tmux session exists (used for the tab tests).
 add_tmux_session() { printf '%s\n' "$1" >> "$TEST_TMUX_SESSIONS"; }
 
+# Put a path in the frecency log, which is where "repos I work in" comes from.
+record_history_for() { printf '%s\t%s\n' "$(date +%s)" "$1" >> "$HOME/.fzedit_history"; }
+
 # A tig that records how it was called instead of drawing one, via the FZEDIT_TIG seam
 # open_tig already has. Writes "<type> <path>" to $TEST_TMPDIR/tig_call, and leaves no
 # file at all when tig was never reached.

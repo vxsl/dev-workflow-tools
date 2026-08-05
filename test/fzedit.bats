@@ -911,11 +911,41 @@ ED
     [ "$output" = "src/" ]
 }
 
-@test "^T on a row outside the scope offers that row's directory, tilde-collapsed" {
-    setup_repo_under_home
-    pin_scope "$H_MAIN"
-    run fz --new-prefill "$HOME/notes.md" ''
-    [ "$output" = "~/" ]
+# "new file in ul >" over a prefill of ~/bin/dev-workflow-tools/ is two different answers
+# to "where", and the one in the label is the wrong one. So the base follows the row.
+@test "^T follows the row into its own repo, so the label cannot lie" {
+    pin_scope "$WT_FEATURE"
+    run fz --new-base "$MAIN/src/app.ts" ''
+    [ "$output" = "$MAIN" ]
+    run fz --new-prefill "$MAIN/src/app.ts" ''
+    [ "$output" = "src/" ]
+}
+
+@test "^T on a row in no repo at all uses that row's own directory" {
+    mkdir -p "$TEST_TMPDIR/loose/sub"
+    echo x > "$TEST_TMPDIR/loose/sub/thing.txt"
+    pin_scope "$WT_FEATURE"
+    run fz --new-base "$TEST_TMPDIR/loose/sub/thing.txt" ''
+    [ "$output" = "$TEST_TMPDIR/loose/sub" ]
+}
+
+# A query with a slash was typed while looking at THIS checkout's files, so it is a path
+# against the scope no matter which row the cursor drifted onto.
+@test "^T with a path query stays anchored to the scope" {
+    pin_scope "$WT_FEATURE"
+    run fz --new-base "$MAIN/src/app.ts" 'client/web/x.ts'
+    [ "$output" = "$WT_FEATURE" ]
+}
+
+# Under fzf's execute() a silent return is invisible: fzf repaints the moment we exit, so
+# "I declined" and "the key did nothing" look identical -- which is how you end up
+# pressing it three times.
+@test "^T says why when it refuses, rather than looking like a dead key" {
+    pin_scope "$WT_FEATURE"
+    run bash -c "printf 'src/\n' | '$FZEDIT' --new '$WT_FEATURE/src/app.ts' ''"
+    [[ "$output" == *"directory"* ]]
+    run bash -c "printf 'src\n' | '$FZEDIT' --new '$WT_FEATURE/src/app.ts' ''"
+    [[ "$output" == *"already a directory"* ]]
 }
 
 @test "^T at the scope root offers an empty box, not a redundant prefix" {
@@ -1689,4 +1719,73 @@ ED
     TMUX=fake fz --close-tab '%42'
     run cat "$TEST_TMPDIR/killed"
     [[ "$output" == *"%42"* ]]
+}
+
+# --------------------------------------------------------------------------
+# Any repo, not just the monorepo's worktrees
+#
+# The pad could OPEN a file in ~/bin/dev-workflow-tools but could not point AT it: the
+# three narrow rungs, the header's branch and ^A's tig status are all functions of the
+# scope, and the scope could only ever be a worktree of DEFAULT_REPO.
+# --------------------------------------------------------------------------
+
+@test "a repo you have opened a file in becomes a ⊙ row" {
+    other="$TEST_TMPDIR/elsewhere/tool"
+    mkdir -p "$other"
+    git -C "$other" init -q -b main
+    echo x > "$other/thing.sh"
+    git_q "$other" add -A
+    git_q "$other" commit -q -m init
+    record_history_for "$other/thing.sh"
+    pin_scope "$WT_FEATURE"
+    set_mode files
+    run bash -c "'$FZEDIT' --generate-list | awk -F'\t' '\$1 == \"w\"' | cut -f2"
+    [[ "$output" == *"$other"* ]]
+}
+
+@test "a repo of its own is named by its basename, with a leading slash" {
+    other="$TEST_TMPDIR/elsewhere/tool"
+    mkdir -p "$other"
+    git -C "$other" init -q -b main
+    echo x > "$other/thing.sh"
+    git_q "$other" add -A
+    git_q "$other" commit -q -m init
+    record_history_for "$other/thing.sh"
+    pin_scope "$WT_FEATURE"
+    set_mode files
+    out="$(rows_of_type w | display_col | grep -- '/tool')"
+    # The slash is what makes it reachable: fzf scores a match after "/" above one after
+    # a space, and every file inside the repo competes with it on the same name.
+    [[ "$out" == *"⊙ /tool"* ]]
+}
+
+# Sibling worktrees of the scope repo keep their own naming, which disambiguates the
+# nested ones -- the leading slash is only for repos that are not in that family.
+@test "worktree rows are not renamed by the other-repo rule" {
+    pin_scope "$WT_FEATURE"
+    set_mode files
+    out="$(rows_of_type w | display_col)"
+    [[ "$out" != *"⊙ /deep"* ]]
+}
+
+@test "scoping to a repo of its own makes the narrow rungs work there" {
+    other="$TEST_TMPDIR/elsewhere/tool"
+    mkdir -p "$other"
+    git -C "$other" init -q -b main
+    echo x > "$other/thing.sh"
+    git_q "$other" add -A
+    git_q "$other" commit -q -m init
+    echo dirty >> "$other/thing.sh"
+    pin_scope "$other"
+    set_mode changed
+    out="$(rows_of_type f | cut -f2)"
+    [[ "$out" == *"$other/thing.sh"* ]]
+}
+
+@test "^K says why when the row cannot be carried" {
+    echo loose > "$TEST_TMPDIR/loose.txt"
+    run fz --carry "$TEST_TMPDIR/loose.txt"
+    [[ "$output" == *"not in a git repository"* ]]
+    run fz --carry "$WT_FEATURE"
+    [[ "$output" == *"not one"* ]]
 }
