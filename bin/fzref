@@ -43,15 +43,20 @@ source "$FZREF_TOOLS_DIR/lib/worktree-colour.sh"
 # .env is where JIRA_PROJECTS lives; without it the ticket columns just stay empty, which
 # is a perfectly good degraded mode (you still get branches, worktrees and commit
 # subjects), so a missing .env is not an error.
-if [ -f "$FZREF_TOOLS_DIR/.env" ]; then
+#
+# FZREF_ENV_FILE overrides which one, because `set -a; source .env` beats anything the
+# caller exported — so a test that wants its own project keys cannot get them by setting
+# JIRA_PROJECTS, only by naming a different file.
+FZREF_ENV_FILE="${FZREF_ENV_FILE-}"
+if [ -z "$FZREF_ENV_FILE" ]; then
+    if   [ -f "$FZREF_TOOLS_DIR/.env" ];    then FZREF_ENV_FILE="$FZREF_TOOLS_DIR/.env"
+    elif [ -f "$FZREF_TOOLS_DIR/../.env" ]; then FZREF_ENV_FILE="$FZREF_TOOLS_DIR/../.env"
+    fi
+fi
+if [ -n "$FZREF_ENV_FILE" ] && [ -f "$FZREF_ENV_FILE" ]; then
     set -a
     # shellcheck disable=SC1091
-    source "$FZREF_TOOLS_DIR/.env"
-    set +a
-elif [ -f "$FZREF_TOOLS_DIR/../.env" ]; then
-    set -a
-    # shellcheck disable=SC1091
-    source "$FZREF_TOOLS_DIR/../.env"
+    source "$FZREF_ENV_FILE"
     set +a
 fi
 # shellcheck source=../lib/jira-projects.sh

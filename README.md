@@ -317,6 +317,68 @@ agree on "most recent" and each updates it.
 See [WORKFLOW.md](WORKFLOW.md) for the whole loop — fzedit, nvim, tig and rr
 together — including the nvim keymaps worth internalising.
 
+### `fzref` (bound to `Ctrl+B`, and to `Tab` where a ref is the only option)
+
+Picks a ref for a command you are already typing — `git rebase <TAB>` is the case it
+exists for. Git's own completion offers every branch, alphabetically, which is the wrong
+index: what you remember is the ticket ("the AOI fill one"), and the branch name is the
+thing you are trying to look up.
+
+So the rows are keyed on the work rather than on the ref — Jira title and status from
+`rr`'s caches, and the ⊙ block in the worktree's own colour, the same block the p10k
+segment and `fzedit` draw:
+
+```
+ ⊙  ➤ UL-1633        fix queries stuck loading when rapidly cancelled…  ⬡ IN REVIEW  9 minutes ago
+    ⊙ UL-1773        AOI shapes should have no fill on the map          ⬡ IN REVIEW  16 minutes ago
+      origin/UL-1774 Re-land the zip-ingestion batch runner             ○ TO DO      12 hours ago
+```
+
+A coloured ⊙ means that branch is checked out in that worktree (untinted = the primary
+checkout, none = no worktree); `➤` is the branch you are on right now. Ordered by the
+later of the tip commit and the last time you were in its worktree, so "the one I was just
+in" floats up alongside "the one I just committed to".
+
+**The accept key picks which of a ref's names you get**, because that depends entirely on
+the verb in front of it:
+
+| key | inserts | for |
+|---|---|---|
+| `enter` | `UL-1633` | `git rebase` / `merge` / `switch` |
+| `alt-enter` | `/home/kyle/work/repos/ul.UL-1633` | `cd`, `ls`, anything taking a path |
+| `ctrl-r` | `origin/UL-1633` | rebasing onto the remote |
+| `ctrl-t` | `UL-1633` | the bare ticket id, for `ticket-ask` etc |
+
+Each falls back to the branch name when the row has no such value. `ctrl-/` toggles the
+preview, which shows how far the ref is ahead/behind you and the commits that differ.
+
+**Two ways in.** `Ctrl+B` always opens the picker and replaces the word at the cursor.
+`Tab` opens it only where a ref is the *only* possible argument (`rebase`, `merge`,
+`switch`, `cherry-pick`, `revert`, `branch -d/-m/-f`, `worktree add <path> …`,
+`push/pull/fetch <remote> …`, `create-wt`) and, for the ref-or-path commands (`checkout`,
+`diff`, `log`, `show`, `reset`, `restore`), only when the partial word already matches a
+ref — so `git diff src/<TAB>` keeps completing filenames. Everywhere else it falls straight
+through to normal completion. Bare `git branch <TAB>` is deliberately left alone: that is
+naming a branch to *create*.
+
+Tab is wired up from `~/.zshrc`'s Tab dispatcher, guarded on `$+functions[_fzref_tab_try]`
+so that file keeps working with this repo unsourced:
+
+```zsh
+if (( $+functions[_fzref_tab_try] )) && _fzref_tab_try; then
+    return
+fi
+```
+
+Everything is computed live — `for-each-ref` and `worktree list` are ~8ms each on a
+370-branch repo, so the whole list is ~150ms and a cache would only ever be a way to be
+wrong. The Jira columns come from `rr`'s caches because those are the only slow part, and
+`rr` already keeps them warm. Unlike `rr`'s rows this does *not* report dirty worktrees:
+that is a `git status` per worktree, and it is not information that helps you choose the
+*name* of a ref.
+
+`bats test/fzref.bats test/fzref_context.bats` — 49 tests.
+
 ### `restage`
 Unstage two WIP commits, keeping oldest staged.
 
@@ -374,6 +436,8 @@ The `shell/dev-workflow.zsh` provides:
 
 ### Keybindings
 - `Ctrl+G` - Commit message history widget (with `^f`/`^x`/`^r`/`^o` for conventional commit types)
+- `Ctrl+B` - Ref picker ([`fzref`](#fzref-bound-to-ctrlb-and-to-tab-where-a-ref-is-the-only-option)); replaces the word at the cursor
+- `Tab` - Also the ref picker, but only where a ref is the only possible argument (needs the hook in `~/.zshrc`, see `fzref`)
 
 ### Functions
 - `gcm "message"` - Commit with message (saves to history)
