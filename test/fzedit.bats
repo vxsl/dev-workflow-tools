@@ -839,6 +839,91 @@ ED
     [[ "$output" == *"argv=$WT_FEATURE/src/app.ts"* ]]
 }
 
+# --------------------------------------------------------------------------
+# ^T: the file that does not exist yet
+# --------------------------------------------------------------------------
+
+@test "^T makes the parent directories and opens the file in them" {
+    pin_scope "$WT_FEATURE"
+    printf 'src/deeply/nested/new.ts\n' |
+        FZEDIT_EDITOR=true fz --new "$WT_FEATURE/src/app.ts" ''
+    [ -d "$WT_FEATURE/src/deeply/nested" ]
+}
+
+# nvim will not mkdir for you, and losing a buffer to E212 is what this key prevents --
+# but creating the file too would leave an empty one behind every time you changed your
+# mind, so the file is the editor's to write.
+@test "^T leaves the file itself to the editor" {
+    pin_scope "$WT_FEATURE"
+    printf 'src/untouched.ts\n' | FZEDIT_EDITOR=true fz --new "$WT_FEATURE/src/app.ts" ''
+    [ ! -e "$WT_FEATURE/src/untouched.ts" ]
+}
+
+@test "^T opens the editor on the path, relative to the scope" {
+    pin_scope "$WT_FEATURE"
+    cat > "$TEST_TMPDIR/fakebin/fake-editor" <<'ED'
+#!/usr/bin/env bash
+printf 'argv=%s\n' "$*" > "$TEST_TMPDIR/editor_call"
+ED
+    chmod +x "$TEST_TMPDIR/fakebin/fake-editor"
+    printf 'src/new.ts\n' |
+        FZEDIT_EDITOR="$TEST_TMPDIR/fakebin/fake-editor" fz --new "$WT_FEATURE/src/app.ts" ''
+    run cat "$TEST_TMPDIR/editor_call"
+    [[ "$output" == *"argv=$WT_FEATURE/src/new.ts"* ]]
+}
+
+@test "^T honours an absolute or tilde path instead of the scope" {
+    pin_scope "$WT_FEATURE"
+    printf '~/outside/thing.md\n' | FZEDIT_EDITOR=true fz --new "$WT_FEATURE/src/app.ts" ''
+    [ -d "$HOME/outside" ]
+}
+
+@test "^T backing out creates nothing" {
+    pin_scope "$WT_FEATURE"
+    printf '\n' | FZEDIT_EDITOR=true fz --new "$WT_FEATURE/src/app.ts" ''
+    run ls "$WT_FEATURE/src"
+    [ "$output" = "app.ts" ]
+}
+
+@test "^T refuses a directory rather than making a file called foo/" {
+    pin_scope "$WT_FEATURE"
+    printf 'src/newdir/\n' | FZEDIT_EDITOR=true fz --new "$WT_FEATURE/src/app.ts" ''
+    [ ! -e "$WT_FEATURE/src/newdir" ]
+}
+
+# Fuzzy-finding a file is how you find its DIRECTORY, so the row under the cursor is
+# where a new file most often belongs -- one keypress and a basename.
+@test "^T starts the box at the directory of the row under the cursor" {
+    pin_scope "$WT_FEATURE"
+    run fz --new-prefill "$WT_FEATURE/src/app.ts" ''
+    [ "$output" = "src/" ]
+}
+
+@test "^T starts the box at the query when the query is a path" {
+    pin_scope "$WT_FEATURE"
+    run fz --new-prefill "$WT_FEATURE/src/app.ts" 'client/web/thing.ts'
+    [ "$output" = "client/web/thing.ts" ]
+}
+
+@test "^T ignores a query that is just a fuzzy filter" {
+    pin_scope "$WT_FEATURE"
+    run fz --new-prefill "$WT_FEATURE/src/app.ts" 'appts'
+    [ "$output" = "src/" ]
+}
+
+@test "^T on a row outside the scope offers that row's directory, tilde-collapsed" {
+    setup_repo_under_home
+    pin_scope "$H_MAIN"
+    run fz --new-prefill "$HOME/notes.md" ''
+    [ "$output" = "~/" ]
+}
+
+@test "^T at the scope root offers an empty box, not a redundant prefix" {
+    pin_scope "$WT_FEATURE"
+    run fz --new-prefill "$WT_FEATURE/README.md" ''
+    [ -z "$output" ]
+}
+
 @test "the pad is never poked while tests run" {
     # FZEDIT_NO_PAD is set by the harness; without it the suite would press xmonad's
     # scratchpad toggle on the real desktop.

@@ -27,6 +27,7 @@
 #
 #   enter  open file / switch worktree     ^O cursor    ^S tmux window here
 #   ^space mark a row    ^E open every marked row in ONE nvim
+#   ^T     new file, starting at the directory of the row you are on
 #   ^A     stage / unstage                 esc clear the query
 #   F5     refresh       ^C copy abs path  ^Y copy repo-relative path
 #
@@ -1136,6 +1137,81 @@ open_many() {
     nvim -- "${files[@]}"
 }
 
+# ^T: the file that does not exist yet.
+#
+# The pad answers "which of these files" for everything except the one you are about to
+# write, and that gap sends you to a shell to do three things the pad already knows: cd
+# to the right worktree, mkdir -p the parent, open the editor. So do them here.
+#
+# The prompt is pre-filled with the DIRECTORY OF THE ROW UNDER THE CURSOR, because
+# finding a directory by fuzzy-finding a file in it is exactly what the picker is for --
+# "a test beside this component" is then one keypress and a basename. A query with a
+# slash in it wins instead: if you typed a path, you have already said where.
+#
+# read -e with cwd at the worktree root, so readline's own filename completion works on
+# what is in the box -- TAB completes the directories, which is the half of a path in
+# this monorepo that you least want to type. Empty line or ^C backs out.
+#
+# The file is NOT created, only its parent directory: nvim writes it if you save, so
+# changing your mind leaves nothing behind. The mkdir is the point -- it is what nvim
+# will not do for you, and losing a buffer to "E212: Can't open file for writing" is the
+# failure this key exists to prevent.
+#
+# The prefill is its own arm (--new-prefill) because readline needs a terminal, so the
+# only way to hold this half honest in the suite is to be able to ask for it directly.
+new_file_prefill() {
+    local row="${1:-}" query="${2:-}" base="${3:-$HOME}" dir
+    # "Has a slash" and not "exists": the whole point is a path that does not exist yet.
+    if [ -n "$query" ] && [ "${query%/*}" != "$query" ]; then
+        printf '%s' "$query"
+        return 0
+    fi
+    [ -n "$row" ] && [ -f "$row" ] || return 0
+    dir="$(dirname "$(abspath "$row")")/"
+    case "$dir" in
+        "$base"/)  ;;
+        "$base"/*) printf '%s' "${dir#"$base"/}" ;;
+        "$HOME"/*) printf '~%s' "${dir#"$HOME"}" ;;
+        *)         printf '%s' "$dir" ;;
+    esac
+}
+
+new_file() {
+    local row="${1:-}" query="${2:-}" base prefill path target
+    base=$(resolve_scope)
+    [ -d "$base" ] || base="$HOME"
+    prefill=$(new_file_prefill "$row" "$query" "$base")
+
+    cd "$base" 2>/dev/null || return 0
+    # Named, not spelled out: the prompt says what the path is relative to, and the whole
+    # absolute path of the checkout is both too wide for a prompt and already in the
+    # header block two lines above.
+    local where="${base##*/}"
+    [ "$base" = "$HOME" ] && where="~"
+    # -r so a backslash in a path survives. readline only when there is a terminal to
+    # drive it -- under fzf's execute() there always is; in the suite there is not.
+    if [ -t 0 ]; then
+        read -e -r -p "new file in $where > " -i "$prefill" path || return 0
+    else
+        read -r path || return 0
+    fi
+    [ -n "$path" ] || return 0
+
+    case "$path" in
+        "~/"*) target="$HOME/${path#\~/}" ;;
+        /*)    target="$path" ;;
+        *)     target="$base/$path" ;;
+    esac
+    # A directory is not a file: bailing beats creating "foo/" as a filename, and beats
+    # opening nvim on a directory and getting netrw.
+    case "$target" in */) return 0 ;; esac
+    [ -d "$target" ] && return 0
+
+    mkdir -p "$(dirname "$target")" || return 0
+    record_history "$target"
+    open_in_editor "$target"
+}
+
 # The plain, fast worktree list: just the worktrees of this repo, most recent first.
 # Prints the chosen path. Used by ^K, where the question is narrow ("which checkout")
 # and rr's whole branch/ticket world would be in the way -- and as the fallback for
@@ -1806,6 +1882,10 @@ ${B}open${O}
   enter          open the file  ${D}(or switch to the ⊙ worktree)${O}
   ^space         mark a row     ${D}(marks accumulate)${O}
   ^E             open every marked row in ONE nvim ${D}— one LSP start, not N${O}
+  ^T             ${C}a file that does not exist yet.${O} ${D}The box starts at the${O}
+                 ${D}directory of the row you are on (or at your query, if you${O}
+                 ${D}typed a path); TAB completes directories. Parent dirs are${O}
+                 ${D}made for you, the file itself only when you save.${O}
   ^O             open in cursor
   ^S             new tmux window at this file's repo root
 
@@ -1861,6 +1941,8 @@ case "${1:-}" in
     --preview)       preview_row "$2" "$3"; exit 0 ;;
     --open)          open_row "$2" "$3" "${4:-}"; exit 0 ;;
     --open-many)     shift; open_many "$@"; exit 0 ;;
+    --new)           new_file "${2:-}" "${3:-}"; exit 0 ;;
+    --new-prefill)   new_file_prefill "${2:-}" "${3:-}" "$(resolve_scope)"; exit 0 ;;
     --pin)           pin_scope "$(git_root_of "${2:-$PWD}" || abspath "${2:-$PWD}")"; exit 0 ;;
     --switched)      took_switch; exit 0 ;;
     --record)        record_history "$2"; exit 0 ;;
@@ -1952,6 +2034,7 @@ generate_list | fzp_run $PERSIST_MODE \
     --preview-window=down:55%:wrap \
     --bind "enter:execute($0 --open {1} {2} < /dev/tty > /dev/tty 2>&1)+$SWITCHED+$REFRESH_MED" \
     --bind "ctrl-e:execute($0 --open-many {+2} < /dev/tty > /dev/tty 2>&1)+deselect-all+$REFRESH_MED" \
+    --bind "ctrl-t:execute($0 --new {2} {q} < /dev/tty > /dev/tty 2>&1)+$REFRESH_HARD" \
     --bind "ctrl-space:toggle+down" \
     --bind "ctrl-o:execute-silent($0 --record {2}; cursor -r {2})" \
     --bind "ctrl-s:execute-silent(tmux new-window -c \"\$($0 --rootof {2})\")" \
