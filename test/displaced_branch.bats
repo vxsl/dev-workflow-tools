@@ -129,6 +129,93 @@ teardown() {
     [[ -z "${WORKTREE_MAP[TEST-300]:-}" ]]
 }
 
+# --- an inferred alias must never outrank a real checkout ---
+
+# Two worktrees share a ticket prefix: one genuinely holds TEST-100, the other
+# is a stacked branch (`TEST-100-on-99-wip`) living in its own `.TEST-100-on-99`
+# directory. Reading TEST-100 out of that directory name and pointing the map at
+# it sent rr to the worktree that cannot possibly check TEST-100 out, because
+# git holds it next door — rr then offered a "switch back" git always refused.
+setup_stacked_sibling_worktrees() {
+    setup_git_repo
+    export JIRA_PROJECT="TEST" JIRA_PROJECT_REGEX="TEST"
+
+    create_branch_at_time "TEST-100" "1770000000"
+    create_branch_at_time "TEST-100-on-99-wip" "1770000100"
+
+    OWNER_WT="$TEST_TMPDIR/repo.TEST-100-fix-the-widget"
+    STACKED_WT="$TEST_TMPDIR/repo.TEST-100-on-99"
+    cd "$TEST_GIT_REPO"
+    git worktree add -q "$OWNER_WT" "TEST-100" 2>/dev/null
+    git worktree add -q "$STACKED_WT" "TEST-100-on-99-wip" 2>/dev/null
+    export OWNER_WT STACKED_WT
+
+    cd "$TEST_GIT_REPO"
+}
+
+@test "build_worktree_map: the worktree really holding the ticket wins over a lookalike sibling" {
+    setup_stacked_sibling_worktrees
+
+    declare -A WORKTREE_MAP=()
+    declare -a DISPLACED_BRANCHES=()
+    load_worktree_map_functions
+
+    cd "$TEST_GIT_REPO"
+    export GIT_ROOT="$TEST_GIT_REPO"
+    build_worktree_map
+
+    # TEST-100 belongs to the worktree that has it checked out, not to the
+    # sibling whose directory name merely starts with the same ticket.
+    [[ "${WORKTREE_MAP[TEST-100]}" = "$OWNER_WT" ]]
+
+    # Each worktree is still reachable by its own names.
+    [[ "${WORKTREE_MAP[TEST-100-on-99-wip]}" = "$STACKED_WT" ]]
+    [[ "${WORKTREE_MAP[TEST-100-on-99]}" = "$STACKED_WT" ]]
+    [[ "${WORKTREE_MAP[TEST-100-fix-the-widget]}" = "$OWNER_WT" ]]
+}
+
+@test "build_worktree_map: a branch suffixed onto its own directory name displaces nothing" {
+    setup_git_repo
+    export JIRA_PROJECT="TEST" JIRA_PROJECT_REGEX="TEST"
+
+    # Only the stacked worktree exists this time — TEST-100 is checked out
+    # nowhere, so nothing competes for the name. It still must not be claimed:
+    # `TEST-100-on-99-wip` is the directory's own branch plus a suffix, not a
+    # guest branch that pushed TEST-100 out.
+    create_branch_at_time "TEST-100" "1770000000"
+    create_branch_at_time "TEST-100-on-99-wip" "1770000100"
+    local wt_path="$TEST_TMPDIR/repo.TEST-100-on-99"
+    cd "$TEST_GIT_REPO"
+    git worktree add -q "$wt_path" "TEST-100-on-99-wip" 2>/dev/null
+
+    declare -A WORKTREE_MAP=()
+    declare -a DISPLACED_BRANCHES=()
+    load_worktree_map_functions
+
+    cd "$TEST_GIT_REPO"
+    export GIT_ROOT="$TEST_GIT_REPO"
+    build_worktree_map
+
+    [[ "${WORKTREE_MAP[TEST-100-on-99-wip]}" = "$wt_path" ]]
+    [[ "${WORKTREE_MAP[TEST-100-on-99]}" = "$wt_path" ]]
+    [[ -z "${WORKTREE_MAP[TEST-100]:-}" ]]
+}
+
+@test "worktree_holding_branch: reports the real checkout, and nothing for an unheld branch" {
+    setup_stacked_sibling_worktrees
+
+    eval "$(sed -n '/^worktree_holding_branch()/,/^}/p' "$REPO_ROOT/bin/rr.sh")"
+
+    cd "$TEST_GIT_REPO"
+    [[ "$(worktree_holding_branch TEST-100)" = "$OWNER_WT" ]]
+    [[ "$(worktree_holding_branch TEST-100-on-99-wip)" = "$STACKED_WT" ]]
+
+    # The directory name is not a checkout.
+    run worktree_holding_branch "TEST-100-on-99"
+    [ "$status" -ne 0 ]
+    [ -z "$output" ]
+}
+
 # --- DISPLACED_BRANCHES tracking in generate_worktree_data ---
 
 @test "generate_worktree_data: populates DISPLACED_BRANCHES for mismatched worktrees" {

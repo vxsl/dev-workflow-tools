@@ -162,34 +162,23 @@ build_worktree_map() {
     local current_wt_path=""
     local current_branch=""
 
-    # Helper: register a worktree's branch mappings (actual + eponymous + displaced ticket)
-    _register_worktree() {
+    # Worktrees are collected first and mapped in two passes below: a name a
+    # worktree really has checked out must always win over a name merely
+    # inferred from some other worktree's directory, whatever order
+    # `git worktree list` happens to emit them in.
+    local -a _wt_paths=() _wt_branches=()
+    _collect_worktree() {
         local _wt="$1" _branch="$2"
         [ -z "$_branch" ] || [ -z "$_wt" ] && return
-        WORKTREE_MAP["$_branch"]="$_wt"
-        WORKTREE_BRANCH["$_wt"]="$_branch"
-        # Also map eponymous branch so navigation works even with guest branches
-        local _epo; _epo=$(get_eponymous_branch "$_wt")
-        if [ -n "$_epo" ] && [ "$_epo" != "$_branch" ] && [ "$_wt" != "$GIT_ROOT" ]; then
-            WORKTREE_MAP["$_epo"]="$_wt"
-            # If genuine mismatch (not just title-suffixed dir), also map the displaced
-            # ticket ID so get_worktree_path("UB-6709") finds the worktree
-            if [[ "$_epo" != "$_branch"* ]]; then
-                local _ticket
-                _ticket=$(echo "$_epo" | grep -oiE "${JIRA_PROJECT_REGEX}-[0-9]+" | tr '[:lower:]' '[:upper:]' | head -1)
-                if [ -n "$_ticket" ] && [ "$_ticket" != "$_branch" ] && [ "$_ticket" != "$_epo" ] \
-                   && git show-ref --verify --quiet "refs/heads/$_ticket" 2>/dev/null; then
-                    WORKTREE_MAP["$_ticket"]="$_wt"
-                fi
-            fi
-        fi
+        _wt_paths+=("$_wt")
+        _wt_branches+=("$_branch")
     }
 
     while IFS= read -r line; do
         if [[ "$line" =~ ^worktree[[:space:]](.+)$ ]]; then
             # Save previous worktree if we have one
             if [[ -n "$current_branch" && -n "$current_wt_path" ]]; then
-                _register_worktree "$current_wt_path" "$current_branch"
+                _collect_worktree "$current_wt_path" "$current_branch"
             fi
             # Start new worktree
             current_wt_path="${BASH_REMATCH[1]}"
@@ -221,10 +210,43 @@ build_worktree_map() {
 
     # Don't forget the last worktree
     if [[ -n "$current_branch" && -n "$current_wt_path" ]]; then
-        _register_worktree "$current_wt_path" "$current_branch"
+        _collect_worktree "$current_wt_path" "$current_branch"
     fi
 
-    unset -f _register_worktree
+    # Pass 1 — authoritative: the branch each worktree actually has checked out.
+    local _i
+    for _i in "${!_wt_paths[@]}"; do
+        WORKTREE_MAP["${_wt_branches[$_i]}"]="${_wt_paths[$_i]}"
+        WORKTREE_BRANCH["${_wt_paths[$_i]}"]="${_wt_branches[$_i]}"
+    done
+
+    # Pass 2 — inferred aliases: the directory's eponymous name, and the ticket
+    # a guest branch displaced. These only fill in names no worktree claimed in
+    # pass 1; an alias that stole a real checkout would send rr to a worktree
+    # that cannot possibly check the branch out, since git holds it elsewhere.
+    local _wt _branch _epo _ticket
+    for _i in "${!_wt_paths[@]}"; do
+        _wt="${_wt_paths[$_i]}"; _branch="${_wt_branches[$_i]}"
+        [ "$_wt" = "$GIT_ROOT" ] && continue
+        _epo=$(get_eponymous_branch "$_wt")
+        [ -n "$_epo" ] && [ "$_epo" != "$_branch" ] || continue
+        [ -z "${WORKTREE_MAP[$_epo]:-}" ] && WORKTREE_MAP["$_epo"]="$_wt"
+
+        # Nothing is displaced when one name is just the other plus a suffix:
+        # `ul.UB-6709-fix-widget` holding `UB-6709` is a title-suffixed dir, and
+        # `ul.UB-6709-on-6700` holding `UB-6709-on-6700-wip` is a suffixed
+        # branch. Only a true guest branch displaces the ticket.
+        [[ "$_epo" != "$_branch"* && "$_branch" != "$_epo"* ]] || continue
+
+        _ticket=$(echo "$_epo" | grep -oiE "${JIRA_PROJECT_REGEX}-[0-9]+" | tr '[:lower:]' '[:upper:]' | head -1)
+        if [ -n "$_ticket" ] && [ "$_ticket" != "$_branch" ] && [ "$_ticket" != "$_epo" ] \
+           && [ -z "${WORKTREE_MAP[$_ticket]:-}" ] \
+           && git show-ref --verify --quiet "refs/heads/$_ticket" 2>/dev/null; then
+            WORKTREE_MAP["$_ticket"]="$_wt"
+        fi
+    done
+
+    unset -f _collect_worktree
 }
 
 # Get the eponymous branch name for a worktree path (inferred from directory name)
@@ -244,6 +266,21 @@ get_eponymous_branch() {
 get_worktree_path() {
     local branch="$1"
     echo "${WORKTREE_MAP[$branch]:-}"
+}
+
+# The worktree git actually has a branch checked out in, if any. Unlike
+# WORKTREE_MAP this never answers with an inferred alias — only a real
+# checkout, which is what decides whether `git checkout` can succeed at all.
+worktree_holding_branch() {
+    local branch="$1" wt="" line
+    [ -n "$branch" ] || return 1
+    while IFS= read -r line; do
+        case "$line" in
+            "worktree "*)                 wt="${line#worktree }" ;;
+            "branch refs/heads/$branch")  echo "$wt"; return 0 ;;
+        esac
+    done < <(git worktree list --porcelain 2>/dev/null)
+    return 1
 }
 
 # Get the actual git directory for a worktree (resolves .git file to actual gitdir)
@@ -3813,6 +3850,20 @@ if [ -n "$branch" ]; then
                 rebase)   echo -e "\033[2mnote: '$wt_basename' is mid-rebase of '$branch' — navigating as-is\033[0m" >&2 ;;
                 ancestor) echo -e "\033[2mnote: '$wt_basename' is detached at an ancestor of '$branch' — navigating as-is\033[0m" >&2 ;;
             esac
+        fi
+
+        # WORKTREE_MAP can reach a worktree through an inferred alias (the
+        # directory's eponymous name, a displaced ticket) rather than a real
+        # checkout. When git holds the branch in some other worktree, that one
+        # is the destination — and the only place a checkout could ever work.
+        # Without this, "switch back" offers a move git will always refuse.
+        if [ -n "$wt_actual_branch" ] && [ "$wt_actual_branch" != "$branch" ] && [ -z "$mismatch_skip" ]; then
+            real_holder=$(worktree_holding_branch "$branch")
+            if [ -n "$real_holder" ] && [ "$real_holder" != "$wt_path" ]; then
+                wt_path="$real_holder"
+                wt_basename=$(basename "$wt_path")
+                wt_actual_branch="$branch"
+            fi
         fi
 
         if [ -n "$wt_actual_branch" ] && [ "$wt_actual_branch" != "$branch" ] && [ -z "$mismatch_skip" ]; then
