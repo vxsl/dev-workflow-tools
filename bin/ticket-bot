@@ -2376,6 +2376,16 @@ def check_running_procs():
                         if clean:
                             print(f"  [{ticket}] {clean}")
 
+                        # Stage labels (":brain: Claude is implementing...",
+                        # worktree activity, etc.) describe the solve/publish
+                        # flow. A read-only Q&A has one phase — its "Reading
+                        # code to answer..." anchor + :loading: react already
+                        # cover it — and it shares the "Running Claude" log
+                        # line with ticket-solve, so applying these would
+                        # mislabel it as "implementing". Skip them for asks.
+                        if info.get("is_ask"):
+                            continue
+
                         # Check for stage transitions
                         for pattern, stage_text in STAGE_PATTERNS:
                             if pattern in clean and stage_text != info["last_stage"]:
