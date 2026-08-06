@@ -686,6 +686,9 @@ EFFORT_OPTIONS = [
 ]
 DEFAULT_MODEL = "opus"
 DEFAULT_EFFORT = "medium"
+# Q&A (ticket-ask) is the fast/cheap read-only path, so its config form
+# defaults to sonnet — opus is one dropdown-click away for a juicy question.
+DEFAULT_ASK_MODEL = "sonnet"
 import signal
 
 def _handle_sigint(sig, frame):
@@ -1095,7 +1098,8 @@ def create_jira_ticket_api(summary, description="", issue_type="Task",
     return None
 
 
-def start_ticket_ask(question, thread_ts, channel, slack_urls=None, req_msg=None):
+def start_ticket_ask(question, thread_ts, channel, slack_urls=None, req_msg=None,
+                     model=DEFAULT_ASK_MODEL, effort=DEFAULT_EFFORT, reuse_status_ts=""):
     """Run ticket-ask (Q&A mode) as a background subprocess.
 
     No worktree-per-question — ticket-ask clones once to
@@ -1118,14 +1122,21 @@ def start_ticket_ask(question, thread_ts, channel, slack_urls=None, req_msg=None
 
     # Advance request reaction now that we're about to post our first reply.
     swap_reaction(req_msg, "loading", "eyes")
-    # Post a status message so the user knows we're on it
-    resp = slack_reply(channel, thread_ts,
-                       f":mag: _Reading code to answer..._")
-    status_ts = resp.get("ts", "") if resp and resp.get("ok") else ""
+    if reuse_status_ts:
+        # Caller already converted the config form into the "reading..." anchor.
+        status_ts = reuse_status_ts
+    else:
+        # Post a status message so the user knows we're on it
+        resp = slack_reply(channel, thread_ts,
+                           f":mag: _Reading code to answer..._")
+        status_ts = resp.get("ts", "") if resp and resp.get("ok") else ""
 
     cmd = [str(SCRIPT_DIR / "ticket-ask"),
            "--thread-ts", thread_ts,
-           "--dm-channel", channel]
+           "--dm-channel", channel,
+           "--model", model]
+    if effort:
+        cmd.extend(["--effort", effort])
     for url in (slack_urls or []):
         cmd.extend(["--slack-url", url])
     cmd.extend(["--", question])
@@ -1141,7 +1152,7 @@ def start_ticket_ask(question, thread_ts, channel, slack_urls=None, req_msg=None
         start_new_session=True,
     )
 
-    print(f"  Starting ticket-ask PID {proc.pid} for thread {thread_ts}: {question[:60]}...")
+    print(f"  Starting ticket-ask PID {proc.pid} ({model}{'/' + effort if effort else ''}) for thread {thread_ts}: {question[:60]}...")
 
     running_procs[dedup_key] = {
         "proc": proc,
@@ -1168,9 +1179,56 @@ def start_ticket_ask(question, thread_ts, channel, slack_urls=None, req_msg=None
         "status": "asking",
         "req_msg": list(req_msg) if req_msg else None,
         "is_ask": True,
+        "model": model,
+        "effort": effort,
     }
     save_job(ask_state)
     jobs[thread_ts] = ask_state
+
+
+def request_ticket_ask_config(question, thread_ts, channel, slack_urls=None, req_msg=None):
+    """Ack a Q&A request, post the model/effort config form, and stash a
+    pending 'ask' config so _handle_config_start runs ticket-ask when the user
+    clicks Start. The Q&A analogue of request_ticket_solve_config — same form,
+    but Start dispatches the read-only ask path instead of ticket-solve."""
+    dedup_key = f"ask-{thread_ts}"
+
+    # Don't clobber an in-flight ask on the same thread.
+    if dedup_key in running_procs:
+        slack_reply(channel, thread_ts,
+                    ":warning: _Still answering the previous question — give me a moment._")
+        swap_reaction(req_msg, "loading", "warning")
+        return
+
+    # Advance request reaction now that we're posting the form.
+    swap_reaction(req_msg, "loading", "eyes")
+
+    headline_text = f":grey_question: _{question[:140]}_"
+    config = {
+        "kind": "ask",
+        "question": question,
+        "thread_ts": thread_ts,
+        "channel": channel,
+        "slack_urls": slack_urls,
+        "req_msg": list(req_msg) if req_msg else None,
+        "created_at": time.time(),
+        "headline_text": headline_text,
+    }
+
+    form_text = f"{headline_text}\n\n:gear: Pick model + effort, then hit Start."
+    form_resp = slack_post(
+        "chat.postMessage",
+        channel=channel,
+        thread_ts=thread_ts,
+        text=form_text,
+        blocks=_config_form_blocks(thread_ts, headline=headline_text, model=DEFAULT_ASK_MODEL),
+    )
+    if form_resp and form_resp.get("ok"):
+        config["form_ts"] = form_resp.get("ts", "")
+    else:
+        print(f"  WARNING: failed to post ask config form: {form_resp.get('error', 'unknown') if form_resp else 'no response'}")
+
+    save_pending_config(thread_ts, config)
 
 
 def _dedup_key_for(ticket, slack_urls):
@@ -2068,15 +2126,16 @@ def _read_config_form_values(payload, default_model=DEFAULT_MODEL, default_effor
 
 
 def _handle_config_start(payload, action):
-    """User clicked Start on the pre-run config form — kick off ticket-solve
-    with the selected model and effort."""
+    """User clicked Start on the pre-run config form — kick off the job
+    (ticket-solve, or ticket-ask for a 'kind: ask' config) with the selected
+    model and effort."""
     thread_ts = action.get("value", "")
     config = pending_configs.get(thread_ts)
     if not config:
         print(f"  [config_start] no pending config for thread_ts={thread_ts}")
         return
-    # Pop+persist now — if start_ticket_solve raises mid-flight, we don't want
-    # a stale pending config lying around for a double-click to resurrect.
+    # Pop+persist now — if the launch raises mid-flight, we don't want a stale
+    # pending config lying around for a double-click to resurrect.
     delete_pending_config(thread_ts)
 
     model, effort = _read_config_form_values(payload)
@@ -2084,6 +2143,33 @@ def _handle_config_start(payload, action):
     channel = config.get("channel", DM_CHANNEL)
     form_ts = config.get("form_ts", "")
     headline_text = config.get("headline_text", "")
+
+    # Q&A path: convert the form into the "reading..." anchor and run the
+    # read-only ask with the chosen model/effort. ticket-ask posts its own
+    # answer and the anchor is deleted on success (see check_running_procs).
+    if config.get("kind") == "ask":
+        if form_ts:
+            status_line = f":mag: _Reading code to answer with *{model}* / effort=*{effort}*..._"
+            confirm_text = f"{headline_text}\n\n{status_line}" if headline_text else status_line
+            slack_post(
+                "chat.update",
+                channel=channel,
+                ts=form_ts,
+                text=confirm_text,
+                blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": confirm_text}}],
+            )
+            react(channel, form_ts, "loading")
+        start_ticket_ask(
+            question=config.get("question", ""),
+            thread_ts=config["thread_ts"],
+            channel=channel,
+            slack_urls=config.get("slack_urls"),
+            req_msg=config.get("req_msg"),
+            model=model,
+            effort=effort,
+            reuse_status_ts=form_ts,
+        )
+        return
 
     # Replace the form with a starting-status message. This message IS the
     # status anchor from here on — start_ticket_solve won't post a separate
@@ -3014,7 +3100,7 @@ def handle_message(channel, ts, user, text, thread_ts=None):
             )
             print(f"  thread reply on {state['ticket']}: intent={intent} — {msg_text[:60]}...")
             if intent == "question":
-                start_ticket_ask(
+                request_ticket_ask_config(
                     question=msg_text,
                     thread_ts=thread_ts,
                     channel=channel,
@@ -3231,7 +3317,7 @@ def handle_message(channel, ts, user, text, thread_ts=None):
         if intent == "question":
             # Q&A: reuse the parent thread for continuity if we're in one,
             # otherwise start a fresh thread from this message.
-            start_ticket_ask(
+            request_ticket_ask_config(
                 question=msg_text, thread_ts=job_thread_ts,
                 channel=channel, slack_urls=thread_urls or None,
                 req_msg=req_msg,
