@@ -353,13 +353,21 @@ Each falls back to the branch name when the row has no such value. `ctrl-/` togg
 preview, which shows how far the ref is ahead/behind you and the commits that differ.
 
 **Two ways in.** `Ctrl+B` always opens the picker and replaces the word at the cursor.
-`Tab` opens it only where a ref is the *only* possible argument (`rebase`, `merge`,
-`switch`, `cherry-pick`, `revert`, `branch -d/-m/-f`, `worktree add <path> …`,
-`push/pull/fetch <remote> …`, `create-wt`) and, for the ref-or-path commands (`checkout`,
-`diff`, `log`, `show`, `reset`, `restore`), only when the partial word already matches a
-ref — so `git diff src/<TAB>` keeps completing filenames. Everywhere else it falls straight
-through to normal completion. Bare `git branch <TAB>` is deliberately left alone: that is
-naming a branch to *create*.
+`Tab` opens it only where a ref is the *only* possible argument, and otherwise falls
+straight through to normal completion:
+
+| where Tab opens the picker | where it stays out of the way |
+|---|---|
+| `rebase`, `merge`, `switch`, `cherry-pick`, `revert` | bare `git branch` — naming one to *create* |
+| `reset --hard/--soft/--merge/--keep` (git forbids paths there) | bare `git reset` and `--mixed` — usually unstaging paths |
+| `branch -d/-D/-f` (a list of existing branches) | `switch -c` / `checkout -b` first arg — a new name |
+| `branch -m/-c <existing>` — but not the new name after it | `restore <pathspec>` — its ref lives in `--source` |
+| `worktree add <path> …`, `push/pull/fetch <remote> …` | anything after a bare `--` — pathspecs by definition |
+| any option whose value is a ref: `--onto`, `--source`, `-u` | `create-wt` excepted, non-git commands |
+
+For the genuinely ambiguous ones — `checkout`, `diff`, `log`, `show`, `bisect` — it opens
+only when the partial word already matches a ref, so `git diff src/<TAB>` keeps completing
+filenames.
 
 Tab is wired up from `~/.zshrc`'s Tab dispatcher, guarded on `$+functions[_fzref_tab_try]`
 so that file keeps working with this repo unsourced:
@@ -377,7 +385,7 @@ wrong. The Jira columns come from `rr`'s caches because those are the only slow 
 that is a `git status` per worktree, and it is not information that helps you choose the
 *name* of a ref.
 
-`bats test/fzref.bats test/fzref_context.bats` — 51 tests.
+`bats test/fzref.bats test/fzref_context.bats` — 60 tests.
 
 ### `restage`
 Unstage two WIP commits, keeping oldest staged.

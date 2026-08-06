@@ -286,7 +286,7 @@ _FZREF_REF_ONLY=(rebase merge switch cherry-pick revert)
 # Subcommands that take a ref OR a path. Tab only takes over when the partial word already
 # looks like a ref (i.e. some ref starts with it) — otherwise `git diff src/<TAB>` would
 # stop completing filenames, which is a much worse trade than not helping at all.
-_FZREF_REF_OR_PATH=(checkout diff log show reset restore bisect)
+_FZREF_REF_OR_PATH=(checkout diff log show bisect)
 
 # Global git options that swallow the word after them. Without this, `git -C /elsewhere
 # rebase` looks like the subcommand is "/elsewhere".
@@ -294,6 +294,22 @@ _FZREF_GIT_OPTS_WITH_VALUE=(-C -c --git-dir --work-tree --namespace --exec-path 
 
 # Flags that turn `git branch` from "name a branch to create" into "name one that exists".
 _FZREF_BRANCH_REF_FLAGS=(-d -D --delete -m -M --move -c -C --copy -f --force --set-upstream-to --edit-description)
+
+# The subset of those taking `<existing> <new>`, where only the FIRST positional is a ref.
+_FZREF_BRANCH_RENAME_FLAGS=(-m -M --move -c -C --copy)
+
+# The reverse, for switch/checkout: flags that mean the next word is a name you are about
+# to INVENT. Scoped to those two subcommands rather than checked globally, because -c/-C
+# mean the opposite under `git branch` (copy an existing one).
+_FZREF_CREATE_FLAGS=(-b -B -c -C --create --force-create --orphan)
+
+# `git reset` modes that forbid pathspecs outright — git errors with "Cannot do hard reset
+# with paths" — so the argument can only be a commit. --mixed is absent on purpose: it
+# still accepts paths, so it stays ambiguous.
+_FZREF_RESET_REF_MODES=(--hard --soft --merge --keep)
+
+# Options whose *value* is a ref, for subcommands whose positionals are not.
+_FZREF_REF_VALUED_OPTS=(--source -s --onto --set-upstream-to -u --start-point)
 
 # The word the cursor is in, and the offsets that delimit it, so a replacement can put
 # back exactly that span. Sets REPLY / _fzref_from / _fzref_to.
@@ -387,15 +403,27 @@ _fzref_tab_context() {
     fi
     (( ${#words} )) || return 1
 
-    local cmd="${words[1]}" w skip_next=0
+    # The word immediately before the cursor's own, so an option that takes a ref as its
+    # value can be recognised in the `--source main` (space) form.
+    local prev="${words[-1]}"
+
+    local cmd="${words[1]}" w skip_next=0 saw_dashdash=0
     # The words that are neither options nor option values, in order — so bare[2] is the
     # subcommand and bare[3..] are its positional arguments.
     local -a bare=() flags=()
     for w in "${words[@]}"; do
         if (( skip_next )); then skip_next=0; continue; fi
+        if [[ "$w" == "--" ]]; then saw_dashdash=1; continue; fi
         if [[ "$w" == -* ]]; then
             flags+=("$w")
-            (( ${_FZREF_GIT_OPTS_WITH_VALUE[(Ie)$w]} )) && skip_next=1
+            # Only git's OWN global options swallow the word after them, and those can only
+            # appear before the subcommand — which is what `${#bare} < 2` means here (bare
+            # holds just "git" until the subcommand lands). Past that point -c and -C belong
+            # to the subcommand and mean something else entirely (`git branch -c <old>
+            # <new>`, `git switch -c <new>`); swallowing their argument made the first
+            # positional invisible, so every "is this the new name or the existing one"
+            # rule below silently read the wrong argument index.
+            (( ${#bare} < 2 )) && (( ${_FZREF_GIT_OPTS_WITH_VALUE[(Ie)$w]} )) && skip_next=1
             continue
         fi
         bare+=("$w")
@@ -408,20 +436,57 @@ _fzref_tab_context() {
         *) return 1 ;;
     esac
 
+    # Everything after a bare `--` is a pathspec by definition, whatever the subcommand
+    # would otherwise want. Checked before anything else so no rule below can override it.
+    (( saw_dashdash )) && return 1
+
     (( ${#bare} >= 2 )) || return 1
     local sub="${bare[2]}"
     # Positional arguments to the subcommand already typed, cursor's own word excluded.
     local argn=$(( ${#bare} - 2 ))
 
+    # An option that takes a ref as its value wants one regardless of what the
+    # subcommand's positionals are — `git restore --source <TAB>`.
+    (( ${_FZREF_REF_VALUED_OPTS[(Ie)$prev]} )) && { REPLY=only; return 0 }
+
+    case "$sub" in
+        # `git switch -c <new> [<start-point>]`. The first positional is a name you are
+        # about to invent, and offering the existing ones there would be offering exactly
+        # the names that cannot work — bare `git branch` below, in the opposite direction.
+        # The second positional is the start point, which is an ordinary ref.
+        switch|checkout)
+            for w in "${flags[@]}"; do
+                (( ${_FZREF_CREATE_FLAGS[(Ie)$w]} )) || continue
+                (( argn >= 1 )) && { REPLY=only; return 0 }
+                return 1
+            done
+            ;;
+    esac
+
     (( ${_FZREF_REF_ONLY[(Ie)$sub]} ))    && { REPLY=only;  return 0 }
     (( ${_FZREF_REF_OR_PATH[(Ie)$sub]} )) && { REPLY=maybe; return 0 }
 
     case "$sub" in
+        # --hard/--soft/--merge/--keep cannot take a pathspec at all (git refuses), so the
+        # argument is unambiguously a commit. Bare `git reset` is usually unstaging paths,
+        # and --mixed still accepts them, so those stay a maybe.
+        reset)
+            for w in "${flags[@]}"; do
+                (( ${_FZREF_RESET_REF_MODES[(Ie)$w]} )) && { REPLY=only; return 0 }
+            done
+            REPLY=maybe; return 0
+            ;;
+        # restore's positionals are pathspecs — the ref goes in --source, handled above.
+        restore) return 1 ;;
         # Bare `git branch <TAB>` is naming a branch to CREATE — hijacking that would be
         # actively wrong. With -d/-m/-f it is naming one that exists.
         branch)
             for w in "${flags[@]}"; do
-                (( ${_FZREF_BRANCH_REF_FLAGS[(Ie)$w]} )) && { REPLY=only; return 0 }
+                (( ${_FZREF_BRANCH_REF_FLAGS[(Ie)$w]} )) || continue
+                # `git branch -m <existing> <new>`: the second positional is the new name.
+                # -d/-D/-f take a list of existing branches, so they have no such cutoff.
+                (( ${_FZREF_BRANCH_RENAME_FLAGS[(Ie)$w]} )) && (( argn >= 1 )) && return 1
+                REPLY=only; return 0
             done
             return 1
             ;;

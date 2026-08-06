@@ -131,13 +131,105 @@ splice() {
     [ "$output" = "only" ]
 }
 
+@test "the reset modes that forbid pathspecs claim Tab outright" {
+    # git refuses `reset --hard <path>` ("Cannot do hard reset with paths"), so the argument
+    # can only be a commit — no reason to make you type a prefix to prove it.
+    local buf
+    for buf in 'git reset --hard ' 'git reset --soft ' 'git reset --merge ' 'git reset --keep '; do
+        run ctx "$buf"
+        [ "$output" = "only" ] || { echo "[$buf] -> $output" >&2; return 1; }
+    done
+}
+
+@test "bare reset and --mixed stay ambiguous, because they do take paths" {
+    run ctx 'git reset '
+    [ "$output" = "maybe" ]
+    run ctx 'git reset --mixed '
+    [ "$output" = "maybe" ]
+}
+
+@test "a flag that means invent-a-new-name suppresses the picker for that argument" {
+    # `git switch -c <TAB>` would otherwise offer exactly the names that cannot work — the
+    # bare `git branch` case, in the opposite direction.
+    local buf
+    for buf in 'git switch -c ' 'git switch -c new-thing' 'git switch -C ' \
+               'git checkout -b ' 'git checkout -B x' 'git switch --orphan '; do
+        run ctx "$buf"
+        [ "$output" = "no" ] || { echo "[$buf] -> $output" >&2; return 1; }
+    done
+}
+
+@test "but the start point after the new name is an ordinary ref" {
+    run ctx 'git switch -c new-thing '
+    [ "$output" = "only" ]
+    run ctx 'git switch -c new-thing UL-16'
+    [ "$output" = "only" ]
+    run ctx 'git checkout -b new UL-16'
+    [ "$output" = "only" ]
+}
+
+@test "-c after the subcommand is the subcommand's own, not git's global -c" {
+    # git -c key=val swallows the next word; `git branch -c <old> <new>` and `git switch -c
+    # <new>` do not. Treating them alike hid the first positional, so every "new name or
+    # existing one" rule silently read the wrong argument index.
+    run ctx 'git -C /elsewhere rebase '
+    [ "$output" = "only" ]
+    run ctx 'git branch -c old '
+    [ "$output" = "no" ]
+    run ctx 'git switch -c new-thing '
+    [ "$output" = "only" ]
+}
+
+@test "git branch rename and copy take the existing name first and the new one second" {
+    run ctx 'git branch -m '
+    [ "$output" = "only" ]
+    run ctx 'git branch -m old '
+    [ "$output" = "no" ]
+    run ctx 'git branch -C old new'
+    [ "$output" = "no" ]
+    # Delete takes a list, so every positional is an existing branch.
+    run ctx 'git branch -d one '
+    [ "$output" = "only" ]
+    run ctx 'git branch -D one two '
+    [ "$output" = "only" ]
+}
+
+@test "everything after a bare -- is a pathspec, whatever the subcommand wanted" {
+    local buf
+    for buf in 'git diff -- ' 'git log -- ' 'git checkout -- ' 'git reset --hard -- ' \
+               'git rebase -- ' 'git reset HEAD -- '; do
+        run ctx "$buf"
+        [ "$output" = "no" ] || { echo "[$buf] -> $output" >&2; return 1; }
+    done
+}
+
+@test "restore takes pathspecs, and its ref goes in --source" {
+    run ctx 'git restore '
+    [ "$output" = "no" ]
+    run ctx 'git restore file.ts'
+    [ "$output" = "no" ]
+    run ctx 'git restore --source '
+    [ "$output" = "only" ]
+    run ctx 'git restore --source UL-16'
+    [ "$output" = "only" ]
+}
+
+@test "an option whose value is a ref wants one regardless of the positionals" {
+    run ctx 'git rebase --onto '
+    [ "$output" = "only" ]
+    run ctx 'git branch -u '
+    [ "$output" = "only" ]
+    run ctx 'git branch --set-upstream-to '
+    [ "$output" = "only" ]
+}
+
 # ============================================================================
 # A ref OR a path — Tab defers to the word already typed
 # ============================================================================
 
 @test "the dual-purpose subcommands are only a maybe" {
     local buf
-    for buf in 'git diff ' 'git checkout ' 'git log ' 'git show ' 'git reset --hard ' 'git restore '; do
+    for buf in 'git diff ' 'git checkout ' 'git log ' 'git show ' 'git bisect good '; do
         run ctx "$buf"
         [ "$output" = "maybe" ] || { echo "[$buf] -> $output" >&2; return 1; }
     done
