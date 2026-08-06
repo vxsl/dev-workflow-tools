@@ -8,7 +8,7 @@
 # follow-up questions retain context.
 #
 # Usage (called by ticket-bot):
-#   ticket-ask --thread-ts 123.456 --dm-channel C0123 [--model sonnet] \
+#   ticket-ask --thread-ts 123.456 --dm-channel C0123 [--model sonnet] [--effort high] \
 #              [--slack-url https://slack.com/...] -- "the question text"
 #
 # Stdout: Claude's answer. Also posted to the Slack thread.
@@ -40,6 +40,7 @@ mkdir -p "$ASK_DIR" "$ASK_SESSIONS" "$ASK_LOGS"
 
 # ── Defaults ──
 MODEL="sonnet"
+EFFORT=""
 THREAD_TS=""
 DM_CHANNEL=""
 SLACK_URLS=()
@@ -51,6 +52,7 @@ while [[ $# -gt 0 ]]; do
         --thread-ts)    THREAD_TS="$2"; shift 2 ;;
         --dm-channel)   DM_CHANNEL="$2"; shift 2 ;;
         --model)        MODEL="$2"; shift 2 ;;
+        --effort)       EFFORT="$2"; shift 2 ;;
         --slack-url)    SLACK_URLS+=("$2"); shift 2 ;;
         --) shift; QUESTION="$*"; break ;;
         *)
@@ -172,14 +174,25 @@ fi
 
 PROMPT="$PROMPT
 
-Answer concisely in plain prose. Markdown formatting is fine (code fences, bullets). Cite file paths using \`file_path:line_number\` so the user can click through. If the question is ambiguous, state your assumption up front and answer the most likely interpretation. Keep it focused — don't dump large code blocks unless necessary."
+Answer for Slack — brief and correctly formatted.
+
+LENGTH: Open with a one-sentence direct answer, then only essential support. Aim for a few short paragraphs that fit on a phone screen. If the answer is genuinely long, give the conclusion first and offer to expand. Don't restate the question, don't list every file you opened, don't append a summary section, don't dump large code blocks.
+
+FORMATTING — this is Slack mrkdwn, NOT GitHub Markdown. Use only: *bold* with a SINGLE asterisk (never **double**), _italic_, \`inline code\`, \`\`\` fenced blocks \`\`\`, • for bullet lists, > for quotes. Do NOT use # / ## headers, **double-asterisk bold**, or | pipe tables | — none of these render in Slack (they show as literal characters). For tabular data, use a fenced code block with space-aligned columns, or a short bullet list. Cite files as \`path:line\`.
+
+If the question is ambiguous, state your assumption in one line, then answer the most likely reading."
 
 # ── Run Claude ──
 LOG_FILE="$ASK_LOGS/$(date +%Y%m%d-%H%M%S).${THREAD_TS:-standalone}.log"
-echo -e "  ${DIM}Running Claude (${MODEL}) [session: ${SESSION_ID:0:8}, resume: $RESUME]...${RESET}" >&2
+echo -e "  ${DIM}Running Claude (${MODEL}${EFFORT:+, effort=$EFFORT}) [session: ${SESSION_ID:0:8}, resume: $RESUME]...${RESET}" >&2
 
-CLAUDE_ARGS=(-p --model "$MODEL" --dangerously-skip-permissions
-    --append-system-prompt "You are running headlessly in a Q&A context. Do NOT run notify-send or notification-sound.sh. Do NOT modify files or run shell commands that mutate state.")
+EFFORT_ARGS=()
+if [ -n "$EFFORT" ]; then
+    EFFORT_ARGS=(--effort "$EFFORT")
+fi
+
+CLAUDE_ARGS=(-p --model "$MODEL" "${EFFORT_ARGS[@]}" --dangerously-skip-permissions
+    --append-system-prompt "You are running headlessly in a Q&A context. Do NOT run notify-send or notification-sound.sh. Do NOT modify files or run shell commands that mutate state. Reply as Slack mrkdwn — single-asterisk *bold* (never **), _italic_, \`code\`, • bullets, > quotes; no # headers and no | tables |. Be concise: lead with the answer and keep it short.")
 if $RESUME; then
     CLAUDE_ARGS+=(--resume "$SESSION_ID")
 else
