@@ -70,6 +70,12 @@ wtm_same_branch() {
 #
 # Used to keep the alarm short: the whole point of it is to be read at a glance, and
 # forty characters of branch name is not a glance.
+#
+# A "review" straight after the number stays in: UB-6802-review is a second worktree for
+# the same ticket, not a description of it, and shortening it to UB-6802 makes the review
+# checkout's badge indistinguishable from the implementation checkout sitting next to it
+# -- the exact confusion this file exists to prevent. Words further along are ordinary
+# description ("add-review-button") and still drop.
 wtm_ticket() {
     local b="$1" proj rest num
     WTM_TICKET=""
@@ -82,4 +88,5 @@ wtm_ticket() {
     case "$proj" in ''|*[!A-Z]*) return 0 ;; esac
     case "$num"  in ''|*[!0-9]*) return 0 ;; esac
     WTM_TICKET="$proj-$num"
+    case "$rest" in "$num-review"|"$num-review-"*) WTM_TICKET="$WTM_TICKET-review" ;; esac
 }

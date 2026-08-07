@@ -73,6 +73,21 @@ setup() {
     [ "$WTM_TICKET" = DE-3101 ]
 }
 
+# Two worktrees for one ticket -- ul.UB-6802 holding the implementation and
+# ul.UB-6802-review-<branch-under-review> for reviewing it -- must not wear the same
+# badge, so the review flavour survives the shortening. A "review" further along is
+# ordinary description and still drops.
+@test "a review worktree keeps its -review, and only when it leads" {
+    wtm_ticket UB-6802-review-migrate-from-wasm-join-engine-to-geo-fil
+    [ "$WTM_TICKET" = UB-6802-review ]
+    wtm_ticket UB-6802-review
+    [ "$WTM_TICKET" = UB-6802-review ]
+    wtm_ticket UB-6802-add-review-button
+    [ "$WTM_TICKET" = UB-6802 ]
+    wtm_ticket UB-6802-reviewers
+    [ "$WTM_TICKET" = UB-6802 ]
+}
+
 @test "a branch that only looks ticket-shaped has no ticket id" {
     for b in feature main add-6709-thing ub-6709-lowercase UB-six-hundred UB- -6709; do
         wtm_ticket "$b"
@@ -90,11 +105,13 @@ setup() {
                 wtm_check repo.UB-6709 UB-6709-add-x   ; print -r -- "2:$WTM_MISMATCH"
                 wtm_check repo HEAD                    ; print -r -- "3:$WTM_EXPECTED"
                 wtm_ticket UB-6709-add-x               ; print -r -- "4:$WTM_TICKET"
-                wtm_ticket feature                     ; print -r -- "5:$WTM_TICKET"'
+                wtm_ticket feature                     ; print -r -- "5:$WTM_TICKET"
+                wtm_ticket UB-6802-review-migrate-x    ; print -r -- "6:$WTM_TICKET"'
     [ "$status" -eq 0 ]
     [ "$output" = "1:elsewhere
 2:
 3:
 4:UB-6709
-5:" ] || { echo "$output"; return 1; }
+5:
+6:UB-6802-review" ] || { echo "$output"; return 1; }
 }
