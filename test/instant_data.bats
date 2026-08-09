@@ -483,6 +483,73 @@ teardown() {
     [ "$main_ts2" -gt "$main_ts" ]
 }
 
+@test "generate_instant_data: a branch never checked out still appears, dated by its commit" {
+    # `git branch X` from somewhere else, or a branch fetched and never visited,
+    # leaves no reflog entry at all. Phase 1 used to show only the reflog's top 20,
+    # so such a branch reached the list only via Phase 2 — behind a sort barrier,
+    # seconds later.
+    create_branch_at_time "TEST-800" "1770000000"
+
+    cd "$TEST_GIT_REPO"
+    git branch TEST-801 TEST-800
+
+    declare -gA WORKTREE_NAV_TIMES=()
+    declare -gA WORKTREE_MAP=()
+    declare -gA VALID_BRANCH_REFS=()
+    while IFS= read -r ref; do
+        VALID_BRANCH_REFS["$ref"]=1
+    done < <(git for-each-ref --format='%(refname:short)' refs/heads/)
+
+    local output
+    output=$(generate_instant_data "$TEST_TMPDIR/claimed")
+
+    echo "$output" | awk -F'\t' '{ print $7 }' | grep -qx "TEST-801"
+
+    # With no checkout to date it by, it sorts on its commit time
+    local ts
+    ts=$(echo "$output" | awk -F'\t' '$7 == "TEST-801" { split($5, a, ":"); print a[2] }')
+    [ "$ts" = "1770000000" ]
+
+    # ...and it still carries the author and commit columns Phase 2 would have given it
+    local author commit_info
+    author=$(echo "$output" | awk -F'\t' '$7 == "TEST-801" { print $4 }')
+    commit_info=$(echo "$output" | awk -F'\t' '$7 == "TEST-801" { print $6 }')
+    [ -n "$author" ]
+    [ "$commit_info" != "committed: unknown" ]
+}
+
+@test "generate_instant_data: a never-checked-out branch sorts among the checked-out ones" {
+    # The whole point of listing it in Phase 1 is that it lands in its true place in
+    # one sorted run, not appended below everything Phase 1 already emitted.
+    create_branch_at_time "TEST-810" "1770000000"
+
+    cd "$TEST_GIT_REPO"
+    # TEST-811 committed long after TEST-810, but never checked out
+    git checkout -q -b TEST-811
+    GIT_COMMITTER_DATE="1780000000 +0000" GIT_AUTHOR_DATE="1780000000 +0000" \
+        git commit -q --allow-empty -m "commit on TEST-811"
+    git checkout -q main
+    # Rewrite history so TEST-811 has no checkout entry left in the reflog
+    git reflog expire --expire=now --all
+
+    declare -gA WORKTREE_NAV_TIMES=()
+    declare -gA WORKTREE_MAP=()
+    declare -gA VALID_BRANCH_REFS=()
+    while IFS= read -r ref; do
+        VALID_BRANCH_REFS["$ref"]=1
+    done < <(git for-each-ref --format='%(refname:short)' refs/heads/)
+
+    local branches
+    branches=$(generate_instant_data "$TEST_TMPDIR/claimed" | awk -F'\t' '{ print $7 }')
+
+    local line_811 line_810
+    line_811=$(echo "$branches" | grep -n '^TEST-811$' | cut -d: -f1)
+    line_810=$(echo "$branches" | grep -n '^TEST-810$' | cut -d: -f1)
+    [ -n "$line_811" ]
+    [ -n "$line_810" ]
+    [ "$line_811" -lt "$line_810" ]
+}
+
 @test "compute_worktree_timestamp: returns 0 when path is unreadable" {
     # Verifies the ts=0 guard condition: no nav log + unreadable .git = ts=0
     setup_git_repo

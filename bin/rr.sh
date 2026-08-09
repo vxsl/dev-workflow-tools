@@ -1209,41 +1209,56 @@ generate_instant_data() {
         fi
     done
 
-    # --- Step 2: Top-N reflog branches ---
-    # One git-reflog subprocess + one git-log per branch (only ~20 branches max)
+    # --- Step 2: Every local branch ---
+    # A branch with no worktree used to appear here only if the reflog's top 20
+    # still remembered checking it out; every other branch waited for Phase 2,
+    # which sits behind a sort barrier and so takes seconds. The cap existed
+    # because each branch cost a `git log` fork — but for-each-ref hands over the
+    # name, both commit times and the author in one fork, so the whole list is
+    # affordable and nothing has to wait.
     local _reflog_git_dir=""
     local _common_dir
     _common_dir=$(git rev-parse --git-common-dir 2>/dev/null)
     [[ -n "$_common_dir" && "$_common_dir" != ".git" ]] && _reflog_git_dir="--git-dir=$_common_dir"
 
+    # Checkout times for the branches the reflog still remembers. The rest sort by
+    # commit time, which is the same fallback generate_branch_data's supplement uses.
+    declare -A _reflog_ts=()
+    local _rbranch _rtime
     while IFS=$'\t' read -r _rbranch _rtime; do
-        [ -z "$_rbranch" ] && continue
-        [ -n "${WORKTREE_MAP[$_rbranch]+x}" ] && continue
-        [ -z "${VALID_BRANCH_REFS[$_rbranch]+x}" ] && continue
-        [ "$_rbranch" = "$_current_branch" ] && continue
+        [ -n "$_rbranch" ] && [ -z "${_reflog_ts[$_rbranch]+x}" ] && _reflog_ts["$_rbranch"]="$_rtime"
+    done < <(parse_reflog_branches "$_reflog_git_dir" 5000)
+
+    local _branch _commit_unix _commit_rel _author
+    while IFS=$'\t' read -r _branch _commit_unix _commit_rel _author; do
+        [ -z "$_branch" ] && continue
+        [ -n "${WORKTREE_MAP[$_branch]+x}" ] && continue
+        [ "$_branch" = "$_current_branch" ] && continue
+
+        local _btime="${_reflog_ts[$_branch]:-$_commit_unix}"
+        [ -z "$_btime" ] && _btime=0
 
         local _ticket=""
-        [[ "$_rbranch" =~ (${JIRA_PROJECT_REGEX}-[0-9]+) ]] && _ticket="${BASH_REMATCH[1]^^}"
+        [[ "$_branch" =~ (${JIRA_PROJECT_REGEX}-[0-9]+) ]] && _ticket="${BASH_REMATCH[1]^^}"
         local _title="${JIRA_TITLE_CACHE[$_ticket]:-<EMPTY>}"
         local _jira_status="${JIRA_STATUS_CACHE[$_ticket]:-<EMPTY>}"
         local _jira_assignee="${JIRA_ASSIGNEE_CACHE[$_ticket]:-<UNASSIGNED>}"
 
-        local _last_commit="" _author=""
-        IFS='|' read -r _last_commit _author <<< "$(git log -1 --pretty=format:'%cr|%an' "refs/heads/$_rbranch" 2>/dev/null)"
         _author="${_author:0:15}"
 
-        local _truncated="$_rbranch"
+        local _truncated="$_branch"
         if (( ${#_truncated} > BRANCH_MAX_LENGTH )); then
             _truncated="${_truncated:0:$((BRANCH_MAX_LENGTH-3))}..."
         fi
 
         printf -v _row "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s" \
             "$_truncated" "$_title" "$_jira_status" "$_author" \
-            "checked:$_rtime" "committed: ${_last_commit:-unknown}" \
-            "$_rbranch" "$_jira_assignee" "" "" ""
+            "checked:$_btime" "committed: ${_commit_rel:-unknown}" \
+            "$_branch" "$_jira_assignee" "" "" ""
 
-        _instant_rows+="${_rtime}"$'\t'"${_row}"$'\n'
-    done < <(parse_reflog_branches "$_reflog_git_dir" 200 | head -n 20)
+        _instant_rows+="${_btime}"$'\t'"${_row}"$'\n'
+    done < <(git for-each-ref refs/heads/ \
+        --format='%(refname:short)%09%(committerdate:unix)%09%(committerdate:relative)%09%(authorname)')
 
     # Sort by timestamp descending and strip the sort prefix
     [ -n "$_instant_rows" ] && printf '%s' "$_instant_rows" | sort -t$'\t' -k1,1nr | cut -f2-
@@ -3085,6 +3100,16 @@ mkfifo "$_data_fifo"
         _current_branch_name=$(resolve_current_branch)
         _jira_me_lower="${JIRA_ME,,}"
         _format_now_sec=$(date +%s)
+        # Where each pane is sitting, and how wide its indicator draws. Both are the
+        # same for every row, but asking per row cost four tmux forks per pane per
+        # worktree — seconds of the list's arrival, spent re-reading two answers.
+        declare -A _pane_dirs=() _pane_ind_width=()
+        if [ "$RR_PANE_MGMT_ENABLED" = "true" ] && [ "$PANE_COUNT" -gt 0 ]; then
+            for i in "${!PANE_IDS[@]}"; do
+                _pane_dirs[$i]=$(get_pane_current_dir "${PANE_IDS[$i]}")
+                _pane_ind_width[$i]=$(printf '%s' "${PANE_INDICATORS[$i]}" | wc -L)
+            done
+        fi
         while IFS=$'\t' read -r branch title status author time_info commit_info full_branch assignee wt_indicator wt_path wt_status; do
             # Dedup: Phase 1 (instant) rows arrive first; skip when Phase 2 re-emits them
             if [[ -n "${_seen_branches[$full_branch]+x}" ]]; then continue; fi
@@ -3155,17 +3180,15 @@ mkfifo "$_data_fifo"
                 # " ⊙≠ " / " ⊙ !" / " ⊙  " = 4 visual cols each
                 wt_visual_width=4
 
-                # Add pane indicators if enabled (based on real-time current directory)
+                # Add pane indicators if enabled (pane dirs read once, before the loop)
                 if [ "$RR_PANE_MGMT_ENABLED" = "true" ] && [ "$PANE_COUNT" -gt 0 ]; then
                     for i in "${!PANE_IDS[@]}"; do
-                        pane_current_dir=$(get_pane_current_dir "${PANE_IDS[$i]}")
+                        pane_current_dir="${_pane_dirs[$i]}"
                         # Check if pane is in this worktree (exact match or subdirectory with / separator)
-                        if [ -n "$pane_current_dir" ] && ( [ "$pane_current_dir" = "$wt_path" ] || [[ "$pane_current_dir" == "$wt_path/"* ]] ); then
-                            indicator="${PANE_INDICATORS[$i]}"
-                            wt_display="${wt_display}$(printf '\033[38;5;114m%s\033[0m' "$indicator")"
-                            # Calculate visual width of this indicator (use wc -L)
-                            indicator_width=$(echo -n "$indicator" | wc -L)
-                            wt_visual_width=$((wt_visual_width + indicator_width))
+                        if [ -n "$pane_current_dir" ] && { [ "$pane_current_dir" = "$wt_path" ] || [[ "$pane_current_dir" == "$wt_path/"* ]]; }; then
+                            printf -v _pane_ind '\033[38;5;114m%s\033[0m' "${PANE_INDICATORS[$i]}"
+                            wt_display="${wt_display}${_pane_ind}"
+                            wt_visual_width=$((wt_visual_width + ${_pane_ind_width[$i]}))
                         fi
                     done
                 fi
