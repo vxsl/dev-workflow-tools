@@ -45,13 +45,18 @@ DIRECTORY_TTL="${SLACK_PICKER_DIRECTORY_TTL:-86400}"   # users and the channel l
 HISTORY_DEPTH="${SLACK_PICKER_DEPTH:-40}"              # messages read per channel
 FETCH_JOBS="${SLACK_PICKER_JOBS:-6}"                   # concurrent history calls
 
+# REFRESH forces everything, directory caches included. FORCE_THREADS re-sweeps
+# the threads alone — which is all the background refresher below wants, and all
+# --warm should ask for: who exists and which channels you're in change on a scale
+# of days, and re-fetching them every five minutes buys nothing.
 REFRESH=false
+FORCE_THREADS=false
 WARM_ONLY=false
 RENDER_MODE=""
 while [ "$#" -gt 0 ]; do
     case "$1" in
-        --refresh) REFRESH=true; shift ;;
-        --warm)    REFRESH=true; WARM_ONLY=true; shift ;;
+        --refresh) REFRESH=true; FORCE_THREADS=true; shift ;;
+        --warm)    FORCE_THREADS=true; WARM_ONLY=true; shift ;;
         # Internal: what the picker's reload bindings call to redraw a scope.
         --render)  RENDER_MODE="$2"; shift 2 ;;
         --help|-h) sed -n '2,/^[^#]/{/^[^#]/!p;}' "$0"; exit 0 ;;
@@ -325,7 +330,7 @@ self=$(readlink -f "$0")
 
 # A cold cache is worth waiting for; a stale one isn't. Serve what's on disk and
 # refresh behind the picker, so it only ever opens slowly once.
-if [ ! -s "$THREADS_TSV" ] || [ "$REFRESH" = true ]; then
+if [ ! -s "$THREADS_TSV" ] || [ "$FORCE_THREADS" = true ]; then
     echo "  Reading your Slack threads…" >&2
     refresh_threads || { echo "slack-pick-thread: could not read Slack threads" >&2; exit 2; }
 elif stale "$THREADS_TSV" "$THREADS_TTL"; then
