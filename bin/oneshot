@@ -1787,15 +1787,32 @@ echo "" >&2
 # Validates if checks never ran (e.g. a resume path that skipped Step 1), if extra
 # commits were added after the initial validation, or if code was rebased onto a
 # different base. When checks already passed and nothing changed, this is skipped.
-# (run_prepush_checks is cached per HEAD+diff, so a redundant call here is a no-op.)
+#
+# A rebase is NOT a redundant re-run: cherry-picking onto a freshly fetched base
+# changes the tree, and the checks are scoped to that base (lint/test :since-main),
+# so they cover different ground than the Step 1.5 run. The prepush cache is keyed
+# on HEAD+diff and correctly misses. Say so below — a second full suite arriving
+# right after a green one reads as a bug otherwise.
 if [ "$DRY_RUN" != true ] && { [ "${PREPUSH_VALIDATED:-false}" != true ] || [ "${extra_commits_made:-false}" = true ] || [ "${REBASED:-false}" = true ]; }; then
     repo_root=$(git rev-parse --show-toplevel)
-    
+
     echo -e "${CYAN}┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓${RESET}" >&2
     echo -e "${CYAN}┃${RESET} ${BLUE}Pre-publish validation:${RESET} Running checks                  ${CYAN}┃${RESET}" >&2
     echo -e "${CYAN}┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛${RESET}" >&2
     echo "" >&2
-    
+
+    # Which of the three guard conditions got us here. "since the last run" only
+    # makes sense once Step 1.5 has actually run, so that case is checked first.
+    if [ "${PREPUSH_VALIDATED:-false}" != true ]; then
+        echo -e "  ${DIM}Checks haven't run yet for this change.${RESET}" >&2
+    elif [ "${REBASED:-false}" = true ]; then
+        echo -e "  ${DIM}Base moved to ${BASE_BRANCH} since the last run —${RESET}" >&2
+        echo -e "  ${DIM}revalidating the rebased commits.${RESET}" >&2
+    else
+        echo -e "  ${DIM}New commits since the last run — revalidating.${RESET}" >&2
+    fi
+    echo "" >&2
+
     if ! run_prepush_checks "$repo_root"; then
         echo -e "  ${RED}✗ Pre-push checks failed${RESET}" >&2
         echo -e "  ${YELLOW}⚠ Fix the issues and run: oneshot${RESET}" >&2
