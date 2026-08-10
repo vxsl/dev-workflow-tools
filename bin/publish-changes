@@ -596,6 +596,30 @@ prompt_and_post_slack() {
     local post_ticket_link="$1"
     local pasted=""
 
+    # The picker first, when it can run: the thread an MR belongs in is nearly
+    # always one you're already in, and it can go and find those. It signals
+    # "not available here" with exit 2 — no user token, no fzf — which falls
+    # through to the paste prompt below. Set SLACK_PICKER=0 to always paste.
+    if [ "${SLACK_PICKER:-1}" != "0" ] && [ -x "$SCRIPT_DIR/slack-pick-thread" ]; then
+        local picked picker_rc
+        if picked=$("$SCRIPT_DIR/slack-pick-thread"); then picker_rc=0; else picker_rc=$?; fi
+        case "$picker_rc" in
+            0)
+                if parse_slack_url "$picked"; then
+                    echo "" >&2
+                    post_slack_links "$picked" "$post_ticket_link"
+                    return $?
+                fi
+                ;;
+            1)
+                # Cancelled. The picker takes a pasted URL too, so backing out
+                # of it is a decision not to post, not a wish to type instead.
+                echo -e "  ${DIM}No Slack post${RESET}" >&2
+                return 2
+                ;;
+        esac
+    fi
+
     while :; do
         printf "  ${CYAN}Post MR link to Slack${RESET} ${DIM}— paste a thread or channel URL (Enter to skip):${RESET} " >&2
         read_tty -r pasted

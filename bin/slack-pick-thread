@@ -1,0 +1,378 @@
+#!/usr/bin/env bash
+# Pick a Slack thread with fzf — one you've taken part in.
+#
+# Usage:
+#   slack-pick-thread              Pick a thread; prints its permalink
+#   slack-pick-thread --refresh    Rebuild the thread list first
+#   slack-pick-thread --warm       Rebuild the thread list and exit (no picker)
+#
+# Exit codes:
+#   0  a thread was chosen — its permalink is on stdout
+#   1  cancelled
+#   2  unavailable (no user token, no fzf) — the caller should ask for a paste
+#
+# Why a picker: the destination for an MR link is nearly always a thread you were
+# already in — the one that reported the bug, or asked for the change. Pasting its
+# URL means leaving the terminal, finding the thread, "Copy link", and coming back.
+# The same thread is two keystrokes away if we go and read the ones you're in.
+#
+# Requires SLACK_REACT_TOKEN, a user token (xoxp). A bot token can't see which
+# channels *you* are in, and search.messages — the direct way to ask "what have I
+# been part of" — needs a search:read scope this token doesn't carry. So the list is
+# reconstructed from what the granted scopes do allow: the channels you're a member
+# of (channels:read, groups:read) and the recent messages in each (channels:history,
+# groups:history). A thread counts as yours if you started it, replied to it, or are
+# mentioned in it. DMs are absent because im:read isn't granted — and they aren't
+# where MRs get announced anyway.
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$(type -P "$0" || echo "$0")")")" && pwd)"
+if [ -f "$SCRIPT_DIR/../.env" ]; then
+    source "$SCRIPT_DIR/../.env"
+fi
+
+CACHE_DIR="${SLACK_PICKER_CACHE_DIR:-$HOME/.cache/publish-changes/slack-picker}"
+THREADS_TSV="$CACHE_DIR/threads.tsv"
+CHANNELS_TSV="$CACHE_DIR/channels.tsv"
+USERS_TSV="$CACHE_DIR/users.tsv"
+IDENTITY="$CACHE_DIR/identity"
+
+# How long a thread list stays useful. A stale list is still served instantly and
+# refreshed behind the picker — only a cold cache makes you wait.
+THREADS_TTL="${SLACK_PICKER_TTL:-300}"
+DIRECTORY_TTL="${SLACK_PICKER_DIRECTORY_TTL:-86400}"   # users and the channel list
+HISTORY_DEPTH="${SLACK_PICKER_DEPTH:-40}"              # messages read per channel
+FETCH_JOBS="${SLACK_PICKER_JOBS:-6}"                   # concurrent history calls
+
+REFRESH=false
+WARM_ONLY=false
+RENDER_MODE=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --refresh) REFRESH=true; shift ;;
+        --warm)    REFRESH=true; WARM_ONLY=true; shift ;;
+        # Internal: what the picker's reload bindings call to redraw a scope.
+        --render)  RENDER_MODE="$2"; shift 2 ;;
+        --help|-h) sed -n '2,/^[^#]/{/^[^#]/!p;}' "$0"; exit 0 ;;
+        *) echo "Unknown argument: $1" >&2; exit 2 ;;
+    esac
+done
+
+# ---------------------------------------------------------------------------
+# Availability
+# ---------------------------------------------------------------------------
+
+if [ -z "${SLACK_REACT_TOKEN:-}" ]; then
+    echo "slack-pick-thread: SLACK_REACT_TOKEN (xoxp user token) not set" >&2
+    exit 2
+fi
+for tool in curl jq awk; do
+    command -v "$tool" >/dev/null 2>&1 || { echo "slack-pick-thread: $tool not found" >&2; exit 2; }
+done
+if [ -x "$HOME/.zsh/fzf/bin/fzf" ]; then
+    FZF="$HOME/.zsh/fzf/bin/fzf"
+elif command -v fzf >/dev/null 2>&1; then
+    FZF="fzf"
+else
+    echo "slack-pick-thread: fzf not found" >&2
+    exit 2
+fi
+
+# The cache holds message text from private channels. It's your own machine and
+# your own messages, but it doesn't need to be readable by everyone on the box.
+mkdir -p "$CACHE_DIR"
+chmod 700 "$CACHE_DIR" 2>/dev/null || true
+
+# ---------------------------------------------------------------------------
+# Slack
+# ---------------------------------------------------------------------------
+
+slack_get() {
+    local method="$1"; shift
+    local args=() kv
+    for kv in "$@"; do args+=(--data-urlencode "$kv"); done
+    curl -s --max-time 20 -G "https://slack.com/api/${method}" \
+        -H "Authorization: Bearer ${SLACK_REACT_TOKEN}" "${args[@]}"
+}
+
+# Seconds since $1 was last written, or a number large enough to read as expired.
+age_of() {
+    [ -f "$1" ] || { echo 999999999; return; }
+    echo $(( $(date +%s) - $(stat -c %Y "$1" 2>/dev/null || echo 0) ))
+}
+
+stale() { [ "$(age_of "$1")" -gt "$2" ]; }
+
+# Who am I, and which workspace: the first decides whether a thread is yours, the
+# second lets us build permalinks locally instead of a getPermalink call per row.
+load_identity() {
+    if [ "$REFRESH" != true ] && ! stale "$IDENTITY" "$DIRECTORY_TTL"; then
+        # shellcheck disable=SC1090
+        source "$IDENTITY"
+        [ -n "${SLACK_ME:-}" ] && [ -n "${SLACK_HOST:-}" ] && return 0
+    fi
+
+    local auth
+    auth=$(curl -s --max-time 20 -X POST "https://slack.com/api/auth.test" \
+        -H "Authorization: Bearer ${SLACK_REACT_TOKEN}")
+    if [ "$(printf '%s' "$auth" | jq -r '.ok // false')" != "true" ]; then
+        echo "slack-pick-thread: auth.test failed: $(printf '%s' "$auth" | jq -r '.error // "unknown"')" >&2
+        return 1
+    fi
+
+    SLACK_ME=$(printf '%s' "$auth" | jq -r '.user_id')
+    # .url is "https://team.slack.com/"; permalinks want just the host.
+    SLACK_HOST=$(printf '%s' "$auth" | jq -r '.url' | sed 's|^https://||; s|/$||')
+    printf 'SLACK_ME=%s\nSLACK_HOST=%s\n' "$SLACK_ME" "$SLACK_HOST" > "$IDENTITY"
+}
+
+refresh_users() {
+    { [ "$REFRESH" = true ] || stale "$USERS_TSV" "$DIRECTORY_TTL"; } || return 0
+    local tmp="$USERS_TSV.$$"
+    slack_get users.list "limit=1000" \
+        | jq -r '.members[]? | [.id, (if (.profile.display_name // "") != "" then .profile.display_name else (.real_name // .name) end)] | @tsv' \
+        > "$tmp" 2>/dev/null || true
+    if [ -s "$tmp" ]; then mv "$tmp" "$USERS_TSV"; else rm -f "$tmp"; fi
+}
+
+# The channels you're in — not destinations in their own right, just the set of
+# places a thread you've been in can be.
+refresh_channels() {
+    { [ "$REFRESH" = true ] || stale "$CHANNELS_TSV" "$DIRECTORY_TTL"; } || return 0
+    local tmp="$CHANNELS_TSV.$$"
+    slack_get users.conversations \
+        "types=public_channel,private_channel" "exclude_archived=true" "limit=1000" \
+        | jq -r '.channels[]? | [.id, .name] | @tsv' \
+        > "$tmp" 2>/dev/null || true
+    if [ -s "$tmp" ]; then mv "$tmp" "$CHANNELS_TSV"; else rm -f "$tmp"; fi
+}
+
+# One channel's recent thread parents, as raw rows:
+#   last-activity ts │ mine? │ channel │ author id │ replies │ text │ channel/ts
+#
+# reply_users is how a thread declares its participants without a replies call per
+# thread — Slack caps it at five, so a busy thread you're deep in can still miss;
+# the mention test picks up most of what that loses.
+fetch_channel_threads() {
+    local id="$1" name="$2"
+    slack_get conversations.history "channel=$id" "limit=$HISTORY_DEPTH" 2>/dev/null \
+        | jq -r --arg ch "$id" --arg name "$name" --arg me "$SLACK_ME" '
+            .messages[]?
+            | select((.reply_count // 0) > 0)
+            | (.latest_reply // .ts) as $last
+            | (if (.user == $me)
+                    or ((.reply_users // []) | index($me))
+                    or ((.text // "") | contains("<@" + $me + ">"))
+               then "1" else "0" end) as $mine
+            # .text is empty for anything not typed as plain text: composed in
+            # blocks, posted by a workflow, or — most often here — an uncaptioned
+            # screenshot, where the file name is the whole message. Those
+            # are still threads, and a blank row is a row you cannot pick, so dig
+            # the strings back out of wherever the message actually put them.
+            | ( if (.text // "") != "" then .text
+                else ( [ .blocks[]? | .. | objects | select(.text? | type == "string") | .text ]
+                       + [ .attachments[]? | (.fallback // .text // empty) ]
+                       + [ .files[]? | (.title // .name // empty) ]
+                       | map(select(. != "")) | join(" ") )
+                end
+                | gsub("[\\n\\t]+"; " ") | gsub(" +"; " ") ) as $body
+            | [ $last, $mine, $name, (.user // ""), ((.reply_count // 0) | tostring),
+                $body, ($ch + "/" + .ts) ]
+            | @tsv
+        ' 2>/dev/null || true
+}
+
+# Sweep every channel, a few at a time. Each writes its own file so concurrent
+# output can't interleave, and the merge sorts newest-activity-first once — the
+# picker's reload bindings then only ever filter an already-ordered list.
+refresh_threads() {
+    [ -s "$CHANNELS_TSV" ] || return 1
+
+    local work tmp id name running=0
+    work=$(mktemp -d)
+    tmp="$THREADS_TSV.$$"
+
+    while IFS=$'\t' read -r id name _; do
+        [ -n "$id" ] || continue
+        fetch_channel_threads "$id" "$name" > "$work/$id" &
+        running=$((running + 1))
+        if [ "$running" -ge "$FETCH_JOBS" ]; then
+            wait
+            running=0
+        fi
+    done < "$CHANNELS_TSV"
+    wait
+
+    cat "$work"/* 2>/dev/null | sort -t $'\t' -k1,1nr > "$tmp" || true
+    rm -rf "$work"
+
+    if [ -s "$tmp" ]; then mv "$tmp" "$THREADS_TSV"; else rm -f "$tmp"; return 1; fi
+}
+
+# ---------------------------------------------------------------------------
+# Rendering
+#
+# Two tab-separated fields: what fzf shows, and the permalink behind it.
+# --with-nth=1 hides the second; the selection is cut back down to it.
+# ---------------------------------------------------------------------------
+
+render_threads() {
+    local scope="$1"
+    [ -s "$THREADS_TSV" ] || return 0
+    awk -F'\t' -v OFS='\t' \
+        -v scope="$scope" -v now="$(date +%s)" -v host="$SLACK_HOST" \
+        -v usersfile="$USERS_TSV" '
+        BEGIN {
+            while ((getline u < usersfile) > 0) {
+                split(u, p, "\t"); if (p[1] != "") name[p[1]] = p[2]
+            }
+            close(usersfile)
+        }
+        # 90s → " 90s", then m, h, d, w. Always four columns wide.
+        function ago(ts,   d) {
+            d = now - int(ts)
+            if (d < 60)     return sprintf("%3ds", d)
+            if (d < 3600)   return sprintf("%3dm", d / 60)
+            if (d < 86400)  return sprintf("%3dh", d / 3600)
+            if (d < 604800) return sprintf("%3dd", d / 86400)
+            return sprintf("%3dw", d / 604800)
+        }
+        # Pad and clip to an exact width so the text column starts in the same
+        # place on every row. gawk counts characters here, not bytes.
+        function fit(s, w) {
+            if (length(s) > w) return substr(s, 1, w - 1) "…"
+            return sprintf("%-" w "s", s)
+        }
+        # Same clip without the padding. Applied after unmark, never before —
+        # cutting the raw text first can leave half a <url|label> token behind,
+        # which then has no closing bracket to be recognised by.
+        function clip(s, w) {
+            if (length(s) > w) return substr(s, 1, w - 1) "…"
+            return s
+        }
+        # Slack ships its own markup inside message text: <@U123> for a person,
+        # <#C123|name> for a channel, <url|label> for a link. Left alone it is
+        # most of what a row shows and none of what you recognise a thread by.
+        # Written out with match/substr rather than gawk gensub, so the picker
+        # degrades to a plain awk rather than failing to parse under one.
+        function unmark(s,   out, tok, bar, id) {
+            out = ""
+            while (match(s, /<[^>]*>/)) {
+                out = out substr(s, 1, RSTART - 1)
+                tok = substr(s, RSTART + 1, RLENGTH - 2)
+                bar = index(tok, "|")
+                if (substr(tok, 1, 1) == "@") {
+                    id = bar ? substr(tok, 2, bar - 2) : substr(tok, 2)
+                    out = out "@" ((id in name) ? name[id] : id)
+                } else if (substr(tok, 1, 1) == "#") {
+                    out = out "#" (bar ? substr(tok, bar + 1) : substr(tok, 2))
+                } else if (substr(tok, 1, 1) == "!") {
+                    out = out "@" (bar ? substr(tok, bar + 1) : substr(tok, 2))
+                } else {
+                    out = out (bar ? substr(tok, bar + 1) : tok)
+                }
+                s = substr(s, RSTART + RLENGTH)
+            }
+            out = out s
+            gsub(/&lt;/, "<", out); gsub(/&gt;/, ">", out); gsub(/&amp;/, "\\&", out)
+            return out
+        }
+        scope == "mine" && $2 != "1" { next }
+        {
+            author = ($4 in name) ? name[$4] : $4
+            mark = ($2 == "1") ? "\033[38;5;114m●\033[0m" : "\033[2m·\033[0m"
+
+            # "C123/1785174817.436329" → ".../archives/C123/p1785174817436329".
+            # Only the timestamp loses its dot; the host keeps its own.
+            split($7, loc, "/")
+            ts = loc[2]
+            sub(/\./, "", ts)
+            link = "https://" host "/archives/" loc[1] "/p" ts
+
+            print mark " \033[2m" ago($1) "\033[0m  " \
+                  "\033[38;5;109m" fit("#" $3, 22) "\033[0m " \
+                  "\033[38;5;141m" fit(author, 14) "\033[0m " \
+                  clip(unmark($6), 200) "  \033[2m(" $5 " replies)\033[0m", \
+                  link
+        }
+    ' "$THREADS_TSV"
+}
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+load_identity || exit 2
+
+# Reload bindings re-enter here. Nothing is printed to stderr on this path: fzf
+# owns the terminal while it runs, and a stray line would land on top of it.
+if [ -n "$RENDER_MODE" ]; then
+    case "$RENDER_MODE" in
+        all)     render_threads all ;;
+        refresh) refresh_threads >/dev/null 2>&1 || true; render_threads mine ;;
+        *)       render_threads mine ;;
+    esac
+    exit 0
+fi
+
+refresh_users
+refresh_channels
+
+# Resolved once, and absolutely: it is handed to a detached process below and to
+# fzf's reload bindings further down, neither of which inherits this cwd.
+self=$(readlink -f "$0")
+
+# A cold cache is worth waiting for; a stale one isn't. Serve what's on disk and
+# refresh behind the picker, so it only ever opens slowly once.
+if [ ! -s "$THREADS_TSV" ] || [ "$REFRESH" = true ]; then
+    echo "  Reading your Slack threads…" >&2
+    refresh_threads || { echo "slack-pick-thread: could not read Slack threads" >&2; exit 2; }
+elif stale "$THREADS_TSV" "$THREADS_TTL"; then
+    # Detached, so closing the terminal on the picker doesn't take the refresh
+    # with it and leave a half-written cache behind.
+    if command -v setsid >/dev/null 2>&1; then
+        setsid "$self" --warm >/dev/null 2>&1 < /dev/null &
+    else
+        ( "$self" --warm >/dev/null 2>&1 < /dev/null & )
+    fi
+fi
+
+[ "$WARM_ONLY" = true ] && exit 0
+
+# Open on the threads you're in — unless you aren't in any, in which case that
+# view is an empty box telling you nothing.
+scope=mine
+[ -n "$(render_threads mine | head -1)" ] || scope=all
+
+selection=$(
+    render_threads "$scope" | $FZF \
+        --ansi \
+        --delimiter='\t' \
+        --with-nth=1 \
+        --height=80% \
+        --reverse \
+        --border=rounded \
+        --print-query \
+        --prompt="  Slack > " \
+        --header=$'Ctrl-A: every recent thread  │  Ctrl-R: refresh\nOr paste a Slack URL and press Enter' \
+        --bind "ctrl-a:change-prompt(  Slack all threads > )+reload('$self' --render all)" \
+        --bind "ctrl-r:change-prompt(  Slack > )+reload('$self' --render refresh)" \
+        --bind 'ctrl-d:half-page-down,ctrl-u:half-page-up' \
+    || true
+)
+
+# --print-query puts the typed text on line 1 and the selection, if any, on line
+# 2. A query that matched nothing is how a pasted URL finds its way back out.
+chosen=$(printf '%s\n' "$selection" | sed -n '2p')
+query=$(printf '%s\n' "$selection" | sed -n '1p')
+
+if [ -n "$chosen" ]; then
+    printf '%s\n' "$chosen" | cut -f2
+    exit 0
+fi
+if [[ "$query" =~ ^https://[^/]*slack\.com/ ]]; then
+    printf '%s\n' "$query"
+    exit 0
+fi
+exit 1
