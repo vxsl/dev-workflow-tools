@@ -662,6 +662,26 @@ exclude_args_under() {
     done
 }
 
+# The other direction: is $1 one of $2.., or inside one?
+#
+# exclude_args_under prunes what lies BELOW a search root, which is the whole job for
+# $HOME and for ~/work. It has nothing to say about a search root that is itself INSIDE
+# a pruned tree -- there is no descendant to exclude, so that sweep runs unpruned and
+# puts the tree the $HOME pass just pruned straight back into the listing.
+#
+# Not hypothetical: FZEDIT_PREFERRED_DIRS=~/work/repos/ul/client/web, pointed at any
+# sibling checkout, put 2089 base-repo rows back -- every one of them the same file as
+# a row already in the list under the scope's path, under a name you cannot tell apart
+# from it, which is the exact failure the pruning exists to prevent.
+path_under() {
+    local p="$1" r
+    shift
+    for r in "$@"; do
+        case "$p" in "$r"|"$r"/*) return 0 ;; esac
+    done
+    return 1
+}
+
 # The filesystem half of the two wide rungs, split out so it can be cached without
 # also freezing the history rows that get merged in on top of it.
 SWEEP_TTL="${FZEDIT_SWEEP_TTL:-30}"
@@ -689,6 +709,11 @@ sweep_home() {
     # quietly undoes the pruning.
     for dir in "${PREFERRED_DIRS[@]}"; do
         [ -d "$dir" ] || continue
+        # Which cuts both ways, so a preferred dir inside a pruned tree is dropped
+        # rather than swept (see path_under). Nothing is lost by dropping it: a
+        # preferred dir only ever RERANKS what the $HOME pass finds, and the $HOME
+        # pass does not find this -- so its only possible effect is to re-add rows.
+        path_under "$dir" "${prunable[@]}" && continue
         mapfile -t ex < <(exclude_args_under "$dir" "${prunable[@]}")
         fd . "$dir" --type f --follow --hidden --no-ignore-vcs \
             "${EXCLUDE_DIRS[@]}" "${bare[@]}" "${ex[@]}" "${PREFERRED_EXTS[@]}"
