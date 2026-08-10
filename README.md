@@ -153,7 +153,16 @@ One-shot workflow: staged changes → branch → commit → MR.
 oneshot                    # Interactive
 oneshot PROJ-1234          # Use ticket
 oneshot https://slack...   # From Slack thread
+oneshot --from-commit      # Ticket + MR title/description from the commit
 ```
+
+`--from-commit` applies when the change is one already-made commit and nothing
+is staged: its subject becomes the ticket summary and MR title, its body the
+ticket description and MR description, instead of being typed a third time.
+Trailers (`Co-Authored-By:`, `Session-Id:`) are left out, and the commit itself
+is never rewritten — it keeps the message you gave it, without a ticket key.
+oneshot offers this on its own whenever it sees a lone unpublished commit; the
+flag just answers in advance.
 
 ### `publish-changes`
 Create GitLab MRs with Jira integration.
