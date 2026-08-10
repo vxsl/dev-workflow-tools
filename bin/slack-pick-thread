@@ -5,6 +5,7 @@
 #   slack-pick-thread              Pick a thread; prints its permalink
 #   slack-pick-thread --refresh    Rebuild the thread list first
 #   slack-pick-thread --warm       Rebuild the thread list and exit (no picker)
+#   slack-pick-thread --check      Report the token's identity and scopes, then exit
 #
 # Exit codes:
 #   0  a thread was chosen — its permalink is on stdout
@@ -16,14 +17,22 @@
 # URL means leaving the terminal, finding the thread, "Copy link", and coming back.
 # The same thread is two keystrokes away if we go and read the ones you're in.
 #
-# Requires SLACK_REACT_TOKEN, a user token (xoxp). A bot token can't see which
-# channels *you* are in, and search.messages — the direct way to ask "what have I
-# been part of" — needs a search:read scope this token doesn't carry. So the list is
-# reconstructed from what the granted scopes do allow: the channels you're a member
-# of (channels:read, groups:read) and the recent messages in each (channels:history,
-# groups:history). A thread counts as yours if you started it, replied to it, or are
-# mentioned in it. DMs are absent because im:read isn't granted — and they aren't
-# where MRs get announced anyway.
+# Requires a user token (xoxp) in SLACK_USER_TOKEN. A bot token cannot see which
+# channels *you* are in, so the bot token that posts the MR is no use for finding
+# where to post it.
+#
+# SLACK_REACT_TOKEN is accepted as a fallback because that is where this started:
+# the reaction-notifier app's user token already carried the history scopes, so the
+# picker borrowed it. That app is a different app with a different job, and a tool
+# in this toolkit should not break when it is reinstalled — prefer a user token on
+# the same app as TICKET_CREATOR_BOT_TOKEN, under SLACK_USER_TOKEN.
+#
+# search.messages would answer "what have I been part of" in one call, but needs a
+# search:read scope. Without it the list is reconstructed from what the granted
+# scopes do allow: the channels you're a member of (channels:read, groups:read) and
+# the recent messages in each (channels:history, groups:history). A thread counts as
+# yours if you started it, replied to it, or are mentioned in it. DMs are absent
+# because im:read isn't granted — and they aren't where MRs get announced anyway.
 
 set -e
 
@@ -52,11 +61,13 @@ FETCH_JOBS="${SLACK_PICKER_JOBS:-6}"                   # concurrent history call
 REFRESH=false
 FORCE_THREADS=false
 WARM_ONLY=false
+CHECK_ONLY=false
 RENDER_MODE=""
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --refresh) REFRESH=true; FORCE_THREADS=true; shift ;;
         --warm)    FORCE_THREADS=true; WARM_ONLY=true; shift ;;
+        --check)   CHECK_ONLY=true; REFRESH=true; shift ;;
         # Internal: what the picker's reload bindings call to redraw a scope.
         --render)  RENDER_MODE="$2"; shift 2 ;;
         --help|-h) sed -n '2,/^[^#]/{/^[^#]/!p;}' "$0"; exit 0 ;;
@@ -64,12 +75,28 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 
+RED='\033[38;5;167m'
+GREEN='\033[38;5;114m'
+YELLOW='\033[38;5;221m'
+CYAN='\033[38;5;109m'
+BOLD='\033[1m'
+DIM='\033[2m'
+RESET='\033[0m'
+
 # ---------------------------------------------------------------------------
 # Availability
 # ---------------------------------------------------------------------------
 
-if [ -z "${SLACK_REACT_TOKEN:-}" ]; then
-    echo "slack-pick-thread: SLACK_REACT_TOKEN (xoxp user token) not set" >&2
+# The scopes the sweep needs, split by what losing each one actually costs.
+# Checked up front rather than discovered as an empty list: Slack answers every
+# call with missing_scope, and that reads downstream as "you have no threads".
+SCOPES_REQUIRED="channels:read channels:history"     # public channels — the floor
+SCOPES_PRIVATE="groups:read groups:history"          # private channels
+SCOPES_NAMES="users:read"                            # names instead of U0123ABC
+
+SLACK_TOKEN="${SLACK_USER_TOKEN:-${SLACK_REACT_TOKEN:-}}"
+if [ -z "$SLACK_TOKEN" ]; then
+    echo "slack-pick-thread: no user token — set SLACK_USER_TOKEN (xoxp) in .env" >&2
     exit 2
 fi
 for tool in curl jq awk; do
@@ -98,7 +125,7 @@ slack_get() {
     local args=() kv
     for kv in "$@"; do args+=(--data-urlencode "$kv"); done
     curl -s --max-time 20 -G "https://slack.com/api/${method}" \
-        -H "Authorization: Bearer ${SLACK_REACT_TOKEN}" "${args[@]}"
+        -H "Authorization: Bearer ${SLACK_TOKEN}" "${args[@]}"
 }
 
 # Seconds since $1 was last written, or a number large enough to read as expired.
@@ -109,27 +136,102 @@ age_of() {
 
 stale() { [ "$(age_of "$1")" -gt "$2" ]; }
 
-# Who am I, and which workspace: the first decides whether a thread is yours, the
-# second lets us build permalinks locally instead of a getPermalink call per row.
+# A short, non-reversible stand-in for the token, so the cache can tell "same
+# token as last time" from "you rotated it" without ever storing the token.
+token_fingerprint() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        printf '%s' "$SLACK_TOKEN" | sha256sum | cut -c1-16
+    else
+        printf '%s' "$SLACK_TOKEN" | cksum | tr -d ' '
+    fi
+}
+
+# Who am I, which workspace, and what may this token do. The first decides whether
+# a thread is yours, the second builds permalinks locally instead of a getPermalink
+# call per row, and the third is checked before any of the sweep runs.
+#
+# auth.test carries the granted scopes in a response header, which is the only way
+# to ask "what can this token do" without trying something and reading the error.
 load_identity() {
+    local fp
+    fp=$(token_fingerprint)
+
     if [ "$REFRESH" != true ] && ! stale "$IDENTITY" "$DIRECTORY_TTL"; then
         # shellcheck disable=SC1090
         source "$IDENTITY"
-        [ -n "${SLACK_ME:-}" ] && [ -n "${SLACK_HOST:-}" ] && return 0
+        # A changed token invalidates everything cached about the old one, scopes
+        # above all — otherwise adding the scope you were told to add appears to
+        # do nothing until the 24h TTL runs out.
+        if [ -n "${SLACK_ME:-}" ] && [ -n "${SLACK_HOST:-}" ] && [ "${SLACK_TOKEN_FP:-}" = "$fp" ]; then
+            return 0
+        fi
     fi
 
-    local auth
-    auth=$(curl -s --max-time 20 -X POST "https://slack.com/api/auth.test" \
-        -H "Authorization: Bearer ${SLACK_REACT_TOKEN}")
+    local headers auth
+    headers=$(mktemp)
+    auth=$(curl -s --max-time 20 -D "$headers" -X POST "https://slack.com/api/auth.test" \
+        -H "Authorization: Bearer ${SLACK_TOKEN}")
+    SLACK_SCOPES=$(grep -i '^x-oauth-scopes:' "$headers" 2>/dev/null \
+        | sed 's/^[^:]*: *//; s/[[:space:]]*$//' | tr ',' ' ' | tr -s ' ')
+    rm -f "$headers"
+
     if [ "$(printf '%s' "$auth" | jq -r '.ok // false')" != "true" ]; then
         echo "slack-pick-thread: auth.test failed: $(printf '%s' "$auth" | jq -r '.error // "unknown"')" >&2
         return 1
     fi
 
     SLACK_ME=$(printf '%s' "$auth" | jq -r '.user_id')
+    SLACK_WHO=$(printf '%s' "$auth" | jq -r '.user // "?"')
+    SLACK_TEAM=$(printf '%s' "$auth" | jq -r '.team // "?"')
     # .url is "https://team.slack.com/"; permalinks want just the host.
     SLACK_HOST=$(printf '%s' "$auth" | jq -r '.url' | sed 's|^https://||; s|/$||')
-    printf 'SLACK_ME=%s\nSLACK_HOST=%s\n' "$SLACK_ME" "$SLACK_HOST" > "$IDENTITY"
+    printf 'SLACK_ME=%s\nSLACK_HOST=%s\nSLACK_WHO=%s\nSLACK_TEAM=%s\nSLACK_TOKEN_FP=%s\nSLACK_SCOPES="%s"\n' \
+        "$SLACK_ME" "$SLACK_HOST" "$SLACK_WHO" "$SLACK_TEAM" "$fp" "$SLACK_SCOPES" > "$IDENTITY"
+}
+
+has_scope() {
+    case " ${SLACK_SCOPES:-} " in *" $1 "*) return 0 ;; esac
+    return 1
+}
+
+# Which of $@ this token does not have, space separated.
+missing_scopes() {
+    local want out=""
+    for want in $@; do has_scope "$want" || out="$out $want"; done
+    printf '%s' "${out# }"
+}
+
+# Which token variable is actually in play, for messages that tell you where to fix it.
+token_var_name() {
+    if [ -n "${SLACK_USER_TOKEN:-}" ]; then echo "SLACK_USER_TOKEN"; else echo "SLACK_REACT_TOKEN"; fi
+}
+
+# Refuse loudly rather than sweep 66 channels for an empty list. Silence here is
+# the failure mode worth designing against: every call comes back missing_scope,
+# every one is discarded, and the picker reports that you have no threads.
+require_scopes() {
+    local missing
+    missing=$(missing_scopes "$SCOPES_REQUIRED")
+    [ -z "$missing" ] && return 0
+
+    local var
+    var=$(token_var_name)
+    {
+        echo ""
+        echo -e "${RED}${BOLD}  ✗ slack-pick-thread: ${var} is missing scopes it needs${RESET}"
+        echo ""
+        echo -e "    ${RED}missing:${RESET} ${BOLD}${missing}${RESET}"
+        echo -e "    ${DIM}granted:${RESET} ${DIM}${SLACK_SCOPES:-<none reported>}${RESET}"
+        echo -e "    ${DIM}token:   ${SLACK_WHO:-?} @ ${SLACK_TEAM:-?}${RESET}"
+        echo ""
+        echo -e "    ${DIM}Add them under ${RESET}User Token Scopes${DIM} at api.slack.com/apps, reinstall the${RESET}"
+        echo -e "    ${DIM}app, and put the new xoxp- token in .env as ${RESET}${var}${DIM}.${RESET}"
+        echo -e "    ${DIM}Then: ${RESET}slack-pick-thread --check"
+        echo ""
+        echo -e "    ${DIM}Skipping the picker — paste a Slack URL instead.${RESET}"
+        echo ""
+    } >&2
+    return 1
 }
 
 refresh_users() {
@@ -146,8 +248,13 @@ refresh_users() {
 refresh_channels() {
     { [ "$REFRESH" = true ] || stale "$CHANNELS_TSV" "$DIRECTORY_TTL"; } || return 0
     local tmp="$CHANNELS_TSV.$$"
+    # Ask only for what this token may see. Requesting private_channel without
+    # groups:read fails the whole call, taking the public channels down with it —
+    # so a missing private scope has to narrow the question, not break it.
+    local types="public_channel"
+    [ -z "$(missing_scopes "$SCOPES_PRIVATE")" ] && types="public_channel,private_channel"
     slack_get users.conversations \
-        "types=public_channel,private_channel" "exclude_archived=true" "limit=1000" \
+        "types=$types" "exclude_archived=true" "limit=1000" \
         | jq -r '.channels[]? | [.id, .name] | @tsv' \
         > "$tmp" 2>/dev/null || true
     if [ -s "$tmp" ]; then mv "$tmp" "$CHANNELS_TSV"; else rm -f "$tmp"; fi
@@ -309,6 +416,41 @@ render_threads() {
 # ---------------------------------------------------------------------------
 
 load_identity || exit 2
+
+if [ "$CHECK_ONLY" = true ]; then
+    echo ""
+    echo -e "  ${BOLD}$(token_var_name)${RESET}  ${DIM}(${SLACK_WHO:-?} @ ${SLACK_TEAM:-?})${RESET}"
+    echo ""
+    # Split on | — scope names are full of colons.
+    for group in "$SCOPES_REQUIRED|required — public channels" \
+                 "$SCOPES_PRIVATE|optional — private channels" \
+                 "$SCOPES_NAMES|optional — names instead of user ids"; do
+        want="${group%%|*}"; note="${group#*|}"
+        gone=$(missing_scopes "$want")
+        if [ -z "$gone" ]; then
+            echo -e "  ${GREEN}✓${RESET} ${want}  ${DIM}${note}${RESET}"
+        else
+            echo -e "  ${RED}✗${RESET} ${want}  ${DIM}${note}${RESET}"
+            echo -e "    ${RED}missing: ${gone}${RESET}"
+        fi
+    done
+    echo ""
+    echo -e "  ${DIM}granted: ${SLACK_SCOPES:-<none reported>}${RESET}"
+    echo ""
+    # search:read would replace the whole 66-call sweep with one request, so say
+    # so here rather than leaving it as folklore in a commit message.
+    if has_scope search:read || has_scope search:read.public; then
+        echo -e "  ${GREEN}✓${RESET} search:read ${DIM}— available (the sweep could be replaced by one call)${RESET}"
+    else
+        echo -e "  ${DIM}·${RESET} ${DIM}search:read.public/.private not granted — the thread list is${RESET}"
+        echo -e "    ${DIM}swept one call per channel instead of fetched in one.${RESET}"
+    fi
+    echo ""
+    [ -z "$(missing_scopes "$SCOPES_REQUIRED")" ] || exit 2
+    exit 0
+fi
+
+require_scopes || exit 2
 
 # Reload bindings re-enter here. Nothing is printed to stderr on this path: fzf
 # owns the terminal while it runs, and a stray line would land on top of it.

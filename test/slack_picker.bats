@@ -13,10 +13,21 @@ setup() {
     export SLACK_PICKER_CACHE_DIR="$TEST_TMPDIR/cache"
     mkdir -p "$SLACK_PICKER_CACHE_DIR"
 
-    # A fresh identity file keeps load_identity off the network.
-    cat > "$SLACK_PICKER_CACHE_DIR/identity" <<'EOF'
+    # A token of our own, so the repo's real .env one is never the one under test.
+    # .env sets SLACK_REACT_TOKEN, not SLACK_USER_TOKEN, so this one wins.
+    export SLACK_USER_TOKEN="test-token"
+    TOKEN_FP=$(printf '%s' "$SLACK_USER_TOKEN" | sha256sum | cut -c1-16)
+
+    # A fresh identity keeps load_identity off the network — but only if its
+    # fingerprint matches, which is the same rule that makes a rotated token
+    # re-check its scopes instead of trusting yesterday's answer.
+    cat > "$SLACK_PICKER_CACHE_DIR/identity" <<EOF
 SLACK_ME=U_ME
 SLACK_HOST=example.slack.com
+SLACK_WHO=tester
+SLACK_TEAM=TestTeam
+SLACK_TOKEN_FP=$TOKEN_FP
+SLACK_SCOPES="channels:read channels:history groups:read groups:history users:read"
 EOF
 
     printf 'U_ME\tKyle\nU_OTHER\tAvery\n' > "$SLACK_PICKER_CACHE_DIR/users.tsv"
@@ -132,6 +143,13 @@ render() {
 # never carried any.
 
 stub_slack() {
+    _stub_slack "channels:read channels:history groups:read groups:history users:read"
+}
+
+stub_slack_scopes() { _stub_slack "$1"; }
+
+_stub_slack() {
+    local scopes="$1"
     STUB_BIN="$TEST_TMPDIR/stubs"
     mkdir -p "$STUB_BIN"
     cat > "$TEST_TMPDIR/history.json" <<'EOF'
@@ -151,8 +169,17 @@ stub_slack() {
 EOF
     cat > "$STUB_BIN/curl" <<EOF
 #!/usr/bin/env bash
+echo "\$*" >> "$TEST_TMPDIR/seen-args.log"
+# Honour -D <file>: the granted scopes arrive as a response header, which is the
+# only way to ask what a token may do without trying it and reading the error.
+hdr=""; prev=""
+for a in "\$@"; do
+    [ "\$prev" = "-D" ] && hdr="\$a"
+    prev="\$a"
+done
+[ -n "\$hdr" ] && printf 'HTTP/1.1 200 OK\r\nx-oauth-scopes: %s\r\n\r\n' "$(printf '%s' "$scopes" | tr ' ' ',')" > "\$hdr"
 case "\$*" in
-    *auth.test*)             echo '{"ok":true,"user_id":"U_ME","url":"https://example.slack.com/"}' ;;
+    *auth.test*)             echo '{"ok":true,"user_id":"U_ME","user":"tester","team":"TestTeam","url":"https://example.slack.com/"}' ;;
     *users.list*)            echo '{"ok":true,"members":[{"id":"U_ME","name":"kyle","real_name":"Kyle"}]}' ;;
     *users.conversations*)   echo '{"ok":true,"channels":[{"id":"C0PUB0001","name":"general"}]}' ;;
     *conversations.history*) cat "$TEST_TMPDIR/history.json" ;;
@@ -198,6 +225,96 @@ sweep() {
     run cut -f1 "$SLACK_PICKER_CACHE_DIR/threads.tsv"
     [ "${lines[0]}" = "1700000900.000100" ]
     [ "${lines[-1]}" = "1700000500.000100" ]
+}
+
+# --- scopes ------------------------------------------------------------------
+#
+# A missing scope makes Slack answer every call with missing_scope. Each answer
+# is discarded, the sweep ends with nothing, and the picker reports that you have
+# no threads — which is why this is checked up front and said out loud.
+
+# Re-seed the identity with a given scope set, keeping the fingerprint valid so
+# nothing goes to the network.
+with_scopes() {
+    cat > "$SLACK_PICKER_CACHE_DIR/identity" <<EOF
+SLACK_ME=U_ME
+SLACK_HOST=example.slack.com
+SLACK_WHO=tester
+SLACK_TEAM=TestTeam
+SLACK_TOKEN_FP=$TOKEN_FP
+SLACK_SCOPES="$1"
+EOF
+}
+
+@test "scopes: a token that cannot read history is refused, loudly and by name" {
+    with_scopes "channels:read users:read"
+    run "$REPO_ROOT/bin/slack-pick-thread"
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"missing scopes it needs"* ]]
+    [[ "$output" == *"channels:history"* ]]
+    # Names the variable to fix, since two different tokens can end up here.
+    [[ "$output" == *"SLACK_USER_TOKEN"* ]]
+}
+
+@test "scopes: refusing is exit 2, so the caller falls back to pasting" {
+    with_scopes "channels:read"
+    run "$REPO_ROOT/bin/slack-pick-thread"
+    # Not 1 — that means "the user declined to post".
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"paste a Slack URL instead"* ]]
+}
+
+@test "scopes: --check names what is missing and exits 2" {
+    stub_slack_scopes "channels:read users:read"
+    run "$REPO_ROOT/bin/slack-pick-thread" --check
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"channels:history"* ]]
+}
+
+@test "scopes: even a render reload refuses, rather than redrawing an empty list" {
+    with_scopes "channels:read users:read"
+    run "$REPO_ROOT/bin/slack-pick-thread" --render mine
+    [ "$status" -eq 2 ]
+}
+
+@test "scopes: a complete token is not refused" {
+    with_scopes "channels:read channels:history groups:read groups:history users:read"
+    seed_threads "$(printf '1700000000.1\t1\tgeneral\tU_ME\t3\thello\tC0PUB0001/1700000000.111111')"
+    run render mine
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"hello"* ]]
+}
+
+@test "scopes: without the private ones, only public channels are asked for" {
+    # Requesting private_channel without groups:read fails the whole call and
+    # takes the public channels down with it, so the question has to narrow.
+    with_scopes "channels:read channels:history users:read"
+    rm -f "$SLACK_PICKER_CACHE_DIR/channels.tsv"
+    stub_slack
+    "$REPO_ROOT/bin/slack-pick-thread" --warm 2>/dev/null || true
+    run cat "$TEST_TMPDIR/seen-args.log"
+    [[ "$output" == *"types=public_channel"* ]]
+    [[ "$output" != *"private_channel"* ]]
+}
+
+@test "scopes: with the private ones, private channels are asked for too" {
+    with_scopes "channels:read channels:history groups:read groups:history users:read"
+    rm -f "$SLACK_PICKER_CACHE_DIR/channels.tsv"
+    stub_slack
+    "$REPO_ROOT/bin/slack-pick-thread" --warm 2>/dev/null || true
+    run cat "$TEST_TMPDIR/seen-args.log"
+    [[ "$output" == *"types=public_channel,private_channel"* ]]
+}
+
+@test "scopes: a rotated token re-checks instead of trusting the cached answer" {
+    # Cached identity says the scopes are fine, but it was written for a token
+    # that is no longer the one in play — so it must not be believed.
+    with_scopes "channels:read channels:history groups:read groups:history users:read"
+    sed -i "s/^SLACK_TOKEN_FP=.*/SLACK_TOKEN_FP=stale000000000/" "$SLACK_PICKER_CACHE_DIR/identity"
+    stub_slack_scopes "channels:read"
+    run "$REPO_ROOT/bin/slack-pick-thread"
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"channels:history"* ]]
 }
 
 # --- availability ------------------------------------------------------------
