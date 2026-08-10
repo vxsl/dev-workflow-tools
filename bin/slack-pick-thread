@@ -38,9 +38,20 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$(type -P "$0" || echo "$0")")")" && pwd)"
+
+# .env assigns unconditionally, so sourcing it would overwrite a token passed in
+# for this one run. Defaults belong in the file; an explicit value on the command
+# line has to beat them, or `SLACK_USER_TOKEN=… slack-pick-thread --check` quietly
+# checks a different token than the one you handed it.
+# ${VAR+set} rather than a non-empty test, so that an explicit empty value counts
+# as "the caller said no token" and turns the picker off, instead of silently
+# falling through to whatever .env happens to hold.
+_token_was_passed=${SLACK_USER_TOKEN+yes}
+_token_from_env="${SLACK_USER_TOKEN:-}"
 if [ -f "$SCRIPT_DIR/../.env" ]; then
     source "$SCRIPT_DIR/../.env"
 fi
+[ -n "$_token_was_passed" ] && SLACK_USER_TOKEN="$_token_from_env"
 
 CACHE_DIR="${SLACK_PICKER_CACHE_DIR:-$HOME/.cache/publish-changes/slack-picker}"
 THREADS_TSV="$CACHE_DIR/threads.tsv"
@@ -187,10 +198,41 @@ load_identity() {
     SLACK_ME=$(printf '%s' "$auth" | jq -r '.user_id')
     SLACK_WHO=$(printf '%s' "$auth" | jq -r '.user // "?"')
     SLACK_TEAM=$(printf '%s' "$auth" | jq -r '.team // "?"')
+    # Only a bot token comes back with a bot_id. It is the one reliable way to
+    # tell the two apart — the scope NAMES are identical between bot and user
+    # tokens, so a bot token sails through a check that only reads scopes.
+    SLACK_BOT_ID=$(printf '%s' "$auth" | jq -r '.bot_id // ""')
     # .url is "https://team.slack.com/"; permalinks want just the host.
     SLACK_HOST=$(printf '%s' "$auth" | jq -r '.url' | sed 's|^https://||; s|/$||')
-    printf 'SLACK_ME=%s\nSLACK_HOST=%s\nSLACK_WHO=%s\nSLACK_TEAM=%s\nSLACK_TOKEN_FP=%s\nSLACK_SCOPES="%s"\n' \
-        "$SLACK_ME" "$SLACK_HOST" "$SLACK_WHO" "$SLACK_TEAM" "$fp" "$SLACK_SCOPES" > "$IDENTITY"
+    printf 'SLACK_ME=%s\nSLACK_HOST=%s\nSLACK_WHO=%s\nSLACK_TEAM=%s\nSLACK_BOT_ID=%s\nSLACK_TOKEN_FP=%s\nSLACK_SCOPES="%s"\n' \
+        "$SLACK_ME" "$SLACK_HOST" "$SLACK_WHO" "$SLACK_TEAM" "$SLACK_BOT_ID" "$fp" "$SLACK_SCOPES" > "$IDENTITY"
+}
+
+# A bot token is not a weaker user token, it is a different subject. It would
+# sweep the channels the BOT is in and call the result yours, and search.messages
+# refuses it outright — so this is checked before the scopes, and separately.
+require_user_token() {
+    [ -z "${SLACK_BOT_ID:-}" ] && return 0
+    {
+        echo ""
+        echo -e "${RED}${BOLD}  ✗ slack-pick-thread: SLACK_USER_TOKEN is a bot token${RESET}"
+        echo ""
+        echo -e "    ${DIM}it authenticates as${RESET} ${BOLD}${SLACK_WHO:-?}${RESET} ${DIM}(bot ${SLACK_BOT_ID}), not you${RESET}"
+        echo ""
+        echo -e "    ${DIM}A bot token can only see the channels the BOT is in. The question${RESET}"
+        echo -e "    ${DIM}here is which channels YOU are in, so it has to be a user token.${RESET}"
+        echo ""
+        echo -e "    ${DIM}On OAuth & Permissions there are two, and it is the first one:${RESET}"
+        echo -e "      ${BOLD}User OAuth Token${RESET}       ${DIM}xoxp-…   ← this one${RESET}"
+        echo -e "      ${DIM}Bot User OAuth Token   xoxb-…   ← what is set now${RESET}"
+        echo ""
+        echo -e "    ${DIM}The user token only appears once the app has ${RESET}User Token Scopes${DIM}${RESET}"
+        echo -e "    ${DIM}(a separate list from Bot Token Scopes) and has been reinstalled.${RESET}"
+        echo ""
+        echo -e "    ${DIM}Skipping the picker — paste a Slack URL instead.${RESET}"
+        echo ""
+    } >&2
+    return 1
 }
 
 has_scope() {
@@ -419,6 +461,14 @@ if [ "$CHECK_ONLY" = true ]; then
     echo ""
     echo -e "  ${BOLD}SLACK_USER_TOKEN${RESET}  ${DIM}(${SLACK_WHO:-?} @ ${SLACK_TEAM:-?})${RESET}"
     echo ""
+    # Before any scope line, because the scope lines look identical either way and
+    # would otherwise report a bot token as perfectly configured.
+    if [ -n "${SLACK_BOT_ID:-}" ]; then
+        echo -e "  ${RED}✗${RESET} bot token ${DIM}— needs the User OAuth Token (xoxp-), not the bot one${RESET}"
+    else
+        echo -e "  ${GREEN}✓${RESET} user token ${DIM}— authenticates as you${RESET}"
+    fi
+    echo ""
     # Split on | — scope names are full of colons.
     for group in "$SCOPES_REQUIRED|required — public channels" \
                  "$SCOPES_PRIVATE|optional — private channels" \
@@ -444,10 +494,12 @@ if [ "$CHECK_ONLY" = true ]; then
         echo -e "    ${DIM}swept one call per channel instead of fetched in one.${RESET}"
     fi
     echo ""
+    [ -n "${SLACK_BOT_ID:-}" ] && exit 2
     [ -z "$(missing_scopes "$SCOPES_REQUIRED")" ] || exit 2
     exit 0
 fi
 
+require_user_token || exit 2
 require_scopes || exit 2
 
 # Reload bindings re-enter here. Nothing is printed to stderr on this path: fzf

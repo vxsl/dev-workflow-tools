@@ -306,6 +306,25 @@ EOF
     [[ "$output" == *"types=public_channel,private_channel"* ]]
 }
 
+@test "scopes: a bot token is refused, however well scoped it is" {
+    # The trap this closes: bot and user tokens use the SAME scope names, so a
+    # bot token passes a check that only reads scopes — and then sweeps the
+    # channels the BOT is in and calls the result yours.
+    cat > "$SLACK_PICKER_CACHE_DIR/identity" <<EOF
+SLACK_ME=U_BOT
+SLACK_HOST=example.slack.com
+SLACK_WHO=dev-workflow-bot
+SLACK_TEAM=TestTeam
+SLACK_BOT_ID=B0123BOT
+SLACK_TOKEN_FP=$TOKEN_FP
+SLACK_SCOPES="channels:read channels:history groups:read groups:history users:read"
+EOF
+    run "$REPO_ROOT/bin/slack-pick-thread"
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"is a bot token"* ]]
+    [[ "$output" == *"User OAuth Token"* ]]
+}
+
 @test "scopes: a rotated token re-checks instead of trusting the cached answer" {
     # Cached identity says the scopes are fine, but it was written for a token
     # that is no longer the one in play — so it must not be believed.
