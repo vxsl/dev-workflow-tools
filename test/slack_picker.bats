@@ -227,6 +227,134 @@ sweep() {
     [ "${lines[-1]}" = "1700000500.000100" ]
 }
 
+# --- search ------------------------------------------------------------------
+#
+# With search:read the list is two calls and the answer is the question, rather
+# than 66 calls reconstructing it. A reply's permalink carries ?thread_ts=<root>,
+# which is how each message names the thread it belongs to without a call to ask.
+
+stub_search() {
+    STUB_BIN="$TEST_TMPDIR/stubs"
+    mkdir -p "$STUB_BIN"
+    # from:@me returns only my messages; the mention query only other people's —
+    # which is what Slack does, and what keeps the marker deterministic.
+    cat > "$TEST_TMPDIR/mine.json" <<'EOF'
+{"ok":true,"messages":{"total":2,"matches":[
+ {"ts":"1700000500.000100","user":"U_ME","text":"my first word in it",
+  "channel":{"id":"C0PUB0001","name":"general","is_channel":true},
+  "permalink":"https://example.slack.com/archives/C0PUB0001/p1700000500000100?thread_ts=1700000000.111111"},
+ {"ts":"1700000600.000100","user":"U_ME","text":"my later word in the same thread",
+  "channel":{"id":"C0PUB0001","name":"general","is_channel":true},
+  "permalink":"https://example.slack.com/archives/C0PUB0001/p1700000600000100?thread_ts=1700000000.111111"}
+]}}
+EOF
+    cat > "$TEST_TMPDIR/named.json" <<'EOF'
+{"ok":true,"messages":{"total":2,"matches":[
+ {"ts":"1700000700.000100","user":"U_OTHER","text":"hey <@U_ME> look at this",
+  "channel":{"id":"C0PUB0001","name":"general","is_channel":true},
+  "permalink":"https://example.slack.com/archives/C0PUB0001/p1700000700000100?thread_ts=1700000222.333333"},
+ {"ts":"1700000800.000100","user":"U_OTHER","text":"","files":[{"name":"shot.png"}],
+  "channel":{"id":"D0DM00001","name":"U_OTHER","is_im":true},
+  "permalink":"https://example.slack.com/archives/D0DM00001/p1700000800000100"}
+]}}
+EOF
+    cat > "$STUB_BIN/curl" <<EOF
+#!/usr/bin/env bash
+echo "\$*" >> "$TEST_TMPDIR/seen-args.log"
+case "\$*" in
+    *search.messages*from:*) cat "$TEST_TMPDIR/mine.json" ;;
+    *search.messages*)       cat "$TEST_TMPDIR/named.json" ;;
+    *users.list*)            echo '{"ok":true,"members":[{"id":"U_ME","name":"kyle","real_name":"Kyle"},{"id":"U_OTHER","name":"avery","real_name":"Avery"}]}' ;;
+    *)                       echo '{}' ;;
+esac
+EOF
+    chmod +x "$STUB_BIN/curl"
+    export PATH="$STUB_BIN:$PATH"
+    with_scopes "channels:read channels:history groups:read groups:history users:read search:read"
+    rm -f "$SLACK_PICKER_CACHE_DIR/threads.tsv"
+}
+
+@test "search: the channel sweep is not used at all" {
+    stub_search
+    "$REPO_ROOT/bin/slack-pick-thread" --warm 2>/dev/null
+    run cat "$TEST_TMPDIR/seen-args.log"
+    [[ "$output" != *"conversations.history"* ]]
+    [[ "$output" != *"users.conversations"* ]]
+    [ "$(grep -c search.messages "$TEST_TMPDIR/seen-args.log")" -eq 2 ]
+}
+
+@test "search: a thread is one row however much you said in it" {
+    stub_search
+    "$REPO_ROOT/bin/slack-pick-thread" --warm 2>/dev/null
+    # Two of my messages share a thread root, so they are one place to post.
+    [ "$(wc -l < "$SLACK_PICKER_CACHE_DIR/threads.tsv")" -eq 3 ]
+    run cut -f7 "$SLACK_PICKER_CACHE_DIR/threads.tsv"
+    [[ "$output" == *"C0PUB0001/1700000000.111111"* ]]
+    # ...dated by the most recent of them, not the first.
+    run grep -c "^1700000600.000100" "$SLACK_PICKER_CACHE_DIR/threads.tsv"
+    [ "$output" = "1" ]
+}
+
+@test "search: the thread root comes from the permalink, not the message" {
+    stub_search
+    "$REPO_ROOT/bin/slack-pick-thread" --warm 2>/dev/null
+    run render mine
+    # The row points at the thread root, never at my reply inside it.
+    [[ "$output" == *"/p1700000000111111"* ]]
+    [[ "$output" != *"/p1700000600000100"* ]]
+}
+
+@test "search: a message with no thread_ts stands as its own thread" {
+    stub_search
+    "$REPO_ROOT/bin/slack-pick-thread" --warm 2>/dev/null
+    run cut -f7 "$SLACK_PICKER_CACHE_DIR/threads.tsv"
+    [[ "$output" == *"D0DM00001/1700000800.000100"* ]]
+}
+
+@test "search: the marker says whose words the row shows" {
+    stub_search
+    "$REPO_ROOT/bin/slack-pick-thread" --warm 2>/dev/null
+    run render mine
+    [[ "$output" == *"● "*"my later word"* ]]
+    [[ "$output" == *"◐ "*"look at this"* ]]
+}
+
+@test "search: a DM is named after the person, not their user id" {
+    stub_search
+    "$REPO_ROOT/bin/slack-pick-thread" --warm 2>/dev/null
+    run render mine
+    [[ "$output" == *"@Avery"* ]]
+    [[ "$output" != *"#U_OTHER"* ]]
+}
+
+@test "search: an uncaptioned upload is still described" {
+    stub_search
+    "$REPO_ROOT/bin/slack-pick-thread" --warm 2>/dev/null
+    run render mine
+    [[ "$output" == *"shot.png"* ]]
+}
+
+@test "search: a workspace query is a view, and does not become your thread list" {
+    # Persisting it would leave the next picker opening on a one-off search for
+    # the rest of the cache's life.
+    stub_search
+    "$REPO_ROOT/bin/slack-pick-thread" --warm 2>/dev/null
+    before=$(md5sum < "$SLACK_PICKER_CACHE_DIR/threads.tsv")
+    run "$REPO_ROOT/bin/slack-pick-thread" --render-query "some words"
+    [ "$status" -eq 0 ]
+    [ "$(md5sum < "$SLACK_PICKER_CACHE_DIR/threads.tsv")" = "$before" ]
+}
+
+@test "search: without the scope, the sweep is what runs" {
+    with_scopes "channels:read channels:history groups:read groups:history users:read"
+    rm -f "$SLACK_PICKER_CACHE_DIR/threads.tsv" "$SLACK_PICKER_CACHE_DIR/channels.tsv"
+    stub_slack
+    "$REPO_ROOT/bin/slack-pick-thread" --warm 2>/dev/null || true
+    run cat "$TEST_TMPDIR/seen-args.log"
+    [[ "$output" == *"conversations.history"* ]]
+    [[ "$output" != *"search.messages"* ]]
+}
+
 # --- scopes ------------------------------------------------------------------
 #
 # A missing scope makes Slack answer every call with missing_scope. Each answer

@@ -75,6 +75,7 @@ FORCE_THREADS=false
 WARM_ONLY=false
 CHECK_ONLY=false
 RENDER_MODE=""
+RENDER_QUERY=""
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --refresh) REFRESH=true; FORCE_THREADS=true; shift ;;
@@ -82,6 +83,7 @@ while [ "$#" -gt 0 ]; do
         --check)   CHECK_ONLY=true; REFRESH=true; shift ;;
         # Internal: what the picker's reload bindings call to redraw a scope.
         --render)  RENDER_MODE="$2"; shift 2 ;;
+        --render-query) RENDER_MODE=query; RENDER_QUERY="$2"; shift 2 ;;
         --help|-h) sed -n '2,/^[^#]/{/^[^#]/!p;}' "$0"; exit 0 ;;
         *) echo "Unknown argument: $1" >&2; exit 2 ;;
     esac
@@ -105,6 +107,13 @@ RESET='\033[0m'
 SCOPES_REQUIRED="channels:read channels:history"     # public channels — the floor
 SCOPES_PRIVATE="groups:read groups:history"          # private channels
 SCOPES_NAMES="users:read"                            # names instead of U0123ABC
+
+# With search, the list is two calls and always fresh. Without it, the same list
+# has to be reconstructed by reading every channel you're in — see refresh_threads.
+# Slack grants this either as one umbrella scope or per conversation type.
+has_search() {
+    has_scope search:read || has_scope search:read.public || has_scope search:read.private
+}
 
 SLACK_TOKEN="${SLACK_USER_TOKEN:-}"
 if [ -z "$SLACK_TOKEN" ]; then
@@ -134,6 +143,24 @@ chmod 700 "$CACHE_DIR" 2>/dev/null || true
 # ---------------------------------------------------------------------------
 # Slack
 # ---------------------------------------------------------------------------
+
+# .text is empty for anything not typed as plain text: composed in blocks, posted
+# by a workflow, or — most often — an uncaptioned screenshot, where the file name
+# is the whole message. Those are still threads, and a blank row is a row you
+# cannot pick, so dig the strings back out of wherever the message put them.
+#
+# Shared by both list sources: search matches and channel history carry the same
+# message shape, and a row should not read differently depending on which found it.
+JQ_MESSAGE_BODY='
+def body:
+      ( if (.text // "") != "" then .text
+        else ( [ .blocks[]? | .. | objects | select(.text? | type == "string") | .text ]
+               + [ .attachments[]? | (.fallback // .text // empty) ]
+               + [ .files[]? | (.title // .name // empty) ]
+               | map(select(. != "")) | join(" ") )
+        end
+      | gsub("[\\n\\t]+"; " ") | gsub(" +"; " ") );
+'
 
 slack_get() {
     local method="$1"; shift
@@ -309,7 +336,7 @@ refresh_channels() {
 fetch_channel_threads() {
     local id="$1" name="$2"
     slack_get conversations.history "channel=$id" "limit=$HISTORY_DEPTH" 2>/dev/null \
-        | jq -r --arg ch "$id" --arg name "$name" --arg me "$SLACK_ME" '
+        | jq -r --arg ch "$id" --arg name "$name" --arg me "$SLACK_ME" "$JQ_MESSAGE_BODY"'
             .messages[]?
             | select((.reply_count // 0) > 0)
             | (.latest_reply // .ts) as $last
@@ -333,6 +360,73 @@ fetch_channel_threads() {
                 $body, ($ch + "/" + .ts) ]
             | @tsv
         ' 2>/dev/null || true
+}
+
+# Ask Slack directly: the messages you sent, and the ones that named you. Two
+# calls, and the answer is the question rather than a reconstruction of it.
+#
+# A reply's permalink carries ?thread_ts=<root>, which is the thread's identity —
+# so the thread each message belongs to comes back with the message, and no call
+# per thread is needed to find out. A message without one is top-level: it may be
+# a thread root or a standalone message, and search does not say which. Both are
+# somewhere you can post, so both are offered.
+#
+# $2 says whose words the row is showing: 1 yours, otherwise $kind — 2 for someone
+# else naming you, 0 for someone else who merely matched what you searched for.
+#
+# Derived from the message author, not from which query found it. Slack's
+# "@someone" search matches messages from that person as well as ones naming them,
+# so the query a row arrived on says less about it than its author does.
+search_threads() {
+    local kind="$1" query="$2"
+    slack_get search.messages "query=$query" "count=100" "sort=timestamp" \
+        | jq -r --arg kind "$kind" --arg me "$SLACK_ME" "$JQ_MESSAGE_BODY"'
+            .messages.matches[]?
+            # A reply carries ?thread_ts=<root>; a top-level message carries none,
+            # and is its own root. The fallback has to be inside the binding: a
+            # capture that does not match yields an empty stream, and binding an
+            # empty stream drops the message entirely rather than defaulting it.
+            | ((.permalink | capture("thread_ts=(?<t>[0-9.]+)").t) // .ts) as $root
+            # A DM has no channel name — Slack puts the other persons user id
+            # there instead. Marked with @ so the renderer resolves it to a name
+            # rather than printing #U0A1B2C3 as though it were a channel.
+            | (if (.channel.is_im // false) or (.channel.is_mpim // false)
+               then "@" + (.channel.name // .channel.id // "?")
+               else (.channel.name // .channel.id // "?") end) as $where
+            | [ .ts, (if (.user // "") == $me then "1" else $kind end),
+                $where,
+                (.user // ""),
+                "",
+                body,
+                ((.channel.id // "") + "/" + $root) ]
+            | @tsv
+        ' 2>/dev/null || true
+}
+
+# One row per thread, newest first. A thread you have said five things in is one
+# place to post, not five rows — and the most recent of those is what dates it.
+write_threads() {
+    local tmp="$THREADS_TSV.$$"
+    sort -t $'\t' -k1,1nr | awk -F'\t' '!seen[$7]++' > "$tmp" || true
+    if [ -s "$tmp" ]; then mv "$tmp" "$THREADS_TSV"; else rm -f "$tmp"; return 1; fi
+}
+
+refresh_threads_via_search() {
+    { search_threads 1 "from:@${SLACK_WHO}"
+      search_threads 2 "@${SLACK_WHO}"; } | write_threads
+}
+
+# Search the workspace for words, not for yourself — the thread about a thing you
+# were never in. Reached from the picker with whatever you have typed so far, which
+# is the search you were already halfway through expressing by filtering.
+#
+# Rows go to a file of their own, never the cache. A one-off search is a view, not
+# a new answer to "which threads are yours" — persisting it would leave the next
+# picker opening on someone else's search results for the rest of the TTL.
+query_threads_file() {
+    local out="$CACHE_DIR/query.tsv"
+    search_threads 0 "$1" | sort -t $'\t' -k1,1nr | awk -F'\t' '!seen[$7]++' > "$out" 2>/dev/null || true
+    printf '%s\n' "$out"
 }
 
 # Sweep every channel, a few at a time. Each writes its own file so concurrent
@@ -371,7 +465,8 @@ refresh_threads() {
 
 render_threads() {
     local scope="$1"
-    [ -s "$THREADS_TSV" ] || return 0
+    local src="${2:-$THREADS_TSV}"
+    [ -s "$src" ] || return 0
     awk -F'\t' -v OFS='\t' \
         -v scope="$scope" -v now="$(date +%s)" -v host="$SLACK_HOST" \
         -v usersfile="$USERS_TSV" '
@@ -430,10 +525,18 @@ render_threads() {
             gsub(/&lt;/, "<", out); gsub(/&gt;/, ">", out); gsub(/&amp;/, "\\&", out)
             return out
         }
-        scope == "mine" && $2 != "1" { next }
+        # 0 is a thread you had no part in, which only the channel sweep produces.
+        scope == "mine" && $2 == "0" { next }
         {
             author = ($4 in name) ? name[$4] : $4
-            mark = ($2 == "1") ? "\033[38;5;114m●\033[0m" : "\033[2m·\033[0m"
+            # ● your words   ◐ someone else naming you   · someone else
+            mark = "\033[2m·\033[0m"
+            if ($2 == "1") mark = "\033[38;5;114m●\033[0m"
+            else if ($2 == "2") mark = "\033[38;5;221m◐\033[0m"
+
+            # Search does not report a reply count, and an invented one is worse
+            # than none — say nothing rather than "(0 replies)".
+            replies = ($5 == "") ? "" : "  \033[2m(" $5 " replies)\033[0m"
 
             # "C123/1785174817.436329" → ".../archives/C123/p1785174817436329".
             # Only the timestamp loses its dot; the host keeps its own.
@@ -442,13 +545,23 @@ render_threads() {
             sub(/\./, "", ts)
             link = "https://" host "/archives/" loc[1] "/p" ts
 
+            # A DM arrives as "@<user id>" — resolve it to a name, since an id is
+            # not something you recognise a conversation by.
+            where = $3
+            if (substr(where, 1, 1) == "@") {
+                who = substr(where, 2)
+                where = "@" ((who in name) ? name[who] : who)
+            } else {
+                where = "#" where
+            }
+
             print mark " \033[2m" ago($1) "\033[0m  " \
-                  "\033[38;5;109m" fit("#" $3, 22) "\033[0m " \
+                  "\033[38;5;109m" fit(where, 22) "\033[0m " \
                   "\033[38;5;141m" fit(author, 14) "\033[0m " \
-                  clip(unmark($6), 200) "  \033[2m(" $5 " replies)\033[0m", \
+                  clip(unmark($6), 200) replies, \
                   link
         }
-    ' "$THREADS_TSV"
+    ' "$src"
 }
 
 # ---------------------------------------------------------------------------
@@ -502,29 +615,53 @@ fi
 require_user_token || exit 2
 require_scopes || exit 2
 
+# Where the list comes from. With search it is two calls and the answer is the
+# question; without it, the same list has to be reconstructed by reading every
+# channel you're in, one call each.
+if has_search; then LIST_MODE=search; else LIST_MODE=sweep; fi
+
+refresh_primary() {
+    if [ "$LIST_MODE" = search ]; then
+        refresh_threads_via_search
+    else
+        refresh_channels
+        refresh_threads
+    fi
+}
+
 # Reload bindings re-enter here. Nothing is printed to stderr on this path: fzf
 # owns the terminal while it runs, and a stray line would land on top of it.
 if [ -n "$RENDER_MODE" ]; then
     case "$RENDER_MODE" in
-        all)     render_threads all ;;
-        refresh) refresh_threads >/dev/null 2>&1 || true; render_threads mine ;;
+        # Threads matching words rather than matching you, so they are shown
+        # whether or not you were in them.
+        query)   render_threads all "$(query_threads_file "$RENDER_QUERY")" ;;
+        all)     refresh_channels >/dev/null 2>&1 || true
+                 refresh_threads >/dev/null 2>&1 || true
+                 render_threads all ;;
+        refresh) refresh_primary >/dev/null 2>&1 || true; render_threads mine ;;
         *)       render_threads mine ;;
     esac
     exit 0
 fi
 
 refresh_users
-refresh_channels
 
 # Resolved once, and absolutely: it is handed to a detached process below and to
 # fzf's reload bindings further down, neither of which inherits this cwd.
 self=$(readlink -f "$0")
 
-# A cold cache is worth waiting for; a stale one isn't. Serve what's on disk and
-# refresh behind the picker, so it only ever opens slowly once.
-if [ ! -s "$THREADS_TSV" ] || [ "$FORCE_THREADS" = true ]; then
+if [ "$LIST_MODE" = search ]; then
+    # A second, and current. Nothing to gain by serving yesterday's answer.
+    if [ ! -s "$THREADS_TSV" ] || [ "$FORCE_THREADS" = true ] || stale "$THREADS_TSV" "$THREADS_TTL"; then
+        refresh_threads_via_search \
+            || { echo -e "  ${YELLOW}slack-pick-thread: search returned nothing${RESET}" >&2; exit 2; }
+    fi
+elif [ ! -s "$THREADS_TSV" ] || [ "$FORCE_THREADS" = true ]; then
+    # A cold sweep is worth waiting for; a stale one isn't. Serve what's on disk
+    # and refresh behind the picker, so it only ever opens slowly once.
     echo "  Reading your Slack threads…" >&2
-    refresh_threads || { echo "slack-pick-thread: could not read Slack threads" >&2; exit 2; }
+    refresh_primary || { echo "slack-pick-thread: could not read Slack threads" >&2; exit 2; }
 elif stale "$THREADS_TSV" "$THREADS_TTL"; then
     # Detached, so closing the terminal on the picker doesn't take the refresh
     # with it and leave a half-written cache behind.
@@ -542,6 +679,18 @@ fi
 scope=mine
 [ -n "$(render_threads mine | head -1)" ] || scope=all
 
+# Ctrl-A widens the net, but to different places. With search it means "look for
+# these words across the workspace, mine or not" — the thread about a thing you
+# were never in, which no amount of local filtering will surface. Without search
+# there is nothing to search, so the only way to widen is the channel sweep.
+if [ "$LIST_MODE" = search ]; then
+    widen_bind="ctrl-a:change-prompt(  Slack search > )+reload('$self' --render-query {q})"
+    widen_help='Ctrl-A: search the workspace for what you typed'
+else
+    widen_bind="ctrl-a:change-prompt(  Slack all threads > )+reload('$self' --render all)"
+    widen_help='Ctrl-A: every recent thread in your channels'
+fi
+
 selection=$(
     render_threads "$scope" | $FZF \
         --ansi \
@@ -552,8 +701,8 @@ selection=$(
         --border=rounded \
         --print-query \
         --prompt="  Slack > " \
-        --header=$'Ctrl-A: every recent thread  │  Ctrl-R: refresh\nOr paste a Slack URL and press Enter' \
-        --bind "ctrl-a:change-prompt(  Slack all threads > )+reload('$self' --render all)" \
+        --header="${widen_help}  │  Ctrl-R: back to your threads"$'\nOr paste a Slack URL and press Enter' \
+        --bind "$widen_bind" \
         --bind "ctrl-r:change-prompt(  Slack > )+reload('$self' --render refresh)" \
         --bind 'ctrl-d:half-page-down,ctrl-u:half-page-up' \
     || true
