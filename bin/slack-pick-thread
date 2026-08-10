@@ -17,15 +17,16 @@
 # URL means leaving the terminal, finding the thread, "Copy link", and coming back.
 # The same thread is two keystrokes away if we go and read the ones you're in.
 #
-# Requires a user token (xoxp) in SLACK_USER_TOKEN. A bot token cannot see which
-# channels *you* are in, so the bot token that posts the MR is no use for finding
-# where to post it.
+# Requires a user token (xoxp) in SLACK_USER_TOKEN, issued by the same app as
+# TICKET_CREATOR_BOT_TOKEN. A bot token cannot stand in: it can only see the
+# channels the BOT is in, and the question here is which channels YOU are in.
 #
-# SLACK_REACT_TOKEN is accepted as a fallback because that is where this started:
-# the reaction-notifier app's user token already carried the history scopes, so the
-# picker borrowed it. That app is a different app with a different job, and a tool
-# in this toolkit should not break when it is reinstalled — prefer a user token on
-# the same app as TICKET_CREATOR_BOT_TOKEN, under SLACK_USER_TOKEN.
+# There is deliberately no fallback to another app's user token. This started out
+# borrowing the reaction-notifier's, which worked because that app happened to
+# carry the history scopes — but a token is issued per app install, so falling
+# back means this tool's behaviour depends on which unrelated app is installed,
+# --check reports scopes from an app you are not configuring, and the fix it
+# prints names the wrong one. Set it up on its own app.
 #
 # search.messages would answer "what have I been part of" in one call, but needs a
 # search:read scope. Without it the list is reconstructed from what the granted
@@ -94,9 +95,12 @@ SCOPES_REQUIRED="channels:read channels:history"     # public channels — the f
 SCOPES_PRIVATE="groups:read groups:history"          # private channels
 SCOPES_NAMES="users:read"                            # names instead of U0123ABC
 
-SLACK_TOKEN="${SLACK_USER_TOKEN:-${SLACK_REACT_TOKEN:-}}"
+SLACK_TOKEN="${SLACK_USER_TOKEN:-}"
 if [ -z "$SLACK_TOKEN" ]; then
-    echo "slack-pick-thread: no user token — set SLACK_USER_TOKEN (xoxp) in .env" >&2
+    # Not configured is not the same as misconfigured: the picker is optional and
+    # pasting a URL still works, so this stays a single line. A token that IS set
+    # but cannot do the job gets the loud treatment further down.
+    echo -e "  ${DIM}slack-pick-thread: SLACK_USER_TOKEN not set — see .env.example${RESET}" >&2
     exit 2
 fi
 for tool in curl jq awk; do
@@ -201,11 +205,6 @@ missing_scopes() {
     printf '%s' "${out# }"
 }
 
-# Which token variable is actually in play, for messages that tell you where to fix it.
-token_var_name() {
-    if [ -n "${SLACK_USER_TOKEN:-}" ]; then echo "SLACK_USER_TOKEN"; else echo "SLACK_REACT_TOKEN"; fi
-}
-
 # Refuse loudly rather than sweep 66 channels for an empty list. Silence here is
 # the failure mode worth designing against: every call comes back missing_scope,
 # every one is discarded, and the picker reports that you have no threads.
@@ -214,18 +213,17 @@ require_scopes() {
     missing=$(missing_scopes "$SCOPES_REQUIRED")
     [ -z "$missing" ] && return 0
 
-    local var
-    var=$(token_var_name)
     {
         echo ""
-        echo -e "${RED}${BOLD}  ✗ slack-pick-thread: ${var} is missing scopes it needs${RESET}"
+        echo -e "${RED}${BOLD}  ✗ slack-pick-thread: SLACK_USER_TOKEN is missing scopes it needs${RESET}"
         echo ""
         echo -e "    ${RED}missing:${RESET} ${BOLD}${missing}${RESET}"
         echo -e "    ${DIM}granted:${RESET} ${DIM}${SLACK_SCOPES:-<none reported>}${RESET}"
         echo -e "    ${DIM}token:   ${SLACK_WHO:-?} @ ${SLACK_TEAM:-?}${RESET}"
         echo ""
-        echo -e "    ${DIM}Add them under ${RESET}User Token Scopes${DIM} at api.slack.com/apps, reinstall the${RESET}"
-        echo -e "    ${DIM}app, and put the new xoxp- token in .env as ${RESET}${var}${DIM}.${RESET}"
+        echo -e "    ${DIM}Add them under ${RESET}User Token Scopes${DIM} on the same app as${RESET}"
+        echo -e "    ${DIM}TICKET_CREATOR_BOT_TOKEN, reinstall it, and put the new xoxp- token${RESET}"
+        echo -e "    ${DIM}in .env as ${RESET}SLACK_USER_TOKEN${DIM}.${RESET}"
         echo -e "    ${DIM}Then: ${RESET}slack-pick-thread --check"
         echo ""
         echo -e "    ${DIM}Skipping the picker — paste a Slack URL instead.${RESET}"
@@ -419,7 +417,7 @@ load_identity || exit 2
 
 if [ "$CHECK_ONLY" = true ]; then
     echo ""
-    echo -e "  ${BOLD}$(token_var_name)${RESET}  ${DIM}(${SLACK_WHO:-?} @ ${SLACK_TEAM:-?})${RESET}"
+    echo -e "  ${BOLD}SLACK_USER_TOKEN${RESET}  ${DIM}(${SLACK_WHO:-?} @ ${SLACK_TEAM:-?})${RESET}"
     echo ""
     # Split on | — scope names are full of colons.
     for group in "$SCOPES_REQUIRED|required — public channels" \

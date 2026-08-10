@@ -319,6 +319,22 @@ EOF
 
 # --- availability ------------------------------------------------------------
 
+@test "the token comes from SLACK_USER_TOKEN alone, never another app's" {
+    # A token is issued per app install. Falling back to the reaction-notifier's
+    # would make this tool work or break according to an app you aren't
+    # configuring, and report that app's scopes when you went looking for why.
+    run grep -c "SLACK_REACT_TOKEN" "$REPO_ROOT/bin/slack-pick-thread"
+    [ "$output" = "0" ]
+}
+
+@test "no token at all is a quiet skip, not a misconfiguration" {
+    # Pasting still works, so an unconfigured picker must not shout on every run.
+    SLACK_USER_TOKEN="" run "$REPO_ROOT/bin/slack-pick-thread"
+    [ "$status" -eq 2 ]
+    [ "${#lines[@]}" -eq 1 ]
+    [[ "$output" == *"SLACK_USER_TOKEN not set"* ]]
+}
+
 @test "unknown arguments are refused as unavailable, not as a cancel" {
     # Exit 2 is the caller's cue to fall back to a paste prompt; exit 1 would
     # read as "the user declined to post".
