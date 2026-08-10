@@ -35,6 +35,8 @@
 #   - State is saved after ticket creation
 #   - If script fails (e.g., pre-push checks fail), run 'oneshot' again to resume
 #   - You can add more commits and continue from where you left off
+#   - An interruption at the final "paste a Slack URL" prompt resumes straight to
+#     that prompt: the MR is already up, so there's nothing left to redo
 
 set -e
 
@@ -599,6 +601,33 @@ if [ -n "$saved_state" ]; then
         clear_state
         echo -e "  ${DIM}Cleared saved state, starting fresh${RESET}" >&2
         echo "" >&2
+    fi
+fi
+
+# The previous run got the MR up and was interrupted before its Slack post
+# landed. Steps 1 through 5 would all no-op their way back to that one prompt —
+# but not cheaply: the commit loop and a full check suite stand between here and
+# there. publish-changes can serve the outstanding post on its own, so hand it
+# over and stop.
+#
+# load_pending_slack refuses the record if HEAD has moved; the staged check adds
+# the other half of "nothing new here", so a fresh oneshot on the same branch and
+# commit still runs in full.
+if [ "$DRY_RUN" != true ]; then
+    pending_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+    if git diff --cached --quiet 2>/dev/null && pending_record=$(load_pending_slack "$pending_branch"); then
+        echo -e "${YELLOW}⚠ This branch's MR is already up — only its Slack post is outstanding${RESET}" >&2
+        echo -e "  ${DIM}$(printf '%s' "$pending_record" | jq -r '.mr_url')${RESET}" >&2
+        echo "" >&2
+
+        if ! "$SCRIPT_DIR/publish-changes" --branch "$pending_branch"; then
+            echo -e "${RED}  ✗ publish-changes failed${RESET}" >&2
+            exit 1
+        fi
+
+        clear_state
+        echo -e "${GREEN}=== Done ===${RESET}" >&2
+        exit 0
     fi
 fi
 

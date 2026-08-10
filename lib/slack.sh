@@ -9,12 +9,90 @@
 #   parse_slack_url <url>             → sets SLACK_CHANNEL / SLACK_THREAD_TS, returns 1 if not a Slack URL
 #   verify_slack_channel_access <ch>  → returns 0 if bot can post (or can't be sure), 1 if definitively blocked
 #   post_to_slack <ch> <thread_ts> <ticket|mr> <url> <title>
+#   save_pending_slack / load_pending_slack / clear_pending_slack — see below
 
 # Prevent multiple loads
 if [ -n "$SLACK_LIB_LOADED" ]; then
     return 0
 fi
 SLACK_LIB_LOADED=1
+
+# ---------------------------------------------------------------------------
+# Pending Slack post
+#
+# The MR is created, pushed, and linked in Jira before anyone is asked where in
+# Slack it should go. Everything up to that point is durable — it's on the
+# remote — but the answer to "which thread?" lives only in a prompt, and a
+# closed terminal or a stray Ctrl-C there takes the MR's only link back to the
+# conversation that asked for it with it.
+#
+# So the outstanding post gets written down before the prompt and cleared once
+# it's served, either by posting or by a deliberate skip. What survives is only
+# ever an interruption.
+#
+# Keyed on the worktree root: one unfinished post per checkout, which is as many
+# as can be in flight, and it keeps sibling worktrees from stepping on each
+# other. The record also carries the HEAD it was written at — see
+# load_pending_slack for why that matters.
+# ---------------------------------------------------------------------------
+
+PENDING_SLACK_DIR="${PENDING_SLACK_DIR:-$HOME/.cache/publish-changes/pending-slack}"
+
+pending_slack_file() {
+    local repo_root
+    repo_root=$(git rev-parse --show-toplevel 2>/dev/null) || return 1
+    printf '%s/%s.json\n' "$PENDING_SLACK_DIR" "$(printf '%s' "$repo_root" | sed 's|/|_|g')"
+}
+
+# save_pending_slack <branch> <mr_url> <mr_title> <ticket_key> <ticket_summary>
+#                    <post_ticket_link> [slack_url]
+#
+# post_ticket_link records whether the ticket link is still owed to the thread
+# too. oneshot posts it itself when it knew the destination up front, so this is
+# true only when the destination arrives late, at the prompt below.
+save_pending_slack() {
+    local file
+    file=$(pending_slack_file) || return 1
+    mkdir -p "$(dirname "$file")"
+    jq -n \
+        --arg branch "$1" \
+        --arg head_sha "$(git rev-parse HEAD 2>/dev/null)" \
+        --arg mr_url "$2" \
+        --arg mr_title "$3" \
+        --arg ticket_key "$4" \
+        --arg ticket_summary "$5" \
+        --arg post_ticket_link "$6" \
+        --arg slack_url "${7:-}" \
+        '{branch: $branch, head_sha: $head_sha, mr_url: $mr_url, mr_title: $mr_title,
+          ticket_key: $ticket_key, ticket_summary: $ticket_summary,
+          post_ticket_link: $post_ticket_link, slack_url: $slack_url,
+          timestamp: now | todate}' > "$file"
+}
+
+# load_pending_slack <branch> → prints the record, or returns 1 if none applies.
+#
+# A record only applies to the branch it was written for, at the commit it was
+# written at. A moved HEAD means there's work the MR hasn't seen yet, so the
+# caller should run its normal flow — push included — rather than treat the MR
+# as finished and jump to the prompt. The record isn't discarded on a mismatch;
+# the normal flow ends at the same prompt and will clear it there.
+load_pending_slack() {
+    local file record
+    file=$(pending_slack_file) || return 1
+    [ -f "$file" ] || return 1
+    record=$(cat "$file" 2>/dev/null) || return 1
+
+    [ "$(printf '%s' "$record" | jq -r '.branch // empty' 2>/dev/null)" = "$1" ] || return 1
+    [ "$(printf '%s' "$record" | jq -r '.head_sha // empty' 2>/dev/null)" = "$(git rev-parse HEAD 2>/dev/null)" ] || return 1
+
+    printf '%s\n' "$record"
+}
+
+clear_pending_slack() {
+    local file
+    file=$(pending_slack_file) || return 0
+    rm -f "$file"
+}
 
 # Escape text for Slack mrkdwn. Slack treats &, <, > as control characters
 # (entity/link delimiters), so any human-supplied text — ticket titles, names —

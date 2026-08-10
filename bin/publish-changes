@@ -21,6 +21,9 @@
 #   - Clipboard copy of MR URL
 #   - Opens MR in browser
 #   - Jira integration: adds MR link comment, updates status, sets QA branch
+#   - Resumable Slack post: if a run is interrupted at the "paste a Slack URL"
+#     prompt, re-running it on the same branch skips straight back to that prompt
+#     instead of re-pushing and re-creating an MR that already exists
 #
 # Requirements:
 #   - glab (GitLab CLI)
@@ -546,6 +549,101 @@ add_slack_ref_to_mr() {
     return 0
 }
 
+# Post the MR link — and, when the destination arrived too late for oneshot to
+# have done it, the ticket link — to an already-parsed Slack destination.
+# Expects parse_slack_url to have set SLACK_CHANNEL / SLACK_THREAD_TS, and
+# reads $selected_branch / $mr_url / $mr_title / $TICKET_KEY / $summary.
+post_slack_links() {
+    local slack_url="$1"
+    local post_ticket_link="$2"
+
+    local slack_target="channel"
+    [ -n "$SLACK_THREAD_TS" ] && slack_target="thread"
+
+    add_slack_ref_to_mr "$selected_branch" "$slack_url"
+    echo -e "  ${GREEN}✓${RESET} Added Slack reference to MR description" >&2
+
+    # A definitive "the bot isn't in that channel" is worth catching before we
+    # post: the error it gives is the actionable one.
+    if [ -n "$TICKET_CREATOR_BOT_TOKEN" ] && ! verify_slack_channel_access "$SLACK_CHANNEL"; then
+        return 1
+    fi
+
+    if [ "$post_ticket_link" = "true" ] && [ -n "$TICKET_KEY" ] && [ "$NO_JIRA" != "true" ]; then
+        local ticket_title="$TICKET_KEY"
+        [ -n "$summary" ] && ticket_title="$TICKET_KEY: $summary"
+        if post_to_slack "$SLACK_CHANNEL" "$SLACK_THREAD_TS" "ticket" "https://${JIRA_DOMAIN}/browse/${TICKET_KEY}" "$ticket_title"; then
+            echo -e "  ${GREEN}✓${RESET} Posted ticket link to Slack ${slack_target}" >&2
+        fi
+    fi
+
+    if post_to_slack "$SLACK_CHANNEL" "$SLACK_THREAD_TS" "mr" "$mr_url" "$mr_title"; then
+        echo -e "  ${GREEN}✓${RESET} Posted MR link to Slack ${slack_target}" >&2
+        return 0
+    fi
+    return 1
+}
+
+# Ask where in Slack the MR should go, then post it there.
+#
+# One prompt, not two: a y/N gate in front of a paste prompt asks for the same
+# decision the paste itself already carries, and answering it is one more thing
+# to get wrong at the very end of a long run. An empty line is the "no".
+#
+# Returns 0 posted, 2 deliberately skipped, 1 failed — the caller keeps the
+# pending record only for 1, since only that is worth coming back to.
+prompt_and_post_slack() {
+    local post_ticket_link="$1"
+    local pasted=""
+
+    while :; do
+        printf "  ${CYAN}Post MR link to Slack${RESET} ${DIM}— paste a thread or channel URL (Enter to skip):${RESET} " >&2
+        read_tty -r pasted
+        if [ -z "$pasted" ]; then
+            echo -e "  ${DIM}No Slack post${RESET}" >&2
+            return 2
+        fi
+        parse_slack_url "$pasted" && break
+        # Re-ask rather than discard it. Getting here means they meant to post
+        # and mistyped, and the MR link is the one thing they can't retrieve
+        # from scrollback once the run is over.
+        echo -e "  ${YELLOW}⚠ Not a Slack URL${RESET} ${DIM}(expected .../archives/CHANNEL or .../archives/CHANNEL/pTIMESTAMP)${RESET}" >&2
+    done
+
+    echo "" >&2
+    post_slack_links "$pasted" "$post_ticket_link"
+}
+
+# Serve the outstanding Slack post: use a destination we were handed, otherwise
+# ask for one. Clears the pending record afterwards unless the attempt actually
+# failed — a failure is the one outcome worth coming back to.
+serve_slack_post() {
+    local post_ticket_link="$1"
+    local slack_url="$2"
+    local rc
+
+    if [ -n "$slack_url" ]; then
+        if parse_slack_url "$slack_url"; then
+            if post_slack_links "$slack_url" "$post_ticket_link"; then rc=0; else rc=1; fi
+        else
+            echo -e "  ${YELLOW}⚠ Invalid Slack URL, skipping Slack post${RESET}" >&2
+            rc=2
+        fi
+    elif is_interactive; then
+        if prompt_and_post_slack "$post_ticket_link"; then rc=0; else rc=$?; fi
+    else
+        # No destination and nobody to ask for one: nothing is outstanding.
+        rc=2
+    fi
+
+    if [ "$rc" -eq 1 ]; then
+        echo -e "  ${DIM}Left pending — run 'publish-changes' on this branch to retry${RESET}" >&2
+    else
+        clear_pending_slack
+    fi
+    return 0
+}
+
 # ============================================================================
 # Main flow
 # ============================================================================
@@ -586,6 +684,34 @@ else
     # Strip " (current)" suffix if present
     selected_branch=$(echo "$selected_branch" | sed 's/ (current)$//')
     echo -e "  ${GREEN}✓${RESET} Branch: ${selected_branch}" >&2
+fi
+
+# A previous run got the MR up and was interrupted before its Slack post landed.
+# Everything below — push, MR create, Jira — is already done and would only be
+# re-established at the cost of a push and a round of API calls, so serve the one
+# thing still outstanding and stop. load_pending_slack refuses the record if HEAD
+# has moved since, which is what keeps a branch with new commits on the normal path.
+if pending_record=$(load_pending_slack "$selected_branch"); then
+    mr_url=$(printf '%s' "$pending_record" | jq -r '.mr_url')
+    mr_title=$(printf '%s' "$pending_record" | jq -r '.mr_title')
+    TICKET_KEY=$(printf '%s' "$pending_record" | jq -r '.ticket_key // empty')
+    summary=$(printf '%s' "$pending_record" | jq -r '.ticket_summary // empty')
+    pending_post_ticket=$(printf '%s' "$pending_record" | jq -r '.post_ticket_link // "false"')
+    pending_slack_url=$(printf '%s' "$pending_record" | jq -r '.slack_url // empty')
+
+    echo "" >&2
+    echo -e "  ${YELLOW}⚠ This branch's MR is already up — only its Slack post is outstanding${RESET}" >&2
+    echo -e "  ${DIM}URL:${RESET}  ${UNDERLINE}${BLUE}${mr_url}${RESET}" >&2
+    echo "" >&2
+
+    # A destination we already have is one we were told to use; don't re-ask.
+    serve_slack_post "$pending_post_ticket" "${SLACK_URL:-$pending_slack_url}"
+
+    echo "" >&2
+    if [ "$OUTPUT_URL" = true ]; then
+        echo "$mr_url"
+    fi
+    exit 0
 fi
 
 # Auto-detect ticket from branch name if not provided
@@ -953,57 +1079,26 @@ echo "" >&2
 
 # Post MR link to Slack. Consolidated here so callers (e.g. oneshot) reuse it
 # instead of duplicating the prompt. A caller can pass --slack-url to post
-# non-interactively; otherwise we offer an interactive prompt.
+# non-interactively; otherwise we ask for a destination.
 if [ -n "$mr_url" ]; then
-    if [ -n "$SLACK_URL" ]; then
-        # Non-interactive: caller provided a Slack URL
-        if parse_slack_url "$SLACK_URL"; then
-            slack_target="channel"
-            [ -n "$SLACK_THREAD_TS" ] && slack_target="thread"
-            add_slack_ref_to_mr "$selected_branch" "$SLACK_URL"
-            echo -e "  ${DIM}Posting MR link to Slack ${slack_target}...${RESET}" >&2
-            if post_to_slack "$SLACK_CHANNEL" "$SLACK_THREAD_TS" "mr" "$mr_url" "$mr_title"; then
-                echo -e "  ${GREEN}✓${RESET} Posted MR link to Slack ${slack_target}" >&2
-            fi
-        else
-            echo -e "  ${YELLOW}⚠ Invalid Slack URL, skipping Slack post${RESET}" >&2
-        fi
-    elif is_interactive; then
-        # Interactive: offer to post the MR link to a Slack thread/channel
-        printf "  ${CYAN}Post MR link to Slack?${RESET} ${DIM}(y/N)${RESET} " >&2
-        read_tty -n 1 post_slack_choice
-        echo "" >&2
-        if [[ "$post_slack_choice" =~ ^[Yy]$ ]]; then
-            printf "  ${CYAN}Paste Slack URL (thread or channel):${RESET} " >&2
-            read_tty -r pasted_slack_url
-            if parse_slack_url "$pasted_slack_url"; then
-                echo "" >&2
-                add_slack_ref_to_mr "$selected_branch" "$pasted_slack_url"
-                echo -e "  ${GREEN}✓${RESET} Added Slack reference to MR description" >&2
-                if [ -n "$TICKET_CREATOR_BOT_TOKEN" ] && ! verify_slack_channel_access "$SLACK_CHANNEL"; then
-                    echo -e "  ${YELLOW}⚠ Skipping Slack post${RESET}" >&2
-                else
-                    # Post the ticket link too, not just the MR — but only when the
-                    # caller created the ticket this run (--ticket-created). When the
-                    # Slack URL is pasted here rather than passed up front, oneshot
-                    # never got to post the ticket link itself, so do it now.
-                    # Publishing an MR for a pre-existing ticket skips this.
-                    if [ "$TICKET_CREATED" = "true" ] && [ -n "$TICKET_KEY" ] && [ "$NO_JIRA" != "true" ]; then
-                        ticket_title="$TICKET_KEY"
-                        [ -n "$summary" ] && ticket_title="$TICKET_KEY: $summary"
-                        if post_to_slack "$SLACK_CHANNEL" "$SLACK_THREAD_TS" "ticket" "https://${JIRA_DOMAIN}/browse/${TICKET_KEY}" "$ticket_title"; then
-                            echo -e "  ${GREEN}✓${RESET} Posted ticket link to Slack" >&2
-                        fi
-                    fi
-                    if post_to_slack "$SLACK_CHANNEL" "$SLACK_THREAD_TS" "mr" "$mr_url" "$mr_title"; then
-                        echo -e "  ${GREEN}✓${RESET} Posted MR link to Slack" >&2
-                    fi
-                fi
-            else
-                echo -e "  ${YELLOW}⚠ Invalid Slack URL, skipping${RESET}" >&2
-            fi
-        fi
+    # Post the ticket link alongside the MR only when the destination arrives at
+    # the prompt below: a caller that knew it up front (--slack-url) already
+    # posted the ticket link itself, and publishing an MR against a ticket that
+    # existed before this run shouldn't announce "a ticket" in the thread at all.
+    post_ticket_link=false
+    if [ -z "$SLACK_URL" ] && [ "$TICKET_CREATED" = "true" ]; then
+        post_ticket_link=true
     fi
+
+    # Write the outstanding post down before attempting it. From here on the MR
+    # is real and the only thing that can still be lost is where it should be
+    # announced — see lib/slack.sh.
+    if [ -n "$SLACK_URL" ] || is_interactive; then
+        save_pending_slack "$selected_branch" "$mr_url" "$mr_title" \
+            "$TICKET_KEY" "$summary" "$post_ticket_link" "$SLACK_URL"
+    fi
+
+    serve_slack_post "$post_ticket_link" "$SLACK_URL"
     echo "" >&2
 fi
 
