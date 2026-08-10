@@ -1,12 +1,11 @@
 #!/usr/bin/env bats
 
-# Tests for --no-autofix in oneshot and publish-changes.
+# Tests for --no-autofix and --no-verify in oneshot and publish-changes.
 #
-# The pre-push hook's autofix stage rewrites files with prettier/eslint and
-# commits the result. --no-autofix suppresses that stage by setting
-# SKIP_PRE_PUSH_AUTOFIX=true — in publish-changes on the `git push` itself, in
-# oneshot on its direct invocation of the hook. Both tests assert on what the
-# hook/push actually saw in its environment, not on the scripts' own output.
+# --no-autofix suppresses the hook's prettier/eslint stage (which rewrites files
+# and commits the result) by setting SKIP_PRE_PUSH_AUTOFIX=true, leaving the
+# checks running. --no-verify skips the hook outright. Both tests assert on what
+# the hook/push actually saw — its environment and argv — not on script output.
 
 setup() {
     REPO_ROOT="$(cd "$(dirname "$BATS_TEST_FILENAME")/.." && pwd)"
@@ -34,15 +33,15 @@ teardown() {
     [ -n "$TEST_TMPDIR" ] && rm -rf "$TEST_TMPDIR"
 }
 
-# git stub that records the autofix env var on `git push` and short-circuits it,
-# delegating every other subcommand to the real git.
+# git stub that records how `git push` was invoked — the autofix env var and the
+# full argv — then short-circuits it, delegating every other subcommand to real git.
 stub_git_push() {
     local real_git
     real_git=$(command -v git)
     cat > "$STUB_BIN/git" <<EOF
 #!/usr/bin/env bash
 if [ "\$1" = "push" ]; then
-    echo "SKIP_PRE_PUSH_AUTOFIX=\${SKIP_PRE_PUSH_AUTOFIX-<unset>}" >> "$ENV_LOG"
+    echo "SKIP_PRE_PUSH_AUTOFIX=\${SKIP_PRE_PUSH_AUTOFIX-<unset>} argv=\$*" >> "$ENV_LOG"
     exit 0
 fi
 exec "$real_git" "\$@"
@@ -85,7 +84,7 @@ EOF
     run "$REPO_ROOT/bin/publish-changes" \
         --branch main --target main --no-jira --no-draft-prompt --no-autofix
     [ -f "$ENV_LOG" ]
-    [ "$(cat "$ENV_LOG")" = "SKIP_PRE_PUSH_AUTOFIX=true" ]
+    [[ "$(cat "$ENV_LOG")" == "SKIP_PRE_PUSH_AUTOFIX=true "* ]]
 }
 
 @test "publish-changes without the flag: push leaves autofix enabled" {
@@ -95,7 +94,29 @@ EOF
     run "$REPO_ROOT/bin/publish-changes" \
         --branch main --target main --no-jira --no-draft-prompt
     [ -f "$ENV_LOG" ]
-    [ "$(cat "$ENV_LOG")" = "SKIP_PRE_PUSH_AUTOFIX=<unset>" ]
+    [[ "$(cat "$ENV_LOG")" == "SKIP_PRE_PUSH_AUTOFIX=<unset> "* ]]
+}
+
+@test "publish-changes --no-verify: push gets git's own --no-verify" {
+    stub_git_push
+    stub_glab
+    cd "$GIT_REPO"
+    run "$REPO_ROOT/bin/publish-changes" \
+        --branch main --target main --no-jira --no-draft-prompt --no-verify
+    [ -f "$ENV_LOG" ]
+    [[ "$(cat "$ENV_LOG")" == *"--no-verify"* ]]
+    # --no-verify skips the hook outright, so the env var isn't needed as well.
+    [[ "$(cat "$ENV_LOG")" == "SKIP_PRE_PUSH_AUTOFIX=<unset> "* ]]
+}
+
+@test "publish-changes without --no-verify: push does not suppress the hook" {
+    stub_git_push
+    stub_glab
+    cd "$GIT_REPO"
+    run "$REPO_ROOT/bin/publish-changes" \
+        --branch main --target main --no-jira --no-draft-prompt
+    [ -f "$ENV_LOG" ]
+    [[ "$(cat "$ENV_LOG")" != *"--no-verify"* ]]
 }
 
 # --- oneshot -----------------------------------------------------------------
@@ -120,4 +141,16 @@ EOF
     # Set-but-empty is what an unflagged run passes; the hook's `!= "true"` test
     # treats it the same as unset, so autofix still runs.
     [ "$(cat "$ENV_LOG")" = "SKIP_PRE_PUSH_AUTOFIX=<unset>" ]
+}
+
+@test "oneshot --no-verify: the pre-push hook never runs" {
+    install_recording_hook
+    cd "$GIT_REPO"
+    echo change > file.txt
+    git add file.txt
+    run "$REPO_ROOT/bin/oneshot" --hotfix "test hotfix" --no-verify
+    # The recording hook exits 1, so its absence is what lets oneshot get past
+    # Step 1.5 at all — it dies later, on a prompt with no tty.
+    [ ! -f "$ENV_LOG" ]
+    [[ "$output" == *"Skipping pre-push checks (--no-verify)"* ]]
 }

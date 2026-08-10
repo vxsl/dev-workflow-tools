@@ -1068,6 +1068,31 @@ ED
     [[ "$out" != *"$H_SIBLING/"* ]]
 }
 
+# The preferred-dirs sweeps only exist to RERANK what the $HOME pass finds, so one
+# pointed inside a pruned worktree has nothing to rerank -- it can only put the pruned
+# tree back. exclude_args_under cannot catch this: it prunes what lies BELOW a search
+# root, and here the search root is below the thing being pruned. Measured on the real
+# checkout, FZEDIT_PREFERRED_DIRS=~/work/repos/ul/client/web re-added 2089 base-repo
+# rows, each a duplicate of a scope file under a name you cannot tell apart from it.
+@test "a preferred dir inside a pruned worktree does not resurrect it" {
+    setup_repo_under_home
+    export FZEDIT_PREFERRED_DIRS="$H_MAIN/src"
+    pin_scope "$H_SIBLING"
+    out="$(rows_of_type f | cut -f2)"
+    [[ "$out" != *"$H_MAIN/"* ]]
+    [[ "$out" == *"$H_SIBLING/src/sibling-only.ts"* ]]
+}
+
+@test "a preferred dir outside every pruned tree is still swept" {
+    setup_repo_under_home
+    mkdir -p "$HOME/loose"
+    echo x > "$HOME/loose/preferred.ts"
+    export FZEDIT_PREFERRED_DIRS="$HOME/loose"
+    pin_scope "$H_SIBLING"
+    out="$(rows_of_type f | cut -f2)"
+    [[ "$out" == *"$HOME/loose/preferred.ts"* ]]
+}
+
 @test "home rung still reaches files under \$HOME outside any repo" {
     setup_repo_under_home
     pin_scope "$H_MAIN"

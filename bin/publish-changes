@@ -12,6 +12,7 @@
 #   publish-changes --include-ticket-description  Include ticket description in MR description
 #   publish-changes --slack-url <url>         Post MR link to the given Slack thread/channel (no prompt)
 #   publish-changes --no-autofix              Skip the pre-push hook's prettier/eslint autofix stage
+#   publish-changes --no-verify               Skip the pre-push hook entirely (implies --no-autofix)
 #
 # Features:
 #   - Interactive branch selection with fzf
@@ -86,6 +87,10 @@ FORCE_PUSH=false
 # --no-autofix: push with SKIP_PRE_PUSH_AUTOFIX=true so the pre-push hook runs its
 # checks but doesn't rewrite files and tack on "autofix:" commits.
 NO_AUTOFIX=false
+# --no-verify: push with git's own --no-verify, so the hook never runs at all.
+# Supersedes --no-autofix, and unlike SKIP_PRE_PUSH_CHECKS it doesn't rely on the
+# hook cooperating — it covers pre-commit-managed hooks too.
+NO_VERIFY=false
 INCLUDE_TICKET_DESCRIPTION=false
 TICKET_DESCRIPTION=""
 MR_TITLE_OVERRIDE=""
@@ -143,6 +148,10 @@ while [[ "$#" -gt 0 ]]; do
             NO_AUTOFIX=true
             shift
             ;;
+        --no-verify)
+            NO_VERIFY=true
+            shift
+            ;;
         --force-push)
             FORCE_PUSH=true
             shift
@@ -172,7 +181,9 @@ while [[ "$#" -gt 0 ]]; do
             shift
             ;;
         --help|-h)
-            head -36 "$0" | tail -34
+            # Print the leading comment header — everything between the shebang and
+            # the first line of code. No line counts to keep in sync with edits.
+            sed -n '2,/^[^#]/{/^[^#]/!p;}' "$0"
             exit 0
             ;;
         *)
@@ -609,19 +620,23 @@ if [ "$SKIP_PUSH" != "true" ]; then
     echo -e "${CYAN}┃${RESET} ${BLUE}Step 2/4:${RESET} Pushing branch to remote                      ${CYAN}┃${RESET}" >&2
     echo -e "${CYAN}┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛${RESET}" >&2
 
-    # With --no-autofix the pre-push hook still runs its checks, it just won't
-    # rewrite files and add "autofix:" commits — so the retry path below is dead.
+    # Either flag makes the autofix-retry path below dead: --no-autofix leaves the
+    # checks running but stops the hook rewriting files, --no-verify skips the hook.
     push_env=()
-    if [ "$NO_AUTOFIX" = "true" ]; then
+    push_opts=()
+    if [ "$NO_VERIFY" = "true" ]; then
+        push_opts=(--no-verify)
+        echo -e "  ${YELLOW}⚠${RESET} Skipping pre-push hook (--no-verify)" >&2
+    elif [ "$NO_AUTOFIX" = "true" ]; then
         push_env=(env SKIP_PRE_PUSH_AUTOFIX=true)
         echo -e "  ${DIM}Skipping pre-push autofix (--no-autofix)${RESET}" >&2
     fi
 
-    echo -e "  ${DIM}Running: git push -u origin ${selected_branch}${RESET}" >&2
+    echo -e "  ${DIM}Running: git push -u origin ${selected_branch}${push_opts[*]:+ ${push_opts[*]}}${RESET}" >&2
 
     push_tmp=$(mktemp)
     trap "rm -f '$push_tmp'" EXIT
-    "${push_env[@]}" git push -u origin "$selected_branch" 2>&1 | tee "$push_tmp" | while read -r line; do
+    "${push_env[@]}" git push -u origin "$selected_branch" "${push_opts[@]}" 2>&1 | tee "$push_tmp" | while read -r line; do
         echo -e "  ${DIM}${line}${RESET}" >&2
     done
     push_exit_code="${PIPESTATUS[0]}"
@@ -656,7 +671,7 @@ if [ "$SKIP_PUSH" != "true" ]; then
         fi
         if [[ "$force_choice" =~ ^[Yy]$ ]]; then
             echo -e "  ${DIM}Running: git push -u origin ${selected_branch} --force-with-lease${RESET}" >&2
-            "${push_env[@]}" git push -u origin "$selected_branch" --force-with-lease 2>&1 | while read -r line; do
+            "${push_env[@]}" git push -u origin "$selected_branch" --force-with-lease "${push_opts[@]}" 2>&1 | while read -r line; do
                 echo -e "  ${DIM}${line}${RESET}" >&2
             done
             if [ ${PIPESTATUS[0]} -eq 0 ]; then

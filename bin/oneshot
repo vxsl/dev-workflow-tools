@@ -16,6 +16,7 @@
 #   oneshot --base origin/main           Explicitly set base branch (default: origin/main)
 #   oneshot --include-ticket-description Include ticket description in MR description
 #   oneshot --no-autofix                 Skip the pre-push hook's prettier/eslint autofix stage
+#   oneshot --no-verify                  Skip the pre-push hook entirely (implies --no-autofix)
 #
 # Workflow:
 #   1. Check for staged changes
@@ -74,6 +75,9 @@ ISSUE_TYPE=""
 # --no-autofix: run the pre-push hook with SKIP_PRE_PUSH_AUTOFIX=true so it checks
 # without rewriting files and adding "autofix:" commits. Propagated to publish-changes.
 NO_AUTOFIX=false
+# --no-verify: don't run the pre-push hook at all — neither oneshot's own
+# invocations nor the push publish-changes makes. Supersedes --no-autofix.
+NO_VERIFY=false
 # Tracks whether THIS run created the Jira ticket (vs. publishing for an existing
 # one). Gates the ticket-link Slack post so we don't announce "a ticket" when
 # oneshot is just publishing an MR against a ticket that already existed.
@@ -121,8 +125,14 @@ while [[ "$#" -gt 0 ]]; do
             NO_AUTOFIX=true
             shift
             ;;
+        --no-verify)
+            NO_VERIFY=true
+            shift
+            ;;
         --help|-h)
-            head -21 "$0" | tail -20
+            # Print the leading comment header — everything between the shebang and
+            # the first line of code. No line counts to keep in sync with edits.
+            sed -n '2,/^[^#]/{/^[^#]/!p;}' "$0"
             exit 0
             ;;
         *)
@@ -326,7 +336,15 @@ cleanup_prepush_cache() {
 # Run pre-push checks
 run_prepush_checks() {
     local repo_dir="$1"
-    
+
+    # --no-verify: don't run the hook at all. Announced from here so the message
+    # lands once, at whichever call site gets here first.
+    if [ "$NO_VERIFY" = true ]; then
+        echo -e "  ${YELLOW}⚠ Skipping pre-push checks (--no-verify)${RESET}" >&2
+        echo "" >&2
+        return 0
+    fi
+
     echo -e "${CYAN}┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓${RESET}" >&2
     echo -e "${CYAN}┃${RESET} ${BLUE}Pre-push validation:${RESET} Running checks                     ${CYAN}┃${RESET}" >&2
     echo -e "${CYAN}┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛${RESET}" >&2
@@ -1793,7 +1811,9 @@ echo "" >&2
 # so they cover different ground than the Step 1.5 run. The prepush cache is keyed
 # on HEAD+diff and correctly misses. Say so below — a second full suite arriving
 # right after a green one reads as a bug otherwise.
-if [ "$DRY_RUN" != true ] && { [ "${PREPUSH_VALIDATED:-false}" != true ] || [ "${extra_commits_made:-false}" = true ] || [ "${REBASED:-false}" = true ]; }; then
+# --no-verify suppresses this block entirely rather than letting it print a
+# "Running checks" box around a no-op; the skip was already announced at Step 1.5.
+if [ "$DRY_RUN" != true ] && [ "$NO_VERIFY" != true ] && { [ "${PREPUSH_VALIDATED:-false}" != true ] || [ "${extra_commits_made:-false}" = true ] || [ "${REBASED:-false}" = true ]; }; then
     repo_root=$(git rev-parse --show-toplevel)
 
     echo -e "${CYAN}┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓${RESET}" >&2
@@ -1819,7 +1839,7 @@ if [ "$DRY_RUN" != true ] && { [ "${PREPUSH_VALIDATED:-false}" != true ] || [ "$
         echo -e "  ${DIM}(The script will resume from this point)${RESET}" >&2
         exit 1
     fi
-elif [ "$DRY_RUN" != true ]; then
+elif [ "$DRY_RUN" != true ] && [ "$NO_VERIFY" != true ]; then
     echo -e "  ${DIM}Skipping pre-push checks (already validated, no changes since)${RESET}" >&2
     echo "" >&2
 fi
@@ -1898,6 +1918,11 @@ else
     # on this push, but keep the flags consistent if that ever stops being true.
     if [ "$NO_AUTOFIX" = true ]; then
         publish_args+=(--no-autofix)
+    fi
+    # SKIP_PRE_PUSH_CHECKS only silences hooks that honour it; --no-verify makes
+    # git skip the hook outright, which also covers pre-commit-managed ones.
+    if [ "$NO_VERIFY" = true ]; then
+        publish_args+=(--no-verify)
     fi
     mr_url=$(SKIP_PRE_PUSH_CHECKS=true "$SCRIPT_DIR/publish-changes" "${publish_args[@]}") || {
         echo -e "${RED}  ✗ publish-changes failed${RESET}" >&2
