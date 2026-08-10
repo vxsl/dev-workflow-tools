@@ -1181,29 +1181,30 @@ if [ "${SKIP_TO_COMMIT_LOOP:-false}" != true ]; then
             _base_current="$current_branch"
             echo -e "  ${YELLOW}⚠ You're currently on branch: ${current_branch} (no remote tracking)${RESET}" >&2
         fi
+        # One picker, not a menu in front of one: two of the three menu entries
+        # were branches and the third was this picker, so the menu only stood
+        # between you and the list. origin/main first (Enter keeps the default
+        # this prompt is offering to override), your current branch second, then
+        # everything else. `|| true` so ESC (fzf exit 130) doesn't trip `set -e`.
         echo -e "  ${CYAN}Base new branch off of:${RESET}" >&2
-        echo -e "    ${DIM}1) Current branch (${_base_current})${RESET}" >&2
-        echo -e "    ${DIM}2) origin/main${RESET}" >&2
-        echo -e "    ${DIM}3) Other branch…${RESET}" >&2
-        read -p "  > " -n 1 -r base_choice < /dev/tty
-        echo "" >&2
-
-        if [[ $base_choice =~ ^[1]$ ]]; then
-            BASE_BRANCH="$_base_current"
-        elif [[ $base_choice =~ ^[3]$ ]]; then
-            # Pick any local or remote branch. `|| true` so an ESC in fzf
-            # (exit 130) doesn't trip `set -e`.
-            _picked=$(git for-each-ref --format='%(refname:short)' refs/heads refs/remotes \
-                | grep -v '/HEAD$' | sort -u \
-                | "$FZF" --prompt="base branch> " --height=40% --reverse --no-multi || true)
-            if [ -n "$_picked" ]; then
-                BASE_BRANCH="$_picked"
-            else
-                BASE_BRANCH="$_base_current"
-                echo -e "  ${DIM}(no selection — falling back to ${_base_current})${RESET}" >&2
-            fi
+        _picked=$(
+            {
+                echo "origin/main"
+                echo "$_base_current"
+                git for-each-ref --format='%(refname:short)' refs/heads refs/remotes \
+                    | grep -v '/HEAD$'
+            } | awk '!seen[$0]++' \
+              | "$FZF" --prompt="  Base branch > " --height=40% --reverse --no-multi \
+                  --border=rounded \
+                  --header="Esc keeps origin/main │ current: ${_base_current}" \
+                  --preview='git log --oneline --decorate --color=always -20 {} 2>/dev/null' \
+                  --preview-window=right:55% || true
+        )
+        if [ -n "$_picked" ]; then
+            BASE_BRANCH="$_picked"
         else
             BASE_BRANCH="origin/main"
+            echo -e "  ${DIM}(no selection — using origin/main)${RESET}" >&2
         fi
         echo -e "  ${GREEN}✓${RESET} Will branch from: ${BASE_BRANCH}" >&2
         echo "" >&2

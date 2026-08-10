@@ -9,7 +9,13 @@
 #   create-jira-ticket --summary "..." --slack-url URL    Link to Slack thread
 #   create-jira-ticket --labels "front-end,bug"           Set the default label offered
 #   create-jira-ticket --no-labels                        Create with no labels at all
+#   create-jira-ticket --project UB                       Board to file on (skips the Step 0 picker)
 #   create-jira-ticket --dry-run                          Test without creating
+#
+# Resolved rather than asked:
+#   Board     JIRA_DEFAULT_PROJECT in .env skips the picker for every run
+#   Sprint    the board's running sprint (else the next one due to start)
+#   Assignee  you
 #
 # Output:
 #   Prints JSON to stdout on success: {"key": "PROJ-1234", "summary": "Ticket summary"}
@@ -165,38 +171,39 @@ get_labels() {
     echo "$labels"
 }
 
-# Function to get active sprints (returns most recent active sprint first, then "No sprint")
-get_sprints() {
+# The sprint a new ticket belongs in: the board's current one. Prints
+# "<id>\t<state>\t<name>", or nothing when the board runs no sprints.
+get_default_sprint() {
     # A project can be on several boards, and the first one Jira hands back is not
     # necessarily one that has sprints — UL leads with a deprecated kanban board,
-    # which answers "The board does not support sprints" and used to leave the
-    # picker empty. Kanban boards never have sprints, so skip them and try each
-    # remaining board until one yields sprints.
+    # which answers "The board does not support sprints". Kanban boards never have
+    # sprints, so skip them and try each remaining board until one yields sprints.
     local boards=$(curl -s --max-time 10 -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
         "https://${JIRA_DOMAIN}/rest/agile/1.0/board?projectKeyOrId=${JIRA_PROJECT}" 2>&1)
     local board_ids=$(echo "$boards" | jq -r '.values[]? | select(.type != "kanban") | .id' 2>/dev/null || true)
 
-    local sprint_list=""
-    local board_id
+    local board_id sprints picked
     for board_id in $board_ids; do
-        local sprints=$(curl -s --max-time 10 -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
+        sprints=$(curl -s --max-time 10 -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
             "https://${JIRA_DOMAIN}/rest/agile/1.0/board/${board_id}/sprint?state=active,future" 2>&1)
-        sprint_list=$(echo "$sprints" | jq -r '.values[]? | (.id|tostring) + " - " + .name + " (" + .state + ")"' 2>/dev/null || true)
-        [ -n "$sprint_list" ] && break
-    done
-
-    if [ -n "$sprint_list" ]; then
         # Shared boards list every project's sprints, and sprint names carry the
-        # project key ("Jul 27 - Aug 7, 2026 (UL)"). Surface this project's
-        # sprints first — the top line is what Enter takes as the default.
-        local mine="($JIRA_PROJECT)"
-        # Active before future, this project's before everyone else's.
-        echo "$sprint_list" | grep -F "$mine" | grep "(active)" || true
-        echo "$sprint_list" | grep -vF "$mine" | grep "(active)" || true
-        echo "$sprint_list" | grep -F "$mine" | grep -v "(active)" || true
-        echo "$sprint_list" | grep -vF "$mine" | grep -v "(active)" || true
-    fi
-    echo "0 - No sprint"
+        # project key ("Jul 27 - Aug 7, 2026 (UL)") — so narrow to this project's
+        # when it has any. Then: the running sprint (the latest, if several are
+        # somehow open at once), else the next one due to start.
+        picked=$(echo "$sprints" | jq -r --arg mine "($JIRA_PROJECT)" '
+            def pick:
+                ([.[] | select(.state == "active")]  | sort_by(.startDate // "") | last)
+                // ([.[] | select(.state != "active")] | sort_by(.startDate // "") | first);
+            [.values[]?] as $all
+            | [$all[] | select(.name | contains($mine))] as $ours
+            | (if ($ours | length) > 0 then $ours else $all end)
+            | pick
+            | select(. != null)
+            | ((.id|tostring) + "\t" + .state + "\t" + .name)
+        ' 2>/dev/null || true)
+        [ -n "$picked" ] && printf '%s\n' "$picked" && return 0
+    done
+    return 0
 }
 
 # Fetch the full createmeta fields object for an issue type on the resolved
@@ -245,20 +252,32 @@ mkdir -p "$CACHE_DIR"
 tmpdir="$CACHE_DIR/create_tmp"
 mkdir -p "$tmpdir"
 
-# Resolve target project. With multiple boards configured (JIRA_PROJECTS) and
-# no --project override, prompt the user to pick. All downstream code reads
-# JIRA_PROJECT, so we just assign the chosen key to it.
-if [ -n "$PROJECT_OVERRIDE" ]; then
+# Resolve target project. --project wins, then JIRA_DEFAULT_PROJECT from .env —
+# a standing answer for people who file everything on one board, and who would
+# otherwise pick the same entry at Step 0 on every run. Only when neither says
+# which board, and more than one is configured, is there a question to ask. All
+# downstream code reads JIRA_PROJECT, so we just assign the chosen key to it.
+_project_choice="$PROJECT_OVERRIDE"
+_project_source="--project"
+if [ -z "$_project_choice" ] && [ -n "${JIRA_DEFAULT_PROJECT:-}" ]; then
+    _project_choice="$JIRA_DEFAULT_PROJECT"
+    _project_source="JIRA_DEFAULT_PROJECT"
+fi
+
+if [ -n "$_project_choice" ]; then
     _valid=false
     for _p in "${JIRA_PROJECT_LIST[@]}"; do
-        [ "$_p" = "$PROJECT_OVERRIDE" ] && _valid=true && break
+        [ "$_p" = "$_project_choice" ] && _valid=true && break
     done
     if [ "$_valid" != true ]; then
-        printf "\033[38;5;167m  ✗ Error: --project '%s' is not in JIRA_PROJECTS (%s)\033[0m\n" \
-            "$PROJECT_OVERRIDE" "${JIRA_PROJECT_LIST[*]}" >&2
+        printf "\033[38;5;167m  ✗ Error: %s '%s' is not in JIRA_PROJECTS (%s)\033[0m\n" \
+            "$_project_source" "$_project_choice" "${JIRA_PROJECT_LIST[*]}" >&2
         exit 1
     fi
-    JIRA_PROJECT="$PROJECT_OVERRIDE"
+    JIRA_PROJECT="$_project_choice"
+    if [ "$_project_source" = "JIRA_DEFAULT_PROJECT" ]; then
+        printf "  \033[38;5;114m✓\033[0m Board: \033[0m%s\033[0m \033[2m(JIRA_DEFAULT_PROJECT)\033[0m\n\n" "$JIRA_PROJECT" >&2
+    fi
 elif [ "${#JIRA_PROJECT_LIST[@]}" -gt 1 ]; then
     printf "\033[38;5;109m┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\033[0m\n" >&2
     printf "\033[38;5;109m┃\033[0m \033[38;5;81mStep 0:\033[0m Select board                                    \033[38;5;109m┃\033[0m\n" >&2
@@ -293,7 +312,7 @@ echo "" >&2
 
 # Step 1: Summary
 printf "\033[38;5;109m┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\033[0m\n" >&2
-printf "\033[38;5;109m┃\033[0m \033[38;5;81mStep 1/8:\033[0m Enter ticket summary                         \033[38;5;109m┃\033[0m\n" >&2
+printf "\033[38;5;109m┃\033[0m \033[38;5;81mStep 1/6:\033[0m Enter ticket summary                         \033[38;5;109m┃\033[0m\n" >&2
 printf "\033[38;5;109m┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\033[0m\n" >&2
 echo -n "  ✏️  " >&2
 # Read summary with pre-filled value for editing
@@ -324,7 +343,7 @@ if [ -n "$ISSUE_TYPE" ]; then
     echo "" >&2
 else
     printf "\033[38;5;109m┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\033[0m\n" >&2
-    printf "\033[38;5;109m┃\033[0m \033[38;5;81mStep 2/8:\033[0m Select issue type                             \033[38;5;109m┃\033[0m\n" >&2
+    printf "\033[38;5;109m┃\033[0m \033[38;5;81mStep 2/6:\033[0m Select issue type                             \033[38;5;109m┃\033[0m\n" >&2
     printf "\033[38;5;109m┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\033[0m\n" >&2
     issue_type=$(get_issue_types | $FZF --prompt="  🏷️  Issue Type > " --height=12 --reverse --border=rounded)
     if [ -z "$issue_type" ]; then
@@ -394,7 +413,7 @@ fi
 
 # Step 3: Priority (default to Medium - first in list)
 printf "\033[38;5;109m┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\033[0m\n" >&2
-printf "\033[38;5;109m┃\033[0m \033[38;5;81mStep 3/8:\033[0m Select priority \033[2m(default: Medium)\033[0m            \033[38;5;109m┃\033[0m\n" >&2
+printf "\033[38;5;109m┃\033[0m \033[38;5;81mStep 3/6:\033[0m Select priority \033[2m(default: Medium)\033[0m            \033[38;5;109m┃\033[0m\n" >&2
 printf "\033[38;5;109m┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\033[0m\n" >&2
 priority=$(get_priorities | $FZF --prompt="  ⚡ Priority > " --height=10 --reverse --border=rounded --header="Press Enter for default (Medium)")
 if [ -z "$priority" ]; then
@@ -405,7 +424,7 @@ echo "" >&2
 
 # Step 4: Parent Issue (optional, default: None)
 printf "\033[38;5;109m┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\033[0m\n" >&2
-printf "\033[38;5;109m┃\033[0m \033[38;5;81mStep 4/8:\033[0m Select parent issue \033[2m(default: None)\033[0m          \033[38;5;109m┃\033[0m\n" >&2
+printf "\033[38;5;109m┃\033[0m \033[38;5;81mStep 4/6:\033[0m Select parent issue \033[2m(default: None)\033[0m          \033[38;5;109m┃\033[0m\n" >&2
 printf "\033[38;5;109m┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\033[0m\n" >&2
 parent_line=$(get_parent_issues | $FZF --prompt="  🔗 Parent Issue > " --height=15 --reverse --border=rounded --header="Press Enter for no parent")
 parent_key=""
@@ -421,12 +440,12 @@ echo "" >&2
 labels=""
 if [ "$NO_LABELS" = true ]; then
     printf "\033[38;5;109m┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\033[0m\n" >&2
-    printf "\033[38;5;109m┃\033[0m \033[38;5;81mStep 5/8:\033[0m Labels \033[2m(skipped: --no-labels)\033[0m                   \033[38;5;109m┃\033[0m\n" >&2
+    printf "\033[38;5;109m┃\033[0m \033[38;5;81mStep 5/6:\033[0m Labels \033[2m(skipped: --no-labels)\033[0m                   \033[38;5;109m┃\033[0m\n" >&2
     printf "\033[38;5;109m┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\033[0m\n" >&2
     printf "  \033[38;5;114m✓\033[0m Labels: \033[2m(none)\033[0m\n" >&2
 else
     printf "\033[38;5;109m┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\033[0m\n" >&2
-    printf "\033[38;5;109m┃\033[0m \033[38;5;81mStep 5/8:\033[0m Select labels \033[2m(TAB=multi, default: $DEFAULT_LABELS)\033[0m \033[38;5;109m┃\033[0m\n" >&2
+    printf "\033[38;5;109m┃\033[0m \033[38;5;81mStep 5/6:\033[0m Select labels \033[2m(TAB=multi, default: $DEFAULT_LABELS)\033[0m \033[38;5;109m┃\033[0m\n" >&2
     printf "\033[38;5;109m┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\033[0m\n" >&2
     labels_input=$(get_labels | $FZF --prompt="  🏷️  Labels > " --height=15 --reverse --border=rounded --multi --bind 'tab:toggle+down' --header="TAB to select multiple, Enter to use default ($DEFAULT_LABELS), or pick $NO_LABEL_SENTINEL")
     if [ -z "$labels_input" ]; then
@@ -448,29 +467,25 @@ else
 fi
 echo "" >&2
 
-# Step 6: Sprint (defaults to most recent active sprint)
-printf "\033[38;5;109m┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\033[0m\n" >&2
-printf "\033[38;5;109m┃\033[0m \033[38;5;81mStep 6/8:\033[0m Select sprint \033[2m(default: current active)\033[0m     \033[38;5;109m┃\033[0m\n" >&2
-printf "\033[38;5;109m┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\033[0m\n" >&2
-sprint_line=$(get_sprints | $FZF --prompt="  🏃 Sprint > " --height=12 --reverse --border=rounded --header="Press Enter for default")
+# Sprint: the board's current sprint, resolved rather than asked. A ticket you
+# are creating to work on now goes in the sprint that is running now, and the
+# picker's other lines were sprints belonging to boards you didn't choose.
 sprint_id=""
-if [ -n "$sprint_line" ]; then
-    sprint_id=$(echo "$sprint_line" | awk '{print $1}')
-    # Check if "No sprint" was selected (ID = 0)
-    if [ "$sprint_id" = "0" ]; then
-        sprint_id=""
-        printf "  \033[38;5;114m✓\033[0m Sprint: \033[2mNone\033[0m\n" >&2
-    else
-        printf "  \033[38;5;114m✓\033[0m Sprint: \033[0m%s\033[0m\n" "$(echo "$sprint_line" | cut -d' ' -f3-)" >&2
-    fi
+_sprint_line=$(get_default_sprint)
+if [ -n "$_sprint_line" ]; then
+    sprint_id="${_sprint_line%%$'\t'*}"
+    _sprint_rest="${_sprint_line#*$'\t'}"
+    _sprint_state="${_sprint_rest%%$'\t'*}"
+    _sprint_name="${_sprint_rest#*$'\t'}"
+    printf "  \033[38;5;114m✓\033[0m Sprint: \033[0m%s\033[0m \033[2m(%s)\033[0m\n" "$_sprint_name" "$_sprint_state" >&2
 else
-    printf "  \033[38;5;114m✓\033[0m Sprint: \033[2mNone\033[0m\n" >&2
+    printf "  \033[38;5;114m✓\033[0m Sprint: \033[2mNone (no active or upcoming sprint on this board)\033[0m\n" >&2
 fi
 echo "" >&2
 
-# Step 7: Description
+# Step 6: Description
 printf "\033[38;5;109m┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\033[0m\n" >&2
-printf "\033[38;5;109m┃\033[0m \033[38;5;81mStep 7/8:\033[0m Enter description \033[2m(save & quit to continue)\033[0m \033[38;5;109m┃\033[0m\n" >&2
+printf "\033[38;5;109m┃\033[0m \033[38;5;81mStep 6/6:\033[0m Enter description \033[2m(save & quit to continue)\033[0m \033[38;5;109m┃\033[0m\n" >&2
 printf "\033[38;5;109m┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\033[0m\n" >&2
 
 # Pre-populate with user description if provided
@@ -537,41 +552,18 @@ else
 fi
 echo "" >&2
 
-# Step 8: Assignee (defaults to current user)
-printf "\033[38;5;109m┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\033[0m\n" >&2
-printf "\033[38;5;109m┃\033[0m \033[38;5;81mStep 8/8:\033[0m Select assignee \033[2m(default: yourself)\033[0m         \033[38;5;109m┃\033[0m\n" >&2
-printf "\033[38;5;109m┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\033[0m\n" >&2
-# Try to get current user as default option (first in list)
-if [ -n "$JIRA_EMAIL" ]; then
-    me_response=$(jira_api "user/search?query=$(echo "$JIRA_EMAIL" | jq -sRr @uri)&maxResults=1")
-    me_name=$(echo "$me_response" | jq -r '.[0].displayName // empty')
-    if [ -n "$me_name" ]; then
-        echo "$me_name (me)" > "$tmpdir/assignee_options"
-        echo "Unassigned" >> "$tmpdir/assignee_options"
-    else
-        echo "Unassigned" > "$tmpdir/assignee_options"
-    fi
-else
-    echo "Unassigned" > "$tmpdir/assignee_options"
-fi
-assignee_name=$(cat "$tmpdir/assignee_options" | $FZF --prompt="  👤 Assignee > " --height=10 --reverse --border=rounded --header="Press Enter to assign to yourself" --print-query | tail -1)
-
-# Clean up assignee name
-assignee_name=$(echo "$assignee_name" | sed 's/ (me)$//')
-
-# Get assignee account ID if not "Unassigned"
+# Assignee: you. A ticket created from this script is one you are about to open
+# a branch for — /myself is the answer every time, so it's read, not asked.
 assignee_field=""
-if [ -n "$assignee_name" ] && [ "$assignee_name" != "Unassigned" ]; then
-    assignee_response=$(jira_api "user/search?query=$(echo "$assignee_name" | jq -sRr @uri)&maxResults=1")
-    assignee_id=$(echo "$assignee_response" | jq -r '.[0].accountId // empty')
-    if [ -n "$assignee_id" ]; then
-        assignee_field=", \"assignee\": {\"accountId\": \"$assignee_id\"}"
-        printf "  \033[38;5;114m✓\033[0m Assignee: \033[0m%s\033[0m\n" "$assignee_name" >&2
-    else
-        printf "  \033[38;5;114m✓\033[0m Assignee: \033[2mUnassigned (user not found)\033[0m\n" >&2
-    fi
+assignee_name=""
+me_response=$(jira_api "myself" || true)
+assignee_id=$(echo "$me_response" | jq -r '.accountId // empty' 2>/dev/null || true)
+assignee_name=$(echo "$me_response" | jq -r '.displayName // empty' 2>/dev/null || true)
+if [ -n "$assignee_id" ]; then
+    assignee_field=", \"assignee\": {\"accountId\": \"$assignee_id\"}"
+    printf "  \033[38;5;114m✓\033[0m Assignee: \033[0m%s\033[0m\n" "${assignee_name:-you}" >&2
 else
-    printf "  \033[38;5;114m✓\033[0m Assignee: \033[2mUnassigned\033[0m\n" >&2
+    printf "  \033[38;5;221m⚠\033[0m Assignee: \033[2mUnassigned (could not identify you to Jira)\033[0m\n" >&2
 fi
 echo "" >&2
 

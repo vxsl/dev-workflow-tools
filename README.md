@@ -153,6 +153,15 @@ The label step defaults to `front-end`. To create a ticket with no labels, pick
 or pass `--no-labels` to skip the step. `oneshot` and `jira-fzf` both accept
 `--labels` and `--no-labels` and pass them down.
 
+Three things are resolved rather than asked, because they only ever have one
+answer for a ticket you're creating to work on now:
+
+| | |
+|---|---|
+| **Board** | Set `JIRA_DEFAULT_PROJECT` in `.env` and the "Select board" step disappears. `--project KEY` overrides it for one run. Without either, several keys in `JIRA_PROJECTS` still get a picker. |
+| **Sprint** | The board's running sprint, or the next one due to start. |
+| **Assignee** | You. |
+
 ### `oneshot` (alias: `os`)
 One-shot workflow: staged changes → branch → commit → MR.
 ```bash
