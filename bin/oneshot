@@ -17,6 +17,8 @@
 #   oneshot --include-ticket-description Include ticket description in MR description
 #   oneshot --from-commit                Take the ticket + MR title/description from the
 #                                        lone unpublished commit's subject and body
+#   oneshot --labels "front-end,bug"     Set the default label offered for a new ticket
+#   oneshot --no-labels                  Create the new ticket with no labels at all
 #   oneshot --no-autofix                 Skip the pre-push hook's prettier/eslint autofix stage
 #   oneshot --no-verify                  Skip the pre-push hook entirely (implies --no-autofix)
 #
@@ -78,6 +80,8 @@ FROM_COMMIT_BODY=""
 # Prefill flags handed to every create-jira-ticket invocation (see
 # run_create_jira_ticket). Empty unless --from-commit is in play.
 from_commit_flags=()
+# --no-labels, same route: create-jira-ticket otherwise always lands on a label.
+label_flags=()
 NEW_TICKET_TITLE=""
 HOTFIX_MODE=false
 HOTFIX_DESCRIPTION=""
@@ -126,6 +130,14 @@ while [[ "$#" -gt 0 ]]; do
         --from-commit)
             FROM_COMMIT=true
             shift
+            ;;
+        --no-labels)
+            label_flags+=(--no-labels)
+            shift
+            ;;
+        --labels)
+            label_flags+=(--labels "$2")
+            shift 2
             ;;
         --hotfix)
             HOTFIX_MODE=true
@@ -267,7 +279,7 @@ strip_commit_trailers() {
 # goes first: create-jira-ticket takes last-wins on repeated flags, so a caller's
 # explicit --summary (e.g. `oneshot "some title"`) still beats the commit subject.
 run_create_jira_ticket() {
-    "$SCRIPT_DIR/create-jira-ticket" "${from_commit_flags[@]}" "$@"
+    "$SCRIPT_DIR/create-jira-ticket" "${from_commit_flags[@]}" "${label_flags[@]}" "$@"
 }
 
 # Convert a string to a URL-safe slug (lowercase, hyphens)

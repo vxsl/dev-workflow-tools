@@ -145,7 +145,13 @@ Create Jira tickets with interactive prompts.
 create-jira-ticket                       # Interactive
 create-jira-ticket --summary "Fix bug"   # Quick
 create-jira-ticket --slack-url URL       # Link to Slack
+create-jira-ticket --no-labels           # No labels at all
 ```
+
+The label step defaults to `front-end`. To create a ticket with no labels, pick
+`(no label)` in the picker (second entry, so `Enter` still takes the default),
+or pass `--no-labels` to skip the step. `oneshot` and `jira-fzf` both accept
+`--labels` and `--no-labels` and pass them down.
 
 ### `oneshot` (alias: `os`)
 One-shot workflow: staged changes → branch → commit → MR.
@@ -154,6 +160,7 @@ oneshot                    # Interactive
 oneshot PROJ-1234          # Use ticket
 oneshot https://slack...   # From Slack thread
 oneshot --from-commit      # Ticket + MR title/description from the commit
+oneshot --no-labels        # New ticket gets no labels
 ```
 
 `--from-commit` applies when the change is one already-made commit and nothing

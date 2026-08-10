@@ -7,6 +7,8 @@
 #   create-jira-ticket --summary "Fix bug"                Quick creation with summary
 #   create-jira-ticket --issue-type Bug                   Pre-select issue type (Bug, Task, Story, etc.)
 #   create-jira-ticket --summary "..." --slack-url URL    Link to Slack thread
+#   create-jira-ticket --labels "front-end,bug"           Set the default label offered
+#   create-jira-ticket --no-labels                        Create with no labels at all
 #   create-jira-ticket --dry-run                          Test without creating
 #
 # Output:
@@ -34,6 +36,11 @@ CACHE_DIR="$HOME/.cache/jira-fzf"
 require_env JIRA_DOMAIN JIRA_PROJECT JIRA_EMAIL JIRA_API_TOKEN
 DRY_RUN=false
 DEFAULT_LABELS="front-end"
+# Picked from the label list to mean "none". Every other route out of Step 5
+# lands on a label — Enter takes the default because it sits first, and Esc
+# falls back to the default too — so without this there is no way to say no.
+NO_LABEL_SENTINEL="(no label)"
+NO_LABELS=false
 OUTPUT_FILE=""
 CLEAR_SCREEN=false
 ISSUE_TYPE=""
@@ -50,6 +57,7 @@ while [[ "$#" -gt 0 ]]; do
         --slack-url) SLACK_URL="$2"; shift 2 ;;
         --description) USER_DESCRIPTION="$2"; shift 2 ;;
         --labels) DEFAULT_LABELS="$2"; shift 2 ;;
+        --no-labels) NO_LABELS=true; shift ;;
         --output-file) OUTPUT_FILE="$2"; shift 2 ;;
         --clear) CLEAR_SCREEN=true; shift ;;
         --issue-type) ISSUE_TYPE="$2"; shift 2 ;;
@@ -140,7 +148,7 @@ get_parent_issues() {
 get_labels() {
     local response=$(jira_api "label?maxResults=500")
     local labels=$(echo "$response" | jq -r '.values[]' 2>/dev/null | sort -u)
-    
+
     # Always put default label first in list
     if [ -n "$DEFAULT_LABELS" ]; then
         local default_label=$(echo "$DEFAULT_LABELS" | cut -d',' -f1)
@@ -148,7 +156,12 @@ get_labels() {
         labels=$(echo "$labels" | grep -vx "$default_label")
         echo "$default_label"
     fi
-    
+
+    # Second, never first: the header promises Enter uses the default, and fzf
+    # hands back whatever line is highlighted on open. One ↓ away is discoverable
+    # without taking Enter away from the label people pick nine times in ten.
+    echo "$NO_LABEL_SENTINEL"
+
     echo "$labels"
 }
 
@@ -404,19 +417,34 @@ else
 fi
 echo "" >&2
 
-# Step 5: Labels (default to front-end)
-printf "\033[38;5;109m┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\033[0m\n" >&2
-printf "\033[38;5;109m┃\033[0m \033[38;5;81mStep 5/8:\033[0m Select labels \033[2m(TAB=multi, default: $DEFAULT_LABELS)\033[0m \033[38;5;109m┃\033[0m\n" >&2
-printf "\033[38;5;109m┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\033[0m\n" >&2
-labels_input=$(get_labels | $FZF --prompt="  🏷️  Labels > " --height=15 --reverse --border=rounded --multi --bind 'tab:toggle+down' --header="TAB to select multiple, Enter to use default ($DEFAULT_LABELS)")
+# Step 5: Labels (default to front-end, or none via --no-labels / the picker)
 labels=""
-if [ -n "$labels_input" ]; then
-    # Convert newline-separated labels to comma-separated
-    labels=$(echo "$labels_input" | tr '\n' ',' | sed 's/,$//')
-    printf "  \033[38;5;114m✓\033[0m Labels: \033[0m%s\033[0m\n" "$labels" >&2
+if [ "$NO_LABELS" = true ]; then
+    printf "\033[38;5;109m┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\033[0m\n" >&2
+    printf "\033[38;5;109m┃\033[0m \033[38;5;81mStep 5/8:\033[0m Labels \033[2m(skipped: --no-labels)\033[0m                   \033[38;5;109m┃\033[0m\n" >&2
+    printf "\033[38;5;109m┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\033[0m\n" >&2
+    printf "  \033[38;5;114m✓\033[0m Labels: \033[2m(none)\033[0m\n" >&2
 else
-    labels="$DEFAULT_LABELS"
-    printf "  \033[38;5;114m✓\033[0m Labels: \033[0m%s\033[0m\n" "$labels" >&2
+    printf "\033[38;5;109m┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\033[0m\n" >&2
+    printf "\033[38;5;109m┃\033[0m \033[38;5;81mStep 5/8:\033[0m Select labels \033[2m(TAB=multi, default: $DEFAULT_LABELS)\033[0m \033[38;5;109m┃\033[0m\n" >&2
+    printf "\033[38;5;109m┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\033[0m\n" >&2
+    labels_input=$(get_labels | $FZF --prompt="  🏷️  Labels > " --height=15 --reverse --border=rounded --multi --bind 'tab:toggle+down' --header="TAB to select multiple, Enter to use default ($DEFAULT_LABELS), or pick $NO_LABEL_SENTINEL")
+    if [ -z "$labels_input" ]; then
+        # Esc / no selection — unchanged, the default still applies.
+        labels="$DEFAULT_LABELS"
+    else
+        # Drop the sentinel and keep whatever real labels came with it. Picking
+        # it alongside a real label therefore can't silently discard that label;
+        # picking it alone leaves nothing, which is the point.
+        labels=$(printf '%s\n' "$labels_input" | grep -vxF "$NO_LABEL_SENTINEL" \
+            | tr '\n' ',' | sed 's/,$//') || true
+    fi
+
+    if [ -n "$labels" ]; then
+        printf "  \033[38;5;114m✓\033[0m Labels: \033[0m%s\033[0m\n" "$labels" >&2
+    else
+        printf "  \033[38;5;114m✓\033[0m Labels: \033[2m(none)\033[0m\n" >&2
+    fi
 fi
 echo "" >&2
 

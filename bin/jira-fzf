@@ -15,6 +15,7 @@
 #   jira-fzf --one-shot                   Exit after selection (default)
 #   jira-fzf --dry-run                    Test ticket creation without creating
 #   jira-fzf --labels "front-end,bug"    Set default labels for new tickets
+#   jira-fzf --no-labels                  Create new tickets with no labels
 #   
 # Keybindings:
 #   <CR> maximize preview  <C-y> copy  <C-o> open  <C-t> new  <C-s> sort  <C-r> refresh  <C-f> search Jira
@@ -178,6 +179,7 @@ SORT_ORDER_FILE="$CACHE_DIR/sort_order"
 CACHE_TTL=300  # 5 minutes
 DRY_RUN=false
 DEFAULT_LABELS="front-end"  # Default labels to add to new tickets
+NO_LABELS=false             # --no-labels: create new tickets with none at all
 DEFAULT_SORT="updated DESC"  # Default sort order
 PERSIST_MODE=""  # Empty = use FZF_PERSIST_MODE env var, "--persist" = force on, "--one-shot" = force off
 
@@ -186,6 +188,7 @@ while [[ "$#" -gt 0 ]]; do
     case $1 in
         --dry-run) DRY_RUN=true; shift ;;
         --labels) DEFAULT_LABELS="$2"; shift 2 ;;
+        --no-labels) NO_LABELS=true; shift ;;
         --persist) PERSIST_MODE="--persist"; shift ;;
         --one-shot) PERSIST_MODE="--one-shot"; shift ;;
         *) break ;;
@@ -570,8 +573,12 @@ create_ticket_interactive() {
     if [ "$DRY_RUN" = true ]; then
         args+=(--dry-run)
     fi
-    if [ -n "$DEFAULT_LABELS" ]; then
-        args+=(--labels "$DEFAULT_LABELS")
+    # Pass it even when empty. Withholding the flag doesn't mean "no labels" to
+    # create-jira-ticket — it means "use your own default", so `--labels ""` used
+    # to come back as front-end anyway.
+    args+=(--labels "$DEFAULT_LABELS")
+    if [ "$NO_LABELS" = true ]; then
+        args+=(--no-labels)
     fi
     if [ -n "$initial_summary" ]; then
         args+=(--summary "$initial_summary")
@@ -1465,6 +1472,9 @@ if [ "$1" = "--create-ticket" ]; then
     if [ -n "${JIRA_FZF_DEFAULT_LABELS+x}" ]; then
         DEFAULT_LABELS="$JIRA_FZF_DEFAULT_LABELS"
     fi
+    if [ -n "${JIRA_FZF_NO_LABELS+x}" ]; then
+        NO_LABELS="$JIRA_FZF_NO_LABELS"
+    fi
     create_ticket_interactive "$@"
     exit 0
 fi
@@ -1598,6 +1608,7 @@ fi
 # Export settings for subshells
 export JIRA_FZF_DRY_RUN="$DRY_RUN"
 export JIRA_FZF_DEFAULT_LABELS="$DEFAULT_LABELS"
+export JIRA_FZF_NO_LABELS="$NO_LABELS"
 
 # Main interactive loop
 {
