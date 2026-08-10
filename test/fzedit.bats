@@ -803,6 +803,31 @@ teardown() {
     [[ "$output" != *"$root^"* ]]
 }
 
+# A conflicted file has no stage 0, so there is no index to diff against. gitsigns
+# answers anyway, with a three-way :2:/worktree/:3: view whose outer two panes are
+# read-only -- so pressing E to fix a conflict landed you somewhere every edit failed
+# with E21. Conflicts are git-conflict.nvim's job; hand the file over plain.
+@test "a conflicted file is handed over with no diff at all" {
+    add_tmux_session fzpad
+    git_q "$WT_FEATURE" checkout -q -b theirs
+    printf 'const a = THEIRS;\n' > "$WT_FEATURE/src/app.ts"
+    git_q "$WT_FEATURE" commit -qam theirs
+    git_q "$WT_FEATURE" checkout -q feature
+    printf 'const a = OURS;\n' > "$WT_FEATURE/src/app.ts"
+    git_q "$WT_FEATURE" commit -qam ours
+    git_q "$WT_FEATURE" cherry-pick theirs >/dev/null 2>&1 || true
+    # Guard the premise: if the cherry-pick did not actually conflict, the assertion
+    # below would pass against a clean file and prove nothing.
+    [ -n "$(git -C "$WT_FEATURE" ls-files -u -- "$WT_FEATURE/src/app.ts")" ]
+
+    TMUX=fake FZEDIT_SESSION=fzpad fz --tab "$WT_FEATURE/src/app.ts" 42 index
+    run cat "$TEST_TMPDIR/tmux_new_windows"
+    [[ "$output" != *"FZEDIT_OPEN_DIFF"* ]]
+    # ...but the file and the line still come through: E is still a hand-off.
+    [[ "$output" == *"FZEDIT_OPEN=$WT_FEATURE/src/app.ts"* ]]
+    [[ "$output" == *"FZEDIT_OPEN_LINE=42"* ]]
+}
+
 # Every other way into the editor -- enter, ^E, ^T -- opens a file to work on, not a
 # diff to read, and must not get a split it did not ask for.
 @test "--tab without a diff base seeds no diff at all" {

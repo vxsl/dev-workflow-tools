@@ -2140,6 +2140,17 @@ open_tab() {
         root=$(resolve_scope)
     fi
     label=$(tab_label "$root")
+    # A conflicted file gets no diff at all. An unmerged path has no stage 0 -- `git show
+    # :0:<path>` fails outright -- so "the index" is not a thing to diff against, and
+    # gitsigns answers the request with a THREE-way view instead: :2: ours, your file,
+    # :3: theirs. Two thirds of that is read-only, so the edit you pressed E to make
+    # dies on "E21: Cannot make changes, 'modifiable' is off", in a pane you did not
+    # ask for and cannot tell apart from the file. Conflicts belong to
+    # git-conflict.nvim (]x / [x, co / ct / cb), which needs the file and nothing else.
+    if [ -n "$diff" ] && [ -n "$target" ] \
+       && [ -n "$(git -C "$root" ls-files -u -- "$target" 2>/dev/null)" ]; then
+        diff=""
+    fi
     if [ -n "$diff" ] && [ "$diff" != "index" ]; then
         git -C "$root" rev-parse --verify --quiet "$diff^{commit}" >/dev/null 2>&1 \
             || diff="index"
