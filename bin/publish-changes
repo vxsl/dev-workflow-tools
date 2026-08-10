@@ -11,6 +11,7 @@
 #   publish-changes --no-jira                 Skip Jira integration even if ticket detected
 #   publish-changes --include-ticket-description  Include ticket description in MR description
 #   publish-changes --slack-url <url>         Post MR link to the given Slack thread/channel (no prompt)
+#   publish-changes --no-autofix              Skip the pre-push hook's prettier/eslint autofix stage
 #
 # Features:
 #   - Interactive branch selection with fzf
@@ -82,6 +83,9 @@ SKIP_PUSH=false
 OUTPUT_URL=false
 NO_DRAFT_PROMPT=false
 FORCE_PUSH=false
+# --no-autofix: push with SKIP_PRE_PUSH_AUTOFIX=true so the pre-push hook runs its
+# checks but doesn't rewrite files and tack on "autofix:" commits.
+NO_AUTOFIX=false
 INCLUDE_TICKET_DESCRIPTION=false
 TICKET_DESCRIPTION=""
 MR_TITLE_OVERRIDE=""
@@ -135,6 +139,10 @@ while [[ "$#" -gt 0 ]]; do
             NO_DRAFT_PROMPT=true
             shift
             ;;
+        --no-autofix)
+            NO_AUTOFIX=true
+            shift
+            ;;
         --force-push)
             FORCE_PUSH=true
             shift
@@ -164,7 +172,7 @@ while [[ "$#" -gt 0 ]]; do
             shift
             ;;
         --help|-h)
-            head -35 "$0" | tail -33
+            head -36 "$0" | tail -34
             exit 0
             ;;
         *)
@@ -601,11 +609,19 @@ if [ "$SKIP_PUSH" != "true" ]; then
     echo -e "${CYAN}┃${RESET} ${BLUE}Step 2/4:${RESET} Pushing branch to remote                      ${CYAN}┃${RESET}" >&2
     echo -e "${CYAN}┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛${RESET}" >&2
 
+    # With --no-autofix the pre-push hook still runs its checks, it just won't
+    # rewrite files and add "autofix:" commits — so the retry path below is dead.
+    push_env=()
+    if [ "$NO_AUTOFIX" = "true" ]; then
+        push_env=(env SKIP_PRE_PUSH_AUTOFIX=true)
+        echo -e "  ${DIM}Skipping pre-push autofix (--no-autofix)${RESET}" >&2
+    fi
+
     echo -e "  ${DIM}Running: git push -u origin ${selected_branch}${RESET}" >&2
 
     push_tmp=$(mktemp)
     trap "rm -f '$push_tmp'" EXIT
-    git push -u origin "$selected_branch" 2>&1 | tee "$push_tmp" | while read -r line; do
+    "${push_env[@]}" git push -u origin "$selected_branch" 2>&1 | tee "$push_tmp" | while read -r line; do
         echo -e "  ${DIM}${line}${RESET}" >&2
     done
     push_exit_code="${PIPESTATUS[0]}"
@@ -640,7 +656,7 @@ if [ "$SKIP_PUSH" != "true" ]; then
         fi
         if [[ "$force_choice" =~ ^[Yy]$ ]]; then
             echo -e "  ${DIM}Running: git push -u origin ${selected_branch} --force-with-lease${RESET}" >&2
-            git push -u origin "$selected_branch" --force-with-lease 2>&1 | while read -r line; do
+            "${push_env[@]}" git push -u origin "$selected_branch" --force-with-lease 2>&1 | while read -r line; do
                 echo -e "  ${DIM}${line}${RESET}" >&2
             done
             if [ ${PIPESTATUS[0]} -eq 0 ]; then

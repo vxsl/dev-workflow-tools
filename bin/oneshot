@@ -15,6 +15,7 @@
 #   oneshot --dry-run                    Show what would be done
 #   oneshot --base origin/main           Explicitly set base branch (default: origin/main)
 #   oneshot --include-ticket-description Include ticket description in MR description
+#   oneshot --no-autofix                 Skip the pre-push hook's prettier/eslint autofix stage
 #
 # Workflow:
 #   1. Check for staged changes
@@ -70,6 +71,9 @@ PREEXISTING_COMMITS_BRANCH=""
 REBASED=false
 PREPUSH_VALIDATED=false
 ISSUE_TYPE=""
+# --no-autofix: run the pre-push hook with SKIP_PRE_PUSH_AUTOFIX=true so it checks
+# without rewriting files and adding "autofix:" commits. Propagated to publish-changes.
+NO_AUTOFIX=false
 # Tracks whether THIS run created the Jira ticket (vs. publishing for an existing
 # one). Gates the ticket-link Slack post so we don't announce "a ticket" when
 # oneshot is just publishing an MR against a ticket that already existed.
@@ -113,8 +117,12 @@ while [[ "$#" -gt 0 ]]; do
             ISSUE_TYPE="$2"
             shift 2
             ;;
+        --no-autofix)
+            NO_AUTOFIX=true
+            shift
+            ;;
         --help|-h)
-            head -20 "$0" | tail -19
+            head -21 "$0" | tail -20
             exit 0
             ;;
         *)
@@ -277,7 +285,11 @@ get_prepush_cache_key() {
     local repo_hash=$(echo -n "$repo_root" | sha256sum | cut -d' ' -f1 | head -c 16)
     local head_sha=$(git rev-parse HEAD 2>/dev/null | head -c 12)
     local diff_hash=$(git diff --cached | sha256sum | cut -d' ' -f1 | head -c 16)
-    echo "${repo_hash}/${head_sha}-${diff_hash}"
+    # --no-autofix validates less than a full run, so it gets its own cache slot:
+    # its success must not let a later full run skip the autofix stage.
+    local suffix=""
+    [ "$NO_AUTOFIX" = true ] && suffix="-noautofix"
+    echo "${repo_hash}/${head_sha}-${diff_hash}${suffix}"
 }
 
 # Check if prepush validation is cached
@@ -325,8 +337,10 @@ run_prepush_checks() {
     cd "$repo_dir" || return 1
     
     # Check cache before running expensive checks
+    # A full-run success also satisfies --no-autofix (it validated strictly more),
+    # so fall back to the unsuffixed key. Without --no-autofix both keys are equal.
     local cache_key=$(get_prepush_cache_key)
-    if check_prepush_cache "$cache_key"; then
+    if check_prepush_cache "$cache_key" || check_prepush_cache "${cache_key%-noautofix}"; then
         echo -e "  ${GREEN}✓${RESET} Pre-push validation cached (staged changes unchanged)" >&2
         cd "$original_dir"
         echo "" >&2
@@ -370,8 +384,15 @@ run_prepush_checks() {
         # - FORCE_PRE_PUSH_RUN: tells the personal pre-push to skip its
         #   "no unpushed commits" short-circuits and validate the staged index
         #   directly (nothing is committed yet at this point).
+        # - SKIP_PRE_PUSH_AUTOFIX (--no-autofix): check only, don't rewrite files
+        #   and commit the result.
+        local skip_autofix=""
+        if [ "$NO_AUTOFIX" = true ]; then
+            skip_autofix=true
+            echo -e "  ${DIM}Skipping autofix stage (--no-autofix)${RESET}" >&2
+        fi
         local exit_code=0
-        echo "refs/heads/${current_branch} ${current_sha} refs/heads/main 0000000000000000000000000000000000000000" | SKIP_PROTECTED_BRANCH_CHECK=true FORCE_PRE_PUSH_RUN=true "$pre_push_hook" "$remote_name" "$remote_url" 2>&1 >&2
+        echo "refs/heads/${current_branch} ${current_sha} refs/heads/main 0000000000000000000000000000000000000000" | SKIP_PROTECTED_BRANCH_CHECK=true FORCE_PRE_PUSH_RUN=true SKIP_PRE_PUSH_AUTOFIX="$skip_autofix" "$pre_push_hook" "$remote_name" "$remote_url" 2>&1 >&2
         exit_code="${PIPESTATUS[1]}"
         
         if [ $exit_code -eq 0 ]; then
@@ -1855,6 +1876,11 @@ else
     # pre-existing ticket shouldn't announce "a ticket" in the thread.
     if [ "$TICKET_WAS_CREATED" = true ] && [ "$HOTFIX_MODE" != true ]; then
         publish_args+=(--ticket-created)
+    fi
+    # Belt and braces: SKIP_PRE_PUSH_CHECKS already short-circuits the whole hook
+    # on this push, but keep the flags consistent if that ever stops being true.
+    if [ "$NO_AUTOFIX" = true ]; then
+        publish_args+=(--no-autofix)
     fi
     mr_url=$(SKIP_PRE_PUSH_CHECKS=true "$SCRIPT_DIR/publish-changes" "${publish_args[@]}") || {
         echo -e "${RED}  ✗ publish-changes failed${RESET}" >&2
