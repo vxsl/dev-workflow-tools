@@ -1264,7 +1264,7 @@ took_switch() {
 
 # enter means "open this file" or "switch to this worktree" depending on the row.
 open_row() {
-    local type="$1" path="$2" line="${3:-}"
+    local type="$1" path="$2" line="${3:-}" diff="${4:-}"
     # tig's main view has no %(file); don't try to open the empty string.
     [ -n "$path" ] || return 0
     if [ "$type" = "w" ]; then
@@ -1272,7 +1272,7 @@ open_row() {
         return
     fi
     record_history "$(abspath "$path")"
-    open_in_editor "$path" "$line"
+    open_in_editor "$path" "$line" "$diff"
 }
 
 # ^E: every marked row in ONE editor, so the LSP starts once instead of once per file.
@@ -1965,25 +1965,40 @@ editor_session() {
 # A tab is one whole fzedit instance -- a tmux window in the pad session -- so the
 # editor runs inline inside it. Quitting nvim drops you back on that tab's picker,
 # with that tab's own scope and rung intact.
+#
+# $3 is the diff base, and only the tig hand-off passes one: empty opens the file
+# plainly (enter in the picker, ^E, ^T -- none of which want a split), "index" raises
+# diff mode against the index, anything else against that rev. See open_tab for where
+# the rev comes from and why.
 open_in_editor() {
-    local path line root
+    local path line diff root args
     path=$(abspath "$1")
     line="${2:-}"
+    diff="${3:-}"
     [ "$line" = "0" ] && line=""
 
-    # Test seam: assert dispatch without spawning an editor.
+    args=()
+    [ -n "$line" ] && args+=("+$line")
+    # GitDiffThis with no argument already means the index, so the marker word is
+    # dropped rather than forwarded. Compared whole, not stripped as a prefix: a branch
+    # called index-fix is a rev like any other.
+    if [ "$diff" = "index" ]; then
+        args+=(-c "GitDiffThis")
+    elif [ -n "$diff" ]; then
+        args+=(-c "GitDiffThis $diff")
+    fi
+
+    # Test seam: assert dispatch without spawning an editor. Built above rather than
+    # below so the seam is handed the same flags nvim would get, and a test can assert
+    # what the editor is actually told to do rather than just which file it was given.
     if [ -n "${FZEDIT_EDITOR:-}" ]; then
-        "$FZEDIT_EDITOR" "$path"
+        "$FZEDIT_EDITOR" "$path" "${args[@]}"
         return
     fi
 
     root=$(root_of_file "$path")
     cd "$root" 2>/dev/null || cd "$(dirname "$path")" || return
-    if [ -n "$line" ]; then
-        nvim "+$line" -- "$path"
-    else
-        nvim -- "$path"
-    fi
+    nvim "${args[@]}" -- "$path"
 }
 
 # Tab label: the worktree name, so the tmux status line reads as a tab bar.
@@ -2081,8 +2096,17 @@ tab_step() {
 
 # A new tab is a whole new instance with its own scope and rung, seeded via the
 # environment. With a file argument it opens straight into it.
+#
+# $3 is tig's answer to "what diff was I reading when I pressed E": the literal "index"
+# from the status and stage views, or a rev from the diff view -- which the tigrc
+# binding writes as %(commit)^, the state the file was in BEFORE the commit whose patch
+# is on screen, so that patch is part of what you land in front of.
+#
+# The rev is verified here rather than trusted, because ^ has one real failure: a root
+# commit has no parent, and an unresolvable rev would reach nvim as an error toast on
+# open. That degrades to the index, which is wrong about nothing -- it just shows less.
 open_tab() {
-    local target="${1:-}" line="${2:-}" root label sess
+    local target="${1:-}" line="${2:-}" diff="${3:-}" root label sess
     [ "$line" = "0" ] && line=""
     if [ -n "$target" ]; then
         target=$(abspath "$target")
@@ -2091,6 +2115,10 @@ open_tab() {
         root=$(resolve_scope)
     fi
     label=$(tab_label "$root")
+    if [ -n "$diff" ] && [ "$diff" != "index" ]; then
+        git -C "$root" rev-parse --verify --quiet "$diff^{commit}" >/dev/null 2>&1 \
+            || diff="index"
+    fi
 
     if ! sess=$(editor_session); then
         # Not running at all: the pad's key spawns it. Give it a moment to come up.
@@ -2109,6 +2137,7 @@ open_tab() {
     if [ -n "$target" ]; then
         tmux new-window -t "$sess:" -n "$label" \
             -e "FZEDIT_SCOPE=$root" -e "FZEDIT_OPEN=$target" ${line:+-e "FZEDIT_OPEN_LINE=$line"} \
+            ${diff:+-e "FZEDIT_OPEN_DIFF=$diff"} \
             "$SELF_BIN" || return 1
     else
         tmux new-window -t "$sess:" -n "$label" -e "FZEDIT_SCOPE=$root" "$SELF_BIN" || return 1
@@ -2267,7 +2296,7 @@ case "${1:-}" in
     --header)        sync_tab_chrome; header_line; exit 0 ;;
     --pick-worktree) pick_worktree; exit 0 ;;
     --preview)       preview_row "$2" "$3"; exit 0 ;;
-    --open)          open_row "$2" "$3" "${4:-}"; exit 0 ;;
+    --open)          open_row "$2" "$3" "${4:-}" "${5:-}"; exit 0 ;;
     --open-many)     shift; open_many "$@"; exit 0 ;;
     --new)           new_file "${2:-}" "${3:-}"; exit 0 ;;
     --new-prefill)   new_file_prefill "${2:-}" "${3:-}" "$(new_file_base "${2:-}" "${3:-}")"; exit 0 ;;
@@ -2303,7 +2332,7 @@ case "${1:-}" in
         else echo "hidden (would press $PAD_KEY)"
         fi
         exit 0 ;;
-    --tab)           open_tab "${2:-}" "${3:-}"; exit $? ;;
+    --tab)           open_tab "${2:-}" "${3:-}" "${4:-}"; exit $? ;;
     --close-tab)     close_tab "${2:-}"; exit $? ;;
     --next-tab)      tab_step next "${2:-}"; exit $? ;;
     --prev-tab)      tab_step prev "${2:-}"; exit $? ;;
@@ -2330,7 +2359,7 @@ prune_dead_instances
 sync_tab_chrome
 if [ -n "${FZEDIT_OPEN:-}" ] && [ -f "$FZEDIT_OPEN" ]; then
     record_history "$(abspath "$FZEDIT_OPEN")"
-    open_in_editor "$FZEDIT_OPEN" "${FZEDIT_OPEN_LINE:-}"
+    open_in_editor "$FZEDIT_OPEN" "${FZEDIT_OPEN_LINE:-}" "${FZEDIT_OPEN_DIFF:-}"
 fi
 
 REFRESH="reload($0 --generate-list)+transform-header($0 --header)"

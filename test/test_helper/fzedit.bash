@@ -175,6 +175,18 @@ add_tmux_session() { printf '%s\n' "$1" >> "$TEST_TMUX_SESSIONS"; }
 # Put a path in the frecency log, which is where "repos I work in" comes from.
 record_history_for() { printf '%s\t%s\n' "$(date +%s)" "$1" >> "$HOME/.fzedit_history"; }
 
+# An editor that records its whole argv rather than opening anything, via the
+# FZEDIT_EDITOR seam. Writes "argv=<args>" to $TEST_TMPDIR/editor_call, so a test can
+# assert the flags nvim would have been given -- +<line>, -c GitDiffThis -- and not just
+# which file. Leaves no file at all when the editor was never reached.
+fake_editor_recording_argv() {
+    cat > "$TEST_TMPDIR/fakebin/fake-editor" <<'ED'
+#!/usr/bin/env bash
+printf 'argv=%s\n' "$*" > "$TEST_TMPDIR/editor_call"
+ED
+    chmod +x "$TEST_TMPDIR/fakebin/fake-editor"
+}
+
 # A tig that records how it was called instead of drawing one, via the FZEDIT_TIG seam
 # open_tig already has. Writes "<type> <path>" to $TEST_TMPDIR/tig_call, and leaves no
 # file at all when tig was never reached.

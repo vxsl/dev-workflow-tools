@@ -771,6 +771,79 @@ teardown() {
     [[ "$output" != *"FZEDIT_OPEN="* ]]
 }
 
+# The third argument -- what tig's status/stage/blame views send as "index" and its diff
+# view as %(commit)^, so nvim can put the diff you were reading back in front of you.
+@test "--tab carries tig's diff base through to the tab" {
+    add_tmux_session fzpad
+    TMUX=fake FZEDIT_SESSION=fzpad fz --tab "$WT_FEATURE/src/app.ts" 42 index
+    run cat "$TEST_TMPDIR/tmux_new_windows"
+    [[ "$output" == *"FZEDIT_OPEN_DIFF=index"* ]]
+}
+
+@test "--tab resolves a real rev from tig's diff view and passes it on" {
+    add_tmux_session fzpad
+    # The fixture is a single root commit, so give it a parent to point at first --
+    # otherwise this asserts the degrade path below and passes for the wrong reason.
+    echo 'const b = 2;' >> "$WT_FEATURE/src/app.ts"
+    git_q "$WT_FEATURE" commit -q -am second
+    sha="$(git -C "$WT_FEATURE" rev-parse HEAD)"
+    TMUX=fake FZEDIT_SESSION=fzpad fz --tab "$WT_FEATURE/src/app.ts" 42 "$sha^"
+    run cat "$TEST_TMPDIR/tmux_new_windows"
+    [[ "$output" == *"FZEDIT_OPEN_DIFF=$sha^"* ]]
+}
+
+# ^ has exactly one real failure: the root commit has no parent. Reaching nvim, that is
+# an error toast on open; degrading to the index shows less but is wrong about nothing.
+@test "a diff base that does not resolve degrades to the index, not an error" {
+    add_tmux_session fzpad
+    root="$(git -C "$WT_FEATURE" rev-list --max-parents=0 HEAD | tail -1)"
+    TMUX=fake FZEDIT_SESSION=fzpad fz --tab "$WT_FEATURE/src/app.ts" 42 "$root^"
+    run cat "$TEST_TMPDIR/tmux_new_windows"
+    [[ "$output" == *"FZEDIT_OPEN_DIFF=index"* ]]
+    [[ "$output" != *"$root^"* ]]
+}
+
+# Every other way into the editor -- enter, ^E, ^T -- opens a file to work on, not a
+# diff to read, and must not get a split it did not ask for.
+@test "--tab without a diff base seeds no diff at all" {
+    add_tmux_session fzpad
+    TMUX=fake FZEDIT_SESSION=fzpad fz --tab "$WT_FEATURE/src/app.ts" 42
+    run cat "$TEST_TMPDIR/tmux_new_windows"
+    [[ "$output" != *"FZEDIT_OPEN_DIFF"* ]]
+}
+
+# The editor end of the same hand-off: a base becomes a :GitDiffThis for nvim to run
+# once it has the file open, and the line survives alongside it -- the whole point
+# being that you land ON the line you were reading, with its diff beside it.
+@test "a rev diff base reaches the editor as GitDiffThis, without losing the line" {
+    fake_editor_recording_argv
+    FZEDIT_EDITOR="$TEST_TMPDIR/fakebin/fake-editor" \
+        fz --open f "$WT_FEATURE/src/app.ts" 42 'deadbeef^'
+    run cat "$TEST_TMPDIR/editor_call"
+    [[ "$output" == *"+42"* ]]
+    [[ "$output" == *"-c GitDiffThis deadbeef^"* ]]
+}
+
+# GitDiffThis with no argument already means the index, so the marker word is a marker
+# and not a rev -- forwarding it would send nvim looking for a commit called "index".
+@test "the index diff base becomes a bare GitDiffThis, not a rev called index" {
+    fake_editor_recording_argv
+    FZEDIT_EDITOR="$TEST_TMPDIR/fakebin/fake-editor" \
+        fz --open f "$WT_FEATURE/src/app.ts" 42 index
+    run cat "$TEST_TMPDIR/editor_call"
+    [[ "$output" == *"-c GitDiffThis"* ]]
+    [[ "$output" != *"index"* ]]
+}
+
+@test "opening with no diff base passes no GitDiffThis at all" {
+    fake_editor_recording_argv
+    FZEDIT_EDITOR="$TEST_TMPDIR/fakebin/fake-editor" \
+        fz --open f "$WT_FEATURE/src/app.ts" 42
+    run cat "$TEST_TMPDIR/editor_call"
+    [[ "$output" == *"+42"* ]]
+    [[ "$output" != *"GitDiffThis"* ]]
+}
+
 # With one tab there is nowhere to step to, and tmux says "No next window" -- a complaint
 # in place of an action, for a key you only pressed because you wanted a different tab.
 @test "stepping with only one tab open makes a second one" {
