@@ -64,6 +64,10 @@ MIN_SHARED = int(os.environ.get("ARC_MIN_SHARED", "2"))
 # file-overlap score, because ancestry is a fact and overlap is an inference.
 STACK_SIM = float(os.environ.get("ARC_STACK_SIM", "0.9"))
 
+# How much of a child's history must be its parent's before the two count as one stack.
+# Below this the parent is just the base that happened to be checked out.
+STACK_INHERIT = float(os.environ.get("ARC_STACK_INHERIT", "0.5"))
+
 
 def env_file():
     """Same .env contract as the rest of the repo."""
@@ -122,10 +126,22 @@ def stacking(repo, main, names):
         ancestors[n] = {o for o in names
                         if o != n and tips.get(o) in seen and tips.get(o) != tips.get(n)}
 
+    # Being cut from a branch is not the same as being a continuation of it. You branch
+    # from whatever is checked out, so `UB-6938-before-squash-for-real` sits on
+    # `dove-incremental-catalog-render` while sharing none of its subject -- and taking
+    # that as a stack dragged the whole adaptive-charts family into the dual-map arc.
+    #
+    # What separates the two is how much of the child is the parent. A variant carries
+    # its base almost entirely and adds a little; a branch that merely started somewhere
+    # is mostly its own commits. Measured on the pairs above: the true stacks inherit
+    # 0.53-1.00 of their history, the incidental base 0.19.
     pairs = []
     for n, anc in ancestors.items():
-        if anc:
-            pairs.append((n, max(anc, key=lambda a: depth.get(a, 0))))
+        if not anc or not depth.get(n):
+            continue
+        best = max(anc, key=lambda a: depth.get(a, 0))
+        if depth.get(best, 0) / depth[n] >= STACK_INHERIT:
+            pairs.append((n, best))
     return pairs
 
 
