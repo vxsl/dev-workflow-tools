@@ -91,7 +91,7 @@ def base(p):
     return b if b.endswith(SRC) and b not in UBIQUITOUS else None
 
 
-def stacking(repo, main, names):
+def stacking(repo, main, names, branch_files):
     """Which branches were cut from which, as (child, parent) pairs.
 
     The strongest statement that two branches are the same body of work is that one
@@ -126,23 +126,41 @@ def stacking(repo, main, names):
         ancestors[n] = {o for o in names
                         if o != n and tips.get(o) in seen and tips.get(o) != tips.get(n)}
 
-    # Being cut from a branch is not the same as being a continuation of it. You branch
-    # from whatever is checked out, so `UB-6938-before-squash-for-real` sits on
-    # `dove-incremental-catalog-render` while sharing none of its subject -- and taking
-    # that as a stack dragged the whole adaptive-charts family into the dual-map arc.
+    # Being cut from a branch is not the same as continuing it. You branch from whatever
+    # is checked out, so ancestry alone says where a branch started, not what it is
+    # about, and two independent tests are needed to tell those apart.
     #
-    # What separates the two is how much of the child is the parent. A variant carries
-    # its base almost entirely and adds a little; a branch that merely started somewhere
-    # is mostly its own commits. Measured on the pairs above: the true stacks inherit
-    # 0.53-1.00 of their history, the incidental base 0.19.
-    pairs = []
+    # How much of the child IS the parent catches the case where the base is incidental
+    # to a branch that is mostly its own work -- `UB-6938-before-squash-for-real` on
+    # `dove-incremental-catalog-render`, 3 commits of 16, which dragged the whole
+    # adaptive-charts family into the dual-map arc. Real stacks measure 0.53-1.00 there.
+    #
+    # But that ratio is highest exactly when the child is smallest, so a one-line change
+    # committed on top of a large unrelated base scores 0.98 -- maximum confidence,
+    # completely wrong. Nine such pairs exist here, `attr-popup` on
+    # `UB-6958-before-squash` among them. The ratio cannot see it because it only counts
+    # commits; what settles it is whether the child's OWN work touches what the base is
+    # about. A continuation revisits its base's files. A change that merely sits on top
+    # does not.
+    pairs, nearest = [], {}
     for n, anc in ancestors.items():
         if not anc or not depth.get(n):
             continue
         best = max(anc, key=lambda a: depth.get(a, 0))
-        if depth.get(best, 0) / depth[n] >= STACK_INHERIT:
-            pairs.append((n, best))
-    return pairs
+        # Recorded for every branch with an ancestor, not just the ones that qualify as
+        # a stack: what a branch *added* is a fact about it either way, and the caller
+        # needs it to stop counting inherited files as evidence of subject.
+        nearest[n] = best
+        if depth.get(best, 0) / depth[n] < STACK_INHERIT:
+            continue
+        own = {b for p in git(repo, "diff", "--name-only", f"{best}...{n}").splitlines()
+               if (b := base(p))}
+        # No own files at all means the child is its parent under another name, which
+        # is a stack by any reading.
+        if own and not (own & branch_files.get(best, set())):
+            continue
+        pairs.append((n, best))
+    return pairs, nearest
 
 
 def segment(rows):
@@ -485,7 +503,24 @@ def main():
     if not ents:
         sys.exit("arc-cluster: nothing to cluster (run arc-backfill first?)")
     branch_names = {n for kind, n in ents if kind == "branch"}
-    stacks = stacking(args.repo, args.main, branch_names)
+    branch_files = {n: f for (kind, n), f in ents.items() if kind == "branch"}
+    stacks, nearest = stacking(args.repo, args.main, branch_names, branch_files)
+
+    # A branch's bag is its diff against main, so a branch cut from another carries its
+    # base's whole diff as well as its own. `attr-popup` shares 83 files with the base it
+    # sits on and changes exactly one of its own, and file similarity cannot tell those
+    # apart -- every stacked branch looks like its base whatever it did. Re-bag each
+    # branch that has a real parent with only the work it added; the stack itself is
+    # already held together by ancestry, so nothing is lost by no longer counting
+    # inherited files as evidence of subject.
+    for child, parent in nearest.items():
+        key = ("branch", child)
+        if key not in ents:
+            continue
+        own = {b for p in git(args.repo, "diff", "--name-only",
+                              f"{parent}...{child}").splitlines() if (b := base(p))}
+        if own:
+            ents[key] = own
     comp, sim, idf, keys = cluster(ents, args.k, args.min_sim, stacks)
     if args.method == "louvain":
         comp = louvain(keys, sim, args.resolution)
