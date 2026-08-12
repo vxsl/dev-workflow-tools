@@ -1,0 +1,268 @@
+#!/usr/bin/env -S python3 -u
+"""
+arcs-page: render `work-arcs --json` as the standing picture of your work.
+
+The first version of this page listed artifacts -- 97 stash rows, 261 branch rows --
+and was correctly called useless: `stash@{38}` on its own says nothing, and a flat
+list of branches is the same wall of text in a nicer font. The unit was wrong.
+
+This renders arcs. One card per arc, with the branches, sessions, stashes and MRs it
+contains nested inside it, so the page answers "what am I working on" in one screen
+instead of asking you to reassemble it from rows.
+
+  work-arcs --json | arcs-page --out page.html
+
+Deterministic: the same data renders the same page every time. The one sentence that
+needs judgment comes in with --lede.
+"""
+
+import argparse
+import html
+import json
+import sys
+from datetime import datetime
+from pathlib import Path
+
+CSS = """
+:root{
+  --ground:#F6F7FA;--surface:#FFFFFF;--surface-2:#EFF1F6;
+  --ink:#161922;--ink-soft:#59616F;--ink-faint:#8A91A0;
+  --hairline:#E2E5EC;--accent:#4453C4;
+  --hot:#A93826;--warm:#9C6414;--calm:#3F6E52;
+  --hot-wash:#FBF0EE;--warm-wash:#FBF5EC;--calm-wash:#EFF5F1;
+  --serif:ui-serif,Charter,"Bitstream Charter",Georgia,serif;
+  --sans:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
+}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
+  --ground:#0F1218;--surface:#161A22;--surface-2:#1C212B;
+  --ink:#E3E6EC;--ink-soft:#8F97A6;--ink-faint:#6B7382;
+  --hairline:#262B36;--accent:#93A0F7;
+  --hot:#E27B63;--warm:#DFA24C;--calm:#7CB690;
+  --hot-wash:#241A18;--warm-wash:#241E14;--calm-wash:#16211A;}}
+:root[data-theme="dark"]{
+  --ground:#0F1218;--surface:#161A22;--surface-2:#1C212B;
+  --ink:#E3E6EC;--ink-soft:#8F97A6;--ink-faint:#6B7382;
+  --hairline:#262B36;--accent:#93A0F7;
+  --hot:#E27B63;--warm:#DFA24C;--calm:#7CB690;
+  --hot-wash:#241A18;--warm-wash:#241E14;--calm-wash:#16211A;}
+
+*,*::before,*::after{box-sizing:border-box}
+body{margin:0;background:var(--ground);color:var(--ink);font-family:var(--sans);
+     font-size:15px;line-height:1.55;-webkit-font-smoothing:antialiased}
+.page{max-width:72rem;margin:0 auto;padding:3rem 1.5rem 5rem}
+h1{font-family:var(--serif);font-weight:500;font-size:clamp(1.8rem,4vw,2.4rem);
+   letter-spacing:-.015em;margin:0 0 .3rem;text-wrap:balance}
+.stamp{font-family:var(--mono);font-size:.75rem;color:var(--ink-faint);
+       display:flex;flex-wrap:wrap;gap:.2rem 1rem;margin-bottom:2rem}
+.lede{font-family:var(--serif);font-size:clamp(1.1rem,2.1vw,1.32rem);line-height:1.5;
+      max-width:36em;margin:0 0 2.5rem;text-wrap:pretty}
+.lede em{color:var(--accent);font-style:normal;font-weight:600}
+
+h2{font-family:var(--serif);font-weight:500;font-size:1.25rem;margin:0 0 .2rem;
+   letter-spacing:-.01em}
+.note{color:var(--ink-soft);font-size:.85rem;max-width:54em;margin:0 0 1.1rem}
+section{margin-bottom:3rem}
+
+/* One card per arc. Everything the arc contains lives inside it, which is the whole
+   point -- the flat version made you reassemble this from unrelated rows. */
+.arcs{display:grid;grid-template-columns:repeat(auto-fill,minmax(23rem,1fr));gap:.9rem}
+.arc{background:var(--surface);border:1px solid var(--hairline);border-radius:4px;
+     border-top:3px solid var(--hue,var(--hairline));padding:.9rem 1rem;
+     display:flex;flex-direction:column;gap:.55rem;min-width:0}
+.arc.is-hot{--hue:var(--hot);background:var(--hot-wash)}
+.arc.is-warm{--hue:var(--warm)}
+.arc.is-calm{--hue:var(--calm)}
+.arc-head{display:flex;align-items:baseline;justify-content:space-between;gap:.6rem}
+.arc-name{font-family:var(--mono);font-size:.95rem;overflow-wrap:anywhere;color:var(--ink)}
+.arc-state{font-size:.68rem;text-transform:uppercase;letter-spacing:.06em;
+           color:var(--hue,var(--ink-faint));white-space:nowrap}
+.metrics{display:flex;flex-wrap:wrap;gap:.15rem 1rem;font-family:var(--mono);
+         font-size:.75rem;color:var(--ink-soft);font-variant-numeric:tabular-nums}
+.metrics b{color:var(--ink);font-weight:600}
+.members{font-family:var(--mono);font-size:.72rem;color:var(--ink-faint);
+         display:flex;flex-direction:column;gap:.15rem}
+.members span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.members .risk{color:var(--hot)}
+
+table{width:100%;border-collapse:collapse;font-size:.82rem}
+.scroll{overflow-x:auto;border:1px solid var(--hairline);border-radius:4px;
+        background:var(--surface)}
+th{text-align:left;font-size:.68rem;text-transform:uppercase;letter-spacing:.06em;
+   color:var(--ink-soft);font-weight:600;padding:.5rem .7rem;
+   border-bottom:1px solid var(--hairline);white-space:nowrap}
+td{padding:.45rem .7rem;border-bottom:1px solid var(--hairline);vertical-align:top}
+tr:last-child td{border-bottom:none}
+td.k{font-family:var(--mono);white-space:nowrap;color:var(--ink)}
+td.n{font-family:var(--mono);font-variant-numeric:tabular-nums;text-align:right;
+     white-space:nowrap;color:var(--hot)}
+td.d{color:var(--ink-soft)}
+code{font-family:var(--mono);font-size:.75rem;background:var(--surface-2);
+     border:1px solid var(--hairline);padding:.1rem .3rem;border-radius:2px}
+footer{margin-top:3rem;padding-top:1.4rem;border-top:1px solid var(--hairline);
+       color:var(--ink-soft);font-size:.85rem}
+a{color:var(--accent)}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+@media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
+"""
+
+
+def esc(x):
+    return html.escape(str(x), quote=True)
+
+
+def heat(arc):
+    """State in form as well as number, so what needs attention reads at a glance."""
+    if arc.get("state") == "waiting on review" or arc.get("unpushed", 0) >= 25:
+        return "hot"
+    if arc.get("unpushed", 0) > 0 or arc.get("state") == "at risk":
+        return "warm"
+    return "calm"
+
+
+def render(data, lede, focus_days, limit):
+    out = []
+    a = out.append
+    arcs = [x for x in data.get("arcs", []) if x.get("age_days", 999) <= focus_days]
+    arcs.sort(key=lambda x: (-x.get("engagement", 0), x.get("age_days", 999)))
+    gap = data.get("gap") or {}
+
+    try:
+        stamp = datetime.fromisoformat(data.get("generated", "")).strftime(
+            "%a %-d %b %Y, %-I:%M %p")
+    except (ValueError, TypeError):
+        stamp = data.get("generated", "unknown")
+
+    a("<title>Work Arcs</title>")
+    a(f"<style>{CSS}</style>")
+    a('<div class="page">')
+    a("<h1>Work Arcs</h1>")
+    a('<div class="stamp">')
+    a(f"<span>{esc(stamp)}</span><span>{esc(data.get('repo',''))}</span>")
+    a(f"<span>{data.get('arc_count',0)} arcs</span>")
+    a(f"<span>active &le; {focus_days}d</span>")
+    a("</div>")
+    if lede:
+        a(f'<p class="lede">{lede}</p>')
+
+    # --- what you are working on -------------------------------------------
+    a("<section>")
+    a("<h2>In flight</h2>")
+    a('<p class="note">Arcs with real activity, ranked by how deeply you engaged with '
+      "them rather than by which was touched most recently. Each card holds everything "
+      "the arc contains — that is the difference from a list of branches.</p>")
+    a('<div class="arcs">')
+    for arc in arcs[:limit]:
+        c = arc.get("counts", {})
+        a(f'<div class="arc is-{heat(arc)}">')
+        a('<div class="arc-head">'
+          f'<span class="arc-name">{esc(arc.get("label","?"))}</span>'
+          f'<span class="arc-state">{esc(arc.get("state",""))}</span></div>')
+        a('<div class="metrics">')
+        if arc.get("unpushed"):
+            a(f"<span><b>{arc['unpushed']}</b> unpushed</span>")
+        a(f"<span>{c.get('branches',0)} branches</span>")
+        if c.get("sessions"):
+            a(f"<span>{c['sessions']} sessions</span>")
+        if arc.get("stacked"):
+            a(f"<span>{arc['stacked']} stacked</span>")
+        if c.get("stashes"):
+            a(f"<span>{c['stashes']} stashes</span>")
+        a(f"<span>{arc.get('age_days','?')}d idle</span>")
+        a("</div>")
+        a('<div class="members">')
+        for b in arc.get("branches", [])[:4]:
+            cls = "risk" if b.get("unpushed") else ""
+            tail = f" · {b['unpushed']} unpushed" if b.get("unpushed") else ""
+            a(f'<span class="{cls}">{esc(b.get("name","?"))}{esc(tail)}</span>')
+        extra = c.get("branches", 0) - 4
+        if extra > 0:
+            a(f"<span>+{extra} more</span>")
+        a("</div></div>")
+    a("</div></section>")
+
+    # --- where Jira disagrees with the code --------------------------------
+    if gap:
+        mism = gap.get("status_mismatch") or []
+        if mism:
+            a("<section>")
+            a("<h2>Jira says otherwise</h2>")
+            a('<p class="note">Tickets whose status asserts the work left your hands, '
+              "while the commits are still on this laptop.</p>")
+            a('<div class="scroll"><table><thead><tr>'
+              "<th>Ticket</th><th>Claim</th><th>Reality</th><th>Summary</th>"
+              "</tr></thead><tbody>")
+            for m in mism[:14]:
+                i = m.get("issue", {})
+                a(f'<tr><td class="k">{esc(i.get("key",""))}</td>'
+                  f'<td class="d">{esc(i.get("status",""))}</td>'
+                  f'<td class="n">{esc(m.get("why","").split(" but ")[-1])}</td>'
+                  f'<td class="d">{esc(i.get("summary","")[:58])}</td></tr>')
+            a("</tbody></table></div></section>")
+
+        unt = gap.get("unticketed_work") or []
+        if unt:
+            a("<section>")
+            a("<h2>Real work with no ticket</h2>")
+            a('<p class="note">Invisible to Jira, and therefore to Trellis — absent '
+              "from capacity, burndown and every initiative rollup. Each has a one-step "
+              "command to file it.</p>")
+            a('<div class="scroll"><table><thead><tr>'
+              "<th>Arc</th><th>Branches</th><th>Sessions</th><th>Unpushed</th>"
+              "<th>File it</th></tr></thead><tbody>")
+            for x in unt[:12]:
+                cc = x.get("counts", {})
+                a(f'<tr><td class="k">{esc(x.get("label","?"))}</td>'
+                  f'<td class="d">{cc.get("branches",0)}</td>'
+                  f'<td class="d">{cc.get("sessions",0)}</td>'
+                  f'<td class="n">{x.get("unpushed",0) or ""}</td>'
+                  f'<td><code>work-arcs --jira-ify {esc(x.get("label","?"))}</code></td>'
+                  "</tr>")
+            a("</tbody></table></div></section>")
+
+        empty = gap.get("tickets_without_work") or []
+        if empty:
+            a("<section>")
+            a("<h2>Tickets with nothing behind them</h2>")
+            a('<p class="note">Assigned and open, with no branch or session against '
+              "them. Either they have not started, or they are done and nobody closed "
+              "them.</p>")
+            a('<div class="scroll"><table><thead><tr>'
+              "<th>Ticket</th><th>Status</th><th>Summary</th><th>Initiative</th>"
+              "</tr></thead><tbody>")
+            for i in empty[:14]:
+                init = ", ".join(i.get("initiatives") or []) or "—"
+                a(f'<tr><td class="k">{esc(i.get("key",""))}</td>'
+                  f'<td class="d">{esc(i.get("status",""))}</td>'
+                  f'<td class="d">{esc(i.get("summary","")[:52])}</td>'
+                  f'<td class="d">{esc(init[:44])}</td></tr>')
+            a("</tbody></table></div></section>")
+
+    a("<footer>Derived, never declared — arcs come from the files your work "
+      "touched, not from what branches were named. Nothing here is written to Jira, "
+      "Slack or a repo unless you run the command yourself.</footer>")
+    a("</div>")
+    return "\n".join(out)
+
+
+def main():
+    p = argparse.ArgumentParser(description="Render work-arcs --json as a page.")
+    p.add_argument("--lede", default="", help="the sentence that says what matters today")
+    p.add_argument("--focus", type=int, default=14, help="arcs idle at most this long")
+    p.add_argument("--limit", type=int, default=12, help="arc cards to show")
+    p.add_argument("--out", type=Path)
+    args = p.parse_args()
+    try:
+        data = json.load(sys.stdin)
+    except json.JSONDecodeError as e:
+        sys.exit(f"arcs-page: stdin is not `work-arcs --json`: {e}")
+    page = render(data, args.lede, args.focus, args.limit)
+    if args.out:
+        args.out.write_text(page)
+        print(f"✓ {args.out} ({len(page)} bytes)", file=sys.stderr)
+    else:
+        print(page)
+
+
+if __name__ == "__main__":
+    main()
