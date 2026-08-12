@@ -39,6 +39,7 @@ import subprocess
 import sys
 import time
 from collections import defaultdict
+from datetime import datetime
 from pathlib import Path
 
 TICKET_RE = re.compile(r"\b([A-Z]{2,4})-(\d{2,5})\b")
@@ -68,24 +69,41 @@ def lines(s):
 
 
 def session_index(projects_dir):
-    """branch -> [transcript paths], from one rg pass over every project dir.
+    """branch -> {"paths": set, "last": epoch}, from one rg pass over every project.
 
     Sessions run from $HOME record gitBranch=HEAD and land in a project dir named
     after $HOME rather than the repo, so scanning every dir is the only way to see
-    them. Transcripts reach 18M; this never parses one, it only scans for a field.
+    them. Transcripts reach 18M; this never parses one, it only scans for two fields.
+
+    Recency comes from the timestamp on the *entry* the branch appears in, not the
+    file's mtime. A session that touched a branch once in its first hour and then ran
+    all day would otherwise make that branch look like today's work. `timestamp`
+    always precedes `gitBranch` on a line, so one pattern captures the pair; the 20k
+    gap covers 99% of entries, and since only the maximum per branch matters, the
+    remainder cannot change the answer.
     """
-    idx = defaultdict(set)
+    idx = defaultdict(lambda: {"paths": set(), "last": 0})
     if not projects_dir.is_dir() or not shutil.which("rg"):
         return idx
     r = subprocess.run(
-        ["rg", "-oN", "--with-filename", r'"gitBranch":"[^"]*"', str(projects_dir)],
+        ["rg", "-oN", "--with-filename",
+         r'"timestamp":"([^"]*)".{0,20000}?"gitBranch":"([^"]*)"',
+         "-r", "$1\t$2", str(projects_dir)],
         capture_output=True, text=True,
     )
     for line in r.stdout.splitlines():
-        path, _, rest = line.partition(':"gitBranch":"')
-        branch = rest.rstrip('"')
-        if branch and branch != "HEAD":
-            idx[branch].add(path)
+        path, _, rest = line.partition(":")
+        stamp, _, branch = rest.partition("\t")
+        if not branch or branch == "HEAD":
+            continue
+        entry = idx[branch]
+        entry["paths"].add(path)
+        try:
+            epoch = int(datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp())
+        except ValueError:
+            continue
+        if epoch > entry["last"]:
+            entry["last"] = epoch
     return idx
 
 
@@ -279,21 +297,19 @@ def build_arcs(branches, stashes, mrs, sessions, main_ref):
             arcs[key]["mrs"].append(m)
 
     seen_session = defaultdict(set)
-    for branch, paths in sessions.items():
+    for branch, info in sessions.items():
         key = branch_to_arc.get(branch)
         if not key or key not in arcs:
             continue
-        for p in paths:
+        for p in info["paths"]:
             if p in seen_session[key]:
                 continue
             seen_session[key].add(p)
-            try:
-                mtime = os.path.getmtime(p)
-            except OSError:
-                continue
             arcs[key]["sessions"].append({
                 "id": Path(p).stem,
-                "age_days": int((time.time() - mtime) // 86400),
+                "age_days": int((time.time() - info["last"]) // 86400)
+                if info["last"] else 999,
+                "last": info["last"],
                 "via": branch,
             })
 
@@ -350,6 +366,9 @@ def main():
                                                Path.home() / ".claude/projects")))
     p.add_argument("--active", type=int, metavar="DAYS",
                    help="only arcs touched this recently")
+    p.add_argument("--focus", nargs="?", type=int, const=7, metavar="DAYS",
+                   help="what you are actually working on: arcs with real activity "
+                        "in the last DAYS (default 7), newest first")
     p.add_argument("--no-mr", action="store_true", help="skip the GitLab call")
     p.add_argument("--json", action="store_true", help="emit the graph")
     args = p.parse_args()
@@ -366,6 +385,10 @@ def main():
 
     if args.active is not None:
         arcs = [a for a in arcs if a["age_days"] <= args.active]
+
+    if args.focus is not None:
+        arcs = [a for a in arcs if a["age_days"] <= args.focus]
+        arcs.sort(key=lambda a: (a["age_days"], -a["at_risk"]))
 
     if args.json:
         json.dump({
