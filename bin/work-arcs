@@ -275,6 +275,59 @@ def collect_jira():
     return issues, None
 
 
+def collect_initiatives(issues):
+    """Map each issue to the initiative(s) it rolls up to.
+
+    The chain is task -> parent Epic -> Initiative, and the last hop is NOT the parent
+    field: epics report `parent: none` while still belonging to an initiative. The link
+    is a Polaris work item link ("implements"), which is many-to-many -- UL-1533
+    implements both SBX-2 and UL-1825 -- so a parent field could not express it even in
+    principle. Initiatives also live in SBX, a project absent from JIRA_PROJECTS, which
+    is why the hierarchy looked missing until Trellis's own JQL turned up.
+    """
+    domain = os.environ.get("JIRA_DOMAIN")
+    email = os.environ.get("JIRA_EMAIL")
+    token = os.environ.get("JIRA_API_TOKEN")
+    if not (domain and email and token):
+        return {}, {}
+    auth = base64.b64encode(f"{email}:{token}".encode()).decode()
+
+    def get(path):
+        req = urllib.request.Request(f"https://{domain}/rest/api/3/{path}",
+                                     headers={"Accept": "application/json"})
+        req.add_header("Authorization", f"Basic {auth}")
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return json.load(r)
+        except (urllib.error.URLError, json.JSONDecodeError, TimeoutError, ValueError):
+            return None
+
+    epics = {}
+    for i in issues:
+        key = i["key"]
+        d = get(f"issue/{key}?fields=parent")
+        if d:
+            par = (d.get("fields") or {}).get("parent")
+            if par:
+                epics.setdefault(par["key"], []).append(key)
+
+    issue_to_init, initiatives = {}, {}
+    for epic, children in epics.items():
+        d = get(f"issue/{epic}?fields=issuelinks,summary")
+        if not d:
+            continue
+        inits = []
+        for link in (d.get("fields") or {}).get("issuelinks") or []:
+            other = link.get("outwardIssue") or link.get("inwardIssue") or {}
+            f = other.get("fields") or {}
+            if (f.get("issuetype") or {}).get("name") == "Initiative":
+                inits.append(other["key"])
+                initiatives[other["key"]] = " ".join((f.get("summary") or "").split())
+        for child in children:
+            issue_to_init[child] = inits
+    return issue_to_init, initiatives
+
+
 def reconcile(arcs, issues):
     """Where the derived picture and the declared one disagree.
 
@@ -566,6 +619,9 @@ def main():
                         "in the last DAYS (default 7), newest first")
     p.add_argument("--focus-limit", type=int, default=8,
                    help="how many arcs the focus view shows (default 8)")
+    p.add_argument("--initiatives", action="store_true",
+                   help="resolve each ticket's initiative via Polaris links (extra "
+                        "Jira calls, so opt-in)")
     p.add_argument("--no-cluster", action="store_true",
                    help="fall back to branch-name grouping (the old, wrong way)")
     p.add_argument("--resolution", type=float, default=3.0,
@@ -620,6 +676,13 @@ def main():
     if args.gap or args.json:
         issues, jira_error = collect_jira()
         gap = reconcile(arcs, issues) if not jira_error else None
+        if gap and args.initiatives:
+            i2i, inits = collect_initiatives(issues)
+            gap["initiatives"] = inits
+            for m in gap["status_mismatch"]:
+                m["initiatives"] = [inits.get(k, k) for k in i2i.get(m["issue"]["key"], [])]
+            for i in gap["tickets_without_work"]:
+                i["initiatives"] = [inits.get(k, k) for k in i2i.get(i["key"], [])]
 
     if args.gap:
         if jira_error:
@@ -636,7 +699,9 @@ def main():
             print(f"    └ {m['issue']['summary'][:64]}")
         print("\n── assigned tickets with no branch or session ───────────")
         for i in gap["tickets_without_work"][:12]:
-            print(f"  {i['key']:<10} {i['status']:<18} {i['summary'][:52]}")
+            print(f"  {i['key']:<10} {i['status']:<18} {i['summary'][:44]}")
+            if "initiatives" in i:
+                print(f"    └ {', '.join(i['initiatives']) or 'no initiative'}"[:76])
         print(f"\n✓ {len(gap['unticketed_work'])} unticketed, "
               f"{len(gap['status_mismatch'])} mismatched, "
               f"{len(gap['tickets_without_work'])} tickets with no work",
