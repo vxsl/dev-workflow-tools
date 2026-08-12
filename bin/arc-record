@@ -1,0 +1,156 @@
+#!/usr/bin/env -S python3 -u
+"""
+arc-record: record what a Claude turn actually did, as it happens.
+
+Reconstructing work arcs by mining transcripts is archaeology: 376MB rescanned every
+run, tool_use blocks parsed back out of JSONL, topic boundaries guessed with a
+20,000-character regex gap, and sessions run from $HOME invisible because the project
+directory is derived from cwd. All of that is recovering information that was plainly
+available at the moment it happened.
+
+So this runs as a Stop hook -- which fires after every response -- and appends the
+facts for that turn to an event log. The expensive scan becomes a one-time backfill,
+and every reader (work-arcs, the page, a session brief) reads the log instead of the
+transcripts.
+
+Recorded per turn: the prompt, the files touched, the branch, the repo, the session.
+Those are exactly the inputs arc identification needs, and none of them require
+inference to collect.
+
+Install as a Stop hook (alongside any existing one):
+  "Stop": [{"hooks": [{"type": "command", "command": "~/bin/dev-workflow-tools/bin/arc-record"}]}]
+
+Reads the hook payload on stdin. Writes one JSON line per turn to
+$XDG_STATE_HOME/work-arcs/turns.jsonl. Never writes to a repo, never blocks a turn:
+any failure exits 0 silently, because a recorder must not break the thing it observes.
+"""
+
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+SRC = (".rs", ".ts", ".tsx", ".js", ".jsx", ".py", ".sql", ".toml", ".go",
+       ".java", ".kt", ".swift", ".c", ".cc", ".cpp", ".h", ".hpp", ".md", ".sh")
+
+STATE = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "work-arcs"
+LOG = STATE / "turns.jsonl"
+
+# Wrapper text that is machinery rather than intent.
+WRAPPERS = ("<system-reminder", "<command-name", "<command-message", "<command-args",
+            "<local-command-stdout", "<task-notification", "<user-prompt-submit-hook",
+            "[Request interrupted")
+
+
+def text_of(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(b.get("text", "") for b in content
+                        if isinstance(b, dict) and b.get("type") == "text")
+    return ""
+
+
+def tail_turn(transcript, limit=400):
+    """The last user prompt and the tool calls that followed it.
+
+    Reading only the tail keeps this O(turn) rather than O(session): a Stop hook runs
+    after every response, so it must not care that the transcript is 18MB.
+    """
+    try:
+        with open(transcript, "rb") as fh:
+            try:
+                fh.seek(-2_000_000, os.SEEK_END)
+                fh.readline()          # discard the partial line
+            except OSError:
+                fh.seek(0)
+            lines = fh.read().decode("utf-8", "replace").splitlines()[-limit:]
+    except OSError:
+        return None, [], None
+
+    prompt, files, branch = None, [], None
+    for raw in lines:
+        try:
+            e = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if e.get("gitBranch"):
+            branch = e["gitBranch"]
+        msg = e.get("message") or {}
+        if e.get("type") == "user" and not e.get("isMeta"):
+            t = text_of(msg.get("content")).strip()
+            if len(t) > 15 and not t.startswith(WRAPPERS):
+                prompt = re.sub(r"\s+", " ", t)[:1500]
+                files = []             # a new prompt starts a new turn
+        c = msg.get("content")
+        if isinstance(c, list):
+            for b in c:
+                if not (isinstance(b, dict) and b.get("type") == "tool_use"):
+                    continue
+                i = b.get("input") or {}
+                for k in ("file_path", "notebook_path", "path"):
+                    v = i.get(k)
+                    if isinstance(v, str) and v.endswith(SRC):
+                        files.append(v)
+                for k in ("command", "pattern", "glob"):
+                    v = i.get(k)
+                    if isinstance(v, str):
+                        files += re.findall(r"[\w./-]+\.(?:rs|ts|tsx|py|sql|toml|go|sh)\b", v)
+    return prompt, files, branch
+
+
+def repo_of(cwd):
+    """The repo root, so a session run from $HOME still attributes correctly."""
+    try:
+        r = subprocess.run(["git", "-C", cwd, "rev-parse", "--show-toplevel"],
+                           capture_output=True, text=True, timeout=5)
+        return r.stdout.strip() or None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def main():
+    try:
+        payload = json.load(sys.stdin)
+    except (json.JSONDecodeError, ValueError):
+        return
+
+    cwd = payload.get("cwd") or ""
+    transcript = payload.get("transcript_path")
+    if not transcript:
+        return
+
+    prompt, files, branch = tail_turn(transcript)
+    if not prompt and not files:
+        return
+
+    # Canonical basenames are the form every source agrees on -- tool inputs give
+    # absolute paths, repo-relative paths and bare filenames, git gives
+    # repo-relative. Full paths are kept too, for exact joins where available.
+    basenames = sorted({p.rsplit("/", 1)[-1] for p in files})
+
+    rec = {
+        "at": int(time.time()),
+        "session": payload.get("session_id"),
+        "cwd": cwd,
+        "repo": repo_of(cwd) if cwd else None,
+        "branch": branch,
+        "prompt": prompt,
+        "files": sorted(set(files))[:60],
+        "basenames": basenames[:60],
+    }
+    STATE.mkdir(parents=True, exist_ok=True)
+    with LOG.open("a") as fh:
+        fh.write(json.dumps(rec, separators=(",", ":")) + "\n")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:
+        # A recorder must never break the session it observes.
+        pass
+    sys.exit(0)
