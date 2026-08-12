@@ -48,10 +48,17 @@ LOG = STATE / "turns.jsonl"
 SRC = (".rs", ".ts", ".tsx", ".js", ".jsx", ".py", ".sql", ".toml", ".go",
        ".java", ".kt", ".swift", ".c", ".cc", ".cpp", ".h", ".hpp")
 
-# Filenames so common they identify nothing. They still count for a little, via idf,
-# but excluding the worst outright keeps them out of the top-k rankings.
+# Filenames so common they identify nothing. Kept as a floor for the pathological
+# names, but the real ceiling is derived per-run from document frequency -- see HUB_SHARE.
 UBIQUITOUS = {"index.ts", "index.tsx", "types.ts", "constants.ts", "utils.ts",
               "mod.rs", "lib.rs", "main.rs", "__init__.py", "index.js"}
+
+# A file held by this share of entities or more contributes nothing. Derived per run so
+# it tracks the codebase instead of a list someone has to remember to update.
+HUB_SHARE = float(os.environ.get("ARC_HUB_SHARE", "0.10"))
+
+# Distinct files two entities must share before an edge exists between them.
+MIN_SHARED = int(os.environ.get("ARC_MIN_SHARED", "2"))
 
 
 def env_file():
@@ -134,14 +141,36 @@ def cluster(ents, k, min_sim):
         for f in ents[kk]:
             by_file[f].append(kk)
 
+    # A file most of the codebase touches is not evidence of anything, and idf alone
+    # does not say so loudly enough: at 441 branches, a file in a third of them still
+    # scored ~3% of a unique file's weight rather than 0. That was enough to put
+    # UL-1797 in the adaptive-line-charts arc on `useMetric.tsx` alone. The ceiling is
+    # derived rather than a hand-kept list of names, so it tracks the codebase.
+    hub_at = max(3, int(N * HUB_SHARE))
+
     sim = collections.defaultdict(float)
+    shared = collections.defaultdict(int)
     for f, holders in by_file.items():
         w = idf.get(f, 0) ** 2
-        if w <= 0 or len(holders) > 60:      # a file in 60+ places discriminates nothing
+        if w <= 0 or len(holders) >= hub_at:
             continue
         for i, a in enumerate(holders):
             for b in holders[i + 1:]:
-                sim[(a, b) if a < b else (b, a)] += w
+                pair = (a, b) if a < b else (b, a)
+                sim[pair] += w
+                shared[pair] += 1
+
+    # One file in common is a coincidence: a drive-by fix, a rebase artefact, or a
+    # component two unrelated changes both had to touch. Measured on 441 branches, a
+    # recharts-animation hotfix, a workspace-picker redesign and two AOI tickets were
+    # one arc because every pair shared exactly ULWorkspacePickerView.tsx and nothing
+    # else. Corroboration is the cheap discriminator -- and it is a floor on *count*,
+    # not on weight, precisely because a single very rare file can outweigh two
+    # ordinary ones and still mean nothing.
+    for pair, n in shared.items():
+        if n < MIN_SHARED:
+            del sim[pair]
+
     for pair in list(sim):
         a, b = pair
         sim[pair] /= (norm[a] * norm[b])

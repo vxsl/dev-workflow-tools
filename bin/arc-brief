@@ -220,23 +220,42 @@ def parse_reply(text):
             "blocker": str(obj.get("blocker", "")).strip()}
 
 
-def ask(evidence, model, timeout):
-    """One model call. Returns None on any failure -- a missing brief is not a crash.
+def ask(evidence, model, timeout, tries=2):
+    """One model call, retried once. Returns (brief, reason) -- brief is None on failure.
 
     Every other tool in this pipeline degrades rather than fails, and this one has to as
     well: the page must still render from the deterministic data when the model is
     unreachable, the CLI is missing, or one arc's evidence trips something.
+
+    But degrading silently is its own failure. Running 8 at a time, two of the largest
+    arcs came back empty and the page showed them under their cluster label with no
+    description -- the arcs that most need explaining are the ones with the most going
+    on, so a transient error lands hardest exactly where it hurts. One retry clears the
+    transient case, and the reason is reported rather than swallowed.
     """
     prompt = PROMPT.replace("{evidence}", evidence)
-    try:
-        r = headless_claude.run(
-            ["--model", model, "--dangerously-skip-permissions", prompt],
-            timeout=timeout)
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if r.returncode != 0:
-        return None
-    return parse_reply(r.stdout)
+    reason = "unknown"
+    for attempt in range(tries):
+        if attempt:
+            time.sleep(2 * attempt)
+        try:
+            r = headless_claude.run(
+                ["--model", model, "--dangerously-skip-permissions", prompt],
+                timeout=timeout)
+        except subprocess.TimeoutExpired:
+            reason = f"timed out after {timeout}s"
+            continue
+        except (OSError, subprocess.SubprocessError) as e:
+            reason = f"could not run claude ({e.__class__.__name__})"
+            continue
+        if r.returncode != 0:
+            reason = f"exit {r.returncode}: {(r.stderr or '').strip()[:120]}"
+            continue
+        brief = parse_reply(r.stdout)
+        if brief:
+            return brief, None
+        reason = f"unparseable reply: {(r.stdout or '').strip()[:120]!r}"
+    return None, reason
 
 
 def load_cache():
@@ -315,13 +334,15 @@ def main():
         with futures.ThreadPoolExecutor(max_workers=max(1, args.jobs)) as pool:
             futs = {pool.submit(ask, ev, args.model, args.timeout): (arc, ev, fp)
                     for arc, ev, fp in work}
-            done = 0
+            done = failed = 0
             for fut in futures.as_completed(futs):
                 arc, ev, fp = futs[fut]
-                brief = fut.result()
+                brief, reason = fut.result()
                 done += 1
                 if brief is None:
-                    print(f"  ! no brief for {arc.get('label','?')}", file=sys.stderr)
+                    failed += 1
+                    print(f"  ! no brief for {arc.get('label','?')} — {reason}",
+                          file=sys.stderr)
                     continue
                 # The evidence rides along with the inference. A cached judgement you
                 # cannot audit is worse than no judgement.
@@ -332,6 +353,9 @@ def main():
                 print(f"  [{done}/{len(work)}] {arc.get('label','?')} -> "
                       f"{brief['name']}", file=sys.stderr)
         save_cache(cache)
+        if failed:
+            print(f"arc-brief: {failed} arc(s) have no description; they fall back to "
+                  f"their cluster label", file=sys.stderr)
     else:
         print(f"arc-brief: {hits} cached, nothing to write", file=sys.stderr)
 
