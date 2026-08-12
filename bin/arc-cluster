@@ -60,6 +60,10 @@ HUB_SHARE = float(os.environ.get("ARC_HUB_SHARE", "0.10"))
 # Distinct files two entities must share before an edge exists between them.
 MIN_SHARED = int(os.environ.get("ARC_MIN_SHARED", "2"))
 
+# Similarity floor for "this branch was cut from that one". High enough to dominate the
+# file-overlap score, because ancestry is a fact and overlap is an inference.
+STACK_SIM = float(os.environ.get("ARC_STACK_SIM", "0.9"))
+
 
 def env_file():
     """Same .env contract as the rest of the repo."""
@@ -81,6 +85,48 @@ def git(repo, *a):
 def base(p):
     b = p.rsplit("/", 1)[-1].strip().strip('"\'')
     return b if b.endswith(SRC) and b not in UBIQUITOUS else None
+
+
+def stacking(repo, main, names):
+    """Which branches were cut from which, as (child, parent) pairs.
+
+    The strongest statement that two branches are the same body of work is that one
+    was cut from the other, and until now the clusterer could not see it: it compared
+    bags of filenames while work-arcs derived the ancestry separately and kept it to
+    itself. Requiring two shared files then split UB-6938-preX away from UB-6939-preX
+    -- branches that are literally a stack -- because their overlap was mostly in files
+    common enough to be discounted.
+
+    A branch's tip appearing in another's commit list is ancestry, no heuristics. Only
+    the nearest ancestor is kept: everything below a stack's tip is an ancestor of it,
+    and joining a branch to its whole stack would recreate the chaining that fused 313
+    branches into one component.
+    """
+    tips = {}
+    for line in git(repo, "for-each-ref", "--format=%(objectname) %(refname:short)",
+                    "refs/heads").splitlines():
+        sha, _, n = line.partition(" ")
+        if n in names:
+            tips[n.strip()] = sha.strip()
+    by_sha = collections.defaultdict(list)
+    for n, sha in tips.items():
+        by_sha[sha].append(n)
+
+    depth, ancestors = {}, {}
+    for n in names:
+        revs = git(repo, "rev-list", f"{main}..{n}").split()
+        depth[n] = len(revs)
+        seen = set(revs)
+        # A branch sharing a tip is not an ancestor of anything -- it is the same
+        # commit under another name, and treating that as a stack makes a cycle.
+        ancestors[n] = {o for o in names
+                        if o != n and tips.get(o) in seen and tips.get(o) != tips.get(n)}
+
+    pairs = []
+    for n, anc in ancestors.items():
+        if anc:
+            pairs.append((n, max(anc, key=lambda a: depth.get(a, 0))))
+    return pairs
 
 
 def load_entities(repo, main, max_files):
@@ -125,7 +171,7 @@ def load_entities(repo, main, max_files):
     return ents
 
 
-def cluster(ents, k, min_sim):
+def cluster(ents, k, min_sim, stacks=()):
     keys = list(ents)
     df = collections.Counter()
     for s in ents.values():
@@ -174,6 +220,17 @@ def cluster(ents, k, min_sim):
     for pair in list(sim):
         a, b = pair
         sim[pair] /= (norm[a] * norm[b])
+
+    # Ancestry outranks anything the filenames can say, so it is applied after
+    # normalisation and as a floor rather than a contribution: a branch cut from
+    # another belongs with it even when the two barely overlap on disk, which is the
+    # usual case for the tip of a long stack.
+    present = set(keys)
+    for child, parent in stacks:
+        a, b = ("branch", child), ("branch", parent)
+        if a in present and b in present:
+            pair = (a, b) if a < b else (b, a)
+            sim[pair] = max(sim[pair], STACK_SIM)
 
     nbrs = collections.defaultdict(list)
     for (a, b), s in sim.items():
@@ -320,7 +377,9 @@ def main():
     meta = load_entities.meta
     if not ents:
         sys.exit("arc-cluster: nothing to cluster (run arc-backfill first?)")
-    comp, sim, idf, keys = cluster(ents, args.k, args.min_sim)
+    branch_names = {n for kind, n in ents if kind == "branch"}
+    stacks = stacking(args.repo, args.main, branch_names)
+    comp, sim, idf, keys = cluster(ents, args.k, args.min_sim, stacks)
     if args.method == "louvain":
         comp = louvain(keys, sim, args.resolution)
 
