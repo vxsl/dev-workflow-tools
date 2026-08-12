@@ -20,7 +20,7 @@
 # Read-only. Never pushes, never writes to a repo, never posts anywhere.
 #
 # Usage: loose-ends [--days N] [--repos DIR] [--all] [--dismiss] [--forget]
-#                   [--no-mr] [--no-sessions] [--limit N]
+#                   [--no-mr] [--no-sessions] [--slack] [--limit N]
 
 set -euo pipefail
 
@@ -39,6 +39,9 @@ SHOW_ALL=0
 DO_DISMISS=0
 WANT_MR=1
 WANT_SESSIONS=1
+WANT_SLACK="${LOOSE_ENDS_SLACK:-0}"
+SLACK_BUDGET="${LOOSE_ENDS_SLACK_BUDGET:-15}"
+SLACK_SLEEP="${LOOSE_ENDS_SLACK_SLEEP:-1}"
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -50,6 +53,7 @@ while [ $# -gt 0 ]; do
         --forget)      rm -f "$DISMISSED"; echo "✓ Forgot all dismissals" >&2; exit 0 ;;
         --no-mr)       WANT_MR=0; shift ;;
         --no-sessions) WANT_SESSIONS=0; shift ;;
+        --slack)       WANT_SLACK=1; shift ;;
         -h|--help)     sed -n '2,25p' "$0" | sed 's/^# \?//'; exit 0 ;;
         *)             echo "✗ Unknown argument: $1" >&2; exit 1 ;;
     esac
@@ -67,7 +71,12 @@ CUTOFF_DAYS="$DAYS"
 # a sha or count so the item returns the moment the underlying work changes.
 FINDINGS=$(mktemp); trap 'rm -f "$FINDINGS"' EXIT
 
-add() { printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" >>"$FINDINGS"; }
+# add <score> <class> <fingerprint> <text> [slack-query]
+# The query is the identifier other people would have typed when talking about
+# this work -- a branch name, a ticket key, an MR number. Empty means unsearchable.
+add() {
+    printf '%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "${5:-}" >>"$FINDINGS"
+}
 
 # ---------------------------------------------------------------- session index
 # A branch that appears in a session transcript is one a session invested in.
@@ -168,7 +177,7 @@ for repo in "${REPOS[@]}"; do
             why="no session, no worktree"
         fi
         add "$score" unpushed "$rname:unpushed:$name:$sha:$n" \
-            "$rname: $name has $n unpushed commit(s), idle ${age}d ($why)"
+            "$rname: $name has $n unpushed commit(s), idle ${age}d ($why)" "$name"
     done < <(git -C "$repo" for-each-ref --no-merged origin/main \
                 --format='%(refname:short)|%(objectname:short)|%(committerdate:unix)' \
                 refs/heads)
@@ -214,7 +223,7 @@ for repo in "${REPOS[@]}"; do
         detail="${nsrc} source file(s)"
         [ -n "$stranded" ] && detail="$detail, $stranded"
         add "$score" stash "$rname:stash:$sha" \
-            "$rname: $ref on '${base:-?}' -- ${age}d old, $detail"
+            "$rname: $ref on '${base:-?}' -- ${age}d old, $detail" "$base"
     done < <(git -C "$repo" stash list --format='%gd|%H|%ct|%gs' 2>/dev/null)
 
     # -- open MRs nobody has commented on --------------------------------------
@@ -235,7 +244,8 @@ for repo in "${REPOS[@]}"; do
                 [ -n "$num" ] || continue
                 age=$(( (NOW - updated) / 86400 ))
                 add $(( 70 + age )) mr-quiet "$rname:mr:$num:$updated" \
-                    "$rname: !$num has no comments, idle ${age}d -- $(printf '%.60s' "$title")"
+                    "$rname: !$num has no comments, idle ${age}d -- $(printf '%.60s' "$title")" \
+                    "$num"
             done < <(printf '%s' "$mrs" | jq -r --argjson cut "$mr_cutoff" '
                         .[]
                         | select(.user_notes_count == 0)
@@ -298,6 +308,54 @@ DISPLAY=$(mktemp)
 trap 'rm -f "$FINDINGS" "$SESSION_BRANCHES" "$SHOWN" "$DISPLAY"' EXIT
 awk -F'\t' -v lim="$LIMIT" -v all="$SHOW_ALL" \
     '{ c[$2]++; if (all == 1 || c[$2] <= lim) print }' "$SHOWN" >"$DISPLAY"
+
+# ------------------------------------------------------------- slack enrichment
+# Slack is not asked to narrate anything -- it answers one question per finding:
+# has anyone else mentioned this work? A branch with a dozen unpushed commits that
+# someone has been asking about is a different problem from the same branch nobody
+# knows exists, and only Slack can tell those apart.
+#
+# It runs on the displayed findings only, after the caps, because search.messages
+# is rate-limited and this is one HTTP call per finding. Off unless --slack.
+if [ "$WANT_SLACK" -eq 1 ]; then
+    if [ -z "${SLACK_USER_TOKEN:-}" ]; then
+        echo "⚠ --slack needs SLACK_USER_TOKEN (search:read) in .env -- skipping" >&2
+    else
+        ENRICHED=$(mktemp)
+        spent=0
+        while IFS=$'\t' read -r score class fp text query; do
+            hits=""
+            # Only search identifiers specific enough to mean one thing. 'main' or
+            # 'smp' would match half the workspace and tell us nothing.
+            if [ "$spent" -lt "$SLACK_BUDGET" ] && [ -n "$query" ] \
+               && { printf '%s' "$query" | rg -q '^[A-Z]{2,4}-[0-9]+$' \
+                    || [ "${#query}" -ge 8 ]; }; then
+                spent=$(( spent + 1 ))
+                resp=$(curl -sS --max-time 20 -X POST \
+                        https://slack.com/api/search.messages \
+                        -H "Authorization: Bearer $SLACK_USER_TOKEN" \
+                        --data-urlencode "query=$query" \
+                        --data-urlencode "count=1" 2>/dev/null) || resp=''
+                if [ -n "$resp" ] && [ "$(jq -r '.ok' <<<"$resp" 2>/dev/null)" = true ]; then
+                    n=$(jq -r '.messages.total // 0' <<<"$resp")
+                    if [ "${n:-0}" -gt 0 ]; then
+                        link=$(jq -r '.messages.matches[0].permalink // ""' <<<"$resp")
+                        hits=" [slack: $n, $link]"
+                        score=$(( score + 40 ))
+                    else
+                        hits=" [slack: nobody has mentioned this]"
+                    fi
+                fi
+                sleep "$SLACK_SLEEP"   # search.messages is rate-limited; stay under it
+            fi
+            printf '%s\t%s\t%s\t%s\t%s\n' "$score" "$class" "$fp" "$text$hits" "$query"
+        done <"$DISPLAY" >"$ENRICHED"
+        sort -t$'\t' -k1,1nr "$ENRICHED" >"$DISPLAY"
+        rm -f "$ENRICHED"
+        [ "$spent" -ge "$SLACK_BUDGET" ] && \
+            echo "⚠ Slack budget of $SLACK_BUDGET searches spent; later findings unchecked" >&2
+    fi
+fi
 
 if [ "$DO_DISMISS" -eq 1 ]; then
     cut -f3 "$DISPLAY" >>"$DISMISSED"

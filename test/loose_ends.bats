@@ -206,3 +206,95 @@ fake_session() {
     [[ "$output" == *"MR checks skipped"* ]]
     [[ "$output" == *"feature has 1 unpushed"* ]]
 }
+
+# --- slack enrichment -------------------------------------------------------
+
+# Slack answers one question per finding: has anyone else mentioned this work?
+# Stubbed, so these assert on how the answer is used, not on Slack itself.
+stub_curl() {
+    local total="$1"
+    STUB="$TEST_TMPDIR/stubs"; mkdir -p "$STUB"
+    cat >"$STUB/curl" <<EOF
+#!/usr/bin/env bash
+# Record what was searched so a test can assert which queries were issued.
+for a in "\$@"; do
+  case "\$a" in query=*) echo "\${a#query=}" >>"$TEST_TMPDIR/queries" ;; esac
+done
+echo '{"ok":true,"messages":{"total":$total,"matches":[{"permalink":"https://x/p1"}]}}'
+EOF
+    chmod +x "$STUB/curl"
+    export PATH="$STUB:$PATH"
+}
+
+@test "--slack marks work others have mentioned, and work nobody has" {
+    unpushed_branch discussed-branch 1
+    stub_curl 7
+    LOOSE_ENDS_SLACK_SLEEP=0 SLACK_USER_TOKEN=tok run_le --slack
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"slack: 7"* ]]
+
+    stub_curl 0
+    LOOSE_ENDS_SLACK_SLEEP=0 SLACK_USER_TOKEN=tok run_le --slack
+    [[ "$output" == *"nobody has mentioned this"* ]]
+}
+
+@test "--slack promotes discussed work above undiscussed work" {
+    # The undiscussed branch has more commits, so it outranks on git evidence
+    # alone; Slack saying people are asking about the other one flips that.
+    unpushed_branch quiet-long-branch 9
+    unpushed_branch noisy-branch-here 1
+
+    STUB="$TEST_TMPDIR/stubs"; mkdir -p "$STUB"
+    cat >"$STUB/curl" <<'EOF'
+#!/usr/bin/env bash
+q=""
+for a in "$@"; do case "$a" in query=*) q="${a#query=}" ;; esac; done
+if [ "$q" = "noisy-branch-here" ]; then
+  echo '{"ok":true,"messages":{"total":12,"matches":[{"permalink":"https://x/p1"}]}}'
+else
+  echo '{"ok":true,"messages":{"total":0,"matches":[]}}'
+fi
+EOF
+    chmod +x "$STUB/curl"
+
+    PATH="$STUB:$PATH" LOOSE_ENDS_SLACK_SLEEP=0 SLACK_USER_TOKEN=tok \
+        run "$LOOSE_ENDS" --repos "$REPOS" --no-mr --days 0 --slack
+    [ "$status" -eq 0 ]
+    noisy=$(printf '%s\n' "$output" | grep -n 'noisy-branch-here' | cut -d: -f1)
+    quiet=$(printf '%s\n' "$output" | grep -n 'quiet-long-branch' | cut -d: -f1)
+    [ "$noisy" -lt "$quiet" ]
+}
+
+@test "--slack does not spend a search on an identifier that means nothing" {
+    # 'smp' would match half the workspace. Only ticket keys and names long
+    # enough to be distinctive are worth a query.
+    unpushed_branch smp 1
+    stub_curl 5
+    LOOSE_ENDS_SLACK_SLEEP=0 SLACK_USER_TOKEN=tok run_le --slack
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"slack:"* ]]
+    [ ! -f "$TEST_TMPDIR/queries" ]
+}
+
+@test "--slack respects its search budget and says so" {
+    for i in $(seq 1 5); do unpushed_branch "long-branch-name-$i" 1; done
+    stub_curl 3
+    LOOSE_ENDS_SLACK_SLEEP=0 LOOSE_ENDS_SLACK_BUDGET=2 SLACK_USER_TOKEN=tok \
+        run_le --slack
+    [ "$status" -eq 0 ]
+    [ "$(wc -l <"$TEST_TMPDIR/queries")" -eq 2 ]
+    [[ "$output" == *"budget of 2 searches spent"* ]]
+}
+
+@test "--slack without a token warns and still reports git findings" {
+    # Run from a copy with no sibling .env, so the real token is not sourced.
+    BARE="$TEST_TMPDIR/bare"; mkdir -p "$BARE"
+    cp "$LOOSE_ENDS" "$BARE/loose-ends"
+    unpushed_branch feature 1
+
+    run env -u SLACK_USER_TOKEN "$BARE/loose-ends" \
+        --repos "$REPOS" --no-mr --days 0 --slack
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"needs SLACK_USER_TOKEN"* ]]
+    [[ "$output" == *"feature has 1 unpushed"* ]]
+}
