@@ -1,0 +1,405 @@
+#!/usr/bin/env -S python3 -u
+"""
+work-arcs: group a repo's loose work into the arcs it actually belongs to.
+
+A flat report of branches, stashes and MRs is unreadable at real scale, because the
+unit is wrong. Measured in ~/work/repos/ul: 389 unmerged branches, but UB-6919 alone
+owns 20 of them and UB-6918 owns another 20. Shown as 40 unrelated rows that is
+noise; shown as two arcs it is two pieces of work.
+
+So this derives the graph instead of listing the artifacts:
+
+  root  -- a ticket key, or a shared name prefix for work that never got a ticket
+  |- branch          (commits ahead, whether any remote has them, how stale)
+  |  '- branch       stacked on the one above it -- real parent edges, and a branch
+  |                  can sit on several, so this is a DAG rather than a tree
+  |- stash           with the files in it, because `stash@{38}` alone says nothing
+  |- merge request   with whether anyone has commented
+  '- session         Claude sessions that touched any branch in the arc
+
+Every edge here is derived, nothing is declared. The one thing that cannot be
+derived is a name for work that never got a ticket: `adaptive`, `adaptive-bak`,
+`adaptive-bak-bak-bak` is obviously one arc, but only reading it tells you what it
+was for. Those come out as kind="prefix" with a provisional label for a session to
+rename.
+
+  work-arcs --json                 the graph
+  work-arcs                        a summary, most recently touched first
+  work-arcs --active 14            only arcs touched in the last 14 days
+
+Read-only. Runs git and glab, writes nothing.
+"""
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from collections import defaultdict
+from pathlib import Path
+
+TICKET_RE = re.compile(r"\b([A-Z]{2,4})-(\d{2,5})\b")
+# Branch names like `6919-review` and `6802-kyle` carry the number but not the
+# project, so they look unkeyed. They are resolved against the keys that do appear.
+BARE_NUM_RE = re.compile(r"(?:^|[^0-9A-Za-z])(\d{4,5})(?:[^0-9]|$)")
+
+SRC_SUFFIXES = (
+    ".rs", ".ts", ".tsx", ".js", ".jsx", ".py", ".sql", ".go",
+    ".java", ".kt", ".swift", ".c", ".cc", ".cpp", ".h", ".hpp",
+)
+
+
+def git(repo, *args, check=False):
+    """Run git, returning stdout. Failures are normal here (missing refs, etc)."""
+    r = subprocess.run(
+        ["git", "-C", str(repo), *args],
+        capture_output=True, text=True,
+    )
+    if check and r.returncode != 0:
+        sys.exit(f"work-arcs: git {' '.join(args)} failed: {r.stderr.strip()}")
+    return r.stdout
+
+
+def lines(s):
+    return [x for x in s.splitlines() if x.strip()]
+
+
+def session_index(projects_dir):
+    """branch -> [transcript paths], from one rg pass over every project dir.
+
+    Sessions run from $HOME record gitBranch=HEAD and land in a project dir named
+    after $HOME rather than the repo, so scanning every dir is the only way to see
+    them. Transcripts reach 18M; this never parses one, it only scans for a field.
+    """
+    idx = defaultdict(set)
+    if not projects_dir.is_dir() or not shutil.which("rg"):
+        return idx
+    r = subprocess.run(
+        ["rg", "-oN", "--with-filename", r'"gitBranch":"[^"]*"', str(projects_dir)],
+        capture_output=True, text=True,
+    )
+    for line in r.stdout.splitlines():
+        path, _, rest = line.partition(':"gitBranch":"')
+        branch = rest.rstrip('"')
+        if branch and branch != "HEAD":
+            idx[branch].add(path)
+    return idx
+
+
+def collect_branches(repo, main_ref):
+    """Every unmerged local branch with the facts that decide its state."""
+    fmt = "%(refname:short)\t%(objectname)\t%(committerdate:unix)"
+    out = git(repo, "for-each-ref", "--no-merged", main_ref, f"--format={fmt}", "refs/heads")
+    branches = {}
+    for line in lines(out):
+        parts = line.split("\t")
+        if len(parts) != 3:
+            continue
+        name, sha, ts = parts
+        branches[name] = {
+            "name": name,
+            "sha": sha[:9],
+            "committed": int(ts),
+            "age_days": int((time.time() - int(ts)) // 86400),
+        }
+
+    worktrees = set()
+    for line in lines(git(repo, "worktree", "list", "--porcelain")):
+        if line.startswith("branch refs/heads/"):
+            worktrees.add(line[len("branch refs/heads/"):])
+
+    for name, b in branches.items():
+        ahead = git(repo, "rev-list", "--count", f"{main_ref}..{name}").strip()
+        b["commits_ahead"] = int(ahead) if ahead.isdigit() else 0
+        unpushed = git(repo, "rev-list", "--count", name, "--not", "--remotes").strip()
+        b["unpushed"] = int(unpushed) if unpushed.isdigit() else 0
+        b["pushed"] = b["unpushed"] == 0
+        b["worktree"] = name in worktrees
+        # Parents = branches contained in this one that still have unmerged work.
+        # Both filters matter: --merged alone returns every long-merged branch whose
+        # tip sits in main's history, which invents a parent edge for everything.
+        parents = lines(git(
+            repo, "for-each-ref", "--merged", name, "--no-merged", main_ref,
+            "--format=%(refname:short)", "refs/heads",
+        ))
+        b["parents"] = [p for p in parents if p != name]
+    return branches
+
+
+def collect_stashes(repo):
+    """Stashes with their contents. The ref alone is useless; the files are the point."""
+    out = git(repo, "stash", "list", "--format=%gd\t%H\t%ct\t%gs")
+    stashes = []
+    for line in lines(out):
+        parts = line.split("\t")
+        if len(parts) != 4:
+            continue
+        ref, sha, ts, subject = parts
+        m = re.match(r"^(?:WIP on|On) ([^:]+):", subject)
+        base = m.group(1) if m else ""
+        files = lines(git(repo, "stash", "show", "--name-only", sha))
+        stashes.append({
+            "ref": ref,
+            "sha": sha[:9],
+            "base": base,
+            "age_days": int((time.time() - int(ts)) // 86400),
+            "files": files[:8],
+            "file_count": len(files),
+            "src_count": sum(1 for f in files if f.endswith(SRC_SUFFIXES)),
+        })
+    return stashes
+
+
+def collect_mrs(repo):
+    """Open MRs of mine, with comment counts. One API call gets what list cannot."""
+    if not shutil.which("glab"):
+        return [], "glab not installed"
+    r = subprocess.run(
+        ["glab", "api",
+         "projects/:id/merge_requests?scope=created_by_me&state=opened&per_page=100"],
+        capture_output=True, text=True, cwd=str(repo), timeout=40,
+    )
+    if r.returncode != 0 or not r.stdout.strip():
+        return [], "glab could not read merge requests"
+    try:
+        raw = json.loads(r.stdout)
+    except json.JSONDecodeError:
+        return [], "unreadable response from glab"
+    mrs = []
+    for m in raw:
+        mrs.append({
+            "iid": m.get("iid"),
+            "title": m.get("title", ""),
+            "branch": m.get("source_branch", ""),
+            "notes": m.get("user_notes_count", 0),
+            "draft": bool(m.get("draft") or m.get("work_in_progress")),
+            "updated": m.get("updated_at", ""),
+            "url": m.get("web_url", ""),
+        })
+    return mrs, None
+
+
+def ticket_of(name, known_projects):
+    """The arc a branch name declares, if it declares one."""
+    m = TICKET_RE.search(name.upper())
+    if m:
+        return f"{m.group(1)}-{m.group(2)}"
+    # `6919-review` names a ticket without its project. Resolve the number against
+    # projects that appear elsewhere, and only when it is unambiguous.
+    m = BARE_NUM_RE.search(name)
+    if m:
+        num = m.group(1)
+        hits = {p for (p, n) in known_projects if n == num}
+        if len(hits) == 1:
+            return f"{hits.pop()}-{num}"
+    return None
+
+
+# `hotfix/`, `fix/`, `review/` are categories every unrelated branch shares -- as an
+# arc name, `hotfix` collected 37 branches with nothing in common. Skip past them to
+# the token that actually names the work.
+PREFIX_STOPWORDS = {
+    "hotfix", "fix", "fixes", "review", "wip", "temp", "tmp", "test", "tests",
+    "feat", "feature", "chore", "bak", "backup", "old", "new", "try", "spike",
+    "kyle", "misc", "draft", "release",
+}
+
+
+def prefix_of(name):
+    """A provisional arc name for work that never got a ticket.
+
+    Groups the `adaptive` / `adaptive-bak` / `adaptive-bak-bak-bak` family that a
+    ticket-key grouping cannot see at all. Conventional prefixes are stepped over,
+    since they describe the kind of branch rather than the work in it.
+    """
+    for token in re.split(r"[-/_.]", name):
+        t = token.lower()
+        if len(t) >= 4 and t not in PREFIX_STOPWORDS and not t.isdigit():
+            return t
+    return None
+
+
+def build_arcs(branches, stashes, mrs, sessions, main_ref):
+    known_projects = set()
+    for name in branches:
+        m = TICKET_RE.search(name.upper())
+        if m:
+            known_projects.add((m.group(1), m.group(2)))
+
+    # Assign every branch to an arc: a ticket if it names one, else a shared name
+    # prefix, else itself.
+    assign, prefix_members = {}, defaultdict(list)
+    for name in branches:
+        key = ticket_of(name, known_projects)
+        if key:
+            assign[name] = ("ticket", key)
+        else:
+            p = prefix_of(name)
+            if p:
+                prefix_members[p].append(name)
+            else:
+                assign[name] = ("single", name)
+    for p, members in prefix_members.items():
+        # A prefix shared by one branch is not a cluster, it is just a branch.
+        kind = "prefix" if len(members) > 1 else "single"
+        for name in members:
+            assign[name] = (kind, p if kind == "prefix" else name)
+
+    arcs = {}
+    for name, b in branches.items():
+        kind, key = assign[name]
+        arc = arcs.setdefault(key, {
+            "id": key, "kind": kind, "label": key,
+            "branches": [], "stashes": [], "mrs": [], "sessions": [],
+        })
+        arcs[key]["branches"].append(b)
+
+    branch_to_arc = {n: assign[n][1] for n in branches}
+
+    # A stash belongs to the arc of the branch it was taken on. Stashes are a weak
+    # signal here by policy: Kyle keeps meaningful work unstashed, so a stash is
+    # usually scratch. One with no arc to belong to is listed as unattached rather
+    # than promoted to an arc of its own -- inventing 97 single-stash arcs was the
+    # tail wagging the dog.
+    unattached = []
+    for s in stashes:
+        key = branch_to_arc.get(s["base"])
+        if key is None:
+            if s["src_count"] > 0:
+                unattached.append(s)
+            continue
+        arcs[key]["stashes"].append(s)
+
+    for m in mrs:
+        key = branch_to_arc.get(m["branch"]) or ticket_of(m["title"], known_projects)
+        if key and key in arcs:
+            arcs[key]["mrs"].append(m)
+
+    seen_session = defaultdict(set)
+    for branch, paths in sessions.items():
+        key = branch_to_arc.get(branch)
+        if not key or key not in arcs:
+            continue
+        for p in paths:
+            if p in seen_session[key]:
+                continue
+            seen_session[key].add(p)
+            try:
+                mtime = os.path.getmtime(p)
+            except OSError:
+                continue
+            arcs[key]["sessions"].append({
+                "id": Path(p).stem,
+                "age_days": int((time.time() - mtime) // 86400),
+                "via": branch,
+            })
+
+    for arc in arcs.values():
+        finalize(arc)
+    ordered = sorted(arcs.values(), key=lambda a: (a["age_days"], -a["at_risk"]))
+    return ordered, unattached
+
+
+def finalize(arc):
+    # Two different ages, because they answer different questions. The newest
+    # touch says "is this live"; the median says "how much of this has gone cold".
+    # Min alone made every large arc look active: one commit today in a 17-branch
+    # cluster is not the same as the cluster being worked on.
+    ages = sorted(
+        [b["age_days"] for b in arc["branches"]]
+        + [s["age_days"] for s in arc["sessions"]]
+    )
+    arc["age_days"] = ages[0] if ages else 999
+    arc["median_age_days"] = ages[len(ages) // 2] if ages else 999
+
+    arc["unpushed"] = sum(b["unpushed"] for b in arc["branches"])
+    # Stashes contribute a token amount: they break ties, they do not set priority.
+    arc["at_risk"] = arc["unpushed"] + min(sum(s["src_count"] for s in arc["stashes"]), 3)
+    arc["stacked"] = sum(1 for b in arc["branches"] if b["parents"])
+
+    if arc["mrs"] and any(m["notes"] == 0 for m in arc["mrs"]):
+        arc["state"] = "waiting on review"
+    elif arc["age_days"] <= 3:
+        arc["state"] = "active"
+    elif arc["unpushed"]:
+        arc["state"] = "at risk"
+    else:
+        arc["state"] = "idle"
+
+    arc["counts"] = {
+        "branches": len(arc["branches"]),
+        "stashes": len(arc["stashes"]),
+        "mrs": len(arc["mrs"]),
+        "sessions": len(arc["sessions"]),
+    }
+    arc["branches"].sort(key=lambda b: (-b["unpushed"], b["age_days"]))
+    arc["stashes"].sort(key=lambda s: -s["src_count"])
+    arc["sessions"].sort(key=lambda s: s["age_days"])
+
+
+def main():
+    p = argparse.ArgumentParser(description="Group a repo's loose work into arcs.")
+    p.add_argument("--repo", type=Path,
+                   default=Path(os.environ.get("WORK_ARCS_REPO", Path.home() / "work/repos/ul")))
+    p.add_argument("--main", default=os.environ.get("WORK_ARCS_MAIN", "origin/main"))
+    p.add_argument("--projects", type=Path,
+                   default=Path(os.environ.get("WORK_ARCS_PROJECTS",
+                                               Path.home() / ".claude/projects")))
+    p.add_argument("--active", type=int, metavar="DAYS",
+                   help="only arcs touched this recently")
+    p.add_argument("--no-mr", action="store_true", help="skip the GitLab call")
+    p.add_argument("--json", action="store_true", help="emit the graph")
+    args = p.parse_args()
+
+    if not (args.repo / ".git").exists():
+        sys.exit(f"work-arcs: not a git repo: {args.repo}")
+    git(args.repo, "rev-parse", "--verify", args.main, check=True)
+
+    branches = collect_branches(args.repo, args.main)
+    stashes = collect_stashes(args.repo)
+    mrs, mr_error = ([], None) if args.no_mr else collect_mrs(args.repo)
+    sessions = session_index(args.projects)
+    arcs, unattached = build_arcs(branches, stashes, mrs, sessions, args.main)
+
+    if args.active is not None:
+        arcs = [a for a in arcs if a["age_days"] <= args.active]
+
+    if args.json:
+        json.dump({
+            "generated": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "repo": args.repo.name,
+            "main": args.main,
+            "mr_error": mr_error,
+            "arc_count": len(arcs),
+            "arcs": arcs,
+            "unattached_stashes": unattached,
+        }, sys.stdout, indent=1)
+        print()
+        return
+
+    if mr_error:
+        print(f"⚠ {mr_error}", file=sys.stderr)
+    for a in arcs:
+        c = a["counts"]
+        bits = [f"{c['branches']}b"]
+        if c["stashes"]:
+            bits.append(f"{c['stashes']}stash")
+        if c["mrs"]:
+            bits.append(f"{c['mrs']}mr")
+        if c["sessions"]:
+            bits.append(f"{c['sessions']}sess")
+        if a["stacked"]:
+            bits.append(f"{a['stacked']}stacked")
+        risk = f"  {a['unpushed']} unpushed" if a["unpushed"] else ""
+        print(f"{a['age_days']:>4}d  {a['state']:<18} {a['label']:<28} "
+              f"{','.join(bits):<28}{risk}")
+    print(f"\n✓ {len(arcs)} arcs from {len(branches)} branches, "
+          f"{len(mrs)} MRs; {len(unattached)} stashes attached to no arc",
+          file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()
