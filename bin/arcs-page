@@ -6,14 +6,21 @@ The first version of this page listed artifacts -- 97 stash rows, 261 branch row
 and was correctly called useless: `stash@{38}` on its own says nothing, and a flat
 list of branches is the same wall of text in a nicer font. The unit was wrong.
 
-This renders arcs. One card per arc, with the branches, sessions, stashes and MRs it
-contains nested inside it, so the page answers "what am I working on" in one screen
-instead of asking you to reassemble it from rows.
+This renders arcs, and each card leads with what the arc IS rather than with how much
+of it there is. A count is an input to a judgement, not the judgement: opening a card
+with "112 unpushed / 15 branches / 19 sessions / 7 stacked" is what made the previous
+version a spreadsheet in a nicer font, so the counts moved to the bottom of the card
+and the description arc-brief derived moved to the top.
 
-  work-arcs --json | arcs-page --out page.html
+Under each description is the arc's spawn tree. work-arcs has always derived which
+branch each branch was cut from; the previous version printed a flat list of the four
+with the most commits, so the structure was computed on every run and discarded at the
+last step.
 
-Deterministic: the same data renders the same page every time. The one sentence that
-needs judgment comes in with --lede.
+  work-arcs --json | arc-brief | arcs-page --out page.html
+
+Renders without arc-brief in the pipeline too -- the cards fall back to the cluster
+label and lose their descriptions, which is the honest degradation.
 """
 
 import argparse
@@ -64,26 +71,52 @@ h2{font-family:var(--serif);font-weight:500;font-size:1.25rem;margin:0 0 .2rem;
 .note{color:var(--ink-soft);font-size:.85rem;max-width:54em;margin:0 0 1.1rem}
 section{margin-bottom:3rem}
 
-/* One card per arc. Everything the arc contains lives inside it, which is the whole
-   point -- the flat version made you reassemble this from unrelated rows. */
-.arcs{display:grid;grid-template-columns:repeat(auto-fill,minmax(23rem,1fr));gap:.9rem}
+/* One card per arc, leading with what the arc IS. The counts moved to the footer of
+   the card because a count is an input to a judgement, not the judgement -- reading
+   "112 unpushed / 15 branches / 19 sessions" first is what made this a spreadsheet. */
+.arcs{display:grid;grid-template-columns:repeat(auto-fill,minmax(30rem,1fr));gap:1rem}
 .arc{background:var(--surface);border:1px solid var(--hairline);border-radius:4px;
-     border-top:3px solid var(--hue,var(--hairline));padding:.9rem 1rem;
-     display:flex;flex-direction:column;gap:.55rem;min-width:0}
+     border-top:3px solid var(--hue,var(--hairline));padding:1rem 1.1rem;
+     display:flex;flex-direction:column;gap:.6rem;min-width:0}
 .arc.is-hot{--hue:var(--hot);background:var(--hot-wash)}
 .arc.is-warm{--hue:var(--warm)}
 .arc.is-calm{--hue:var(--calm)}
-.arc-head{display:flex;align-items:baseline;justify-content:space-between;gap:.6rem}
-.arc-name{font-family:var(--mono);font-size:.95rem;overflow-wrap:anywhere;color:var(--ink)}
-.arc-state{font-size:.68rem;text-transform:uppercase;letter-spacing:.06em;
-           color:var(--hue,var(--ink-faint));white-space:nowrap}
-.metrics{display:flex;flex-wrap:wrap;gap:.15rem 1rem;font-family:var(--mono);
-         font-size:.75rem;color:var(--ink-soft);font-variant-numeric:tabular-nums}
-.metrics b{color:var(--ink);font-weight:600}
-.members{font-family:var(--mono);font-size:.72rem;color:var(--ink-faint);
-         display:flex;flex-direction:column;gap:.15rem}
-.members span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.members .risk{color:var(--hot)}
+.arc-name{font-family:var(--serif);font-size:1.12rem;line-height:1.3;color:var(--ink);
+          letter-spacing:-.01em;text-wrap:balance;margin:0}
+.arc-sub{display:flex;flex-wrap:wrap;align-items:baseline;gap:.2rem .55rem;
+         font-family:var(--mono);font-size:.72rem;color:var(--ink-faint)}
+.arc-sub .key{color:var(--accent)}
+.arc-state{text-transform:uppercase;letter-spacing:.06em;color:var(--hue,var(--ink-faint))}
+.arc-sum{font-size:.87rem;line-height:1.5;color:var(--ink-soft);margin:0;
+         text-wrap:pretty}
+.blocker{font-size:.8rem;color:var(--hue,var(--ink-soft));display:flex;gap:.4rem;
+         align-items:baseline;margin:0}
+.blocker::before{content:"▲";font-size:.6rem;flex:none;opacity:.8}
+.tickets{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;
+         gap:.12rem;font-size:.78rem}
+.tickets li{display:flex;gap:.5rem;min-width:0}
+.tickets .key{font-family:var(--mono);font-size:.72rem;color:var(--accent);flex:none}
+.tickets .t{color:var(--ink-soft);overflow:hidden;text-overflow:ellipsis;
+            white-space:nowrap}
+
+/* The stacking edges. work-arcs derives a parent for 106 of 389 branches and the
+   first version of this page printed a flat top-4 list sorted by commit count, so
+   the tree was computed on every run and thrown away at the last step. */
+.tree{overflow-x:auto;border-top:1px solid var(--hairline);padding-top:.55rem;
+      margin-top:.1rem}
+.tree svg{display:block}
+.tree .n{font-family:var(--mono);font-size:11px;fill:var(--ink-soft)}
+.tree .n.risk{fill:var(--hot)}
+.tree .c{font-family:var(--mono);font-size:10px;fill:var(--ink-faint)}
+.tree .edge{stroke:var(--hairline);fill:none;stroke-width:1.5}
+.tree .dot{fill:var(--ink-faint)}
+.tree .dot.risk{fill:var(--hot)}
+.tree .dot.head{stroke:var(--accent);stroke-width:1.5;fill:var(--surface)}
+
+.metrics{display:flex;flex-wrap:wrap;gap:.15rem .9rem;font-family:var(--mono);
+         font-size:.72rem;color:var(--ink-faint);font-variant-numeric:tabular-nums;
+         border-top:1px solid var(--hairline);padding-top:.5rem;margin-top:auto}
+.metrics b{color:var(--ink-soft);font-weight:600}
 
 table{width:100%;border-collapse:collapse;font-size:.82rem}
 .scroll{overflow-x:auto;border:1px solid var(--hairline);border-radius:4px;
@@ -146,8 +179,9 @@ def derive_lede(data, focus_days):
         top = max(arcs, key=lambda a: a.get("unpushed", 0))
         if top.get("unpushed", 0) > 0:
             c = top.get("counts", {})
+            name = (top.get("brief") or {}).get("name") or top.get("label", "?")
             bits.append(
-                f'The heaviest is <em>{esc(top.get("label","?"))}</em>: '
+                f'The heaviest is <em>{esc(name)}</em>: '
                 f'{top["unpushed"]} unpushed across {c.get("branches",0)} branches '
                 f'and {c.get("sessions",0)} sessions.')
 
@@ -157,6 +191,134 @@ def derive_lede(data, focus_days):
 
 def esc(x):
     return html.escape(str(x), quote=True)
+
+
+ROW, INDENT, PAD = 17, 15, 4
+
+
+def spawn_forest(branches):
+    """Turn the multi-parent ancestry into the one tree a reader can follow.
+
+    `parents` holds every branch in the arc whose tip is an ancestor of this one, so a
+    branch cut from a stack lists its whole stack. The immediate parent is the ancestor
+    with the most commits of its own -- the deepest one -- and that single edge is what
+    "spawned this" means. Branches sharing a sha are mutual ancestors and would form a
+    cycle, so the second edge of any loop is dropped.
+    """
+    by_name = {b["name"]: b for b in branches}
+    parent = {}
+    for b in branches:
+        cands = [by_name[p] for p in (b.get("parents") or [])
+                 if p in by_name and p != b["name"]]
+        if cands:
+            parent[b["name"]] = max(cands,
+                                    key=lambda c: c.get("commits_ahead", 0))["name"]
+
+    for name in list(parent):
+        seen, cur = {name}, parent.get(name)
+        while cur is not None:
+            if cur in seen:
+                del parent[name]
+                break
+            seen.add(cur)
+            cur = parent.get(cur)
+
+    kids = {}
+    for child, par in parent.items():
+        kids.setdefault(par, []).append(child)
+    for v in kids.values():
+        v.sort(key=lambda n: -by_name[n].get("unpushed", 0))
+
+    order = [b["name"] for b in branches]
+    roots = [n for n in order if n not in parent]
+
+    rows = []
+
+    def walk(name, depth):
+        rows.append((by_name[name], depth))
+        for k in kids.get(name, []):
+            walk(k, depth + 1)
+
+    for r in roots:
+        walk(r, 0)
+    return rows, parent
+
+
+def spawn_svg(arc, limit=12):
+    """Draw the arc's stacking tree, or nothing when there is no structure to show.
+
+    Build the forest over every branch and prune afterwards, never the other way round.
+    Taking the top N first and then looking for parents severs any edge whose parent
+    happens to carry fewer commits than the cut -- on the heaviest arc that discarded
+    half the structure, which is how a tree renders as a flat list. Keeping each shown
+    branch's ancestors means an edge is only ever hidden with the branch it belongs to.
+    """
+    branches = arc.get("branches", [])
+    if len(branches) < 2:
+        return ""
+    rows, parent = spawn_forest(branches)
+    if not rows:
+        return ""
+
+    if len(rows) > limit:
+        keep = set()
+        for b in branches[:limit]:
+            cur, guard = b["name"], 0
+            while cur is not None and cur not in keep and guard < 40:
+                keep.add(cur)
+                cur = parent.get(cur)
+                guard += 1
+        rows = [(b, d) for b, d in rows if b["name"] in keep]
+        # A kept branch whose parent was pruned would draw an edge to nothing.
+        parent = {c: p for c, p in parent.items() if c in keep and p in keep}
+        # Re-level so a surviving subtree does not start indented under empty space.
+        shallowest = min(d for _, d in rows)
+        rows = [(b, d - shallowest) for b, d in rows]
+
+    at = {b["name"]: i for i, (b, _) in enumerate(rows)}
+    depth_of = {b["name"]: d for b, d in rows}
+
+    def x_of(d):
+        return PAD + d * INDENT
+
+    def y_of(i):
+        return PAD + i * ROW + ROW // 2
+
+    widest = max((len(b["name"]) + len(str(b.get("unpushed") or "")) + 4) * 6.4
+                 + x_of(d) for b, d in rows)
+    height = PAD * 2 + len(rows) * ROW
+    svg = [f'<svg width="{int(widest) + 16}" height="{height}" '
+           f'viewBox="0 0 {int(widest) + 16} {height}" role="img" '
+           f'aria-label="how this arc&rsquo;s branches were cut from each other">']
+
+    # Elbows first so the dots sit on top of them.
+    for b, d in rows:
+        par = parent.get(b["name"])
+        if par is None or par not in at:
+            continue
+        px, py = x_of(depth_of[par]), y_of(at[par])
+        cx, cy = x_of(d), y_of(at[b["name"]])
+        svg.append(f'<path class="edge" d="M{px} {py + 5} V{cy} H{cx - 3}"/>')
+
+    for b, d in rows:
+        cx, cy = x_of(d), y_of(at[b["name"]])
+        risk = " risk" if b.get("unpushed") else ""
+        head = " head" if b.get("worktree") else ""
+        svg.append(f'<circle class="dot{risk}{head}" cx="{cx}" cy="{cy}" r="3.2"/>')
+        n = b.get("unpushed") or 0
+        # The count rides in the same <text> as a dx-offset tspan. Positioning it with
+        # its own x means guessing the font's advance width, and the guess ran short
+        # often enough to jam `+13` against the branch name.
+        tail = f'<tspan class="c" dx="7">+{n}</tspan>' if n else ""
+        svg.append(f'<text class="n{risk}" x="{cx + 8}" y="{cy + 4}">'
+                   f'{esc(b["name"])}{tail}</text>')
+
+    svg.append("</svg>")
+    hidden = len(branches) - len(rows)
+    more = (f'<div class="arc-sub" style="padding-top:.35rem">'
+            f'{hidden} more branch{"es" if hidden != 1 else ""} in this arc</div>'
+            if hidden > 0 else "")
+    return f'<div class="tree">{"".join(svg)}</div>{more}'
 
 
 def heat(arc):
@@ -197,38 +359,59 @@ def render(data, lede, focus_days, limit):
     # --- what you are working on -------------------------------------------
     a("<section>")
     a("<h2>In flight</h2>")
-    a('<p class="note">Arcs with real activity, ranked by how deeply you engaged with '
-      "them rather than by which was touched most recently. Each card holds everything "
-      "the arc contains — that is the difference from a list of branches.</p>")
+    a('<p class="note">Ranked by how deeply you engaged with them, not by what was '
+      "touched most recently. Each name and description is derived from the arc's own "
+      "evidence — its commits, tickets, merge requests and the prompts you typed — and "
+      "the diagram under each is how those branches were actually cut from one "
+      "another.</p>")
     a('<div class="arcs">')
+    def plural(n, word):
+        return f"{n} {word}" + ("" if n == 1 else "s")
+
     for arc in arcs[:limit]:
         c = arc.get("counts", {})
+        brief = arc.get("brief") or {}
         a(f'<div class="arc is-{heat(arc)}">')
-        a('<div class="arc-head">'
-          f'<span class="arc-name">{esc(arc.get("label","?"))}</span>'
-          f'<span class="arc-state">{esc(arc.get("state",""))}</span></div>')
+
+        # The name the model derived, not the cluster label: `DE-3101` is what the
+        # deterministic namer picked for an arc that is really the impedance work, and
+        # a heading that misnames its own contents is worse than a terse one.
+        a(f'<h3 class="arc-name">{esc(brief.get("name") or arc.get("label","?"))}</h3>')
+
+        sub = []
+        keys = [i.get("key", "") for i in arc.get("issues", [])[:3]]
+        if keys:
+            sub.append(f'<span class="key">{esc(" · ".join(keys))}</span>')
+        elif brief.get("name"):
+            sub.append(f'<span>{esc(arc.get("label","?"))}</span>')
+        if arc.get("state"):
+            sub.append(f'<span class="arc-state">{esc(arc["state"])}</span>')
+        if sub:
+            a(f'<div class="arc-sub">{"".join(sub)}</div>')
+
+        if brief.get("summary"):
+            a(f'<p class="arc-sum">{esc(brief["summary"])}</p>')
+        if brief.get("blocker"):
+            a(f'<p class="blocker">{esc(brief["blocker"])}</p>')
+
+        if arc.get("issues"):
+            a('<ul class="tickets">')
+            for i in arc["issues"][:4]:
+                a(f'<li><span class="key">{esc(i.get("key",""))}</span>'
+                  f'<span class="t">{esc(i.get("summary",""))}</span></li>')
+            a("</ul>")
+
+        a(spawn_svg(arc))
+
         a('<div class="metrics">')
         if arc.get("unpushed"):
             a(f"<span><b>{arc['unpushed']}</b> unpushed</span>")
-        def plural(n, word):
-            return f"{n} {word}" + ("" if n == 1 else "s")
         a(f"<span>{plural(c.get('branches',0),'branch').replace('branchs','branches')}</span>")
         if c.get("sessions"):
             a(f"<span>{plural(c['sessions'],'session')}</span>")
-        if arc.get("stacked"):
-            a(f"<span>{arc['stacked']} stacked</span>")
         if c.get("stashes"):
             a(f"<span>{plural(c['stashes'],'stash').replace('stashs','stashes')}</span>")
         a(f"<span>{arc.get('age_days','?')}d idle</span>")
-        a("</div>")
-        a('<div class="members">')
-        for b in arc.get("branches", [])[:4]:
-            cls = "risk" if b.get("unpushed") else ""
-            tail = f" · {b['unpushed']} unpushed" if b.get("unpushed") else ""
-            a(f'<span class="{cls}">{esc(b.get("name","?"))}{esc(tail)}</span>')
-        extra = c.get("branches", 0) - 4
-        if extra > 0:
-            a(f"<span>+{extra} more</span>")
         a("</div></div>")
     a("</div></section>")
 
@@ -248,7 +431,7 @@ def render(data, lede, focus_days, limit):
                 a(f'<tr><td class="k">{esc(i.get("key",""))}</td>'
                   f'<td class="d">{esc(i.get("status",""))}</td>'
                   f'<td class="n">{esc(m.get("why","").split(" but ")[-1])}</td>'
-                  f'<td class="d">{esc(i.get("summary","")[:58])}</td></tr>')
+                  f'<td class="d">{esc(i.get("summary",""))}</td></tr>')
             a("</tbody></table></div></section>")
 
         unt = gap.get("unticketed_work") or []
@@ -259,11 +442,12 @@ def render(data, lede, focus_days, limit):
               "from capacity, burndown and every initiative rollup. Each has a one-step "
               "command to file it.</p>")
             a('<div class="scroll"><table><thead><tr>'
-              "<th>Arc</th><th>Branches</th><th>Sessions</th><th>Unpushed</th>"
+              "<th>What it is</th><th>Branches</th><th>Sessions</th><th>Unpushed</th>"
               "<th>File it</th></tr></thead><tbody>")
             for x in unt[:12]:
                 cc = x.get("counts", {})
-                a(f'<tr><td class="k">{esc(x.get("label","?"))}</td>'
+                nm = (x.get("brief") or {}).get("name") or x.get("label", "?")
+                a(f'<tr><td class="d">{esc(nm)}</td>'
                   f'<td class="d">{cc.get("branches",0)}</td>'
                   f'<td class="d">{cc.get("sessions",0)}</td>'
                   f'<td class="n">{x.get("unpushed",0) or ""}</td>'
@@ -285,8 +469,8 @@ def render(data, lede, focus_days, limit):
                 init = ", ".join(i.get("initiatives") or []) or "—"
                 a(f'<tr><td class="k">{esc(i.get("key",""))}</td>'
                   f'<td class="d">{esc(i.get("status",""))}</td>'
-                  f'<td class="d">{esc(i.get("summary","")[:52])}</td>'
-                  f'<td class="d">{esc(init[:44])}</td></tr>')
+                  f'<td class="d">{esc(i.get("summary",""))}</td>'
+                  f'<td class="d">{esc(init)}</td></tr>')
             a("</tbody></table></div></section>")
 
     a("<footer>Derived, never declared — arcs come from the files your work "
