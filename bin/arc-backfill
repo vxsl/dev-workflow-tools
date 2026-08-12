@@ -1,0 +1,160 @@
+#!/usr/bin/env -S python3 -u
+"""
+arc-backfill: seed the turn log from transcripts already on disk.
+
+arc-record captures turns as they happen, but there are months of history that predate
+it. This walks every transcript once and emits the same records, so the readers have
+something to cluster from day one and the expensive scan never has to run again.
+
+Turn boundaries here are the honest approximation the live hook does not need: a new
+substantive user prompt starts a turn, and the tool calls that follow belong to it.
+That is exactly how arc-record reads a tail, applied to whole files.
+
+  arc-backfill                 append turns not already present
+  arc-backfill --rebuild       discard the log and rebuild from scratch
+  arc-backfill --repo-only     only turns whose files look like the work repo
+
+Writes $XDG_STATE_HOME/work-arcs/turns.jsonl. Reads nothing else, writes nowhere else.
+"""
+
+import argparse
+import json
+import os
+import re
+import sys
+import time
+from pathlib import Path
+
+SRC = (".rs", ".ts", ".tsx", ".js", ".jsx", ".py", ".sql", ".toml", ".go",
+       ".java", ".kt", ".swift", ".c", ".cc", ".cpp", ".h", ".hpp", ".md", ".sh")
+WRAPPERS = ("<system-reminder", "<command-name", "<command-message", "<command-args",
+            "<local-command-stdout", "<task-notification", "<user-prompt-submit-hook",
+            "[Request interrupted")
+PATH_RE = re.compile(r"[\w./-]+\.(?:rs|ts|tsx|py|sql|toml|go|sh)\b")
+
+STATE = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "work-arcs"
+LOG = STATE / "turns.jsonl"
+
+
+def text_of(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(b.get("text", "") for b in content
+                        if isinstance(b, dict) and b.get("type") == "text")
+    return ""
+
+
+def turns_in(path):
+    """Yield one record per substantive prompt, with the files its turn touched."""
+    session = path.stem
+    cur = None
+    branch = cwd = None
+    try:
+        fh = path.open(errors="replace")
+    except OSError:
+        return
+    with fh:
+        for raw in fh:
+            try:
+                e = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if e.get("gitBranch"):
+                branch = e["gitBranch"]
+            if e.get("cwd"):
+                cwd = e["cwd"]
+            msg = e.get("message") or {}
+
+            if e.get("type") == "user" and not e.get("isMeta"):
+                t = text_of(msg.get("content")).strip()
+                if len(t) > 15 and not t.startswith(WRAPPERS):
+                    if cur:
+                        yield cur
+                    ts = e.get("timestamp") or ""
+                    at = 0
+                    if ts:
+                        try:
+                            from datetime import datetime
+                            at = int(datetime.fromisoformat(
+                                ts.replace("Z", "+00:00")).timestamp())
+                        except ValueError:
+                            at = 0
+                    cur = {"at": at, "session": session, "cwd": cwd,
+                           "repo": None, "branch": branch,
+                           "prompt": re.sub(r"\s+", " ", t)[:1500], "files": []}
+                    continue
+
+            c = msg.get("content")
+            if cur and isinstance(c, list):
+                for b in c:
+                    if not (isinstance(b, dict) and b.get("type") == "tool_use"):
+                        continue
+                    i = b.get("input") or {}
+                    for k in ("file_path", "notebook_path", "path"):
+                        v = i.get(k)
+                        if isinstance(v, str) and v.endswith(SRC):
+                            cur["files"].append(v)
+                    for k in ("command", "pattern", "glob"):
+                        v = i.get(k)
+                        if isinstance(v, str):
+                            cur["files"] += PATH_RE.findall(v)
+    if cur:
+        yield cur
+
+
+def main():
+    p = argparse.ArgumentParser(description="Seed the turn log from existing transcripts.")
+    p.add_argument("--projects", type=Path,
+                   default=Path(os.environ.get("WORK_ARCS_PROJECTS",
+                                               Path.home() / ".claude/projects")))
+    p.add_argument("--rebuild", action="store_true", help="discard the log first")
+    p.add_argument("--repo-only", action="store_true",
+                   help="keep only turns that touched the work repo's files")
+    args = p.parse_args()
+
+    if not args.projects.is_dir():
+        sys.exit(f"arc-backfill: no such projects dir: {args.projects}")
+
+    STATE.mkdir(parents=True, exist_ok=True)
+    seen = set()
+    if args.rebuild:
+        LOG.unlink(missing_ok=True)
+    elif LOG.exists():
+        # Idempotent on (session, timestamp, first 60 chars of prompt): re-running
+        # must not double every turn already recorded.
+        for line in LOG.open(errors="replace"):
+            try:
+                r = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            seen.add((r.get("session"), r.get("at"), (r.get("prompt") or "")[:60]))
+
+    written = skipped = files_seen = 0
+    t0 = time.time()
+    with LOG.open("a") as out:
+        for f in sorted(args.projects.glob("*/*.jsonl")):
+            files_seen += 1
+            for rec in turns_in(f):
+                key = (rec["session"], rec["at"], rec["prompt"][:60])
+                if key in seen:
+                    skipped += 1
+                    continue
+                seen.add(key)
+                files = sorted(set(rec.pop("files")))
+                if args.repo_only and not files:
+                    skipped += 1
+                    continue
+                rec["files"] = files[:60]
+                rec["basenames"] = sorted({p.rsplit("/", 1)[-1] for p in files})[:60]
+                out.write(json.dumps(rec, separators=(",", ":")) + "\n")
+                written += 1
+
+    print(f"✓ {written} turns from {files_seen} transcripts "
+          f"({skipped} already present or empty) in {time.time()-t0:.1f}s",
+          file=sys.stderr)
+    print(f"  {LOG}", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()
