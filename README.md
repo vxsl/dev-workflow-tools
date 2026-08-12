@@ -463,6 +463,47 @@ slack-react-notify --print-service launchd > ~/Library/LaunchAgents/com.dev-work
 launchctl load -w ~/Library/LaunchAgents/com.dev-workflow-tools.slack-react-notify.plist
 ```
 
+### `work-arcs`
+Group the repo's loose work into the arcs it actually belongs to, and reconcile that
+against Jira. 389 unmerged branches is not 389 things — `UB-6919` alone owns 20 of
+them. Flat, that's noise; grouped, it's a handful of pieces of work.
+
+Roots are ticket keys, or a shared name prefix for work that never got a ticket (the
+`adaptive` / `adaptive-bak` / `adaptive-bak-bak-bak` family is one arc no key-based
+grouping can see). Under each: branches with their stacking parents — a branch can
+sit on several, so this is a DAG — stashes with the files in them, MRs with comment
+counts, and the Claude sessions that touched any of it.
+
+```bash
+work-arcs                  # every arc, most recently touched first
+work-arcs --focus          # what you are actually working on (8 arcs, derived)
+work-arcs --gap            # where Jira and reality disagree
+work-arcs --jira-ify dove  # file a ticket for an arc, prefilled from what it is
+work-arcs --json           # the whole graph
+```
+
+**`--focus` is derived, never declared** — there's nothing to keep up to date.
+Recency decides what's eligible; *engagement* decides the order. Sorting by recency
+alone returned 28 arcs for a two-day window, because a session sweeping across
+branches touches many of them. How many transcript entries mention a branch tells
+those apart: three mentions is a grep, four thousand is what you were doing.
+
+**`--gap` answers whether Jira is representative.** Three disagreements, each wanting
+a different action:
+
+| Gap | Meaning |
+|---|---|
+| real work with no ticket | `dove` — 17 branches, 182 unpushed commits, no Jira presence |
+| status claims handed off | `UL-1692` says *In Review* with 136 commits never pushed |
+| ticket with no work | assigned and open, but no branch or session exists |
+
+`--jira-ify` files the ticket using what the arc already knows — branches, unpushed
+count, session count, recent commit subjects — then drops into `create-jira-ticket`'s
+board picker, because UL vs UB is a judgment call. Add `--dry-run` to see it first.
+
+Env: `WORK_ARCS_REPO` (default `~/work/repos/ul`), `WORK_ARCS_MAIN` (`origin/main`),
+`WORK_ARCS_PROJECTS` (`~/.claude/projects`), plus the `JIRA_*` vars for `--gap`.
+
 ### `loose-ends`
 Find work you finished and then lost track of. Work arcs sprawl across Claude
 sessions, git branches, stashes and MRs; each source looks fine alone and the loss

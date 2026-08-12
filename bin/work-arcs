@@ -31,6 +31,7 @@ Read-only. Runs git and glab, writes nothing.
 """
 
 import argparse
+import base64
 import json
 import os
 import re
@@ -38,6 +39,9 @@ import shutil
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -51,6 +55,21 @@ SRC_SUFFIXES = (
     ".rs", ".ts", ".tsx", ".js", ".jsx", ".py", ".sql", ".go",
     ".java", ".kt", ".swift", ".c", ".cc", ".cpp", ".h", ".hpp",
 )
+
+
+ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
+
+
+def load_env():
+    """Same .env contract as the rest of the repo's tools; existing vars win."""
+    if not ENV_FILE.exists():
+        return
+    for line in ENV_FILE.read_text().splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            key, _, value = line.partition("=")
+            value = value.strip().strip('"').strip("'")
+            os.environ.setdefault(key.strip(), os.path.expandvars(value))
 
 
 def git(repo, *args, check=False):
@@ -202,6 +221,107 @@ def collect_mrs(repo):
             "url": m.get("web_url", ""),
         })
     return mrs, None
+
+
+# Statuses that assert the work has left your hands. If a ticket claims one of these
+# while its branch still holds unpushed commits, Jira is describing a world that does
+# not exist -- which is the whole thing this reconciliation is for.
+HANDED_OFF = {"in review", "mr", "in qualification", "releasing", "ready for review",
+              "code review", "qa", "in qa", "verifying"}
+
+
+def collect_jira():
+    """Open issues assigned to me. Jira is the declared picture of my work."""
+    domain = os.environ.get("JIRA_DOMAIN")
+    email = os.environ.get("JIRA_EMAIL")
+    token = os.environ.get("JIRA_API_TOKEN")
+    if not (domain and email and token):
+        return [], "JIRA_DOMAIN / JIRA_EMAIL / JIRA_API_TOKEN not set in .env"
+    url = (f"https://{domain}/rest/api/3/search/jql"
+           "?jql=" + urllib.parse.quote(
+               "assignee = currentUser() AND statusCategory != Done ORDER BY updated DESC")
+           + "&fields=key,summary,status,updated,priority&maxResults=100")
+    req = urllib.request.Request(url, headers={"Accept": "application/json"})
+    auth = base64.b64encode(f"{email}:{token}".encode()).decode()
+    req.add_header("Authorization", f"Basic {auth}")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            raw = json.load(r)
+    except (urllib.error.URLError, json.JSONDecodeError, TimeoutError) as e:
+        return [], f"could not reach Jira: {e}"
+    issues = []
+    for i in raw.get("issues", []):
+        f = i.get("fields", {})
+        status = (f.get("status") or {}).get("name", "")
+        issues.append({
+            "key": i.get("key", ""),
+            "summary": " ".join((f.get("summary") or "").split()),
+            "status": status,
+            "handed_off": status.strip().lower() in HANDED_OFF,
+            "updated": (f.get("updated") or "")[:10],
+        })
+    return issues, None
+
+
+def reconcile(arcs, issues):
+    """Where the derived picture and the declared one disagree.
+
+    Three gaps, and they want different actions: work with no ticket needs one
+    filing, a ticket with no work needs closing or starting, and a ticket claiming
+    to be handed off while its commits sit on this laptop needs a push.
+    """
+    by_key = {a["id"]: a for a in arcs if a["kind"] == "ticket"}
+    issue_keys = {i["key"] for i in issues}
+
+    unticketed = [
+        a for a in arcs
+        if a["kind"] != "ticket" and a["engagement"] >= 200 and a["age_days"] <= 30
+    ]
+    unticketed.sort(key=lambda a: -a["engagement"])
+
+    no_work = [i for i in issues if i["key"] not in by_key]
+
+    mismatched = []
+    for i in issues:
+        a = by_key.get(i["key"])
+        if not a:
+            continue
+        if i["handed_off"] and a["unpushed"] > 0:
+            mismatched.append({"issue": i, "arc": a,
+                               "why": f"status '{i['status']}' but {a['unpushed']} commits never pushed"})
+        elif not i["handed_off"] and a["age_days"] > 21:
+            mismatched.append({"issue": i, "arc": a,
+                               "why": f"status '{i['status']}' but untouched {a['age_days']}d"})
+    return {"unticketed_work": unticketed, "tickets_without_work": no_work,
+            "status_mismatch": mismatched}
+
+
+def jira_ify(repo, arc, dry_run):
+    """File a ticket for work that already exists, using what the arc already knows."""
+    branches = ", ".join(b["name"] for b in arc["branches"][:6])
+    subjects = []
+    for b in arc["branches"][:3]:
+        out = git(repo, "log", "--format=%s", "-3", f"origin/main..{b['name']}")
+        subjects += [f"  - {x}" for x in lines(out)[:3]]
+    desc = "\n".join([
+        f"Work already in progress under the name '{arc['label']}'.",
+        "",
+        f"Branches: {branches}",
+        f"Unpushed commits: {arc['unpushed']}",
+        f"Claude sessions touching this work: {arc['counts']['sessions']}",
+        f"Last activity: {arc['age_days']}d ago",
+        "",
+        "Recent commit subjects:",
+        *subjects,
+    ])
+    cmd = ["create-jira-ticket", "--summary", arc["label"], "--description", desc]
+    if dry_run:
+        cmd.append("--dry-run")
+    script = Path(__file__).resolve().parent / "create-jira-ticket"
+    if script.exists():
+        cmd[0] = str(script)
+    print(f"→ {' '.join(cmd[:3])} ...", file=sys.stderr)
+    return subprocess.run(cmd).returncode
 
 
 def ticket_of(name, known_projects):
@@ -380,8 +500,16 @@ def main():
     p.add_argument("--focus-limit", type=int, default=8,
                    help="how many arcs the focus view shows (default 8)")
     p.add_argument("--no-mr", action="store_true", help="skip the GitLab call")
+    p.add_argument("--gap", action="store_true",
+                   help="where Jira and reality disagree: work with no ticket, "
+                        "tickets with no work, tickets claiming to be handed off")
+    p.add_argument("--jira-ify", metavar="ARC",
+                   help="file a ticket for an arc, prefilled from what it already is")
+    p.add_argument("--dry-run", action="store_true",
+                   help="with --jira-ify, show the ticket without creating it")
     p.add_argument("--json", action="store_true", help="emit the graph")
     args = p.parse_args()
+    load_env()
 
     if not (args.repo / ".git").exists():
         sys.exit(f"work-arcs: not a git repo: {args.repo}")
@@ -392,6 +520,43 @@ def main():
     mrs, mr_error = ([], None) if args.no_mr else collect_mrs(args.repo)
     sessions = session_index(args.projects)
     arcs, unattached = build_arcs(branches, stashes, mrs, sessions, args.main)
+
+    if args.jira_ify:
+        match = [a for a in arcs if a["label"] == args.jira_ify or a["id"] == args.jira_ify]
+        if not match:
+            sys.exit(f"work-arcs: no arc named {args.jira_ify!r} "
+                     f"(try `work-arcs --gap` for the candidates)")
+        arc = match[0]
+        if arc["kind"] == "ticket":
+            sys.exit(f"work-arcs: {arc['label']} already is a ticket")
+        sys.exit(jira_ify(args.repo, arc, args.dry_run))
+
+    gap = None
+    if args.gap or args.json:
+        issues, jira_error = collect_jira()
+        gap = reconcile(arcs, issues) if not jira_error else None
+
+    if args.gap:
+        if jira_error:
+            sys.exit(f"work-arcs: {jira_error}")
+        print("── real work with no ticket ─────────────────────────────")
+        for a in gap["unticketed_work"][:10]:
+            print(f"  {a['label']:<28} {a['counts']['branches']}b, "
+                  f"{a['counts']['sessions']}sess, {a['engagement']}ref, "
+                  f"{a['unpushed']} unpushed, {a['age_days']}d")
+            print(f"    └ work-arcs --jira-ify {a['label']}")
+        print("\n── Jira says handed off, but the work is still here ─────")
+        for m in gap["status_mismatch"][:10]:
+            print(f"  {m['issue']['key']:<10} {m['why']}")
+            print(f"    └ {m['issue']['summary'][:64]}")
+        print("\n── assigned tickets with no branch or session ───────────")
+        for i in gap["tickets_without_work"][:12]:
+            print(f"  {i['key']:<10} {i['status']:<18} {i['summary'][:52]}")
+        print(f"\n✓ {len(gap['unticketed_work'])} unticketed, "
+              f"{len(gap['status_mismatch'])} mismatched, "
+              f"{len(gap['tickets_without_work'])} tickets with no work",
+              file=sys.stderr)
+        return
 
     if args.active is not None:
         arcs = [a for a in arcs if a["age_days"] <= args.active]
@@ -413,6 +578,7 @@ def main():
             "arc_count": len(arcs),
             "arcs": arcs,
             "unattached_stashes": unattached,
+            "gap": gap,
         }, sys.stdout, indent=1)
         print()
         return
