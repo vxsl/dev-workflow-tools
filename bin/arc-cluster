@@ -12,11 +12,19 @@ So branches and sessions are both treated as bags of filenames and clustered tog
 Nothing is declared, nothing is named by hand, and a session that ran from $HOME joins
 the right arc because of what it edited rather than where it was launched.
 
-The clustering is mutual k-nearest-neighbour, not threshold-union. Union-find over a
-similarity threshold chains A~B~C~D into one blob -- measured here, it fused 313 of 378
-branches, because a large refactor branch shares something with nearly everything. An
-edge now survives only if BOTH entities rank each other in their top k, which is what
-stops hubs from bridging unrelated work.
+Clustering went through three algorithms, and the failures are worth keeping. Union-find
+over a similarity threshold chains A~B~C~D into one blob: it fused 313 of 378 branches,
+because one large refactor branch shares something with nearly everything. Mutual
+k-nearest-neighbour fixed the chaining but traded one fault for another -- no global k
+could both hold the TDAT investigation together and stop a 45% component forming.
+
+Modularity communities resolve it, because they adapt per neighbourhood instead of
+applying one k everywhere: a hub needs proportionally more evidence to pull a neighbour
+in. At resolution 3.0 the nine-way TDAT fragmentation becomes one arc while the largest
+component is 6% of entities -- both at once, which neither earlier method managed.
+
+Read-only, and deliberately so: this tool and its siblings never write to Jira, Slack,
+or a repo. Anything outward-facing happens only when you run it yourself.
 
   arc-cluster                 the arcs, largest first
   arc-cluster --json          the full graph
@@ -165,7 +173,62 @@ def cluster(ents, k, min_sim):
     comp = collections.defaultdict(list)
     for kk in keys:
         comp[find(kk)].append(kk)
-    return comp, sim, idf
+    return comp, sim, idf, keys
+
+
+def louvain(keys, sim, resolution, passes=12):
+    """Modularity communities, which is what mutual-kNN was approximating badly.
+
+    A global k cannot be right everywhere: the same value that keeps a dense
+    refactor-adjacent neighbourhood from fusing also splits a legitimately broad arc.
+    Modularity compares each node's edges against what a random graph with the same
+    degrees would give, so a hub needs proportionally more evidence to pull a
+    neighbour in, and it adapts per neighbourhood instead of per run.
+
+    Resolution tunes granularity: higher splits more. Single-level local moving is
+    enough here -- the graph is small and sparse, and full aggregation buys little.
+    """
+    adj = collections.defaultdict(dict)
+    for (a, b), w in sim.items():
+        if w <= 0:
+            continue
+        adj[a][b] = w
+        adj[b][a] = w
+    deg = {n: sum(d.values()) for n, d in adj.items()}
+    m2 = sum(deg.values()) or 1.0            # 2m
+    comm = {n: n for n in keys}
+    ctot = collections.defaultdict(float)
+    for n in keys:
+        ctot[comm[n]] += deg.get(n, 0.0)
+
+    for _ in range(passes):
+        moved = False
+        for n in keys:
+            if n not in adj:
+                continue
+            dn = deg.get(n, 0.0)
+            here = comm[n]
+            ctot[here] -= dn
+            # Weight from n into each candidate community.
+            wc = collections.defaultdict(float)
+            for nb, w in adj[n].items():
+                wc[comm[nb]] += w
+            best, gain = here, wc.get(here, 0.0) - resolution * ctot[here] * dn / m2
+            for c, w in wc.items():
+                g = w - resolution * ctot[c] * dn / m2
+                if g > gain:
+                    best, gain = c, g
+            ctot[best] += dn
+            if best != here:
+                comm[n] = best
+                moved = True
+        if not moved:
+            break
+
+    out = collections.defaultdict(list)
+    for n in keys:
+        out[comm[n]].append(n)
+    return out
 
 
 def label(members, ents, idf, meta):
@@ -205,19 +268,21 @@ def main():
     p.add_argument("--repo", type=Path,
                    default=Path(os.environ.get("JIRA_REPO", Path.home() / "work/repos/ul")))
     p.add_argument("--main", default=os.environ.get("WORK_ARCS_MAIN", "origin/main"))
-    # UNRESOLVED. k trades arc quality against blob formation, and no global value
-    # gets both. Measured on 534 entities:
-    #   k=2  307 arcs, largest 1%   — no blob, real arcs shattered
-    #   k=3  224 arcs, largest 3%   — no blob, the TDAT arc splits back into 4
-    #   k=4  156 arcs, largest 16%  — the compromise defaulted to here
-    #   k=6   90 arcs, largest 45%  — TDAT consolidates correctly, but a blob returns
-    # The fix is community detection (Louvain/modularity), which adapts the
-    # neighbourhood locally instead of applying one k everywhere. Until that lands,
-    # this default is a judgement call rather than a right answer.
+    # Only used by --method mknn, kept for comparison. Measured on 534 entities, no
+    # global k got both properties: k=3 killed the blob but split TDAT four ways,
+    # k=6 held TDAT together but fused 45% of entities. That is what motivated
+    # modularity, which gets both.
     p.add_argument("-k", type=int, default=4, help="neighbours considered (default 4)")
     p.add_argument("--min-sim", type=float, default=0.10)
     p.add_argument("--max-files", type=int, default=150,
                    help="entities touching more than this are bridges, not members")
+    p.add_argument("--method", choices=("louvain", "mknn"), default="louvain",
+                   help="louvain adapts per neighbourhood; mknn is the earlier "
+                        "global-k approximation, kept for comparison")
+    # Measured: 1.6 → largest 11%, TDAT across 2. 3.0 → largest 6%, TDAT across 1.
+    # 4.0 → largest 5%, but starts shaving genuine members off real arcs.
+    p.add_argument("--resolution", type=float, default=3.0,
+                   help="louvain granularity; higher splits more (default 3.0)")
     p.add_argument("--json", action="store_true")
     p.add_argument("--explain", metavar="NAME", help="why this branch landed where it did")
     args = p.parse_args()
@@ -226,7 +291,9 @@ def main():
     meta = load_entities.meta
     if not ents:
         sys.exit("arc-cluster: nothing to cluster (run arc-backfill first?)")
-    comp, sim, idf = cluster(ents, args.k, args.min_sim)
+    comp, sim, idf, keys = cluster(ents, args.k, args.min_sim)
+    if args.method == "louvain":
+        comp = louvain(keys, sim, args.resolution)
 
     arcs = []
     for members in comp.values():
