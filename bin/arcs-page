@@ -107,6 +107,54 @@ a{color:var(--accent)}
 """
 
 
+def derive_lede(data, focus_days):
+    """Compose the opening sentence from the data itself.
+
+    A hand-written lede goes stale the moment anything moves, which turns a dashboard
+    back into a report. This picks the single most consequential fact available and
+    states it with its numbers, in a fixed order of severity: work other people are
+    waiting on, then work that exists nowhere but this laptop, then the arc carrying
+    the most unlanded risk. It never editorialises beyond what the counts support.
+    """
+    gap = data.get("gap") or {}
+    arcs = [a for a in data.get("arcs", []) if a.get("age_days", 999) <= focus_days]
+    bits = []
+
+    mism = gap.get("status_mismatch") or []
+    if mism:
+        worst = max(mism, key=lambda m: m.get("arc", {}).get("unpushed", 0))
+        k = worst.get("issue", {})
+        n = worst.get("arc", {}).get("unpushed", 0)
+        bits.append(
+            f'Jira believes <em>{esc(k.get("key",""))}</em> is '
+            f'&ldquo;{esc(k.get("status",""))}&rdquo;, but {n} of its commits have '
+            f"never reached a remote"
+            + (f", and {len(mism)-1} other tickets claim a status the code contradicts"
+               if len(mism) > 1 else "") + ".")
+
+    unt = gap.get("unticketed_work") or []
+    if unt:
+        hidden = sum(a.get("unpushed", 0) for a in unt)
+        bits.append(
+            f"{len(unt)} arc{'s' if len(unt) != 1 else ''} of real work "
+            f"{'have' if len(unt) != 1 else 'has'} no ticket at all"
+            + (f", carrying {hidden} unpushed commits" if hidden else "")
+            + " — invisible to Jira, and so absent from Trellis&rsquo;s capacity, "
+              "burndown and every initiative rollup.")
+
+    if arcs:
+        top = max(arcs, key=lambda a: a.get("unpushed", 0))
+        if top.get("unpushed", 0) > 0:
+            c = top.get("counts", {})
+            bits.append(
+                f'The heaviest is <em>{esc(top.get("label","?"))}</em>: '
+                f'{top["unpushed"]} unpushed across {c.get("branches",0)} branches '
+                f'and {c.get("sessions",0)} sessions.')
+
+    return " ".join(bits) if bits else (
+        "Nothing outstanding — every arc is pushed, ticketed, and says what it is.")
+
+
 def esc(x):
     return html.escape(str(x), quote=True)
 
@@ -142,6 +190,7 @@ def render(data, lede, focus_days, limit):
     a(f"<span>{data.get('arc_count',0)} arcs</span>")
     a(f"<span>active &le; {focus_days}d</span>")
     a("</div>")
+    lede = lede or derive_lede(data, focus_days)
     if lede:
         a(f'<p class="lede">{lede}</p>')
 
@@ -161,13 +210,15 @@ def render(data, lede, focus_days, limit):
         a('<div class="metrics">')
         if arc.get("unpushed"):
             a(f"<span><b>{arc['unpushed']}</b> unpushed</span>")
-        a(f"<span>{c.get('branches',0)} branches</span>")
+        def plural(n, word):
+            return f"{n} {word}" + ("" if n == 1 else "s")
+        a(f"<span>{plural(c.get('branches',0),'branch').replace('branchs','branches')}</span>")
         if c.get("sessions"):
-            a(f"<span>{c['sessions']} sessions</span>")
+            a(f"<span>{plural(c['sessions'],'session')}</span>")
         if arc.get("stacked"):
             a(f"<span>{arc['stacked']} stacked</span>")
         if c.get("stashes"):
-            a(f"<span>{c['stashes']} stashes</span>")
+            a(f"<span>{plural(c['stashes'],'stash').replace('stashs','stashes')}</span>")
         a(f"<span>{arc.get('age_days','?')}d idle</span>")
         a("</div>")
         a('<div class="members">')
@@ -247,7 +298,9 @@ def render(data, lede, focus_days, limit):
 
 def main():
     p = argparse.ArgumentParser(description="Render work-arcs --json as a page.")
-    p.add_argument("--lede", default="", help="the sentence that says what matters today")
+    p.add_argument("--lede", default="",
+                   help="override the derived opening sentence (normally unnecessary — "
+                        "it is composed from the data so it cannot go stale)")
     p.add_argument("--focus", type=int, default=14, help="arcs idle at most this long")
     p.add_argument("--limit", type=int, default=12, help="arc cards to show")
     p.add_argument("--out", type=Path)
