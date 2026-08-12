@@ -463,6 +463,46 @@ slack-react-notify --print-service launchd > ~/Library/LaunchAgents/com.dev-work
 launchctl load -w ~/Library/LaunchAgents/com.dev-workflow-tools.slack-react-notify.plist
 ```
 
+### `loose-ends`
+Find work you finished and then lost track of. Work arcs sprawl across Claude
+sessions, git branches, stashes and MRs; each source looks fine alone and the loss
+happens in the joins. Read-only — it never pushes, writes to a repo, or posts
+anywhere.
+
+Listing every anomaly does not work at this scale (on one machine: 310 branches
+with unpushed commits, 98 stashes touching source). So it **ranks** instead, using
+the signal that a branch a Claude session actually worked on is work you invested
+in rather than an experiment. What it reports:
+
+| Class | What it means |
+|---|---|
+| `unpushed` | commits reachable from no remote, ranked by session and worktree evidence |
+| `stash` | stashes touching source, or stranded on a branch that's gone, merged, or was detached |
+| `dup-tip` | two branches at the same tip — redundant workstreams |
+| `mr-quiet` | open MRs with zero comments that haven't moved |
+| `session-no-branch` | substantive sessions with no branch recorded (sessions run from `$HOME`) |
+| `main-behind` | local `main` behind `origin/main` |
+
+```bash
+loose-ends                    # ranked report, capped per class
+loose-ends --days 14          # only work idle this long (default 7)
+loose-ends --all              # everything, no caps, ignore dismissals
+loose-ends --dismiss          # acknowledge what was shown; quiet until it changes
+loose-ends --all --dismiss    # acknowledge the withheld ones too
+loose-ends --forget           # clear all dismissals
+loose-ends --no-mr            # skip the GitLab call
+```
+
+Silence comes from `--dismiss`, not from having nothing to say. Findings are
+fingerprinted by content — tip sha, commit count, stash sha — so a dismissed item
+stays quiet until the work behind it changes, and any new work changes it.
+`--dismiss` only ever acknowledges what was actually printed, never findings
+withheld behind a `... and N more` line.
+
+Env overrides: `LOOSE_ENDS_DAYS`, `LOOSE_ENDS_REPOS` (default `~/work/repos`),
+`LOOSE_ENDS_PROJECTS` (default `~/.claude/projects`), `LOOSE_ENDS_LIMIT`.
+Dismissals live in `${XDG_STATE_HOME:-~/.local/state}/loose-ends/dismissed`.
+
 ## Shell Integration
 
 The `shell/dev-workflow.zsh` provides:
