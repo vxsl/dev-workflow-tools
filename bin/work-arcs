@@ -282,12 +282,29 @@ def reconcile(arcs, issues):
     filing, a ticket with no work needs closing or starting, and a ticket claiming
     to be handed off while its commits sit on this laptop needs a push.
     """
-    by_key = {a["id"]: a for a in arcs if a["kind"] == "ticket"}
+    # An arc's ticket keys live in its member branches, not in its label: clustering
+    # names an arc after its evidence, so UL-1692's arc may be called something else
+    # entirely. Keying off the label alone silently emptied this map and made every
+    # issue look like work that never started.
+    by_key = {}
+    for a in arcs:
+        for b in a["branches"]:
+            m = TICKET_RE.search(b["name"].upper())
+            if m:
+                by_key.setdefault(m.group(0), a)
+        m = TICKET_RE.search((a.get("label") or "").upper())
+        if m:
+            by_key.setdefault(m.group(0), a)
     issue_keys = {i["key"] for i in issues}
+
+    def has_ticket(a):
+        if a["kind"] == "ticket":
+            return True
+        return any(TICKET_RE.search(b["name"].upper()) for b in a["branches"])
 
     unticketed = [
         a for a in arcs
-        if a["kind"] != "ticket" and a["engagement"] >= 200 and a["age_days"] <= 30
+        if not has_ticket(a) and a["engagement"] >= 200 and a["age_days"] <= 30
     ]
     unticketed.sort(key=lambda a: -a["engagement"])
 
@@ -336,6 +353,38 @@ def jira_ify(repo, arc, dry_run):
     return subprocess.run(cmd).returncode
 
 
+def load_clusters(repo, main, resolution):
+    """Arc membership from arc-cluster, i.e. from what the work touched.
+
+    Branch names are a fallback now, not the mechanism. A name describes the change;
+    the files describe the intent, which is why one investigation used to come out as
+    nine arcs. Returns {branch_name: arc_label} plus each arc's session ids.
+    """
+    tool = Path(__file__).resolve().parent / "arc-cluster"
+    if not tool.exists():
+        return {}, {}
+    try:
+        r = subprocess.run(
+            [str(tool), "--repo", str(repo), "--main", main,
+             "--resolution", str(resolution), "--json"],
+            capture_output=True, text=True, timeout=180)
+        data = json.loads(r.stdout)
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError, ValueError):
+        return {}, {}
+
+    assign, sessions = {}, {}
+    for arc in data.get("arcs", []):
+        label = arc.get("label") or "?"
+        # Two clusters can derive the same label; keep them distinct so their members
+        # are not silently merged back together.
+        if label in sessions and sessions[label] != arc.get("sessions", []):
+            label = f"{label} ({len(sessions)})"
+        sessions[label] = arc.get("sessions", [])
+        for b in arc.get("branches", []):
+            assign[b] = label
+    return assign, sessions
+
+
 def ticket_of(name, known_projects):
     """The arc a branch name declares, if it declares one."""
     m = TICKET_RE.search(name.upper())
@@ -376,7 +425,7 @@ def prefix_of(name):
     return None
 
 
-def build_arcs(branches, stashes, mrs, sessions, main_ref):
+def build_arcs(branches, stashes, mrs, sessions, main_ref, cluster_assign=None):
     known_projects = set()
     for name in branches:
         m = TICKET_RE.search(name.upper())
@@ -386,7 +435,12 @@ def build_arcs(branches, stashes, mrs, sessions, main_ref):
     # Assign every branch to an arc: a ticket if it names one, else a shared name
     # prefix, else itself.
     assign, prefix_members = {}, defaultdict(list)
+    cluster_assign = cluster_assign or {}
     for name in branches:
+        # Files first, names only where the clustering had nothing to say.
+        if name in cluster_assign:
+            assign[name] = ("cluster", cluster_assign[name])
+            continue
         key = ticket_of(name, known_projects)
         if key:
             assign[name] = ("ticket", key)
@@ -512,6 +566,10 @@ def main():
                         "in the last DAYS (default 7), newest first")
     p.add_argument("--focus-limit", type=int, default=8,
                    help="how many arcs the focus view shows (default 8)")
+    p.add_argument("--no-cluster", action="store_true",
+                   help="fall back to branch-name grouping (the old, wrong way)")
+    p.add_argument("--resolution", type=float, default=3.0,
+                   help="arc-cluster granularity passed through")
     p.add_argument("--no-mr", action="store_true", help="skip the GitLab call")
     p.add_argument("--gap", action="store_true",
                    help="where Jira and reality disagree: work with no ticket, "
@@ -537,11 +595,16 @@ def main():
         sys.exit(f"work-arcs: not a git repo: {args.repo}")
     git(args.repo, "rev-parse", "--verify", args.main, check=True)
 
+    cluster_assign = {}
+    if not args.no_cluster:
+        cluster_assign, _ = load_clusters(args.repo, args.main, args.resolution)
+
     branches = collect_branches(args.repo, args.main)
     stashes = collect_stashes(args.repo)
     mrs, mr_error = ([], None) if args.no_mr else collect_mrs(args.repo)
     sessions = session_index(args.projects)
-    arcs, unattached = build_arcs(branches, stashes, mrs, sessions, args.main)
+    arcs, unattached = build_arcs(branches, stashes, mrs, sessions, args.main,
+                                  cluster_assign)
 
     if args.jira_ify:
         match = [a for a in arcs if a["label"] == args.jira_ify or a["id"] == args.jira_ify]
