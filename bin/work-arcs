@@ -350,6 +350,19 @@ def reconcile(arcs, issues):
             by_key.setdefault(m.group(0), a)
     issue_keys = {i["key"] for i in issues}
 
+    # An arc that owns a ticket owns its summary too. Without this the arc knows only
+    # the key, so anything rendering an arc can print `UL-1692` and nothing about what
+    # UL-1692 *is* -- the summary existed all along, but only inside the gap report.
+    for i in issues:
+        arc = by_key.get(i["key"])
+        if arc is not None:
+            arc.setdefault("issues", []).append(i)
+    for a in arcs:
+        a.setdefault("issues", [])
+        # Most-recently-updated ticket first: on an arc holding several, that is the
+        # one the work is currently about.
+        a["issues"].sort(key=lambda i: i.get("updated", ""), reverse=True)
+
     def has_ticket(a):
         if a["kind"] == "ticket":
             return True

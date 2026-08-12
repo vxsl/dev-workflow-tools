@@ -1,0 +1,345 @@
+#!/usr/bin/env python3
+"""Name an arc and say what it is, from the evidence the arc already carries.
+
+Everything upstream of this is deterministic: arc-cluster groups branches by the files
+they touched, work-arcs joins branches to stashes, MRs, sessions and tickets. That
+pipeline is a very good *extraction* layer with no *interpretation* layer at all, which
+is why its output reads as a spreadsheet -- every number on an arc card is an input to a
+judgement that nothing ever made.
+
+The deterministic name is the specific failure. arc-cluster picks the first branch in
+iteration order that contains a ticket key, so the arc holding UL-1640, UL-1440, UB-6944
+and the impedance work is called `DE-3101` after one pushed branch inside it. That name
+is not merely terse, it misrepresents the contents.
+
+So: assemble each arc's evidence -- the stacking tree, commit subjects, MR titles, ticket
+summaries, stashed files, and the prompts recorded against its sessions -- and have a
+model write a name and two sentences. Cached on a fingerprint of that evidence, so the
+inference is auditable, recomputes exactly when the work moves, and costs nothing on a
+re-run that changed nothing.
+
+Reads work-arcs --json on stdin (or --from FILE), writes the same JSON with each arc's
+`brief` filled in. Read-only with respect to the work repo; the only thing it writes is
+its own cache under $XDG_STATE_HOME/work-arcs/briefs.json.
+
+    work-arcs --json | arc-brief | arcs-page -
+    arc-brief --from arcs.json --refresh     # ignore the cache
+"""
+
+import argparse
+import concurrent.futures as futures
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+STATE = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "work-arcs"
+CACHE = STATE / "briefs.json"
+TURNS = STATE / "turns.jsonl"
+
+# Naming an arc from mixed evidence is a judgement, not an extraction, and a bad name
+# here reproduces exactly the failure this tool exists to fix. `claude -p` resolves the
+# alias, so there is no model id to keep in sync.
+DEFAULT_MODEL = os.environ.get("ARC_BRIEF_MODEL", "opus")
+
+PROMPT = """\
+You are naming a unit of software work so an engineer can recognise it at a glance.
+
+Below is everything one arc contains: branches (with the branch each was cut from),
+commit subjects, merge request titles, Jira tickets, stashed file paths, and prompts the
+engineer typed while working on it. These artifacts were grouped together because they
+touch the same files -- the grouping is reliable, the existing label is not.
+
+Return ONLY a JSON object, no prose and no code fence:
+
+{"name": "...", "summary": "...", "blocker": "..."}
+
+name     What this work IS, 3-7 words, in the engineer's own vocabulary as it appears in
+         the evidence. Not a ticket key, not a branch name, not a file path. Say the
+         subject matter. Good: "Dove catalog gating and dual-map neighborhoods". Bad:
+         "UL-1632", "various fixes", "frontend work".
+summary  Two sentences on what this work is doing and where it stands. Concrete: name
+         the actual behaviour being changed. Draw on the prompts -- they say what the
+         engineer was chasing in a way branch names never do. Never restate the counts
+         you were given; the reader can already see them.
+blocker  One short clause naming the single thing most in the way -- unpushed work, a
+         stalled review, a rebase that never landed, an abandoned variant. Empty string
+         if nothing stands out. No hedging, no advice.
+
+Evidence:
+{evidence}
+"""
+
+
+def load_turns():
+    """Session id -> the prompts typed in it. The richest description source there is.
+
+    A branch name is chosen in one second before the work starts; a prompt is what the
+    engineer actually said they were trying to do, at the moment they were doing it.
+    """
+    by_session = {}
+    if not TURNS.exists():
+        return by_session
+    for line in TURNS.open(errors="replace"):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        sid, prompt = row.get("session"), (row.get("prompt") or "").strip()
+        if sid and prompt:
+            by_session.setdefault(sid, []).append(prompt)
+    return by_session
+
+
+def commit_subjects(repo, branch, main, limit=6):
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(repo), "log", "--format=%s", f"-{limit}",
+             f"{main}..{branch}"],
+            capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return [x for x in out.stdout.splitlines() if x.strip()]
+
+
+def spawn_tree(branches):
+    """The stacking edges, rendered as the tree they are.
+
+    work-arcs derives `parents` for every branch and the page throws it away. An arc is
+    not a bag of branches -- it is a few chains and some orphans, and which is which is
+    most of what you want to know about it.
+    """
+    names = {b["name"] for b in branches}
+    lines_out = []
+    for b in branches:
+        parents = [p for p in (b.get("parents") or []) if p in names and p != b["name"]]
+        if parents:
+            lines_out.append(f"  {b['name']} <- cut from {', '.join(parents[:3])}")
+        else:
+            lines_out.append(f"  {b['name']} (no parent in this arc)")
+    return lines_out
+
+
+def evidence_for(arc, repo, main, turns):
+    """Everything known about one arc, in a stable order so the fingerprint is stable."""
+    out = []
+    branches = arc.get("branches", [])[:14]
+
+    if arc.get("issues"):
+        out.append("Jira tickets:")
+        for i in arc["issues"][:5]:
+            out.append(f"  {i.get('key','?')} [{i.get('status','?')}] {i.get('summary','')}")
+
+    if arc.get("mrs"):
+        out.append("Merge requests:")
+        for m in arc["mrs"][:5]:
+            draft = " (draft)" if m.get("draft") else ""
+            out.append(f"  !{m.get('iid','?')}{draft} {m.get('title','')}")
+
+    out.append("Branches and how they stack:")
+    out += spawn_tree(branches)
+
+    subjects, seen = [], set()
+    for b in branches[:6]:
+        for s in commit_subjects(repo, b["name"], main):
+            if s not in seen:
+                seen.add(s)
+                subjects.append(s)
+    if subjects:
+        out.append("Commit subjects:")
+        out += [f"  {s}" for s in subjects[:24]]
+
+    files, seen_f = [], set()
+    for st in arc.get("stashes", [])[:6]:
+        for f in st.get("files", [])[:6]:
+            if f not in seen_f:
+                seen_f.add(f)
+                files.append(f)
+    if files:
+        out.append("Files in stashed work:")
+        out += [f"  {f}" for f in files[:20]]
+
+    prompts = []
+    for s in arc.get("sessions", [])[:12]:
+        for p in turns.get(s.get("id"), [])[:6]:
+            p = " ".join(p.split())
+            if len(p) > 300:
+                p = p[:300] + "..."
+            prompts.append(p)
+    if prompts:
+        out.append("Prompts typed while working on this:")
+        out += [f"  - {p}" for p in prompts[:24]]
+
+    return "\n".join(out)
+
+
+def fingerprint(evidence, model):
+    """What the brief was derived from, so a stale one is detectable and not just old.
+
+    Cached inference is only safe if it is recomputable and auditable. Keying on the
+    evidence rather than on a timestamp means the brief expires exactly when the work it
+    describes changes -- and never drifts silently while the arc moves underneath it.
+    """
+    h = hashlib.sha256()
+    h.update(model.encode())
+    h.update(b"\0")
+    h.update(evidence.encode())
+    return h.hexdigest()[:20]
+
+
+def parse_reply(text):
+    """The model was asked for bare JSON; take it even when it arrives wrapped."""
+    text = text.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+    try:
+        obj = json.loads(text)
+    except json.JSONDecodeError:
+        m = re.search(r"\{.*\}", text, re.S)
+        if not m:
+            return None
+        try:
+            obj = json.loads(m.group(0))
+        except json.JSONDecodeError:
+            return None
+    if not isinstance(obj, dict) or not obj.get("name"):
+        return None
+    return {"name": str(obj.get("name", "")).strip(),
+            "summary": str(obj.get("summary", "")).strip(),
+            "blocker": str(obj.get("blocker", "")).strip()}
+
+
+def ask(evidence, model, timeout):
+    """One model call. Returns None on any failure -- a missing brief is not a crash.
+
+    Every other tool in this pipeline degrades rather than fails, and this one has to as
+    well: the page must still render from the deterministic data when the model is
+    unreachable, the CLI is missing, or one arc's evidence trips something.
+    """
+    prompt = PROMPT.replace("{evidence}", evidence)
+    try:
+        r = subprocess.run(
+            ["claude", "-p", "--model", model, "--dangerously-skip-permissions", prompt],
+            capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode != 0:
+        return None
+    return parse_reply(r.stdout)
+
+
+def load_cache():
+    if not CACHE.exists():
+        return {}
+    try:
+        data = json.loads(CACHE.read_text())
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_cache(cache):
+    STATE.mkdir(parents=True, exist_ok=True)
+    tmp = CACHE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(cache, indent=1, sort_keys=True))
+    tmp.replace(CACHE)
+
+
+def main():
+    p = argparse.ArgumentParser(
+        description="Give each arc a name and a description derived from its evidence.")
+    p.add_argument("--from", dest="src", type=Path, default=None,
+                   help="work-arcs --json output (default: stdin)")
+    p.add_argument("--repo", type=Path, default=None,
+                   help="the work repo (default: the repo named in the input)")
+    p.add_argument("--model", default=DEFAULT_MODEL,
+                   help=f"claude -p model alias (default: {DEFAULT_MODEL})")
+    p.add_argument("--refresh", action="store_true",
+                   help="recompute every brief, ignoring cached ones")
+    p.add_argument("--limit", type=int, default=0,
+                   help="only brief the N most-engaged arcs (0 = all)")
+    p.add_argument("--jobs", type=int, default=6, help="concurrent model calls")
+    p.add_argument("--timeout", type=int, default=180, help="seconds per model call")
+    p.add_argument("--out", type=Path, default=None, help="write here instead of stdout")
+    args = p.parse_args()
+
+    raw = args.src.read_text() if args.src else sys.stdin.read()
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        sys.exit(f"arc-brief: input is not the JSON work-arcs emits ({e})")
+
+    repo = args.repo or Path(data.get("repo", ""))
+    main_ref = data.get("main", "origin/main")
+    turns = load_turns()
+    if not turns:
+        print("arc-brief: no prompt log at "
+              f"{TURNS} -- run arc-backfill for better names", file=sys.stderr)
+
+    arcs = data.get("arcs", [])
+    # The gap report embeds the same arc objects, so briefing `arcs` names them there
+    # too. Anything only reachable through the gap still needs doing explicitly.
+    extra = [a for a in (data.get("gap") or {}).get("unticketed_work", [])
+             if not any(a is x for x in arcs)]
+    todo = sorted(arcs, key=lambda a: -a.get("engagement", 0))
+    if args.limit:
+        todo = todo[:args.limit]
+    todo += extra
+
+    cache = load_cache()
+    work, hits = [], 0
+    for arc in todo:
+        ev = evidence_for(arc, repo, main_ref, turns)
+        fp = fingerprint(ev, args.model)
+        cached = None if args.refresh else cache.get(fp)
+        if cached:
+            arc["brief"] = cached
+            hits += 1
+        else:
+            work.append((arc, ev, fp))
+
+    if work:
+        print(f"arc-brief: {hits} cached, {len(work)} to write "
+              f"({args.model}, {args.jobs} at a time)", file=sys.stderr)
+        with futures.ThreadPoolExecutor(max_workers=max(1, args.jobs)) as pool:
+            futs = {pool.submit(ask, ev, args.model, args.timeout): (arc, ev, fp)
+                    for arc, ev, fp in work}
+            done = 0
+            for fut in futures.as_completed(futs):
+                arc, ev, fp = futs[fut]
+                brief = fut.result()
+                done += 1
+                if brief is None:
+                    print(f"  ! no brief for {arc.get('label','?')}", file=sys.stderr)
+                    continue
+                # The evidence rides along with the inference. A cached judgement you
+                # cannot audit is worse than no judgement.
+                brief = dict(brief, model=args.model, at=int(time.time()),
+                             evidence_sha=fp, evidence=ev)
+                arc["brief"] = brief
+                cache[fp] = brief
+                print(f"  [{done}/{len(work)}] {arc.get('label','?')} -> "
+                      f"{brief['name']}", file=sys.stderr)
+        save_cache(cache)
+    else:
+        print(f"arc-brief: {hits} cached, nothing to write", file=sys.stderr)
+
+    data["briefed"] = sum(1 for a in arcs if a.get("brief"))
+    out = json.dumps(data, indent=1)
+    if args.out:
+        args.out.write_text(out)
+        print(f"✓ {args.out}", file=sys.stderr)
+    else:
+        print(out)
+
+
+if __name__ == "__main__":
+    main()
