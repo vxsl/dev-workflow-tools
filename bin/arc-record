@@ -33,6 +33,9 @@ import sys
 import time
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+import headless_claude  # noqa: E402
+
 SRC = (".rs", ".ts", ".tsx", ".js", ".jsx", ".py", ".sql", ".toml", ".go",
        ".java", ".kt", ".swift", ".c", ".cc", ".cpp", ".h", ".hpp", ".md", ".sh")
 
@@ -121,6 +124,12 @@ def main():
     cwd = payload.get("cwd") or ""
     transcript = payload.get("transcript_path")
     if not transcript:
+        return
+
+    # A `claude -p` utility call fires the Stop hook like any session. Recording one
+    # would make the tools that call Claude into work Claude did, and feed the arc
+    # namer's own prompts back to the clusterer that groups them.
+    if cwd and Path(cwd).resolve() == headless_claude.SESSION_DIR.resolve():
         return
 
     prompt, files, branch = tail_turn(transcript)

@@ -25,6 +25,9 @@ import sys
 import time
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+import headless_claude  # noqa: E402
+
 SRC = (".rs", ".ts", ".tsx", ".js", ".jsx", ".py", ".sql", ".toml", ".go",
        ".java", ".kt", ".swift", ".c", ".cc", ".cpp", ".h", ".hpp", ".md", ".sh")
 WRAPPERS = ("<system-reminder", "<command-name", "<command-message", "<command-args",
@@ -134,6 +137,13 @@ def main():
     t0 = time.time()
     with LOG.open("a") as out:
         for f in sorted(args.projects.glob("*/*.jsonl")):
+            # Utility `claude -p` calls made by these very tools -- the arc namer, the
+            # Slack intent classifier -- write transcripts like any other session. Read
+            # back as prompts they close a loop: arc-brief describing 59 arcs seeds 59
+            # prompts that the next run clusters and describes. They are marked by the
+            # directory they run in, so one check keeps them out for good.
+            if f.parent.name == headless_claude.PROJECT_DIR:
+                continue
             files_seen += 1
             for rec in turns_in(f):
                 key = (rec["session"], rec["at"], rec["prompt"][:60])

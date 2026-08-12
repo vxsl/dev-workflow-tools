@@ -30,6 +30,9 @@ import urllib.request
 import uuid
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+import headless_claude  # noqa: E402
+
 try:
     from slack_sdk.web import WebClient
     from slack_sdk.socket_mode import SocketModeClient
@@ -757,10 +760,9 @@ def classify_intent(text, slack_urls=None):
         prompt += f"\n\n(Message also references these Slack threads: {', '.join(slack_urls)})"
 
     try:
-        result = subprocess.run(
-            ["claude", "-p", "--model", "haiku",
-             "--dangerously-skip-permissions", prompt],
-            capture_output=True, text=True, timeout=30,
+        result = headless_claude.run(
+            ["--model", "haiku", "--dangerously-skip-permissions", prompt],
+            timeout=30,
         )
         out = result.stdout.strip().lower()
         # Claude sometimes wraps in backticks or adds punctuation
@@ -825,10 +827,9 @@ def summarize_intent(text, ticket=None, slack_urls=None):
             prompt += f"\n\nReferenced Slack thread(s): {', '.join(slack_urls)}"
 
     try:
-        result = subprocess.run(
-            ["claude", "-p", "--model", "haiku",
-             "--dangerously-skip-permissions", prompt],
-            capture_output=True, text=True, timeout=30,
+        result = headless_claude.run(
+            ["--model", "haiku", "--dangerously-skip-permissions", prompt],
+            timeout=30,
         )
         out = result.stdout.strip()
         # Strip common wrapping Claude sometimes emits
@@ -946,10 +947,9 @@ def summarize_slack_thread(slack_urls, commit_summary=""):
         f"Commit message:\n{commit_summary}"
     )
     try:
-        result = subprocess.run(
-            ["claude", "-p", "--model", "haiku",
-             "--dangerously-skip-permissions", prompt],
-            capture_output=True, text=True, timeout=60,
+        result = headless_claude.run(
+            ["--model", "haiku", "--dangerously-skip-permissions", prompt],
+            timeout=60,
         )
         out = result.stdout.strip()
         out = out.strip("`*_\"' \n")

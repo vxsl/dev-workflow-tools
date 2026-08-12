@@ -37,6 +37,9 @@ import sys
 import time
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+import headless_claude  # noqa: E402
+
 STATE = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "work-arcs"
 CACHE = STATE / "briefs.json"
 TURNS = STATE / "turns.jsonl"
@@ -226,9 +229,9 @@ def ask(evidence, model, timeout):
     """
     prompt = PROMPT.replace("{evidence}", evidence)
     try:
-        r = subprocess.run(
-            ["claude", "-p", "--model", model, "--dangerously-skip-permissions", prompt],
-            capture_output=True, text=True, timeout=timeout)
+        r = headless_claude.run(
+            ["--model", model, "--dangerously-skip-permissions", prompt],
+            timeout=timeout)
     except (OSError, subprocess.SubprocessError):
         return None
     if r.returncode != 0:
