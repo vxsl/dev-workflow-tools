@@ -46,7 +46,19 @@ from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
-TICKET_RE = re.compile(r"\b([A-Z]{2,4})-(\d{2,5})\b")
+# Built from JIRA_PROJECTS rather than a generic [A-Z]{2,4}, which matched things
+# like "UTF-8" and "IPV-4" as ticket keys. Falls back to the generic form only if
+# .env declares nothing.
+def _ticket_re():
+    keys = [k.strip().upper() for k in
+            os.environ.get("JIRA_PROJECTS", os.environ.get("JIRA_PROJECT", "")).split(",")
+            if k.strip()]
+    if keys:
+        return re.compile(r"\b(" + "|".join(map(re.escape, keys)) + r")-(\d{2,5})\b")
+    return re.compile(r"\b([A-Z]{2,4})-(\d{2,5})\b")
+
+
+TICKET_RE = re.compile(r"\b([A-Z]{2,4})-(\d{2,5})\b")  # replaced after load_env()
 # Branch names like `6919-review` and `6802-kyle` carry the number but not the
 # project, so they look unkeyed. They are resolved against the keys that do appear.
 BARE_NUM_RE = re.compile(r"(?:^|[^0-9A-Za-z])(\d{4,5})(?:[^0-9]|$)")
@@ -486,8 +498,9 @@ def finalize(arc):
 
 def main():
     p = argparse.ArgumentParser(description="Group a repo's loose work into arcs.")
-    p.add_argument("--repo", type=Path,
-                   default=Path(os.environ.get("WORK_ARCS_REPO", Path.home() / "work/repos/ul")))
+    p.add_argument("--repo", type=Path, default=None,
+                   help="defaults to JIRA_REPO from .env — the work repo is already "
+                        "declared there, so it is not re-declared here")
     p.add_argument("--main", default=os.environ.get("WORK_ARCS_MAIN", "origin/main"))
     p.add_argument("--projects", type=Path,
                    default=Path(os.environ.get("WORK_ARCS_PROJECTS",
@@ -510,6 +523,15 @@ def main():
     p.add_argument("--json", action="store_true", help="emit the graph")
     args = p.parse_args()
     load_env()
+
+    global TICKET_RE
+    TICKET_RE = _ticket_re()
+
+    if args.repo is None:
+        declared = os.environ.get("JIRA_REPO") or os.environ.get("WORK_ARCS_REPO")
+        if not declared:
+            sys.exit("work-arcs: set JIRA_REPO in .env (the work repo this tracks)")
+        args.repo = Path(declared)
 
     if not (args.repo / ".git").exists():
         sys.exit(f"work-arcs: not a git repo: {args.repo}")
