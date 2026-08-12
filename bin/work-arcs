@@ -82,7 +82,7 @@ def session_index(projects_dir):
     gap covers 99% of entries, and since only the maximum per branch matters, the
     remainder cannot change the answer.
     """
-    idx = defaultdict(lambda: {"paths": set(), "last": 0})
+    idx = defaultdict(lambda: {"paths": set(), "last": 0, "entries": 0})
     if not projects_dir.is_dir() or not shutil.which("rg"):
         return idx
     r = subprocess.run(
@@ -98,6 +98,10 @@ def session_index(projects_dir):
             continue
         entry = idx[branch]
         entry["paths"].add(path)
+        # How many entries mention the branch, not just whether one did. A branch
+        # named three times in a sweep is incidental; one named four hundred times
+        # is what the session was actually about.
+        entry["entries"] += 1
         try:
             epoch = int(datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp())
         except ValueError:
@@ -301,6 +305,9 @@ def build_arcs(branches, stashes, mrs, sessions, main_ref):
         key = branch_to_arc.get(branch)
         if not key or key not in arcs:
             continue
+        # Once per branch. Adding it per session multiplied a branch's mentions by
+        # how many sessions mentioned it, which put a 109,272 on a five-branch arc.
+        arcs[key]["engagement"] = arcs[key].get("engagement", 0) + info["entries"]
         for p in info["paths"]:
             if p in seen_session[key]:
                 continue
@@ -345,6 +352,7 @@ def finalize(arc):
     else:
         arc["state"] = "idle"
 
+    arc.setdefault("engagement", 0)
     arc["counts"] = {
         "branches": len(arc["branches"]),
         "stashes": len(arc["stashes"]),
@@ -369,6 +377,8 @@ def main():
     p.add_argument("--focus", nargs="?", type=int, const=7, metavar="DAYS",
                    help="what you are actually working on: arcs with real activity "
                         "in the last DAYS (default 7), newest first")
+    p.add_argument("--focus-limit", type=int, default=8,
+                   help="how many arcs the focus view shows (default 8)")
     p.add_argument("--no-mr", action="store_true", help="skip the GitLab call")
     p.add_argument("--json", action="store_true", help="emit the graph")
     args = p.parse_args()
@@ -387,8 +397,12 @@ def main():
         arcs = [a for a in arcs if a["age_days"] <= args.active]
 
     if args.focus is not None:
+        # Recency decides eligibility, engagement decides order. Sorting focus by
+        # recency alone returned 28 arcs for a two-day window, which is a list of
+        # everything git noticed rather than a picture of what you are doing.
         arcs = [a for a in arcs if a["age_days"] <= args.focus]
-        arcs.sort(key=lambda a: (a["age_days"], -a["at_risk"]))
+        arcs.sort(key=lambda a: (-a["engagement"], a["age_days"], -a["at_risk"]))
+        arcs = arcs[:args.focus_limit]
 
     if args.json:
         json.dump({
@@ -416,6 +430,8 @@ def main():
             bits.append(f"{c['sessions']}sess")
         if a["stacked"]:
             bits.append(f"{a['stacked']}stacked")
+        if a["engagement"]:
+            bits.append(f"{a['engagement']}ref")
         risk = f"  {a['unpushed']} unpushed" if a["unpushed"] else ""
         print(f"{a['age_days']:>4}d  {a['state']:<18} {a['label']:<28} "
               f"{','.join(bits):<28}{risk}")
