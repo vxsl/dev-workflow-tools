@@ -1,0 +1,275 @@
+#!/usr/bin/env -S python3 -u
+"""
+arc-cluster: work out what the arcs actually are, from the files work touched.
+
+Branch names describe the change, not the intent. `mvdb-half-open-bounds` is a good
+name for a diff and says nothing about chasing a slow TDAT query, so name-based
+grouping split one investigation across nine arcs. What the work touched is a better
+signal than what it was called: the sessions behind those branches all read the same
+query-path files.
+
+So branches and sessions are both treated as bags of filenames and clustered together.
+Nothing is declared, nothing is named by hand, and a session that ran from $HOME joins
+the right arc because of what it edited rather than where it was launched.
+
+The clustering is mutual k-nearest-neighbour, not threshold-union. Union-find over a
+similarity threshold chains A~B~C~D into one blob -- measured here, it fused 313 of 378
+branches, because a large refactor branch shares something with nearly everything. An
+edge now survives only if BOTH entities rank each other in their top k, which is what
+stops hubs from bridging unrelated work.
+
+  arc-cluster                 the arcs, largest first
+  arc-cluster --json          the full graph
+  arc-cluster --explain NAME  why a branch landed where it did
+
+Reads $XDG_STATE_HOME/work-arcs/turns.jsonl (see arc-backfill) and git. Read-only.
+"""
+
+import argparse
+import collections
+import json
+import math
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+STATE = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "work-arcs"
+LOG = STATE / "turns.jsonl"
+SRC = (".rs", ".ts", ".tsx", ".js", ".jsx", ".py", ".sql", ".toml", ".go",
+       ".java", ".kt", ".swift", ".c", ".cc", ".cpp", ".h", ".hpp")
+
+# Filenames so common they identify nothing. They still count for a little, via idf,
+# but excluding the worst outright keeps them out of the top-k rankings.
+UBIQUITOUS = {"index.ts", "index.tsx", "types.ts", "constants.ts", "utils.ts",
+              "mod.rs", "lib.rs", "main.rs", "__init__.py", "index.js"}
+
+
+def env_file():
+    """Same .env contract as the rest of the repo."""
+    f = Path(__file__).resolve().parent.parent / ".env"
+    if not f.exists():
+        return
+    for line in f.read_text().splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            k, _, v = line.partition("=")
+            os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+
+
+def git(repo, *a):
+    return subprocess.run(["git", "-C", str(repo), *a],
+                          capture_output=True, text=True).stdout
+
+
+def base(p):
+    b = p.rsplit("/", 1)[-1].strip().strip('"\'')
+    return b if b.endswith(SRC) and b not in UBIQUITOUS else None
+
+
+def load_entities(repo, main, max_files):
+    """Branches and sessions, both as bags of filenames."""
+    ents = {}
+
+    for name in git(repo, "for-each-ref", "--no-merged", main,
+                    "--format=%(refname:short)", "refs/heads").split():
+        files = {b for p in git(repo, "diff", "--name-only", f"{main}...{name}").splitlines()
+                 if (b := base(p))}
+        # A branch touching hundreds of files is a refactor or a merge artefact. It
+        # overlaps with everything, so as a cluster member it only creates bridges.
+        if 0 < len(files) <= max_files:
+            ents[("branch", name)] = files
+
+    if LOG.exists():
+        per = collections.defaultdict(set)
+        meta = {}
+        for line in LOG.open(errors="replace"):
+            try:
+                r = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            sid = r.get("session")
+            if not sid:
+                continue
+            for b in r.get("basenames") or []:
+                if (cb := base(b)):
+                    per[sid].add(cb)
+            m = meta.setdefault(sid, {"prompts": [], "branches": set(), "at": 0})
+            if r.get("prompt"):
+                m["prompts"].append(r["prompt"])
+            if r.get("branch"):
+                m["branches"].add(r["branch"])
+            m["at"] = max(m["at"], r.get("at") or 0)
+        for sid, files in per.items():
+            if 0 < len(files) <= max_files:
+                ents[("session", sid)] = files
+        load_entities.meta = meta
+    else:
+        load_entities.meta = {}
+    return ents
+
+
+def cluster(ents, k, min_sim):
+    keys = list(ents)
+    df = collections.Counter()
+    for s in ents.values():
+        for f in s:
+            df[f] += 1
+    N = len(keys)
+    idf = {f: math.log(N / (1 + n)) for f, n in df.items()}
+    norm = {kk: math.sqrt(sum(idf.get(f, 0) ** 2 for f in ents[kk])) or 1.0 for kk in keys}
+
+    # Invert to file -> entities so pairs are only scored when they share something.
+    by_file = collections.defaultdict(list)
+    for kk in keys:
+        for f in ents[kk]:
+            by_file[f].append(kk)
+
+    sim = collections.defaultdict(float)
+    for f, holders in by_file.items():
+        w = idf.get(f, 0) ** 2
+        if w <= 0 or len(holders) > 60:      # a file in 60+ places discriminates nothing
+            continue
+        for i, a in enumerate(holders):
+            for b in holders[i + 1:]:
+                sim[(a, b) if a < b else (b, a)] += w
+    for pair in list(sim):
+        a, b = pair
+        sim[pair] /= (norm[a] * norm[b])
+
+    nbrs = collections.defaultdict(list)
+    for (a, b), s in sim.items():
+        if s >= min_sim:
+            nbrs[a].append((s, b))
+            nbrs[b].append((s, a))
+    top = {kk: {b for _, b in sorted(v, reverse=True)[:k]} for kk, v in nbrs.items()}
+
+    # Mutual kNN: an edge only if each ranks the other. This is what prevents the
+    # chain A~B~C~D that fused 313 branches into one component.
+    parent = {kk: kk for kk in keys}
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for a, ns in top.items():
+        for b in ns:
+            if a in top.get(b, ()):
+                ra, rb = find(a), find(b)
+                if ra != rb:
+                    parent[rb] = ra
+
+    comp = collections.defaultdict(list)
+    for kk in keys:
+        comp[find(kk)].append(kk)
+    return comp, sim, idf
+
+
+def label(members, ents, idf, meta):
+    """Name an arc from its own evidence: distinctive files, then prompt words."""
+    files = collections.Counter()
+    for kind, name in members:
+        for f in ents[(kind, name)]:
+            files[f] += idf.get(f, 0)
+    top_files = [f for f, _ in files.most_common(4)]
+
+    words = collections.Counter()
+    for kind, name in members:
+        if kind != "session":
+            continue
+        for p in (meta.get(name, {}).get("prompts") or []):
+            for w in re.findall(r"[a-zA-Z][\w-]{4,}", p.lower()):
+                words[w] += 1
+    stop = {"should","would","could","there","which","where","about","think","because",
+            "thing","things","really","actually","instead","though","still","maybe",
+            "these","those","after","before","while","claude","please","right","looks",
+            "seems","using","based","doesn","didn","files","file","change","changes"}
+    top_words = [w for w, _ in words.most_common(30) if w not in stop][:3]
+
+    branches = [n for k, n in members if k == "branch"]
+    ticket = next((m.group(0) for n in branches
+                   if (m := re.search(r"\b(UB|UL|DE|SBX)-\d{2,5}\b", n.upper()))), None)
+    if ticket:
+        return ticket
+    if top_words:
+        return " ".join(top_words)
+    return top_files[0] if top_files else (branches[0] if branches else "?")
+
+
+def main():
+    env_file()
+    p = argparse.ArgumentParser(description="Derive work arcs from files touched.")
+    p.add_argument("--repo", type=Path,
+                   default=Path(os.environ.get("JIRA_REPO", Path.home() / "work/repos/ul")))
+    p.add_argument("--main", default=os.environ.get("WORK_ARCS_MAIN", "origin/main"))
+    # UNRESOLVED. k trades arc quality against blob formation, and no global value
+    # gets both. Measured on 534 entities:
+    #   k=2  307 arcs, largest 1%   — no blob, real arcs shattered
+    #   k=3  224 arcs, largest 3%   — no blob, the TDAT arc splits back into 4
+    #   k=4  156 arcs, largest 16%  — the compromise defaulted to here
+    #   k=6   90 arcs, largest 45%  — TDAT consolidates correctly, but a blob returns
+    # The fix is community detection (Louvain/modularity), which adapts the
+    # neighbourhood locally instead of applying one k everywhere. Until that lands,
+    # this default is a judgement call rather than a right answer.
+    p.add_argument("-k", type=int, default=4, help="neighbours considered (default 4)")
+    p.add_argument("--min-sim", type=float, default=0.10)
+    p.add_argument("--max-files", type=int, default=150,
+                   help="entities touching more than this are bridges, not members")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--explain", metavar="NAME", help="why this branch landed where it did")
+    args = p.parse_args()
+
+    ents = load_entities(args.repo, args.main, args.max_files)
+    meta = load_entities.meta
+    if not ents:
+        sys.exit("arc-cluster: nothing to cluster (run arc-backfill first?)")
+    comp, sim, idf = cluster(ents, args.k, args.min_sim)
+
+    arcs = []
+    for members in comp.values():
+        br = sorted(n for k, n in members if k == "branch")
+        se = sorted(n for k, n in members if k == "session")
+        if not br and not se:
+            continue
+        arcs.append({
+            "label": label(members, ents, idf, meta),
+            "branches": br,
+            "sessions": se,
+            "size": len(members),
+        })
+    arcs.sort(key=lambda a: (-len(a["branches"]), -len(a["sessions"])))
+
+    if args.explain:
+        me = ("branch", args.explain)
+        if me not in ents:
+            sys.exit(f"arc-cluster: no such branch in scope: {args.explain}")
+        pairs = sorted(((s, a if b == me else b) for (a, b), s in sim.items()
+                        if me in (a, b)), reverse=True)[:8]
+        print(f"{args.explain}: {len(ents[me])} distinctive files")
+        for s, other in pairs:
+            shared = sorted(ents[me] & ents[other], key=lambda f: -idf.get(f, 0))[:4]
+            print(f"  {s:.3f}  {other[0]}:{other[1][:44]}  ← {', '.join(shared)}")
+        return
+
+    if args.json:
+        json.dump({"arcs": arcs, "entities": len(ents)}, sys.stdout, indent=1)
+        print()
+        return
+
+    multi = [a for a in arcs if a["size"] > 1]
+    print(f"{len(ents)} entities → {len(arcs)} arcs "
+          f"({len(multi)} with more than one member)")
+    for a in arcs[:24]:
+        if a["size"] < 2:
+            continue
+        print(f"\n  {a['label']}  [{len(a['branches'])}b {len(a['sessions'])}s]")
+        if a["branches"]:
+            print(f"    {', '.join(a['branches'][:6])}"
+                  f"{' …' if len(a['branches']) > 6 else ''}")
+
+
+if __name__ == "__main__":
+    main()
