@@ -129,6 +129,44 @@ def stacking(repo, main, names):
     return pairs
 
 
+def segment(rows):
+    """Cut a session where the work stops overlapping. Yields (files, turn-rows).
+
+    A branch is a unit of work. A session is a unit of conversational continuity -- one
+    resumed thread -- which is neither a unit of work nor even a unit of time: measured
+    here, 22% of sessions span more than a day, 10% more than a week, and one runs 41
+    days. That is exactly why a session cannot be assumed to be about one thing. Coming
+    back to a thread across months makes it *more* likely to have changed subject, so
+    the cut has to follow the subject rather than any clock.
+
+    Treating the whole thread as one bag lets it weld unrelated arcs together. Traced
+    live: branch UL-1634 sat in the adaptive-line-charts arc with no shared ancestry and
+    only two catalog files, because its strongest link was a session that had also been
+    in UB-6938's files.
+
+    Splitting per turn would fix the bridging by destroying the evidence -- a turn's
+    median bag is 3 files, too few to corroborate under MIN_SHARED, so sessions would
+    stop contributing at all. Cutting on topic shift instead leaves 70% of sessions
+    whole (measured: 114 of 164) and produces 380 segments rather than 986 turns, with
+    a p90 bag of 26 files -- still large enough to form real edges.
+
+    A turn that shares no file with the run so far is where the subject changed.
+    """
+    cur_files, cur_rows = set(), []
+    for _, files, row in rows:
+        if not files:
+            cur_rows.append(row)          # conversation, not a subject change
+            continue
+        if cur_files and not (cur_files & files):
+            yield cur_files, cur_rows
+            cur_files, cur_rows = set(files), [row]
+        else:
+            cur_files |= files
+            cur_rows.append(row)
+    if cur_files or cur_rows:
+        yield cur_files, cur_rows
+
+
 def load_entities(repo, main, max_files):
     """Branches and sessions, both as bags of filenames."""
     ents = {}
@@ -143,8 +181,7 @@ def load_entities(repo, main, max_files):
             ents[("branch", name)] = files
 
     if LOG.exists():
-        per = collections.defaultdict(set)
-        meta = {}
+        turns = collections.defaultdict(list)
         for line in LOG.open(errors="replace"):
             try:
                 r = json.loads(line)
@@ -153,22 +190,76 @@ def load_entities(repo, main, max_files):
             sid = r.get("session")
             if not sid:
                 continue
-            for b in r.get("basenames") or []:
-                if (cb := base(b)):
-                    per[sid].add(cb)
-            m = meta.setdefault(sid, {"prompts": [], "branches": set(), "at": 0})
-            if r.get("prompt"):
-                m["prompts"].append(r["prompt"])
-            if r.get("branch"):
-                m["branches"].add(r["branch"])
-            m["at"] = max(m["at"], r.get("at") or 0)
-        for sid, files in per.items():
-            if 0 < len(files) <= max_files:
-                ents[("session", sid)] = files
+            files = {cb for b in (r.get("basenames") or []) if (cb := base(b))}
+            turns[sid].append((r.get("at") or 0, files, r))
+
+        meta = {}
+        for sid, rows in turns.items():
+            rows.sort(key=lambda t: t[0])
+            for n, (seg_files, seg_rows) in enumerate(segment(rows)):
+                name = f"{sid}#{n}"
+                m = meta.setdefault(name, {"prompts": [], "branches": set(), "at": 0,
+                                           "session": sid})
+                for r in seg_rows:
+                    if r.get("prompt"):
+                        m["prompts"].append(r["prompt"])
+                    if r.get("branch"):
+                        m["branches"].add(r["branch"])
+                    m["at"] = max(m["at"], r.get("at") or 0)
+                if 0 < len(seg_files) <= max_files:
+                    ents[("session", name)] = seg_files
         load_entities.meta = meta
     else:
         load_entities.meta = {}
     return ents
+
+
+def enforce_stacks(comp, stacks, present):
+    """Put every branch in the same arc as the stack it was cut from.
+
+    Weighting ancestry heavily is not enough, because modularity is relative: adding
+    session segments as entities raised the graph's total edge weight, and at a fixed
+    resolution that alone re-split the UB-6938/UB-6939 stack that a strong edge had been
+    holding together. Whether two branches are one stack cannot depend on how many
+    sessions happened to be logged that week, so ancestry is applied as a constraint
+    after the communities are found rather than as a hint the partition may overrule.
+
+    It moves the *branches of a stack*, never their communities. Unioning the two
+    communities instead pulled UL-1634 -- which has no ancestors at all -- into the
+    adaptive-line-charts arc, because some other pair spanned the two: one ancestry edge
+    dragged every unrelated member with it. Relocating only the stack keeps the
+    invariant without inventing membership for its neighbours.
+    """
+    home = {}
+    for root, members in comp.items():
+        for m in members:
+            home[m] = root
+
+    parent = {}
+    for child, anc in stacks:
+        a, b = ("branch", child), ("branch", anc)
+        if a in present and b in present:
+            parent[a] = b
+
+    def root_of(x, guard=64):
+        seen = {x}
+        while x in parent and guard > 0:
+            x = parent[x]
+            if x in seen:
+                break
+            seen.add(x)
+            guard -= 1
+        return x
+
+    # The whole stack lands wherever its base already sits, so a stack is one arc and
+    # nothing else moves.
+    for child in parent:
+        home[child] = home[root_of(child)]
+
+    out = collections.defaultdict(list)
+    for member, root in home.items():
+        out[root].append(member)
+    return out
 
 
 def cluster(ents, k, min_sim, stacks=()):
@@ -382,11 +473,14 @@ def main():
     comp, sim, idf, keys = cluster(ents, args.k, args.min_sim, stacks)
     if args.method == "louvain":
         comp = louvain(keys, sim, args.resolution)
+    comp = enforce_stacks(comp, stacks, set(ents))
 
     arcs = []
     for members in comp.values():
         br = sorted(n for k, n in members if k == "branch")
-        se = sorted(n for k, n in members if k == "session")
+        # Segments are an internal device for keeping one session's two subjects apart.
+        # Everything downstream joins on session id, so they never leave this file.
+        se = sorted({n.rsplit("#", 1)[0] for k, n in members if k == "session"})
         if not br and not se:
             continue
         arcs.append({
