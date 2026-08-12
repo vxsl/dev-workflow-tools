@@ -43,6 +43,7 @@ AS_JSON=0
 WANT_SLACK="${LOOSE_ENDS_SLACK:-0}"
 SLACK_BUDGET="${LOOSE_ENDS_SLACK_BUDGET:-15}"
 SLACK_SLEEP="${LOOSE_ENDS_SLACK_SLEEP:-1}"
+SLACK_MAX="${LOOSE_ENDS_SLACK_MAX:-200}"
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -230,8 +231,8 @@ for repo in "${REPOS[@]}"; do
         detail="${nsrc} source file(s)"
         [ -n "$stranded" ] && detail="$detail, $stranded"
         add "$score" stash "$rname:stash:$sha" \
-            "$rname: $ref on '${base:-?}' -- ${age}d old, $detail" "$base" \
-            "repo=$rname;ref=$ref;base=${base:-?};age=$age;src=$nsrc;stranded=$stranded"
+            "$rname: $ref on '${base:-?}' -- ${age}d old, $detail" \
+            "" "repo=$rname;ref=$ref;base=${base:-?};age=$age;src=$nsrc;stranded=$stranded"
     done < <(git -C "$repo" stash list --format='%gd|%H|%ct|%gs' 2>/dev/null)
 
     # -- open MRs nobody has commented on --------------------------------------
@@ -378,8 +379,11 @@ if [ "$WANT_SLACK" -eq 1 ]; then
         while IFS=$'\t' read -r score class fp text query meta; do
             hits=""
             # Only search identifiers specific enough to mean one thing. 'main' or
-            # 'smp' would match half the workspace and tell us nothing.
+            # 'smp' would match half the workspace and tell us nothing, and a
+            # query with spaces in it is a description, not an identifier --
+            # '(no branch)' matched 23,975 messages before this rule existed.
             if [ "$spent" -lt "$SLACK_BUDGET" ] && [ -n "$query" ] \
+               && ! printf '%s' "$query" | rg -q '[[:space:]()]' \
                && { printf '%s' "$query" | rg -q '^[A-Z]{2,4}-[0-9]+$' \
                     || [ "${#query}" -ge 8 ]; }; then
                 spent=$(( spent + 1 ))
@@ -390,7 +394,14 @@ if [ "$WANT_SLACK" -eq 1 ]; then
                         --data-urlencode "count=1" 2>/dev/null) || resp=''
                 if [ -n "$resp" ] && [ "$(jq -r '.ok' <<<"$resp" 2>/dev/null)" = true ]; then
                     n=$(jq -r '.messages.total // 0' <<<"$resp")
-                    if [ "${n:-0}" -gt 0 ]; then
+                    if [ "${n:-0}" -gt "$SLACK_MAX" ]; then
+                        # A five-figure match count means the identifier is a common
+                        # word, not a name. That is a failed query, not a signal, and
+                        # promoting it would put a false badge on a page read at a
+                        # glance.
+                        hits=" [slack: $n matches -- too many to mean anything]"
+                        meta="$meta;slack_ambiguous=$n"
+                    elif [ "${n:-0}" -gt 0 ]; then
                         link=$(jq -r '.messages.matches[0].permalink // ""' <<<"$resp")
                         hits=" [slack: $n, $link]"
                         meta="$meta;slack=$n;slack_url=$link"

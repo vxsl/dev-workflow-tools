@@ -1,0 +1,445 @@
+#!/usr/bin/env -S python3 -u
+"""
+loose-ends-page: render `loose-ends --json` as a page worth glancing at.
+
+A ranked list in a terminal only exists while you are looking at it. This turns
+the same data into a standing surface -- one page, one URL, republished in place --
+so the state of your loose work is somewhere you pass by rather than somewhere you
+have to remember to go and ask.
+
+Layout is deterministic and lives here, in code, so the page looks identical every
+time it is regenerated. The one part that needs judgment -- the lede, the sentence
+that says which of 386 findings actually matters today -- is passed in with --lede
+by whoever knows. That split is deliberate: a renderer cannot form an opinion, and
+an opinion regenerated from scratch each run would never look the same twice.
+
+Reads JSON on stdin. Writes HTML to stdout, or to --out.
+
+  loose-ends --json --slack | loose-ends-page --lede "..." --out page.html
+
+Pass --previous with the last run's JSON to mark findings that are new since then;
+a recurring page is mostly read for what changed.
+"""
+
+import argparse
+import html
+import json
+import sys
+from datetime import datetime
+from pathlib import Path
+
+# Severity is information, not decoration: it answers "would I be upset to lose
+# this?". Stashes lead because a stash is the only place work can exist with no
+# ref pointing at it -- that is where a diagnosed prod bug once sat unnoticed.
+CLASS_INFO = {
+    "stash": (
+        "Stashes",
+        "Work with no branch pointing at it. The only place a fix can exist "
+        "while being invisible to every git command you would normally run.",
+    ),
+    "unpushed": (
+        "Unpushed work",
+        "Commits that exist on this machine and nowhere else. A disk failure "
+        "is the whole backup story.",
+    ),
+    "mr-quiet": (
+        "Waiting on review",
+        "Open, no comments, not moving. Nobody has picked these up.",
+    ),
+    "main-behind": ("Local main", "Behind its remote, so every new branch starts stale."),
+    "dup-tip": (
+        "Duplicate branches",
+        "Two names on the same commit — the same work, tracked twice.",
+    ),
+    "session-no-branch": (
+        "Sessions with no branch",
+        "Substantive sessions that recorded no branch, usually because they ran "
+        "from $HOME. Invisible to any search scoped to a repo.",
+    ),
+    "mr-unavailable": ("Not checked", "GitLab could not be reached this run."),
+}
+
+# The order the page reads in, most-likely-to-hurt first.
+CLASS_ORDER = [
+    "stash",
+    "unpushed",
+    "mr-quiet",
+    "main-behind",
+    "dup-tip",
+    "session-no-branch",
+    "mr-unavailable",
+]
+
+
+def severity(finding):
+    """critical / warning / quiet, from what the finding actually is.
+
+    Someone else having mentioned the work is the strongest escalation available:
+    unpushed commits nobody knows about are a private risk, and the same commits
+    with a Slack thread attached are somebody waiting on you.
+    """
+    cls = finding["class"]
+    meta = finding.get("meta", {})
+    slack = int(meta.get("slack") or 0)
+
+    if slack > 0 and cls in ("unpushed", "stash", "mr-quiet"):
+        return "critical"
+    if cls == "stash":
+        return "critical" if (int(meta.get("src") or 0) > 0 or meta.get("stranded")) else "warning"
+    if cls == "unpushed":
+        return "warning" if int(meta.get("sessions") or 0) > 0 else "quiet"
+    if cls == "mr-quiet":
+        return "warning"
+    return "quiet"
+
+
+def subject_and_facts(finding):
+    """Split a finding into the thing it is about and the figures about it.
+
+    The prose line from loose-ends stays available, but a page wants the branch
+    name set apart from the numbers so both can be scanned in a column.
+    """
+    cls = finding["class"]
+    m = finding.get("meta", {})
+    facts = []
+
+    if cls == "unpushed":
+        subject = m.get("branch", "?")
+        facts = [f"{m.get('commits', '?')} commits", f"idle {m.get('age', '?')}d"]
+        if int(m.get("sessions") or 0) > 0:
+            facts.append(f"{m['sessions']} session" + ("s" if m["sessions"] != "1" else ""))
+        if m.get("worktree"):
+            facts.append("worktree")
+    elif cls == "stash":
+        subject = m.get("ref", "?")
+        facts = [f"on {m.get('base', '?')}", f"{m.get('age', '?')}d old"]
+        if int(m.get("src") or 0) > 0:
+            facts.append(f"{m['src']} source files")
+        if m.get("stranded"):
+            facts.append(m["stranded"])
+    elif cls == "mr-quiet":
+        subject = f"!{m.get('mr', '?')}"
+        facts = [f"idle {m.get('age', '?')}d", m.get("title", "")]
+    elif cls == "main-behind":
+        subject = f"{m.get('repo', '?')}/main"
+        facts = [f"{m.get('behind', '?')} commits behind origin/main"]
+    elif cls == "dup-tip":
+        subject = m.get("sha", "?")
+        facts = [m.get("branches", "")]
+    elif cls == "session-no-branch":
+        subject = (m.get("session") or "?")[:8]
+        facts = [f"{m.get('turns', '?')} turns", f"{m.get('age', '?')}d ago"]
+    else:
+        subject = m.get("repo", "?")
+        facts = [finding.get("text", "")]
+
+    return subject, [f for f in facts if f]
+
+
+CSS = """
+/* Neutrals carry a blue bias so they read as chosen rather than inherited, and
+   sit under an indigo accent. Severity hues stay separate from the accent: the
+   accent is structure and interaction, severity is state. */
+:root {
+  --ground:#F6F7FA; --surface:#FFFFFF; --surface-2:#F0F2F7;
+  --ink:#161922; --ink-soft:#59616F; --ink-faint:#8A91A0;
+  --hairline:#E2E5EC; --accent:#4453C4;
+  --critical:#A93826; --warning:#9C6414; --quiet:#3F6E52;
+  --critical-wash:#FBF0EE; --warning-wash:#FBF5EC; --quiet-wash:#EFF5F1;
+  --shadow:0 1px 2px rgba(22,25,34,.05), 0 8px 24px -12px rgba(22,25,34,.12);
+}
+/* Only tokens are redefined per theme. Guarded so an explicit light choice still
+   beats a dark OS, and repeated under the stamp so the toggle wins both ways. */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --ground:#0F1218; --surface:#161A22; --surface-2:#1C212B;
+    --ink:#E3E6EC; --ink-soft:#8F97A6; --ink-faint:#6B7382;
+    --hairline:#262B36; --accent:#93A0F7;
+    --critical:#E27B63; --warning:#DFA24C; --quiet:#7CB690;
+    --critical-wash:#241A18; --warning-wash:#241E14; --quiet-wash:#16211A;
+    --shadow:0 1px 2px rgba(0,0,0,.3), 0 8px 24px -12px rgba(0,0,0,.5);
+  }
+}
+:root[data-theme="dark"] {
+  --ground:#0F1218; --surface:#161A22; --surface-2:#1C212B;
+  --ink:#E3E6EC; --ink-soft:#8F97A6; --ink-faint:#6B7382;
+  --hairline:#262B36; --accent:#93A0F7;
+  --critical:#E27B63; --warning:#DFA24C; --quiet:#7CB690;
+  --critical-wash:#241A18; --warning-wash:#241E14; --quiet-wash:#16211A;
+  --shadow:0 1px 2px rgba(0,0,0,.3), 0 8px 24px -12px rgba(0,0,0,.5);
+}
+
+/* Three type roles: a serif for the human voice, a sans for chrome, a mono for
+   machine facts. Branch names and shas are mono data, not prose. */
+:root {
+  --serif: ui-serif, Charter, "Bitstream Charter", Georgia, serif;
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+
+*,*::before,*::after { box-sizing:border-box; }
+body {
+  margin:0; background:var(--ground); color:var(--ink);
+  font-family:var(--sans); font-size:15px; line-height:1.55;
+  -webkit-font-smoothing:antialiased;
+}
+.page { max-width:60rem; margin:0 auto; padding:3.5rem 1.5rem 5rem; }
+
+header.masthead { display:flex; flex-direction:column; gap:.4rem; margin-bottom:2.5rem; }
+h1 {
+  font-family:var(--serif); font-weight:500; font-size:clamp(1.9rem,4vw,2.6rem);
+  letter-spacing:-.015em; margin:0; text-wrap:balance;
+}
+.stamp {
+  font-family:var(--mono); font-size:.75rem; color:var(--ink-faint);
+  display:flex; flex-wrap:wrap; gap:.25rem 1rem;
+}
+
+/* The lede is the whole reason the page exists, so it gets the largest serif on
+   the page and a measure short enough to actually read. */
+.lede {
+  font-family:var(--serif); font-size:clamp(1.15rem,2.2vw,1.4rem); line-height:1.5;
+  max-width:34em; margin:0 0 2.5rem; color:var(--ink); text-wrap:pretty;
+}
+.lede em { color:var(--accent); font-style:normal; font-weight:600; }
+
+.tiles { display:grid; grid-template-columns:repeat(auto-fit,minmax(8.5rem,1fr));
+         gap:.75rem; margin-bottom:3rem; }
+.tile {
+  background:var(--surface); border:1px solid var(--hairline); border-radius:3px;
+  padding:.85rem .9rem; display:flex; flex-direction:column; gap:.15rem;
+  border-top:2px solid var(--tile-hue,var(--hairline));
+}
+.tile .n {
+  font-family:var(--mono); font-size:1.55rem; line-height:1.1;
+  font-variant-numeric:tabular-nums; color:var(--tile-hue,var(--ink));
+}
+.tile .k { font-size:.7rem; text-transform:uppercase; letter-spacing:.07em; color:var(--ink-soft); }
+.tile.is-critical { --tile-hue:var(--critical); }
+.tile.is-warning  { --tile-hue:var(--warning); }
+.tile.is-quiet    { --tile-hue:var(--quiet); }
+
+section.group { margin-bottom:3rem; }
+.group-head { display:flex; align-items:baseline; gap:.6rem; margin-bottom:.3rem; }
+h2 { font-family:var(--serif); font-weight:500; font-size:1.3rem; margin:0; letter-spacing:-.01em; }
+.count {
+  font-family:var(--mono); font-size:.8rem; color:var(--ink-faint);
+  font-variant-numeric:tabular-nums;
+}
+.group-note { color:var(--ink-soft); font-size:.85rem; max-width:52em; margin:0 0 1rem; }
+
+.rows { display:flex; flex-direction:column; gap:1px; background:var(--hairline);
+        border:1px solid var(--hairline); border-radius:3px; overflow:hidden; }
+.row {
+  background:var(--surface); display:grid;
+  grid-template-columns:3px minmax(0,14rem) minmax(0,1fr) auto;
+  align-items:center; gap:0 1rem; padding:0;
+}
+.row > .stripe { background:var(--row-hue,var(--hairline)); align-self:stretch; }
+.row.is-critical { --row-hue:var(--critical); background:var(--critical-wash); }
+.row.is-warning  { --row-hue:var(--warning); }
+.row.is-quiet    { --row-hue:var(--hairline); }
+.subject {
+  font-family:var(--mono); font-size:.85rem; padding:.7rem 0 .7rem .9rem;
+  overflow-wrap:anywhere; color:var(--ink);
+}
+.facts {
+  display:flex; flex-wrap:wrap; gap:.2rem .9rem; padding:.7rem 0;
+  font-size:.78rem; color:var(--ink-soft); min-width:0;
+}
+.facts span { font-family:var(--mono); font-variant-numeric:tabular-nums; }
+.marks { display:flex; align-items:center; gap:.4rem; padding:.7rem .9rem .7rem 0; }
+
+.pill {
+  font-family:var(--sans); font-size:.68rem; text-transform:uppercase;
+  letter-spacing:.06em; padding:.15rem .45rem; border-radius:2px;
+  border:1px solid currentColor; white-space:nowrap;
+}
+.pill.new { color:var(--accent); }
+.pill.slack { color:var(--critical); text-decoration:none; }
+a.pill.slack:hover, a.pill.slack:focus-visible { background:var(--critical); color:var(--surface); }
+.pill.alone { color:var(--ink-faint); border-color:var(--hairline); }
+
+.withheld { font-size:.78rem; color:var(--ink-faint); font-family:var(--mono); margin:.6rem 0 0; }
+
+footer {
+  margin-top:4rem; padding-top:1.5rem; border-top:1px solid var(--hairline);
+  color:var(--ink-soft); font-size:.85rem; display:flex; flex-direction:column; gap:.8rem;
+}
+footer h3 { font-family:var(--serif); font-weight:500; font-size:1rem; margin:0; color:var(--ink); }
+.cmds { display:flex; flex-direction:column; gap:.35rem; overflow-x:auto; }
+.cmds code {
+  font-family:var(--mono); font-size:.78rem; color:var(--ink);
+  background:var(--surface-2); border:1px solid var(--hairline);
+  padding:.25rem .45rem; border-radius:2px; white-space:pre;
+}
+.cmds code b { font-weight:400; color:var(--ink-faint); }
+
+a { color:var(--accent); }
+:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+.empty { font-family:var(--serif); font-size:1.25rem; color:var(--ink-soft); }
+@media (prefers-reduced-motion:reduce) { * { transition:none !important; animation:none !important; } }
+@media (max-width:34rem) {
+  .row { grid-template-columns:3px minmax(0,1fr); }
+  .facts, .marks { padding-left:.9rem; }
+  .marks { padding-bottom:.8rem; }
+}
+"""
+
+
+def esc(s):
+    return html.escape(str(s), quote=True)
+
+
+def render(data, lede, previous_ids):
+    findings = data.get("findings", [])
+    totals = data.get("totals", {})
+    gen = data.get("generated", "")
+    try:
+        stamp = datetime.fromisoformat(gen).strftime("%a %-d %b %Y, %-I:%M %p")
+    except (ValueError, TypeError):
+        stamp = gen or "unknown"
+
+    grand = sum(totals.values())
+    out = []
+    a = out.append
+
+    a("<title>Loose Ends</title>")
+    a(f"<style>{CSS}</style>")
+    a('<div class="page">')
+
+    a('<header class="masthead">')
+    a("<h1>Loose Ends</h1>")
+    a('<div class="stamp">')
+    a(f"<span>{esc(stamp)}</span>")
+    a(f"<span>idle &ge; {esc(data.get('threshold_days', '?'))}d</span>")
+    a(f"<span>{grand} open</span>")
+    if data.get("dismissed"):
+        a(f"<span>{esc(data['dismissed'])} dismissed</span>")
+    a("</div></header>")
+
+    if lede:
+        a(f'<p class="lede">{lede}</p>')
+
+    if not findings:
+        a('<p class="empty">Nothing outstanding. Everything you have written down is '
+          "somewhere other than this laptop.</p>")
+        a("</div>")
+        return "\n".join(out)
+
+    # Tiles summarise before the detail, and carry the worst severity present in
+    # each class so the row of numbers is scannable on its own.
+    worst = {}
+    for f in findings:
+        rank = {"critical": 3, "warning": 2, "quiet": 1}
+        s = severity(f)
+        if rank[s] > rank.get(worst.get(f["class"], "quiet"), 1):
+            worst[f["class"]] = s
+    a('<div class="tiles">')
+    for cls in CLASS_ORDER:
+        if cls not in totals:
+            continue
+        label = CLASS_INFO.get(cls, (cls, ""))[0]
+        sev = worst.get(cls, "quiet")
+        a(f'<div class="tile is-{sev}"><span class="n">{totals[cls]}</span>'
+          f'<span class="k">{esc(label)}</span></div>')
+    a("</div>")
+
+    for cls in CLASS_ORDER:
+        rows = [f for f in findings if f["class"] == cls]
+        if not rows:
+            continue
+        label, note = CLASS_INFO.get(cls, (cls, ""))
+        total = totals.get(cls, len(rows))
+
+        a('<section class="group">')
+        a('<div class="group-head">')
+        a(f"<h2>{esc(label)}</h2>")
+        a(f'<span class="count">{total}</span>')
+        a("</div>")
+        if note:
+            a(f'<p class="group-note">{esc(note)}</p>')
+
+        a('<div class="rows">')
+        for f in rows:
+            sev = severity(f)
+            subject, facts = subject_and_facts(f)
+            meta = f.get("meta", {})
+            a(f'<div class="row is-{sev}">')
+            a('<div class="stripe"></div>')
+            a(f'<div class="subject">{esc(subject)}</div>')
+            a('<div class="facts">'
+              + "".join(f"<span>{esc(x)}</span>" for x in facts)
+              + "</div>")
+            a('<div class="marks">')
+            if previous_ids is not None and f["id"] not in previous_ids:
+                a('<span class="pill new">new</span>')
+            slack = int(meta.get("slack") or 0)
+            if slack > 0:
+                url = meta.get("slack_url", "")
+                text = f"slack &times;{slack}"
+                if url:
+                    a(f'<a class="pill slack" href="{esc(url)}">{text}</a>')
+                else:
+                    a(f'<span class="pill slack">{text}</span>')
+            elif "slack" in meta:
+                a('<span class="pill alone">unmentioned</span>')
+            a("</div></div>")
+        a("</div>")
+
+        if total > len(rows):
+            a(f'<p class="withheld">+{total - len(rows)} more not shown</p>')
+        a("</section>")
+
+    a("<footer>")
+    a("<h3>Acting on this</h3>")
+    a('<div class="cmds">')
+    a("<code>loose-ends --all <b># everything, no caps</b></code>")
+    a("<code>git stash show -p 'stash@{N}' <b># read one before dropping it</b></code>")
+    a("<code>loose-ends --dismiss <b># acknowledge what is here; quiet until it changes</b></code>")
+    a("</div>")
+    a("<p>Dismissing is fingerprinted by content, so anything you acknowledge comes "
+      "back the moment the work behind it changes.</p>")
+    a("</footer>")
+    a("</div>")
+    return "\n".join(out)
+
+
+def main():
+    p = argparse.ArgumentParser(
+        description="Render loose-ends --json as an HTML page.",
+        epilog="loose-ends --json --slack | loose-ends-page --lede '...' --out page.html",
+    )
+    p.add_argument("--lede", default="",
+                   help="the sentence that says what matters today; inline HTML allowed "
+                        "(wrap the key phrase in <em> to accent it)")
+    p.add_argument("--previous", type=Path,
+                   help="last run's JSON; findings absent from it are marked new")
+    p.add_argument("--out", type=Path, help="write here instead of stdout")
+    args = p.parse_args()
+
+    try:
+        data = json.load(sys.stdin)
+    except json.JSONDecodeError as e:
+        sys.exit(f"loose-ends-page: stdin is not the JSON from `loose-ends --json`: {e}")
+
+    previous_ids = None
+    if args.previous and args.previous.exists():
+        try:
+            prev = json.loads(args.previous.read_text())
+            previous_ids = {f["id"] for f in prev.get("findings", [])}
+        except (json.JSONDecodeError, KeyError, TypeError):
+            # A corrupt snapshot should cost the "new" badges, not the page.
+            print("loose-ends-page: unreadable --previous, not marking new findings",
+                  file=sys.stderr)
+
+    page = render(data, args.lede, previous_ids)
+    if args.out:
+        args.out.write_text(page)
+        print(f"✓ Wrote {args.out} ({len(page)} bytes)", file=sys.stderr)
+    else:
+        print(page)
+
+
+if __name__ == "__main__":
+    main()
