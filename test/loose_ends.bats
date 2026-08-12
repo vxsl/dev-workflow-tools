@@ -298,3 +298,40 @@ EOF
     [[ "$output" == *"needs SLACK_USER_TOKEN"* ]]
     [[ "$output" == *"feature has 1 unpushed"* ]]
 }
+
+# --- json -------------------------------------------------------------------
+
+# --json is the contract the artifact renderer consumes, so the shape matters
+# more than the prose does: valid JSON on every path, including the empty ones.
+@test "--json emits structured fields, not prose to be re-parsed" {
+    unpushed_branch feature 4
+    run_le --json
+    [ "$status" -eq 0 ]
+    printf '%s' "$output" | jq -e . >/dev/null
+    [ "$(printf '%s' "$output" | jq -r '.totals.unpushed')" = 1 ]
+    [ "$(printf '%s' "$output" | jq -r '.findings[0].meta.branch')" = feature ]
+    [ "$(printf '%s' "$output" | jq -r '.findings[0].meta.commits')" = 4 ]
+}
+
+@test "--json stays valid JSON when there is nothing to report" {
+    run_le --json
+    [ "$status" -eq 0 ]
+    printf '%s' "$output" | jq -e '.findings == []' >/dev/null
+}
+
+@test "--json never dismisses anything" {
+    # Publishing a page must not silence a finding before anyone has read it.
+    unpushed_branch feature 1
+    run_le --json
+    run_le
+    [[ "$output" == *"feature has 1 unpushed"* ]]
+}
+
+@test "--json survives a branch name that would break hand-rolled JSON" {
+    git -C "$REPO" checkout -q -b 'fix/quote"and\back' main 2>/dev/null || skip "refname rejected"
+    git -C "$REPO" commit -q --allow-empty -m weird
+    git -C "$REPO" checkout -q main
+    run_le --json
+    [ "$status" -eq 0 ]
+    printf '%s' "$output" | jq -e . >/dev/null
+}

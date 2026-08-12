@@ -20,7 +20,7 @@
 # Read-only. Never pushes, never writes to a repo, never posts anywhere.
 #
 # Usage: loose-ends [--days N] [--repos DIR] [--all] [--dismiss] [--forget]
-#                   [--no-mr] [--no-sessions] [--slack] [--limit N]
+#                   [--no-mr] [--no-sessions] [--slack] [--json] [--limit N]
 
 set -euo pipefail
 
@@ -39,6 +39,7 @@ SHOW_ALL=0
 DO_DISMISS=0
 WANT_MR=1
 WANT_SESSIONS=1
+AS_JSON=0
 WANT_SLACK="${LOOSE_ENDS_SLACK:-0}"
 SLACK_BUDGET="${LOOSE_ENDS_SLACK_BUDGET:-15}"
 SLACK_SLEEP="${LOOSE_ENDS_SLACK_SLEEP:-1}"
@@ -54,6 +55,7 @@ while [ $# -gt 0 ]; do
         --no-mr)       WANT_MR=0; shift ;;
         --no-sessions) WANT_SESSIONS=0; shift ;;
         --slack)       WANT_SLACK=1; shift ;;
+        --json)        AS_JSON=1; shift ;;
         -h|--help)     sed -n '2,25p' "$0" | sed 's/^# \?//'; exit 0 ;;
         *)             echo "✗ Unknown argument: $1" >&2; exit 1 ;;
     esac
@@ -71,11 +73,13 @@ CUTOFF_DAYS="$DAYS"
 # a sha or count so the item returns the moment the underlying work changes.
 FINDINGS=$(mktemp); trap 'rm -f "$FINDINGS"' EXIT
 
-# add <score> <class> <fingerprint> <text> [slack-query]
+# add <score> <class> <fingerprint> <text> [slack-query] [meta]
 # The query is the identifier other people would have typed when talking about
 # this work -- a branch name, a ticket key, an MR number. Empty means unsearchable.
+# meta is "k=v;k=v" and becomes the structured fields of --json, so a renderer
+# never has to parse the prose in <text>.
 add() {
-    printf '%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "${5:-}" >>"$FINDINGS"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "${5:-}" "${6:-}" >>"$FINDINGS"
 }
 
 # ---------------------------------------------------------------- session index
@@ -129,7 +133,8 @@ for repo in "${REPOS[@]}"; do
     if behind=$(git -C "$repo" rev-list --count main..origin/main 2>/dev/null) \
        && [ "${behind:-0}" -gt 0 ]; then
         add 50 main-behind "$rname:main-behind:$behind" \
-            "$rname: local main is $behind commit(s) behind origin/main"
+            "$rname: local main is $behind commit(s) behind origin/main" \
+            "" "repo=$rname;behind=$behind"
     fi
 
     # -- worktree set, to tell a set-up workspace from a bare branch ------------
@@ -146,7 +151,8 @@ for repo in "${REPOS[@]}"; do
         names=$(git -C "$repo" for-each-ref --points-at "$sha" \
                     --format='%(refname:short)' refs/heads | paste -sd', ' -)
         add 60 dup-tip "$rname:dup:$sha" \
-            "$rname: same tip ${sha:0:9} on multiple branches -- $names"
+            "$rname: same tip ${sha:0:9} on multiple branches -- $names" \
+            "" "repo=$rname;sha=${sha:0:9};branches=$names"
     done < <(git -C "$repo" for-each-ref --format='%(objectname)' refs/heads \
                 | sort | uniq -d)
 
@@ -177,7 +183,8 @@ for repo in "${REPOS[@]}"; do
             why="no session, no worktree"
         fi
         add "$score" unpushed "$rname:unpushed:$name:$sha:$n" \
-            "$rname: $name has $n unpushed commit(s), idle ${age}d ($why)" "$name"
+            "$rname: $name has $n unpushed commit(s), idle ${age}d ($why)" "$name" \
+            "repo=$rname;branch=$name;commits=$n;age=$age;sessions=$nsess;worktree=${wt:+yes}"
     done < <(git -C "$repo" for-each-ref --no-merged origin/main \
                 --format='%(refname:short)|%(objectname:short)|%(committerdate:unix)' \
                 refs/heads)
@@ -223,7 +230,8 @@ for repo in "${REPOS[@]}"; do
         detail="${nsrc} source file(s)"
         [ -n "$stranded" ] && detail="$detail, $stranded"
         add "$score" stash "$rname:stash:$sha" \
-            "$rname: $ref on '${base:-?}' -- ${age}d old, $detail" "$base"
+            "$rname: $ref on '${base:-?}' -- ${age}d old, $detail" "$base" \
+            "repo=$rname;ref=$ref;base=${base:-?};age=$age;src=$nsrc;stranded=$stranded"
     done < <(git -C "$repo" stash list --format='%gd|%H|%ct|%gs' 2>/dev/null)
 
     # -- open MRs nobody has commented on --------------------------------------
@@ -238,14 +246,15 @@ for repo in "${REPOS[@]}"; do
                 2>/dev/null) || mrs=""
         if [ -z "$mrs" ]; then
             add 40 mr-unavailable "$rname:mr-unavailable" \
-                "$rname: could not read MRs (glab failed or not authed) -- MR checks skipped"
+                "$rname: could not read MRs (glab failed or not authed) -- MR checks skipped" \
+                "" "repo=$rname"
         else
             while IFS='|' read -r num updated title; do
                 [ -n "$num" ] || continue
                 age=$(( (NOW - updated) / 86400 ))
                 add $(( 70 + age )) mr-quiet "$rname:mr:$num:$updated" \
                     "$rname: !$num has no comments, idle ${age}d -- $(printf '%.60s' "$title")" \
-                    "$num"
+                    "$num" "repo=$rname;mr=$num;age=$age;title=$title"
             done < <(printf '%s' "$mrs" | jq -r --argjson cut "$mr_cutoff" '
                         .[]
                         | select(.user_notes_count == 0)
@@ -270,14 +279,53 @@ if [ "$WANT_SESSIONS" -eq 1 ] && [ -d "$PROJECTS_DIR" ]; then
             "$SESSION_BRANCHES" && continue
         turns=$(rg -cN '"type":"user"' "$f" 2>/dev/null || echo 0)
         [ "${turns:-0}" -ge 40 ] || continue
-        add $(( 90 + turns / 10 )) session-no-branch "session:$(basename "$f" .jsonl)" \
-            "session $(basename "$f" .jsonl | cut -c1-8) -- $turns turns, ${age}d ago, no branch recorded"
+        sid=$(basename "$f" .jsonl)
+        add $(( 90 + turns / 10 )) session-no-branch "session:$sid" \
+            "session ${sid:0:8} -- $turns turns, ${age}d ago, no branch recorded" \
+            "" "session=$sid;turns=$turns;age=$age"
     done < <(find "$PROJECTS_DIR" -name '*.jsonl' -size +200k 2>/dev/null)
 fi
 
 # ------------------------------------------------------------------- reporting
+# --json goes to stdout while every human line goes to stderr, so a renderer can
+# consume the data and still let the terminal output through. jq does the quoting
+# from raw TSV -- branch names and MR titles contain characters that hand-rolled
+# JSON would corrupt.
+emit_json() {
+    local display="$1" totals="$2" nd="$3"
+    jq -Rs \
+        --arg generated "$(date -Iseconds)" \
+        --argjson days "$DAYS" \
+        --argjson totals "$totals" \
+        --argjson dismissed "$nd" '
+        def parsemeta:
+            if . == "" then {}
+            else (split(";")
+                  | map(select(length > 0) | split("=") | {(.[0]): (.[1:] | join("="))})
+                  | add // {})
+            end;
+        {
+            generated: $generated,
+            threshold_days: $days,
+            dismissed: $dismissed,
+            totals: $totals,
+            findings: (split("\n") | map(select(length > 0)) | map(split("\t")) | map({
+                score: (.[0] | tonumber),
+                class: .[1],
+                id:    .[2],
+                text:  .[3],
+                query: (.[4] // ""),
+                meta:  ((.[5] // "") | parsemeta)
+            }))
+        }' <"$display"
+}
+
 if [ ! -s "$FINDINGS" ]; then
-    echo "✓ No loose ends (threshold ${DAYS}d)" >&2
+    if [ "$AS_JSON" -eq 1 ]; then
+        emit_json /dev/null '{}' 0
+    else
+        echo "✓ No loose ends (threshold ${DAYS}d)" >&2
+    fi
     exit 0
 fi
 
@@ -297,7 +345,11 @@ else
 fi
 
 if [ ! -s "$SHOWN" ]; then
-    echo "✓ No new loose ends ($ndismissed dismissed, threshold ${DAYS}d)" >&2
+    if [ "$AS_JSON" -eq 1 ]; then
+        emit_json /dev/null '{}' "$ndismissed"
+    else
+        echo "✓ No new loose ends ($ndismissed dismissed, threshold ${DAYS}d)" >&2
+    fi
     exit 0
 fi
 
@@ -323,7 +375,7 @@ if [ "$WANT_SLACK" -eq 1 ]; then
     else
         ENRICHED=$(mktemp)
         spent=0
-        while IFS=$'\t' read -r score class fp text query; do
+        while IFS=$'\t' read -r score class fp text query meta; do
             hits=""
             # Only search identifiers specific enough to mean one thing. 'main' or
             # 'smp' would match half the workspace and tell us nothing.
@@ -341,20 +393,35 @@ if [ "$WANT_SLACK" -eq 1 ]; then
                     if [ "${n:-0}" -gt 0 ]; then
                         link=$(jq -r '.messages.matches[0].permalink // ""' <<<"$resp")
                         hits=" [slack: $n, $link]"
+                        meta="$meta;slack=$n;slack_url=$link"
                         score=$(( score + 40 ))
                     else
                         hits=" [slack: nobody has mentioned this]"
+                        meta="$meta;slack=0"
                     fi
                 fi
                 sleep "$SLACK_SLEEP"   # search.messages is rate-limited; stay under it
             fi
-            printf '%s\t%s\t%s\t%s\t%s\n' "$score" "$class" "$fp" "$text$hits" "$query"
+            printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+                "$score" "$class" "$fp" "$text$hits" "$query" "$meta"
         done <"$DISPLAY" >"$ENRICHED"
         sort -t$'\t' -k1,1nr "$ENRICHED" >"$DISPLAY"
         rm -f "$ENRICHED"
         [ "$spent" -ge "$SLACK_BUDGET" ] && \
             echo "⚠ Slack budget of $SLACK_BUDGET searches spent; later findings unchecked" >&2
     fi
+fi
+
+# Emitted after enrichment so Slack's answers are part of the data, and before
+# dismissal so publishing a page can never silence a finding nobody has read yet.
+if [ "$AS_JSON" -eq 1 ]; then
+    class_totals=$(awk -F'\t' '
+        { c[$2]++ }
+        END { printf "{"; n = 0
+              for (k in c) printf "%s\"%s\":%d", (n++ ? "," : ""), k, c[k]
+              printf "}" }' "$SHOWN")
+    emit_json "$DISPLAY" "$class_totals" "$ndismissed"
+    exit 0
 fi
 
 if [ "$DO_DISMISS" -eq 1 ]; then
