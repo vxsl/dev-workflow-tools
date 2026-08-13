@@ -212,6 +212,33 @@ def distinct_unpushed(repo, names):
     return int(out) if out.isdigit() else 0
 
 
+def already_upstream(repo, branches, main_ref):
+    """Branches whose every commit is already in main by patch equivalence.
+
+    The third and last way work lands without the branch showing it. Matching MR source
+    branches catches the squash-merge case; supersession catches a copy of a branch that
+    landed. Neither can see !10367, which merged from `UL-1738` -- a branch that no longer
+    exists on this laptop -- while the local `geo_filter_collection` still holds the same
+    change. There is no name to match and no sibling to be a copy of.
+
+    `git cherry` answers it directly: it compares patch-ids against upstream and marks a
+    commit `-` when an equivalent change is already there. Measured across all 394 branches
+    it flags `geo_filter_collection` 1-of-1 and nothing else, so it is specific as well as
+    the only thing that could have known.
+    """
+    def one(name):
+        out = git(repo, "cherry", main_ref, name)
+        marks = [ln[:1] for ln in out.splitlines() if ln[:1] in "+-"]
+        return name, bool(marks) and all(m == "-" for m in marks), len(marks)
+
+    landed = {}
+    with futures.ThreadPoolExecutor(max_workers=8) as pool:
+        for name, all_up, n in pool.map(one, branches):
+            if all_up:
+                landed[name] = n
+    return landed
+
+
 def patch_ids(repo, branch, main_ref, limit=20):
     """The content-identity of each commit, independent of its sha.
 
@@ -288,8 +315,26 @@ def glab(repo, path, timeout=40):
         return None
 
 
-def unresolved_threads(repo, iid):
+def gitlab_me(repo, _cache={}):
+    """Your GitLab username, so "who spoke last" is answerable."""
+    if "u" not in _cache:
+        me = glab(repo, "user") or {}
+        _cache["u"] = me.get("username") or ""
+    return _cache["u"]
+
+
+def unresolved_threads(repo, iid, me=""):
     """Review threads on your own MR that nobody has resolved.
+
+    Unresolved is not the same as unanswered, and calling them the same was a wrong
+    reminder of the worst kind -- it told Kyle four of ella's questions on !10398 were
+    waiting on him when he had replied to every one. GitLab's `resolved` flag flips only
+    when somebody clicks Resolve; a reply does not set it, and on this project nothing
+    forces anyone to. All four threads read ella → kylegm → ella → kylegm.
+
+    So each thread also records who spoke last. If it was you, the thread is answered and
+    merely unresolved, which needs nothing from you beyond perhaps a click. If it was them,
+    you owe a reply. Those are different obligations and the page must not merge them.
 
     `blocking_discussions_resolved` is the field that looks like it answers this and it
     does not: on !10398 it reads True while four of ella's threads sit unresolved, because
@@ -314,11 +359,16 @@ def unresolved_threads(repo, iid):
         body = re.sub(r"!?\[[^\]]*\]\([^)]*\)(\{[^}]*\})?", " ", body)
         body = re.sub(r"</?[a-z][^>]*>", " ", body)
         body = " ".join(body.split())
+        last = notes[-1]
+        last_by = (last.get("author") or {}).get("username", "?")
         open_.append({
             "author": (first.get("author") or {}).get("username", "?"),
             "quote": body[:180] + ("…" if len(body) > 180 else ""),
             "notes": len(notes),
             "at": (first.get("created_at") or "")[:10],
+            "last_by": last_by,
+            "last_at": (last.get("created_at") or "")[:10],
+            "answered": bool(me) and last_by == me,
         })
     return open_
 
@@ -425,9 +475,11 @@ def collect_mrs(repo, deep=True):
     if not deep or not mrs:
         return mrs, None
 
+    me = gitlab_me(repo)
+
     def enrich(mr):
         if mr["notes"]:
-            mr["threads"] = unresolved_threads(repo, mr["iid"])
+            mr["threads"] = unresolved_threads(repo, mr["iid"], me)
         pipes = glab(repo, f"projects/:id/merge_requests/{mr['iid']}/pipelines?per_page=1")
         if pipes:
             mr["pipeline"] = {"status": pipes[0].get("status", ""),
@@ -930,12 +982,20 @@ def mark_duplicates(arc, repo=None, main_ref="origin/main"):
     mr_branches = {m.get("branch") for m in arc.get("mrs", [])}
 
     def rank(b):
-        # Name before size, and the order is load-bearing. A `-before-squash` branch has
-        # more commits than the squashed version by construction, so ranking on commit
-        # count first nominates the pre-squash copy as the canonical branch and then
-        # declares the real one a duplicate of it. The name only ever picks which of two
-        # branches is canonical; what makes one superseded at all is its content.
-        return (b["name"] in mr_branches, not VARIANT_RE.search(b["name"]),
+        # Having carried a merge request outranks everything except carrying an open one:
+        # of two names for a single tip, the one somebody reviewed is the real branch. Left
+        # to a name tie-break, `at-timezone-accept-zoned-columns` beat `UL-1795` on ASCII
+        # order and was declared canonical, so the arc's only merged MR sat on the branch
+        # marked as the copy -- and the arc reported "pushed, no merge request" with !10416
+        # merged.
+        #
+        # Then name before size, and that order is load-bearing too. A `-before-squash`
+        # branch has more commits than the squashed version by construction, so ranking on
+        # commit count first nominates the pre-squash copy and declares the real one a
+        # duplicate of it. Names only ever pick which of two branches is canonical; what
+        # makes one superseded at all is its content.
+        return (b["name"] in mr_branches, bool(b.get("mr_fate")),
+                not VARIANT_RE.search(b["name"]),
                 b.get("commits_ahead", 0), b.get("pushed", False),
                 -b.get("age_days", 999), b["name"])
 
@@ -960,9 +1020,18 @@ def mark_duplicates(arc, repo=None, main_ref="origin/main"):
             asubs = set(a.get("subjects") or [])
             if not asubs or not subs <= asubs:
                 continue
-            if b["name"] in (a.get("parents") or []):
-                continue  # a stack edge, drawn as one; not a copy
-            kind = "same subjects"
+            if b["sha"] == a["sha"]:
+                # Two names for one tip. These are each other's ancestor, so the stack test
+                # below excluded them -- and that is how `at-timezone-accept-zoned-columns`
+                # and `UL-1795` stayed separate while being the same two shas with an empty
+                # diff between them, leaving the arc claiming no merge request when !10416
+                # had merged it. A stack means one branch is strictly ahead of the other;
+                # equal tips are aliases.
+                kind = "same tip"
+            elif b["name"] in (a.get("parents") or []):
+                continue  # a genuine stack edge, drawn as one; not a copy
+            else:
+                kind = "same subjects"
             if repo is not None and len(subs) <= 20 and len(asubs) <= 20:
                 mine = pids(b["name"])
                 if mine and mine <= pids(a["name"]):
@@ -1030,7 +1099,15 @@ def authoritative(arc):
 # in this list is here because it is large -- each entry is a thing that cannot move until
 # you personally do something.
 DEMAND_RANK = {"conflict": 0, "threads": 1, "pipeline": 2, "approved": 3,
-               "unpushed": 4, "unreviewed": 5, "draft": 6}
+               "unpushed": 4, "unreviewed": 5, "draft": 6, "unresolved": 7}
+
+# Which rung a workstream sits on, decided by the worst thing outstanding. Derived from one
+# table so the ladder cannot drift from the demands it is meant to describe. `unresolved`
+# maps to in-review because a thread you have already answered has not come back to you --
+# it is a loose end on work that is still in someone else's hands.
+STAGE_OF = {"conflict": "came-back", "threads": "came-back", "pipeline": "came-back",
+            "approved": "came-back", "draft": "came-back", "unresolved": "in-review",
+            "unpushed": "local-only", "unreviewed": "not-proposed"}
 
 
 def demands(arc):
@@ -1055,18 +1132,29 @@ def demands(arc):
         # "ella asked, unanswered since 2026-08-13" with only the quote to tell them
         # apart, which is a list of the same sentence. Who is waiting and since when is
         # the demand; the questions are its evidence.
+        # Two different obligations, and merging them produced the worst kind of wrong
+        # reminder: four of ella's threads reported as awaiting Kyle when he had replied to
+        # every one. Whoever spoke last says whose turn it is.
         threads = m.get("threads", [])
-        if threads:
-            who = sorted({t["author"] for t in threads})
-            oldest = min(t["at"] for t in threads if t["at"]) if any(
-                t["at"] for t in threads) else ""
-            n = len(threads)
-            out.append({
-                "kind": "threads",
-                "what": f"{ref}: {n} unanswered question{'' if n == 1 else 's'} from "
-                        f"{', '.join(who)}" + (f", oldest {oldest}" if oldest else ""),
-                "quotes": [t["quote"] for t in threads if t.get("quote")],
-                "url": m.get("url", "")})
+        for answered, kind in ((False, "threads"), (True, "unresolved")):
+            group = [t for t in threads if bool(t.get("answered")) is answered]
+            if not group:
+                continue
+            n = len(group)
+            if answered:
+                who = sorted({t["author"] for t in group})
+                what = (f"{ref}: {n} thread{'' if n == 1 else 's'} you answered that "
+                        f"nobody resolved — {', '.join(who)} raised "
+                        f"{'it' if n == 1 else 'them'}")
+            else:
+                who = sorted({t["last_by"] for t in group})
+                oldest = min((t["last_at"] for t in group if t["last_at"]), default="")
+                what = (f"{ref}: {n} thread{'' if n == 1 else 's'} awaiting your reply — "
+                        f"{', '.join(who)} spoke last"
+                        + (f", oldest {oldest}" if oldest else ""))
+            out.append({"kind": kind, "what": what,
+                        "quotes": [t["quote"] for t in group if t.get("quote")],
+                        "url": m.get("url", "")})
         pipe = m.get("pipeline") or {}
         if pipe.get("status") in ("failed", "canceled"):
             out.append({"kind": "pipeline",
@@ -1153,9 +1241,29 @@ def finalize(arc, repo=None, main_ref="origin/main"):
     # only honest place on a page about live work is a count. Any branch still without a
     # settled MR keeps the arc alive -- work continuing on top of a merged branch is normal
     # and is exactly the case a whole-arc test must not swallow.
-    fates = [b.get("mr_fate", {}).get("state") for b in arc["branches"]]
-    if fates and all(f in ("merged", "closed") for f in fates):
-        arc["settled"] = "landed" if "merged" in fates else "abandoned"
+    #
+    # A superseded copy is not such a branch. !10332 merged the bound-sources hotfix and the
+    # arc still read "pushed, no merge request", because one member was a cherry-picked
+    # duplicate that had never had an MR of its own -- its content had landed on the branch
+    # it copies. A copy is accounted for by whatever accounts for its original, so the test
+    # resolves through supersession before asking whether anything is left.
+    by_name = {b["name"]: b for b in arc["branches"]}
+    fate_of = {n: (b.get("mr_fate") or {}).get("state") for n, b in by_name.items()}
+    settled_names = {n for n, f in fate_of.items() if f in ("merged", "closed")}
+    for _ in range(len(by_name)):
+        grew = False
+        for n, b in by_name.items():
+            sup = b.get("superseded_by")
+            if n not in settled_names and sup in settled_names:
+                settled_names.add(n)
+                grew = True
+        if not grew:
+            break
+    if by_name and settled_names == set(by_name) and any(
+            f == "merged" for f in fate_of.values()):
+        arc["settled"] = "landed"
+    elif by_name and settled_names == set(by_name):
+        arc["settled"] = "abandoned"
     else:
         arc["settled"] = None
 
@@ -1217,17 +1325,27 @@ def finalize(arc, repo=None, main_ref="origin/main"):
     arc["urgency"] = (DEMAND_RANK.get(arc["demands"][0]["kind"], 9)
                       if arc["demands"] else 99)
 
+    worst = arc["demands"][0]["kind"] if arc["demands"] else None
     if settled:
         arc["stage"] = settled
         arc["state"] = {"landed": "landed", "abandoned": "abandoned"}[settled]
-    elif arc["demands"] and arc["demands"][0]["kind"] in (
-            "conflict", "threads", "pipeline", "approved", "draft"):
+    elif STAGE_OF.get(worst) == "came-back":
         arc["stage"] = "came-back"
         arc["state"] = {
-            "conflict": "no longer merges", "threads": "questions unanswered",
+            "conflict": "no longer merges", "threads": "awaiting your reply",
             "pipeline": "pipeline failed", "approved": "approved, not merged",
             "draft": "still a draft",
-        }[arc["demands"][0]["kind"]]
+        }[worst]
+    elif worst == "unpushed":
+        # The rung follows the worst thing outstanding, MR or no MR: an arc holding an open
+        # merge request AND 181 commits that no remote has is not simply "in review".
+        arc["stage"] = "local-only"
+        n = arc["unpushed_live"]
+        arc["state"] = (f"{n} commit exists" if n == 1 else f"{n} commits exist") + \
+                       " only here"
+    elif worst == "unreviewed":
+        arc["stage"] = "not-proposed"
+        arc["state"] = "pushed, no merge request"
     elif arc["mrs"]:
         # An MR open with nothing outstanding: his end of the deal is done and the clock
         # belongs to a reviewer. This used to read "waiting on review" and rank first.
@@ -1238,12 +1356,19 @@ def finalize(arc, repo=None, main_ref="origin/main"):
         n = arc["unpushed_live"]
         arc["state"] = (f"{n} commit exists" if n == 1 else f"{n} commits exist") + \
                        " only here"
-    elif arc.get("mrs_known", True) and arc["authoritative"]:
-        arc["stage"] = "not-proposed"
-        arc["state"] = "pushed, no merge request"
     else:
-        arc["stage"] = "not-proposed"
-        arc["state"] = "nothing outstanding"
+        auth_b = next((b for b in arc["branches"]
+                       if b["name"] == arc["authoritative"]), None)
+        # The demand guards against this and the fallback did not, so the same false claim
+        # arrived by a second route: "pushed, no merge request" about a branch whose MR had
+        # merged. Anything asserting an absence has to check for the thing first.
+        if (arc.get("mrs_known", True) and arc["authoritative"]
+                and not (auth_b or {}).get("mr_fate")):
+            arc["stage"] = "not-proposed"
+            arc["state"] = "pushed, no merge request"
+        else:
+            arc["stage"] = "not-proposed"
+            arc["state"] = "nothing outstanding"
 
     arc.setdefault("engagement", 0)
     arc["counts"] = {
@@ -1341,6 +1466,23 @@ def main():
         for name, fate in branch_mr_states(args.repo).items():
             if name in branches:
                 branches[name]["mr_fate"] = fate
+    # Patch equivalence against main, for the branches no MR accounts for. `git cherry`
+    # recomputes patch-ids for main's history on every call, so it is the most expensive
+    # thing here -- unbounded it took the run from 20s to 80s. Bounded to small branches,
+    # which is what a stranded leftover of landed work looks like: `geo_filter_collection`
+    # is one commit. The bound is stated below rather than left implicit, since it is a real
+    # limit on recall and not a free optimisation.
+    CHERRY_MAX = int(os.environ.get("WORK_ARCS_CHERRY_MAX", "25"))
+    unaccounted = [n for n, b in branches.items()
+                   if not b.get("mr_fate") and b["commits_ahead"] <= CHERRY_MAX]
+    skipped = sum(1 for n, b in branches.items()
+                  if not b.get("mr_fate") and b["commits_ahead"] > CHERRY_MAX)
+    if skipped:
+        print(f"  {skipped} branch(es) over {CHERRY_MAX} commits not checked for having "
+              f"already landed (WORK_ARCS_CHERRY_MAX)", file=sys.stderr)
+    for name, n in already_upstream(args.repo, unaccounted, args.main).items():
+        branches[name]["mr_fate"] = {"state": "merged", "iid": None, "at": "",
+                                     "url": "", "via": f"all {n} commits already in main"}
     sessions = session_index(args.projects)
     arcs, unattached = build_arcs(branches, stashes, mrs, sessions, args.main,
                                   cluster_assign, args.repo, mrs_known)

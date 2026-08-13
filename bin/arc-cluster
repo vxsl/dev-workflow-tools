@@ -107,6 +107,32 @@ def base(p):
     return b if b.endswith(SRC) and b not in UBIQUITOUS else None
 
 
+def aliases(repo, names):
+    """Branches that are two names for one commit, as (other, first) pairs.
+
+    Stronger evidence than ancestry and it was being thrown away by the corroboration
+    rule. `at-timezone-accept-zoned-columns` and `UL-1795` are the same tip, sha
+    fd40716f7, with an empty diff between them -- but their change touches a single file,
+    so requiring two shared files deleted the only edge they had and each became its own
+    arc. One of them carried the merged !10416 and the other therefore reported "pushed,
+    no merge request".
+
+    Corroboration exists to stop one incidental shared file inventing a relationship.
+    An identical tip is not an inference that needs corroborating; it is the same commit.
+    """
+    out, first = [], {}
+    fmt = "%(objectname)\t%(refname:short)"
+    for line in git(repo, "for-each-ref", f"--format={fmt}", "refs/heads").splitlines():
+        sha, _, name = line.partition("\t")
+        if name not in names:
+            continue
+        if sha in first:
+            out.append((name, first[sha]))
+        else:
+            first[sha] = name
+    return out
+
+
 def stacking(repo, main, names, branch_files):
     """Which branches were cut from which, as (child, parent) pairs.
 
@@ -573,6 +599,9 @@ def main():
     branch_names = {n for kind, n in ents if kind == "branch"}
     branch_files = {n: f for (kind, n), f in ents.items() if kind == "branch"}
     stacks, nearest = stacking(args.repo, args.main, branch_names, branch_files)
+    # Aliases ride the ancestry machinery: same relation shape, and same need to survive
+    # the partition rather than merely influence it.
+    stacks = list(stacks) + aliases(args.repo, branch_names)
 
     # A branch's bag is its diff against main, so a branch cut from another carries its
     # base's whole diff as well as its own. `attr-popup` shares 83 files with the base it
