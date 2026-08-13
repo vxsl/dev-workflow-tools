@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# arcs: rebuild the work-arcs page, in one word instead of three.
+#
+# The pipeline was three programs joined by pipes and a flag you had to remember, which is
+# fine to type once and wrong to type every morning -- and it was typed differently each
+# time, so the page came back with a different --focus than the last one and looked like the
+# work had changed when only the window had.
+#
+# Publishing is deliberately NOT here, and cannot be: the page lives as a Claude Code
+# artifact, and only a Claude Code session can write to that URL. So this script does every
+# deterministic part and then prints exactly what the publish step needs. `/arcs` is the
+# one-word version that does both.
+#
+#   arcs                 # rebuild with your usual window
+#   arcs --focus 30      # any arcs-page flag passes through
+#   arcs --no-brief      # skip the model pass: faster, and the cards lose their names
+#
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+[ -f "$SCRIPT_DIR/../.env" ] && source "$SCRIPT_DIR/../.env"
+
+STATE="${XDG_STATE_HOME:-$HOME/.local/state}/work-arcs"
+OUT="${WORK_ARCS_PAGE:-$STATE/page.html}"
+FOCUS="${WORK_ARCS_FOCUS:-21}"
+URL="${WORK_ARCS_ARTIFACT_URL:-}"
+
+brief=1
+page_args=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --no-brief) brief=0; shift ;;
+        --focus) FOCUS="$2"; shift 2 ;;
+        --focus=*) FOCUS="${1#*=}"; shift ;;
+        --out) OUT="$2"; shift 2 ;;
+        --out=*) OUT="${1#*=}"; shift ;;
+        -h|--help) sed -n '2,17p' "$0" | sed 's/^# \?//'; exit 0 ;;
+        *) page_args+=("$1"); shift ;;
+    esac
+done
+
+mkdir -p "$(dirname "$OUT")"
+
+# Staged rather than piped, so a failure names the stage it happened in. A three-program
+# pipe reports the exit status of the last one, which meant a GitLab timeout in work-arcs
+# surfaced as arcs-page complaining that stdin was not JSON.
+graph="$(mktemp)"; trap 'rm -f "$graph" "$graph.brief"' EXIT
+work-arcs --json >"$graph"
+if [ "$brief" = 1 ]; then
+    arc-brief --from "$graph" >"$graph.brief"
+    mv "$graph.brief" "$graph"
+fi
+arcs-page --focus "$FOCUS" --out "$OUT" ${page_args+"${page_args[@]}"} <"$graph"
+
+echo
+echo "  page:  $OUT"
+if [ -n "$URL" ]; then
+    echo "  live:  $URL"
+    echo
+    echo "  To republish, from a Claude Code session:"
+    echo "    publish $OUT to $URL"
+else
+    echo
+    echo "  No WORK_ARCS_ARTIFACT_URL set — add it to .env and this will print the"
+    echo "  publish line too. Until then, publishing creates a new artifact each time."
+fi
