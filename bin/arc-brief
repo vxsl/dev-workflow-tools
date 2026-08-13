@@ -579,8 +579,14 @@ def main():
     except json.JSONDecodeError as e:
         sys.exit(f"arc-brief: input is not the JSON work-arcs emits ({e})")
 
-    repo = args.repo or Path(data.get("repo", ""))
+    repo = args.repo or Path(data.get("repo_path") or data.get("repo", ""))
     main_ref = data.get("main", "origin/main")
+    # Loudly, because the silent version of this cost every brief its commit subjects for
+    # as long as the tool has existed. `repo` in the JSON is a display name; older payloads
+    # carry only that, and resolving it as a path makes every git call a no-op.
+    if not (repo / ".git").exists():
+        print(f"arc-brief: {repo} is not a git repo — no commit subjects will reach the "
+              f"model, and the briefs will be markedly worse. Pass --repo.", file=sys.stderr)
     turns = load_turns()
     if not turns:
         print("arc-brief: no prompt log at "

@@ -27,6 +27,7 @@ import argparse
 import html
 import json
 import sys
+import urllib.parse
 from datetime import datetime
 from pathlib import Path
 
@@ -35,8 +36,9 @@ CSS = """
   --ground:#F6F7FA;--surface:#FFFFFF;--surface-2:#EFF1F6;
   --ink:#161922;--ink-soft:#59616F;--ink-faint:#8A91A0;
   --hairline:#E2E5EC;--accent:#4453C4;
-  --hot:#A93826;--warm:#9C6414;--calm:#3F6E52;
+  --hot:#A93826;--warm:#9C6414;--calm:#3F6E52;--parked:#6E7585;
   --hot-wash:#FBF0EE;--warm-wash:#FBF5EC;--calm-wash:#EFF5F1;
+  --quote:#F3F4F8;
   --serif:ui-serif,Charter,"Bitstream Charter",Georgia,serif;
   --sans:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
   --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
@@ -45,14 +47,16 @@ CSS = """
   --ground:#0F1218;--surface:#161A22;--surface-2:#1C212B;
   --ink:#E3E6EC;--ink-soft:#8F97A6;--ink-faint:#6B7382;
   --hairline:#262B36;--accent:#93A0F7;
-  --hot:#E27B63;--warm:#DFA24C;--calm:#7CB690;
-  --hot-wash:#241A18;--warm-wash:#241E14;--calm-wash:#16211A;}}
+  --hot:#E27B63;--warm:#DFA24C;--calm:#7CB690;--parked:#79808F;
+  --hot-wash:#241A18;--warm-wash:#241E14;--calm-wash:#16211A;
+  --quote:#1A1F29;}}
 :root[data-theme="dark"]{
   --ground:#0F1218;--surface:#161A22;--surface-2:#1C212B;
   --ink:#E3E6EC;--ink-soft:#8F97A6;--ink-faint:#6B7382;
   --hairline:#262B36;--accent:#93A0F7;
-  --hot:#E27B63;--warm:#DFA24C;--calm:#7CB690;
-  --hot-wash:#241A18;--warm-wash:#241E14;--calm-wash:#16211A;}
+  --hot:#E27B63;--warm:#DFA24C;--calm:#7CB690;--parked:#79808F;
+  --hot-wash:#241A18;--warm-wash:#241E14;--calm-wash:#16211A;
+  --quote:#1A1F29;}
 
 *,*::before,*::after{box-sizing:border-box}
 body{margin:0;background:var(--ground);color:var(--ink);font-family:var(--sans);
@@ -74,7 +78,11 @@ section{margin-bottom:3rem}
 /* One card per arc, leading with what the arc IS. The counts moved to the footer of
    the card because a count is an input to a judgement, not the judgement -- reading
    "112 unpushed / 15 branches / 19 sessions" first is what made this a spreadsheet. */
-.arcs{display:grid;grid-template-columns:repeat(auto-fill,minmax(30rem,1fr));gap:1rem}
+/* align-items:start, so a short card stays short. Stretching every card to its row's
+   tallest left a card with a two-branch tree holding half a screen of empty wash, which
+   reads as missing content rather than as absent structure. */
+.arcs{display:grid;grid-template-columns:repeat(auto-fill,minmax(30rem,1fr));gap:1rem;
+      align-items:start}
 .arc{background:var(--surface);border:1px solid var(--hairline);border-radius:4px;
      border-top:3px solid var(--hue,var(--hairline));padding:1rem 1.1rem;
      display:flex;flex-direction:column;gap:.6rem;min-width:0}
@@ -85,13 +93,36 @@ section{margin-bottom:3rem}
           letter-spacing:-.01em;text-wrap:balance;margin:0}
 .arc-sub{display:flex;flex-wrap:wrap;align-items:baseline;gap:.2rem .55rem;
          font-family:var(--mono);font-size:.72rem;color:var(--ink-faint)}
-.arc-sub .key{color:var(--accent)}
+/* Three different things used to share one grey run-on line: the ticket the work is
+   filed under, other tickets it touches, and the cluster label -- which is a phrase this
+   pipeline derived, not an identifier anyone else would recognise. Telling them apart is
+   the difference between a subhead and a smear. */
+.arc-sub .key{color:var(--accent);font-weight:600}
+.arc-sub .key-2nd{color:var(--ink-faint)}
+.arc-sub .label{font-style:italic;color:var(--ink-faint)}
+.arc-sub .auth{color:var(--ink-soft)}
 .arc-state{text-transform:uppercase;letter-spacing:.06em;color:var(--hue,var(--ink-faint))}
 .arc-sum{font-size:.87rem;line-height:1.5;color:var(--ink-soft);margin:0;
          text-wrap:pretty}
 .blocker{font-size:.8rem;color:var(--hue,var(--ink-soft));display:flex;gap:.4rem;
          align-items:baseline;margin:0}
 .blocker::before{content:"▲";font-size:.6rem;flex:none;opacity:.8}
+
+/* What the arc needs from you, in form as well as words. The stripe colour and the chip
+   agree, so severity survives being skimmed. */
+.needs{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:.4rem}
+.needs li{display:flex;flex-direction:column;gap:.25rem;font-size:.83rem}
+.needs .row{display:flex;gap:.45rem;align-items:baseline}
+.chip{font-family:var(--mono);font-size:.63rem;text-transform:uppercase;
+      letter-spacing:.07em;padding:.1rem .38rem;border-radius:2px;flex:none;
+      border:1px solid currentColor;line-height:1.4}
+.chip.sev-0,.chip.sev-1,.chip.sev-2{color:var(--hot)}
+.chip.sev-3,.chip.sev-4,.chip.sev-5,.chip.sev-6{color:var(--warm)}
+.needs .what{color:var(--ink)}
+/* Anything asserting you owe someone an answer shows what they asked, verbatim. */
+blockquote{margin:.1rem 0 .1rem .2rem;padding:.35rem .6rem;background:var(--quote);
+           border-left:2px solid var(--hairline);border-radius:0 2px 2px 0;
+           font-size:.8rem;color:var(--ink-soft);text-wrap:pretty}
 .tickets{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;
          gap:.12rem;font-size:.78rem}
 .tickets li{display:flex;gap:.5rem;min-width:0}
@@ -107,11 +138,23 @@ section{margin-bottom:3rem}
 .tree svg{display:block}
 .tree .n{font-family:var(--mono);font-size:11px;fill:var(--ink-soft)}
 .tree .n.risk{fill:var(--hot)}
+/* The branch that IS the work reads as the trunk; a superseded copy recedes. Without
+   this every branch had equal weight, which is how a cherry-pick got read as live work. */
+.tree .n.auth{fill:var(--ink);font-weight:700}
+.tree .n.dup{fill:var(--ink-faint);font-style:italic}
 .tree .c{font-family:var(--mono);font-size:10px;fill:var(--ink-faint)}
+.tree .c.dup{fill:var(--ink-faint);opacity:.8}
 .tree .edge{stroke:var(--hairline);fill:none;stroke-width:1.5}
+.tree .edge.copy{stroke-dasharray:2 2.5}
 .tree .dot{fill:var(--ink-faint)}
 .tree .dot.risk{fill:var(--hot)}
 .tree .dot.head{stroke:var(--accent);stroke-width:1.5;fill:var(--surface)}
+.tree .dot.auth{fill:var(--accent)}
+.tree .dot.dup{fill:none;stroke:var(--ink-faint);stroke-width:1.2}
+.tree a{text-decoration:none}
+.tree a:hover .n{text-decoration:underline}
+.legend{font-family:var(--mono);font-size:.66rem;color:var(--ink-faint);
+        padding-top:.3rem;display:flex;flex-wrap:wrap;gap:.15rem .8rem}
 
 .metrics{display:flex;flex-wrap:wrap;gap:.15rem .9rem;font-family:var(--mono);
          font-size:.72rem;color:var(--ink-faint);font-variant-numeric:tabular-nums;
@@ -134,7 +177,45 @@ code{font-family:var(--mono);font-size:.75rem;background:var(--surface-2);
      border:1px solid var(--hairline);padding:.1rem .3rem;border-radius:2px}
 footer{margin-top:3rem;padding-top:1.4rem;border-top:1px solid var(--hairline);
        color:var(--ink-soft);font-size:.85rem}
-a{color:var(--accent)}
+
+/* Links are the whole point of a dashboard you open every morning: every claim on this
+   page should be one click from the thing it is a claim about. Underlined on hover only,
+   because at this density permanent underlines turn the page into a rug. */
+a{color:var(--accent);text-decoration-color:color-mix(in oklab,var(--accent) 40%,transparent);
+  text-underline-offset:.15em}
+a:hover{text-decoration-color:currentColor}
+.arc-sub a,.needs a{color:inherit;text-decoration:underline;
+  text-decoration-color:color-mix(in oklab,currentColor 35%,transparent)}
+.arc-sub a:hover,.needs a:hover{text-decoration-color:currentColor}
+.tickets a{color:var(--ink-soft);text-decoration:none}
+.tickets a:hover{text-decoration:underline}
+
+/* Work whose only state is "up for review" -- his end of the deal done, the clock now
+   someone else's. Present, countable, linked, and out of the way. This is the tier that
+   used to render hot. */
+details.parked{margin-top:.4rem}
+details.parked>summary{cursor:pointer;font-size:.85rem;color:var(--ink-soft);
+  padding:.5rem .7rem;border:1px solid var(--hairline);border-radius:4px;
+  background:var(--surface);list-style:none}
+details.parked>summary::-webkit-details-marker{display:none}
+details.parked>summary::before{content:"▸ ";color:var(--parked)}
+details.parked[open]>summary::before{content:"▾ "}
+details.parked>summary:hover{border-color:var(--parked)}
+details.parked>summary b{color:var(--ink);font-weight:600}
+.parked-list{margin:.5rem 0 0;padding:0;list-style:none;display:flex;
+  flex-direction:column;border:1px solid var(--hairline);border-radius:4px;
+  background:var(--surface);overflow:hidden}
+.parked-list li{display:grid;grid-template-columns:minmax(0,1fr) auto auto;
+  gap:.3rem .9rem;align-items:baseline;padding:.5rem .7rem;
+  border-bottom:1px solid var(--hairline)}
+.parked-list li:last-child{border-bottom:none}
+.parked-list .nm{color:var(--ink);font-size:.87rem;min-width:0}
+.parked-list .mr,.parked-list .ag{font-family:var(--mono);font-size:.72rem;
+  color:var(--ink-faint);white-space:nowrap;font-variant-numeric:tabular-nums}
+.parked-list .sub{grid-column:1/-1;font-family:var(--mono);font-size:.7rem;
+  color:var(--ink-faint)}
+
+.count{font-family:var(--mono);font-variant-numeric:tabular-nums}
 :focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 @media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
 """
@@ -145,19 +226,35 @@ def derive_lede(data, focus_days):
 
     A hand-written lede goes stale the moment anything moves, which turns a dashboard
     back into a report. This picks the single most consequential fact available and
-    states it with its numbers, in a fixed order of severity: work other people are
-    waiting on, then work that exists nowhere but this laptop, then the arc carrying
-    the most unlanded risk. It never editorialises beyond what the counts support.
+    states it with its numbers, in a fixed order of severity, and never editorialises
+    beyond what the counts support.
+
+    The order starts with the work that has come back to him -- a branch that stopped
+    merging, a question nobody answered, an approval nobody acted on. That is a change from
+    opening on the biggest number, which described the page rather than the day: "112
+    unpushed across 15 branches" is true every morning and asks for nothing.
     """
     gap = data.get("gap") or {}
     arcs = [a for a in data.get("arcs", []) if a.get("age_days", 999) <= focus_days]
     bits = []
 
+    sharp = [a for a in arcs if a.get("urgency", 99) <= 3]
+    if sharp:
+        worst = min(sharp, key=lambda a: a["urgency"])
+        d = worst["demands"][0]
+        name = (worst.get("brief") or {}).get("name") or worst.get("label", "?")
+        others = len(sharp) - 1
+        bits.append(
+            f'<em>{esc(name)}</em> needs you: {esc(d["what"])}'
+            + (f", and {others} other arc{'s' if others != 1 else ''} "
+               f"{'are' if others != 1 else 'is'} waiting on something only you can do"
+               if others else "") + ".")
+
     mism = gap.get("status_mismatch") or []
     if mism:
-        worst = max(mism, key=lambda m: m.get("arc", {}).get("unpushed", 0))
+        worst = max(mism, key=lambda m: m.get("arc", {}).get("unpushed_live", 0))
         k = worst.get("issue", {})
-        n = worst.get("arc", {}).get("unpushed", 0)
+        n = worst.get("arc", {}).get("unpushed_live", 0)
         bits.append(
             f'Jira believes <em>{esc(k.get("key",""))}</em> is '
             f'&ldquo;{esc(k.get("status",""))}&rdquo;, but {n} of its commits have '
@@ -167,7 +264,7 @@ def derive_lede(data, focus_days):
 
     unt = gap.get("unticketed_work") or []
     if unt:
-        hidden = sum(a.get("unpushed", 0) for a in unt)
+        hidden = sum(a.get("unpushed_live", 0) for a in unt)
         bits.append(
             f"{len(unt)} arc{'s' if len(unt) != 1 else ''} of real work "
             f"{'have' if len(unt) != 1 else 'has'} no ticket at all"
@@ -175,22 +272,19 @@ def derive_lede(data, focus_days):
             + " — invisible to Jira, and so absent from Trellis&rsquo;s capacity, "
               "burndown and every initiative rollup.")
 
-    if arcs:
-        top = max(arcs, key=lambda a: a.get("unpushed", 0))
-        if top.get("unpushed", 0) > 0:
+    if arcs and not sharp:
+        top = max(arcs, key=lambda a: a.get("unpushed_live", a.get("unpushed", 0)))
+        live = top.get("unpushed_live", top.get("unpushed", 0))
+        if live > 0:
             c = top.get("counts", {})
             name = (top.get("brief") or {}).get("name") or top.get("label", "?")
             bits.append(
                 f'The heaviest is <em>{esc(name)}</em>: '
-                f'{top["unpushed"]} unpushed across {c.get("branches",0)} branches '
+                f'{live} unpushed across {c.get("branches",0)} branches '
                 f'and {c.get("sessions",0)} sessions.')
 
     return " ".join(bits) if bits else (
         "Nothing outstanding — every arc is pushed, ticketed, and says what it is.")
-
-
-def esc(x):
-    return html.escape(str(x), quote=True)
 
 
 ROW, INDENT, PAD = 17, 15, 4
@@ -204,30 +298,59 @@ def spawn_forest(branches):
     with the most commits of its own -- the deepest one -- and that single edge is what
     "spawned this" means. Branches sharing a sha are mutual ancestors and would form a
     cycle, so the second edge of any loop is dropped.
+
+    Supersession is the second kind of edge and it has to be drawn. A branch holding a
+    cherry-pick of another's commits has no ancestry to either, so ancestry alone drew the
+    pair as two independent roots -- and two roots is a picture of two pieces of work. It
+    read that way to a human and it read that way to the model writing the brief. Copies
+    hang off what they copy, on a dashed edge, because "this is that again" is a different
+    claim from "this was cut from that".
+
+    Returns (rows, parent, kind) -- kind says which of the two an edge is.
     """
     by_name = {b["name"]: b for b in branches}
-    parent = {}
+    parent, kind = {}, {}
+
+    def acyclic():
+        for name in list(parent):
+            seen, cur = {name}, parent.get(name)
+            while cur is not None:
+                if cur in seen:
+                    del parent[name]
+                    kind.pop(name, None)
+                    break
+                seen.add(cur)
+                cur = parent.get(cur)
+
     for b in branches:
         cands = [by_name[p] for p in (b.get("parents") or [])
                  if p in by_name and p != b["name"]]
         if cands:
             parent[b["name"]] = max(cands,
                                     key=lambda c: c.get("commits_ahead", 0))["name"]
+            kind[b["name"]] = "cut"
+    acyclic()
 
-    for name in list(parent):
-        seen, cur = {name}, parent.get(name)
-        while cur is not None:
-            if cur in seen:
-                del parent[name]
-                break
-            seen.add(cur)
-            cur = parent.get(cur)
+    # Copy edges after cycle-breaking, not instead of ancestry. Two branches on the same
+    # sha are each other's ancestor, so one of the pair always loses its edge to the cycle
+    # break -- and `UL-1692-on-1637-wip` then floated as a root despite being a known copy
+    # of a branch three rows below it. A branch left without a parent still has somewhere
+    # to hang if it is a copy of something.
+    for b in branches:
+        if b["name"] in parent:
+            continue
+        sup = b.get("superseded_by")
+        if sup in by_name and sup != b["name"]:
+            parent[b["name"]] = sup
+            kind[b["name"]] = "copy"
+    acyclic()
 
     kids = {}
     for child, par in parent.items():
         kids.setdefault(par, []).append(child)
     for v in kids.values():
-        v.sort(key=lambda n: -by_name[n].get("unpushed", 0))
+        # Copies last: a stack is the structure, a duplicate is a footnote to it.
+        v.sort(key=lambda n: (kind.get(n) == "copy", -by_name[n].get("unpushed", 0)))
 
     order = [b["name"] for b in branches]
     roots = [n for n in order if n not in parent]
@@ -241,10 +364,10 @@ def spawn_forest(branches):
 
     for r in roots:
         walk(r, 0)
-    return rows, parent
+    return rows, parent, kind
 
 
-def spawn_svg(arc, limit=12):
+def spawn_svg(arc, limit=12, base=""):
     """Draw the arc's stacking tree, or nothing when there is no structure to show.
 
     Build the forest over every branch and prune afterwards, never the other way round.
@@ -252,17 +375,23 @@ def spawn_svg(arc, limit=12):
     happens to carry fewer commits than the cut -- on the heaviest arc that discarded
     half the structure, which is how a tree renders as a flat list. Keeping each shown
     branch's ancestors means an edge is only ever hidden with the branch it belongs to.
+
+    The authoritative branch is always kept, whatever the cut. It is the one row that has
+    to be there: a tree of an arc's variants that omits the branch under review is worse
+    than no tree.
     """
     branches = arc.get("branches", [])
     if len(branches) < 2:
         return ""
-    rows, parent = spawn_forest(branches)
+    rows, parent, kind = spawn_forest(branches)
     if not rows:
         return ""
+    auth = arc.get("authoritative")
 
     if len(rows) > limit:
         keep = set()
-        for b in branches[:limit]:
+        head = [b for b in branches if b["name"] == auth]
+        for b in head + [x for x in branches[:limit] if x["name"] != auth]:
             cur, guard = b["name"], 0
             while cur is not None and cur not in keep and guard < 40:
                 keep.add(cur)
@@ -284,12 +413,19 @@ def spawn_svg(arc, limit=12):
     def y_of(i):
         return PAD + i * ROW + ROW // 2
 
-    widest = max((len(b["name"]) + len(str(b.get("unpushed") or "")) + 4) * 6.4
-                 + x_of(d) for b, d in rows)
+    def tail_len(b):
+        if b["name"] == auth:
+            return 11
+        if b.get("superseded_by"):
+            return len(b["superseded_by"]) + 6
+        return len(str(b.get("unpushed") or "")) + 2
+
+    widest = max((len(b["name"]) + tail_len(b) + 2) * 6.4 + x_of(d) for b, d in rows)
     height = PAD * 2 + len(rows) * ROW
     svg = [f'<svg width="{int(widest) + 16}" height="{height}" '
            f'viewBox="0 0 {int(widest) + 16} {height}" role="img" '
-           f'aria-label="how this arc&rsquo;s branches were cut from each other">']
+           f'aria-label="how this arc&rsquo;s branches relate: solid edges were cut from '
+           f'the branch above, dashed edges are copies of it">']
 
     # Elbows first so the dots sit on top of them.
     for b, d in rows:
@@ -298,45 +434,110 @@ def spawn_svg(arc, limit=12):
             continue
         px, py = x_of(depth_of[par]), y_of(at[par])
         cx, cy = x_of(d), y_of(at[b["name"]])
-        svg.append(f'<path class="edge" d="M{px} {py + 5} V{cy} H{cx - 3}"/>')
+        copy = " copy" if kind.get(b["name"]) == "copy" else ""
+        svg.append(f'<path class="edge{copy}" d="M{px} {py + 5} V{cy} H{cx - 3}"/>')
 
     for b, d in rows:
         cx, cy = x_of(d), y_of(at[b["name"]])
-        risk = " risk" if b.get("unpushed") else ""
+        dup = b.get("superseded_by")
+        # A copy's unpushed commits are not risk -- they already exist on the branch it
+        # copies -- so it is marked as the copy it is instead of flagged red.
+        cls = (" dup" if dup else (" auth" if b["name"] == auth
+                                   else (" risk" if b.get("unpushed") else "")))
         head = " head" if b.get("worktree") else ""
-        svg.append(f'<circle class="dot{risk}{head}" cx="{cx}" cy="{cy}" r="3.2"/>')
-        n = b.get("unpushed") or 0
-        # The count rides in the same <text> as a dx-offset tspan. Positioning it with
+        svg.append(f'<circle class="dot{cls}{head}" cx="{cx}" cy="{cy}" r="3.2"/>')
+        # The tail rides in the same <text> as a dx-offset tspan. Positioning it with
         # its own x means guessing the font's advance width, and the guess ran short
         # often enough to jam `+13` against the branch name.
-        tail = f'<tspan class="c" dx="7">+{n}</tspan>' if n else ""
-        svg.append(f'<text class="n{risk}" x="{cx + 8}" y="{cy + 4}">'
-                   f'{esc(b["name"])}{tail}</text>')
+        if dup:
+            tail = (f'<tspan class="c dup" dx="7">= {esc(dup)}</tspan>')
+        elif b["name"] == auth:
+            tail = '<tspan class="c" dx="7">← the work</tspan>'
+        elif b.get("unpushed"):
+            tail = f'<tspan class="c" dx="7">+{b["unpushed"]}</tspan>'
+        else:
+            tail = ""
+        label = (f'<text class="n{cls}" x="{cx + 8}" y="{cy + 4}">'
+                 f'{esc(b["name"])}{tail}</text>')
+        if base and b.get("pushed"):
+            label = (f'<a href="{esc(base)}/-/tree/{esc(urlq(b["name"]))}" '
+                     f'target="_blank" rel="noopener">{label}</a>')
+        svg.append(label)
 
     svg.append("</svg>")
+    legend = []
+    if any(kind.get(b["name"]) == "copy" for b, _ in rows):
+        legend.append("dashed = the same commits again, not separate work")
     hidden = len(branches) - len(rows)
-    more = (f'<div class="arc-sub" style="padding-top:.35rem">'
-            f'{hidden} more branch{"es" if hidden != 1 else ""} in this arc</div>'
-            if hidden > 0 else "")
-    return f'<div class="tree">{"".join(svg)}</div>{more}'
+    if hidden > 0:
+        legend.append(f"{hidden} more branch{'es' if hidden != 1 else ''} in this arc")
+    leg = f'<div class="legend">{" · ".join(esc(x) for x in legend)}</div>' if legend else ""
+    return f'<div class="tree">{"".join(svg)}{leg}</div>'
+
+
+def esc(x):
+    return html.escape(str(x), quote=True)
+
+
+def urlq(x):
+    return urllib.parse.quote(str(x), safe="")
+
+
+def link(url, text, cls=""):
+    """A hyperlink where there is somewhere to go, and plain text where there is not.
+
+    Half the value of this page is being one click from the thing each row asserts. The
+    other half is not lying about it: a branch that was never pushed has no page on
+    GitLab, and a link to a 404 is worse than a label.
+    """
+    c = f' class="{cls}"' if cls else ""
+    if not url:
+        return f"<span{c}>{text}</span>"
+    return f'<a{c} href="{esc(url)}" target="_blank" rel="noopener">{text}</a>'
 
 
 def heat(arc):
-    """State in form as well as number, so what needs attention reads at a glance."""
-    if arc.get("state") == "waiting on review" or arc.get("unpushed", 0) >= 25:
+    """Emphasis by what the arc needs from *you*, which is the opposite of what this did.
+
+    It used to mark "waiting on review" as hot, and that is exactly backwards: getting a
+    discrete piece of work up for review is most of the hard part done, and the clock that
+    is now running belongs to a reviewer. Meanwhile a branch that no longer merges, four
+    unanswered questions from ella, or an approved MR nobody pressed merge on all rendered
+    the same as everything else -- so the page's loudest signal was firing on the arcs that
+    needed nothing.
+
+    Rank now follows `urgency`, which work-arcs derives from the same demand list the card
+    prints, so the colour and the words can never disagree. Nothing is downranked out of
+    sight: arcs with no demands get their own tier, counted and linked.
+    """
+    u = arc.get("urgency", 99)
+    if u <= 2:      # no longer merges / unanswered thread / failed pipeline
         return "hot"
-    if arc.get("unpushed", 0) > 0 or arc.get("state") == "at risk":
+    if u <= 6:      # approved-unmerged / unpushed / unreviewed / stale draft
         return "warm"
     return "calm"
+
+
+DEMAND_LABEL = {"conflict": "rebase", "threads": "unanswered", "pipeline": "pipeline",
+                "approved": "merge it", "unpushed": "unpushed", "unreviewed": "no MR",
+                "draft": "draft"}
+DEMAND_SEV = {"conflict": 0, "threads": 1, "pipeline": 2, "approved": 3,
+              "unpushed": 4, "unreviewed": 5, "draft": 6}
 
 
 def render(data, lede, focus_days, limit):
     out = []
     a = out.append
+    base = data.get("project_url") or ""
     arcs = [x for x in data.get("arcs", []) if x.get("age_days", 999) <= focus_days]
-    arcs.sort(key=lambda x: (-x.get("engagement", 0), x.get("age_days", 999)))
-    shown = arcs[:limit] if limit else arcs
-    hidden = arcs[len(shown):]
+    # Urgency first, engagement second. Engagement alone answered "what have you been
+    # doing", which is not the question you open this page with.
+    arcs.sort(key=lambda x: (x.get("urgency", 99), -x.get("engagement", 0),
+                             x.get("age_days", 999)))
+    needs = [x for x in arcs if x.get("demands")]
+    parked = [x for x in arcs if not x.get("demands")]
+    shown = needs[:limit] if limit else needs
+    hidden = needs[len(shown):]
     gap = data.get("gap") or {}
 
     try:
@@ -350,28 +551,69 @@ def render(data, lede, focus_days, limit):
     a('<div class="page">')
     a("<h1>Work Arcs</h1>")
     a('<div class="stamp">')
-    a(f"<span>{esc(stamp)}</span><span>{esc(data.get('repo',''))}</span>")
+    a(f"<span>{esc(stamp)}</span>")
+    a(f"<span>{link(base, esc(data.get('repo','')))}</span>")
     a(f"<span>{data.get('arc_count',0)} arcs, {len(arcs)} active &le; {focus_days}d</span>")
-    if len(shown) != len(arcs):
+    a(f"<span>{len(needs)} need you, {len(parked)} in someone else&rsquo;s court</span>")
+    if len(shown) != len(needs):
         a(f"<span>{len(shown)} shown</span>")
     a("</div>")
     lede = lede or derive_lede(data, focus_days)
     if lede:
         a(f'<p class="lede">{lede}</p>')
 
-    # --- what you are working on -------------------------------------------
-    a("<section>")
-    a("<h2>In flight</h2>")
-    a('<p class="note">Ranked by how deeply you engaged with them, not by what was '
-      "touched most recently. Each name and description is derived from the arc's own "
-      "evidence — its commits, tickets, merge requests and the prompts you typed — and "
-      "the diagram under each is how those branches were actually cut from one "
-      "another.</p>")
-    a('<div class="arcs">')
+    for s in data.get("stale_overrides") or []:
+        a(f'<p class="note">Ignoring your hand-set authoritative branch '
+          f'<code>{esc(s.get("branch",""))}</code> for {esc(s.get("label",""))}: '
+          f'{esc(s.get("why",""))}. Re-set it if it is still right.</p>')
+
     def plural(n, word):
         return f"{n} {word}" + ("" if n == 1 else "s")
 
-    for arc in shown:
+    def subhead(arc, brief):
+        """The ticket, the other tickets, and the derived label — told apart.
+
+        These were one undifferentiated grey line, so an arc showed either a run of Jira
+        keys or a cluster label with nothing to say which was which, and many showed
+        neither. A key is an identifier other people share; a label is a phrase this
+        pipeline invented. Reading them the same way is how you come to trust a label as a
+        ticket number.
+        """
+        sub = []
+        issues = {i.get("key"): i for i in arc.get("issues", [])}
+        tkt = arc.get("ticket")
+        if tkt:
+            i = issues.get(tkt) or {}
+            sub.append(link(i.get("url", ""), esc(tkt), "key"))
+        rest = [k for k in issues if k != tkt][:3]
+        if rest:
+            sub.append('<span class="key-2nd">also '
+                       + " ".join(link(issues[k].get("url", ""), esc(k)) for k in rest)
+                       + "</span>")
+        if not tkt and not brief.get("name"):
+            # Only worth showing when it is standing in for a name. Since arc-brief
+            # started splitting arcs the label is itself a derived phrase, so printing
+            # it under the heading just said the same thing twice.
+            sub.append(f'<span class="label" title="a label this pipeline derived from '
+                       f'the files these branches touched — not a ticket">'
+                       f'{esc(arc.get("label","?"))}</span>')
+        if arc.get("authoritative"):
+            mr = next((m for m in arc.get("mrs", [])
+                       if m.get("branch") == arc["authoritative"]), None)
+            # A branch named after its ticket says nothing the key did not already say.
+            # Printing both read `UL-1692 also UL-1633 UL-1692 · !10398`.
+            bits = [] if arc["authoritative"] == tkt else [esc(arc["authoritative"])]
+            if mr:
+                bits.append(link(mr.get("url", ""), "!" + str(mr.get("iid"))))
+            if bits:
+                sub.append(f'<span class="auth" title="the branch that IS this work '
+                           f'({esc(arc.get("authoritative_via",""))})">'
+                           f'{" &middot; ".join(bits)}</span>')
+        if arc.get("state"):
+            sub.append(f'<span class="arc-state">{esc(arc["state"])}</span>')
+        return f'<div class="arc-sub">{"".join(sub)}</div>' if sub else ""
+
+    def card(arc):
         c = arc.get("counts", {})
         brief = arc.get("brief") or {}
         a(f'<div class="arc is-{heat(arc)}">')
@@ -380,57 +622,122 @@ def render(data, lede, focus_days, limit):
         # deterministic namer picked for an arc that is really the impedance work, and
         # a heading that misnames its own contents is worse than a terse one.
         a(f'<h3 class="arc-name">{esc(brief.get("name") or arc.get("label","?"))}</h3>')
-
-        sub = []
-        keys = [i.get("key", "") for i in arc.get("issues", [])[:3]]
-        if keys:
-            sub.append(f'<span class="key">{esc(" · ".join(keys))}</span>')
-        elif not brief.get("name"):
-            # Only worth showing when it is standing in for a name. Since arc-brief
-            # started splitting arcs the label is itself a derived phrase, so printing
-            # it under the heading just said the same thing twice.
-            sub.append(f'<span>{esc(arc.get("label","?"))}</span>')
-        if arc.get("state"):
-            sub.append(f'<span class="arc-state">{esc(arc["state"])}</span>')
-        if sub:
-            a(f'<div class="arc-sub">{"".join(sub)}</div>')
+        a(subhead(arc, brief))
 
         if brief.get("summary"):
             a(f'<p class="arc-sum">{esc(brief["summary"])}</p>')
-        if brief.get("blocker"):
+
+        if arc.get("demands"):
+            a('<ul class="needs">')
+            for d in arc["demands"][:4]:
+                sev = DEMAND_SEV.get(d["kind"], 6)
+                lbl = DEMAND_LABEL.get(d["kind"], d["kind"])
+                what = link(d.get("url", ""), esc(d["what"]))
+                a(f'<li><div class="row"><span class="chip sev-{sev}">{esc(lbl)}</span>'
+                  f'<span class="what">{what}</span></div>')
+                for q in (d.get("quotes") or ([d["quote"]] if d.get("quote") else []))[:4]:
+                    a(f"<blockquote>{esc(q)}</blockquote>")
+                a("</li>")
+            a("</ul>")
+        elif brief.get("blocker"):
+            # Only where nothing derived outranks it. A model's sentence about what is in
+            # the way is a guess next to "!10398 no longer merges", and it was measured
+            # getting this exact call wrong.
             a(f'<p class="blocker">{esc(brief["blocker"])}</p>')
 
         if arc.get("issues"):
             a('<ul class="tickets">')
             for i in arc["issues"][:4]:
-                a(f'<li><span class="key">{esc(i.get("key",""))}</span>'
-                  f'<span class="t">{esc(i.get("summary",""))}</span></li>')
+                a('<li>'
+                  + link(i.get("url", ""), esc(i.get("key", "")), "key")
+                  + f'<span class="t">{esc(i.get("summary",""))}</span></li>')
             a("</ul>")
 
-        a(spawn_svg(arc))
+        a(spawn_svg(arc, base=base))
 
         a('<div class="metrics">')
-        if arc.get("unpushed"):
-            a(f"<span><b>{arc['unpushed']}</b> unpushed</span>")
+        live = arc.get("unpushed_live", arc.get("unpushed", 0))
+        if live:
+            a(f"<span><b>{live}</b> unpushed</span>")
+        dead = arc.get("unpushed_only_on_copies", 0)
+        if dead:
+            a(f"<span>{dead} only on a superseded copy</span>")
         a(f"<span>{plural(c.get('branches',0),'branch').replace('branchs','branches')}</span>")
+        if arc.get("superseded"):
+            a(f"<span>{arc['superseded']} superseded</span>")
         if c.get("sessions"):
             a(f"<span>{plural(c['sessions'],'session')}</span>")
         if c.get("stashes"):
             a(f"<span>{plural(c['stashes'],'stash').replace('stashs','stashes')}</span>")
         a(f"<span>{arc.get('age_days','?')}d idle</span>")
         a("</div></div>")
+
+    # --- what needs you ----------------------------------------------------
+    a("<section>")
+    a("<h2>Needs you</h2>")
+    a('<p class="note">Ordered by what will bite soonest, not by what is biggest: a branch '
+      "that no longer merges, then a review question nobody answered, then a red pipeline, "
+      "an approval nobody acted on, and commits that exist only here. Every name and "
+      "description is derived from the arc&rsquo;s own evidence — its commits, tickets, "
+      "merge requests and the prompts you typed — and the diagram under each shows which "
+      "branch is the work.</p>")
+    a('<div class="arcs">')
+    for arc in shown:
+        card(arc)
     a("</div>")
     # A cap that hides more risk than it shows is not a display choice. At 12 cards this
     # page was concealing 35 active arcs holding 282 unpushed commits -- more than the
     # single heaviest arc its own lede named. If anything is held back now, it says so
     # and says what it costs.
     if hidden:
-        lost = sum(a_.get("unpushed", 0) for a_ in hidden)
-        a(f'<p class="note">{len(hidden)} further active '
-          f'arc{"s" if len(hidden) != 1 else ""} not shown'
+        lost = sum(x.get("unpushed_live", 0) for x in hidden)
+        a(f'<p class="note">{len(hidden)} further '
+          f'arc{"s" if len(hidden) != 1 else ""} that need you, not shown'
           + (f", holding {lost} unpushed commits" if lost else "")
           + ". Raise <code>--limit</code>, or drop it to show every one.</p>")
     a("</section>")
+
+    # --- what is out of your hands -----------------------------------------
+    # Downranked, and saying so. Every one of these is still on the page, counted, with a
+    # link to its MR -- the last time this page held work back it concealed 35 arcs and 282
+    # unpushed commits behind a `--limit`, and de-emphasis is not licence to repeat that.
+    if parked:
+        mr_n = sum(len(x.get("mrs") or []) for x in parked)
+        a("<section>")
+        a("<h2>In someone else&rsquo;s court</h2>")
+        a('<p class="note">Nothing here is waiting on you. Your end of the deal is done — '
+          "the work is up for review, nothing conflicts, no thread is unanswered, no "
+          "pipeline is red. Listed in full rather than hidden, because a reviewer going "
+          "quiet is how work disappears; if one of these comes back to you it moves up "
+          "into <em>Needs you</em> on the next run.</p>")
+        a("<details class=\"parked\"><summary>"
+          f"<b>{len(parked)}</b> arc{'s' if len(parked) != 1 else ''} handed off"
+          + (f", carrying <b>{mr_n}</b> open merge request"
+             f"{'s' if mr_n != 1 else ''}" if mr_n else "")
+          + "</summary>")
+        a('<ul class="parked-list">')
+        for arc in parked:
+            brief = arc.get("brief") or {}
+            nm = esc(brief.get("name") or arc.get("label", "?"))
+            mrs = arc.get("mrs") or []
+            ref = " ".join(link(m.get("url", ""), "!" + str(m.get("iid"))) for m in mrs[:3])
+            tkt = arc.get("ticket")
+            i = next((x for x in arc.get("issues", []) if x.get("key") == tkt), {})
+            a(f'<li><span class="nm">{nm}</span>'
+              f'<span class="mr">{ref or "&mdash;"}</span>'
+              f'<span class="ag">{arc.get("age_days","?")}d</span>')
+            bits = []
+            if tkt:
+                bits.append(link(i.get("url", ""), esc(tkt)))
+            if arc.get("authoritative"):
+                bits.append(esc(arc["authoritative"]))
+            rev = sorted({r for m in mrs for r in (m.get("reviewers") or [])})
+            if rev:
+                bits.append("with " + esc(", ".join(rev[:5])))
+            if bits:
+                a(f'<span class="sub">{" · ".join(bits)}</span>')
+            a("</li>")
+        a("</ul></details></section>")
 
     # --- where Jira disagrees with the code --------------------------------
     if gap:
@@ -445,8 +752,9 @@ def render(data, lede, focus_days, limit):
               "</tr></thead><tbody>")
             for m in mism[:14]:
                 i = m.get("issue", {})
-                a(f'<tr><td class="k">{esc(i.get("key",""))}</td>'
-                  f'<td class="d">{esc(i.get("status",""))}</td>'
+                a('<tr><td class="k">'
+                  + link(i.get("url", ""), esc(i.get("key", "")))
+                  + f'</td><td class="d">{esc(i.get("status",""))}</td>'
                   f'<td class="n">{esc(m.get("why","").split(" but ")[-1])}</td>'
                   f'<td class="d">{esc(i.get("summary",""))}</td></tr>')
             a("</tbody></table></div></section>")
@@ -467,7 +775,7 @@ def render(data, lede, focus_days, limit):
                 a(f'<tr><td class="d">{esc(nm)}</td>'
                   f'<td class="d">{cc.get("branches",0)}</td>'
                   f'<td class="d">{cc.get("sessions",0)}</td>'
-                  f'<td class="n">{x.get("unpushed",0) or ""}</td>'
+                  f'<td class="n">{x.get("unpushed_live",0) or ""}</td>'
                   f'<td><code>work-arcs --jira-ify {esc(x.get("label","?"))}</code></td>'
                   "</tr>")
             a("</tbody></table></div></section>")
@@ -484,15 +792,19 @@ def render(data, lede, focus_days, limit):
               "</tr></thead><tbody>")
             for i in empty[:14]:
                 init = ", ".join(i.get("initiatives") or []) or "—"
-                a(f'<tr><td class="k">{esc(i.get("key",""))}</td>'
-                  f'<td class="d">{esc(i.get("status",""))}</td>'
+                a('<tr><td class="k">'
+                  + link(i.get("url", ""), esc(i.get("key", "")))
+                  + f'</td><td class="d">{esc(i.get("status",""))}</td>'
                   f'<td class="d">{esc(i.get("summary",""))}</td>'
                   f'<td class="d">{esc(init)}</td></tr>')
             a("</tbody></table></div></section>")
 
     a("<footer>Derived, never declared — arcs come from the files your work "
-      "touched, not from what branches were named. Nothing here is written to Jira, "
-      "Slack or a repo unless you run the command yourself.</footer>")
+      "touched, not from what branches were named, and which branch is the work comes "
+      "from which one an open merge request points at. Nothing here is written to Jira, "
+      "Slack or a repo unless you run the command yourself. Where a branch is called a "
+      "superseded copy, its commits were checked against the other branch by "
+      "<code>git patch-id</code>, not guessed at from its name.</footer>")
     a("</div>")
     return "\n".join(out)
 

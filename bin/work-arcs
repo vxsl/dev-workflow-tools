@@ -306,7 +306,14 @@ def unresolved_threads(repo, iid):
         if not notes or all(n.get("resolved") for n in notes):
             continue
         first = notes[0]
-        body = " ".join((first.get("body") or "").split())
+        body = first.get("body") or ""
+        # An inline attachment is most of a note's characters and none of its meaning:
+        # one of ella's questions spent 90 of its first 180 on
+        # `![image](/uploads/bc04.../image.png){width=200...}`, which pushed the actual
+        # question out of the excerpt. The quote has to carry what was asked.
+        body = re.sub(r"!?\[[^\]]*\]\([^)]*\)(\{[^}]*\})?", " ", body)
+        body = re.sub(r"</?[a-z][^>]*>", " ", body)
+        body = " ".join(body.split())
         open_.append({
             "author": (first.get("author") or {}).get("username", "?"),
             "quote": body[:180] + ("…" if len(body) > 180 else ""),
@@ -546,9 +553,13 @@ def reconcile(arcs, issues):
         a = by_key.get(i["key"])
         if not a:
             continue
-        if i["handed_off"] and a["unpushed"] > 0:
+        # The distinct count, not the per-branch sum. "240 commits never pushed" against a
+        # ticket that has 114 is the kind of overstatement that costs the whole page its
+        # credibility -- and this row exists to tell someone their ticket is lying.
+        if i["handed_off"] and a["unpushed_live"] > 0:
             mismatched.append({"issue": i, "arc": a,
-                               "why": f"status '{i['status']}' but {a['unpushed']} commits never pushed"})
+                               "why": f"status '{i['status']}' but {a['unpushed_live']} "
+                                      "commits never pushed"})
         elif not i["handed_off"] and a["age_days"] > 21:
             mismatched.append({"issue": i, "arc": a,
                                "why": f"status '{i['status']}' but untouched {a['age_days']}d"})
@@ -982,10 +993,22 @@ def demands(arc):
         if m.get("conflicts"):
             out.append({"kind": "conflict", "what": f"{ref} no longer merges into "
                         f"{m.get('target') or 'main'} — rebase", "url": m.get("url", "")})
-        for t in m.get("threads", []):
-            out.append({"kind": "threads",
-                        "what": f"{ref}: {t['author']} asked, unanswered since {t['at']}",
-                        "quote": t.get("quote", ""), "url": m.get("url", "")})
+        # One demand per MR, not per thread. Four threads produced four rows reading
+        # "ella asked, unanswered since 2026-08-13" with only the quote to tell them
+        # apart, which is a list of the same sentence. Who is waiting and since when is
+        # the demand; the questions are its evidence.
+        threads = m.get("threads", [])
+        if threads:
+            who = sorted({t["author"] for t in threads})
+            oldest = min(t["at"] for t in threads if t["at"]) if any(
+                t["at"] for t in threads) else ""
+            n = len(threads)
+            out.append({
+                "kind": "threads",
+                "what": f"{ref}: {n} unanswered question{'' if n == 1 else 's'} from "
+                        f"{', '.join(who)}" + (f", oldest {oldest}" if oldest else ""),
+                "quotes": [t["quote"] for t in threads if t.get("quote")],
+                "url": m.get("url", "")})
         pipe = m.get("pipeline") or {}
         if pipe.get("status") in ("failed", "canceled"):
             out.append({"kind": "pipeline",
@@ -1061,11 +1084,21 @@ def finalize(arc, repo=None, main_ref="origin/main"):
     # superseded copy's commits already exist on the branch that supersedes it. The gap
     # between the two is how much of this arc's apparent risk is the same work recounted.
     arc["unpushed"] = sum(b["unpushed"] for b in arc["branches"])
+    held = [b["name"] for b in arc["branches"] if b["unpushed"]]
     live = [b["name"] for b in arc["branches"]
             if b["unpushed"] and not b.get("superseded_by")]
-    arc["unpushed_live"] = (distinct_unpushed(repo, live) if repo is not None
-                            else sum(b["unpushed"] for b in arc["branches"]
-                                     if not b.get("superseded_by")))
+    if repo is not None:
+        arc["unpushed_live"] = distinct_unpushed(repo, live)
+        # What deleting only the copies would cost: distinct commits that exist on a
+        # superseded branch and nowhere else. Reporting `unpushed - unpushed_live` as
+        # "on superseded copies" conflated two different corrections and overstated this
+        # by an order of magnitude -- most of that gap is one stack counted per branch.
+        arc["unpushed_only_on_copies"] = (distinct_unpushed(repo, held)
+                                          - arc["unpushed_live"])
+    else:
+        arc["unpushed_live"] = sum(b["unpushed"] for b in arc["branches"]
+                                   if not b.get("superseded_by"))
+        arc["unpushed_only_on_copies"] = arc["unpushed"] - arc["unpushed_live"]
     arc["superseded"] = sum(1 for b in arc["branches"] if b.get("superseded_by"))
     # Stashes contribute a token amount: they break ties, they do not set priority.
     arc["at_risk"] = arc["unpushed_live"] + min(
@@ -1287,6 +1320,12 @@ def main():
         json.dump({
             "generated": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             "repo": args.repo.name,
+            # The path, separately from the name. `repo` is the label a page prints, and
+            # arc-brief was resolving it as a working directory: `git -C ul log` fails from
+            # anywhere but the parent of the repo, silently, so 0 of 54 briefs had ever
+            # seen a commit subject -- the richest evidence they are given after the
+            # prompts. The split pass was unaffected because work-arcs hands it a real path.
+            "repo_path": str(args.repo),
             "main": args.main,
             "project_url": project_url(args.repo, mrs),
             "mr_error": mr_error,
