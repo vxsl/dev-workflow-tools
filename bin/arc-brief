@@ -27,6 +27,7 @@ its own cache under $XDG_STATE_HOME/work-arcs/briefs.json.
 """
 
 import argparse
+import collections
 import concurrent.futures as futures
 import hashlib
 import json
@@ -120,10 +121,10 @@ Return ONLY a JSON object, no prose and no code fence:
 
 {"bodies": [{"name": "...", "branches": ["...", "..."]}]}
 
-- **One body is the default and usually correct.** These branches were grouped by real
-  evidence; you are the last check on it, not a second opinion. Answer with one body
-  unless a branch is clearly about something else. Splitting work that belongs together
-  is as damaging as merging work that does not.
+- These branches were grouped because they edit the same files, and nothing more. That
+  is weak evidence of shared intent and it is the only evidence behind the grouping.
+  Splitting work that belongs together is as damaging as merging work that does not, so
+  decide from the commits rather than from a prior in either direction.
 - Do NOT split a stack, a rebase, or the variants of one change. `x-bak`,
   `x-before-squash`, `backup/x`, `x-preX`, `x-wip` are the SAME work as `x`. Successive
   refinements of one feature are one body however many branches they took.
@@ -138,6 +139,11 @@ Return ONLY a JSON object, no prose and no code fence:
 - DO split when a branch's commits are plainly in service of a different goal -- another
   ticket that merely visits the same module, an unrelated hotfix, a drive-by fix
   committed while something else was checked out.
+- `[commits name UB-1234]` is the ticket that branch's own commits are filed under. Two
+  branches under different tickets are usually two bodies, and that is the single most
+  reliable signal here -- but it is evidence, not a rule. A stack carries one ticket's
+  commits across branches named for another, and unticketed branches are ordinary. Weigh
+  it against the commits; do not apply it mechanically.
 - If a split would leave a body of one branch, be sure that branch really is separate
   work rather than a stray commit belonging to the main body.
 - Every branch listed must appear in exactly one body. Use branch names exactly as given.
@@ -318,6 +324,38 @@ def evidence_for(arc, repo, main, turns):
 # so the check can only ever ask about branches that were actually shown.
 SPLIT_BRANCHES = int(os.environ.get("ARC_SPLIT_BRANCHES", "60"))
 
+# A ticket key anywhere in a branch name or its commit subjects. The two projects that
+# file work here; a bare number is not a key and must not match.
+TICKET_RE = re.compile(r"\b(U[BL]-\d+)\b")
+
+
+def branch_ticket(name, subjects):
+    """The ticket this branch's commits are in service of, or None.
+
+    The single strongest discriminator available and, until now, the one the split pass
+    was never told. It was inferable -- most subjects begin with the key -- but inference
+    competed with a prompt whose stated prior was that one body is usually correct, and
+    the prior won: a TDAT signup hotfix, a DOVE query-dedup ticket and the thor telemetry
+    work were one nine-branch arc while every commit in them named a different ticket.
+
+    Weighted so the branch name outranks any single commit. A branch called `UL-1633`
+    that carries one drive-by commit naming UB-6802 is UL-1633's; the reverse reading
+    would make every branch the ticket of whatever it last borrowed from.
+    """
+    counts = collections.Counter()
+    for s in subjects:
+        for k in TICKET_RE.findall(s):
+            counts[k] += 1
+    for k in TICKET_RE.findall(name):
+        counts[k] += 3
+    if not counts:
+        return None
+    top = counts.most_common()
+    # A tie is not evidence -- say nothing rather than pick one arbitrarily.
+    if len(top) > 1 and top[0][1] == top[1][1]:
+        return None
+    return top[0][0]
+
 
 def split_evidence(arc, repo, main, limit=SPLIT_BRANCHES):
     """Each branch as its own commits, which is what tells two intentions apart.
@@ -326,8 +364,13 @@ def split_evidence(arc, repo, main, limit=SPLIT_BRANCHES):
     bodies of work -- they are evidence of one, written down twice. Left unmarked it reads
     as a second branch pursuing the same goal, which is exactly the shape the prompt is
     told to split on.
+
+    The ticket each branch serves is stated outright rather than left to be read out of
+    the subjects. It is not decisive on its own -- a long stack carries one ticket's
+    commits across branches named for another, and plenty of real work names no ticket at
+    all -- so it is given as evidence and not applied as a rule.
     """
-    out = []
+    blocks = []
     shown = arc.get("branches", [])[:limit]
     names = {b["name"] for b in shown}
     for b in shown:
@@ -338,12 +381,19 @@ def split_evidence(arc, repo, main, limit=SPLIT_BRANCHES):
             marks.append(f"{b.get('superseded_kind','duplicate')} of "
                          f"{b['superseded_by']} — same work, not a second body")
         subs = commit_subjects(repo, b["name"], main, limit=5)
-        out.append(f"  {b['name']}" + (f"  [{'; '.join(marks)}]" if marks else ""))
-        for s in subs:
-            out.append(f"      {s}")
-        if not subs:
-            out.append("      (no commits ahead of main)")
-    return "\n".join(out)
+        tkt = branch_ticket(b["name"], subs)
+        if tkt:
+            marks.append(f"commits name {tkt}")
+        lines = [f"  {b['name']}" + (f"  [{'; '.join(marks)}]" if marks else "")]
+        lines += [f"      {s}" for s in subs] or ["      (no commits ahead of main)"]
+        blocks.append("\n".join(lines))
+    # Shown in the arc's own order, but identified independently of it. The display order
+    # is `(-unpushed, age_days, name)` and `age_days` ticks over on its own, so a branch
+    # crossing a day boundary used to rewrite the evidence text, miss the cache and buy a
+    # fresh verdict on work that had not changed -- which is how one arc accumulated seven
+    # mutually contradictory splits. Sorting the same blocks for the key means the cache
+    # is invalidated by what a branch IS, never by where it sits in the list.
+    return "\n".join(blocks), "\n".join(sorted(blocks))
 
 
 def parse_split(text, known):
@@ -358,9 +408,10 @@ def parse_split(text, known):
     "left whole" means a 39-branch blob on the page.
 
     So enforce the invariant instead of testing for it. A duplicate keeps its first
-    mention; an unmentioned branch joins the largest body, which is the same direction as
-    the prompt's own prior that one body is the default. A reply that has lost track of a
-    fifth of the arc is not a bookkeeping slip and is still rejected.
+    mention; an unmentioned branch joins the largest body, on the grounds that a branch
+    nobody argued about is likelier to belong with the bulk than to be its own workstream.
+    A reply that has lost track of a fifth of the arc is not a bookkeeping slip and is
+    still rejected.
 
     Returns (bodies, note) -- note describes any repair, so it is reported rather than
     done quietly.
@@ -415,7 +466,7 @@ def parse_split(text, known):
     return out, ("; ".join(notes) if notes else None)
 
 
-def ask_split(evidence, known, model, timeout, tries=2):
+def ask_split_once(evidence, known, model, timeout, tries=2):
     prompt = SPLIT_PROMPT.replace("{evidence}", evidence)
     reason = "unknown"
     for attempt in range(tries):
@@ -436,6 +487,96 @@ def ask_split(evidence, known, model, timeout, tries=2):
             return bodies, note
         reason = note or "reply did not partition the branches"
     return None, reason
+
+
+# How many independent verdicts a big arc gets. One sample is a coin flip: `splits.json`
+# accumulated seven verdicts over this repo's query-log arc and they disagreed about
+# everything -- one correctly isolated the thor telemetry work and the TDAT hotfix, another
+# lumped nine branches into one, same model and same prompt. Small arcs get one sample
+# because there is little for a partition to disagree about and they are the bulk of the
+# runs; the cost is bounded by the threshold, not by the arc count.
+SPLIT_VOTES = int(os.environ.get("ARC_SPLIT_VOTES", "3"))
+SPLIT_VOTE_AT = int(os.environ.get("ARC_SPLIT_VOTE_AT", "5"))
+
+
+def consensus_bodies(runs, known):
+    """Merge several partitions of the same branches into the one they agree on.
+
+    Majority co-membership, not majority partition: the verdicts rarely repeat exactly, so
+    comparing them whole would throw away agreement they do share. Two branches end up
+    together only if most samples put them together, which makes the result at least as
+    fine as the median sample and removes the single-sample lottery -- a lump that only one
+    verdict in three proposes cannot survive, and neither can a split only one proposes.
+
+    Names come from the sample whose own partition is closest to the consensus, so the
+    labels stay ones a model actually wrote about these exact groupings.
+    """
+    pair = collections.Counter()
+    for bodies in runs:
+        for body in bodies:
+            names = body["branches"]
+            for i, a in enumerate(names):
+                for b in names[i + 1:]:
+                    pair[(a, b) if a < b else (b, a)] += 1
+    need = len(runs) / 2.0
+
+    parent = {n: n for n in known}
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for (a, b), n in pair.items():
+        if n > need and a in parent and b in parent:
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[rb] = ra
+
+    groups = collections.defaultdict(list)
+    for n in sorted(known):
+        groups[find(n)].append(n)
+
+    # Label each consensus group from whichever sampled body overlaps it most.
+    out = []
+    for members in sorted(groups.values(), key=lambda g: (-len(g), g[0])):
+        want = set(members)
+        best, score = "", -1
+        for bodies in runs:
+            for body in bodies:
+                ov = len(want & set(body["branches"]))
+                if ov > score and body.get("name"):
+                    best, score = body["name"], ov
+        out.append({"name": best, "branches": members})
+    return out
+
+
+def ask_split(evidence, known, model, timeout, tries=2):
+    """One verdict for a small arc, a consensus of several for a big one."""
+    votes = SPLIT_VOTES if len(known) >= SPLIT_VOTE_AT else 1
+    if votes <= 1:
+        return ask_split_once(evidence, known, model, timeout, tries)
+
+    runs, notes = [], []
+    with futures.ThreadPoolExecutor(max_workers=votes) as pool:
+        futs = [pool.submit(ask_split_once, evidence, known, model, timeout, tries)
+                for _ in range(votes)]
+        for f in futs:
+            bodies, note = f.result()
+            if bodies:
+                runs.append(bodies)
+                if note:
+                    notes.append(note)
+    if not runs:
+        return None, "no sample partitioned the branches"
+
+    bodies = consensus_bodies(runs, known)
+    sizes = sorted(len(r) for r in runs)
+    note = f"{len(runs)}/{votes} samples, {sizes} bodies → {len(bodies)}"
+    if notes:
+        note += "; " + "; ".join(sorted(set(notes)))
+    return bodies, note
 
 
 def fingerprint(evidence, model, prompt=""):
@@ -560,8 +701,8 @@ def do_split(data, repo, main_ref, args):
     for arc in candidates:
         # Exactly the branches the model is shown -- see SPLIT_BRANCHES.
         known = {b["name"] for b in arc["branches"][:SPLIT_BRANCHES]}
-        ev = split_evidence(arc, repo, main_ref)
-        fp = fingerprint(ev, args.model + ":split", SPLIT_PROMPT)
+        ev, ident = split_evidence(arc, repo, main_ref)
+        fp = fingerprint(ident, args.model + ":split", SPLIT_PROMPT)
         cached = cache.get(fp)
         if cached:
             hits += 1

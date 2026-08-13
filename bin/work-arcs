@@ -1610,7 +1610,27 @@ def finalize(arc, repo=None, main_ref="origin/main"):
         [b["age_days"] for b in arc["branches"]]
         + [s["age_days"] for s in arc["sessions"]]
     )
-    arc["age_days"] = ages[0] if ages else 999
+    # ...and the newest touch is asked of the work itself, not of everything clustered
+    # with it. File overlap puts foreign branches in an arc and the split pass does not
+    # catch every one, so `min` over all members let a stranger date the arc: the thor
+    # telemetry arc read `today` off a UL-1633 commit while its own branch had not moved
+    # in seven days and its merge request had been open, unreviewed, for as long. The
+    # lineage is the authoritative branch plus anything superseded by something in it --
+    # the backups and pre-squash copies of the same work -- and sessions are scoped the
+    # same way, by the branch they were held on.
+    lineage = {b["name"] for b in arc["branches"] if b.get("authoritative")}
+    if lineage:
+        for _ in range(len(arc["branches"])):
+            grew = {b["name"] for b in arc["branches"]
+                    if b.get("superseded_by") in lineage} - lineage
+            if not grew:
+                break
+            lineage |= grew
+        own = ([b["age_days"] for b in arc["branches"] if b["name"] in lineage]
+               + [s["age_days"] for s in arc["sessions"] if s.get("via") in lineage])
+        arc["age_days"] = min(own) if own else (ages[0] if ages else 999)
+    else:
+        arc["age_days"] = ages[0] if ages else 999
     arc["median_age_days"] = ages[len(ages) // 2] if ages else 999
 
     # Two numbers, because they answer different questions. `unpushed` is the per-branch
