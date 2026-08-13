@@ -771,7 +771,7 @@ def prefix_of(name):
 
 
 def build_arcs(branches, stashes, mrs, sessions, main_ref, cluster_assign=None,
-               repo=None):
+               repo=None, mrs_known=True):
     known_projects = set()
     for name in branches:
         m = TICKET_RE.search(name.upper())
@@ -853,6 +853,7 @@ def build_arcs(branches, stashes, mrs, sessions, main_ref, cluster_assign=None,
             })
 
     for arc in arcs.values():
+        arc["mrs_known"] = mrs_known
         finalize(arc, repo, main_ref)
     ordered = sorted(arcs.values(), key=lambda a: (a["age_days"], -a["at_risk"]))
     return ordered, unattached
@@ -1042,7 +1043,11 @@ def demands(arc):
                             + " nowhere but this laptop"})
 
     auth = arc.get("authoritative")
-    if auth and not arc.get("mrs"):
+    # Only when GitLab was actually asked. With --no-mr, or when glab is missing or the API
+    # call failed, every arc has an empty MR list -- and this fired on all of them, telling
+    # you 8 arcs had no merge request when the truth was that nobody looked. A wrong
+    # reminder costs more trust than ten right ones earn.
+    if auth and arc.get("mrs_known", True) and not arc.get("mrs"):
         b = next((x for x in arc["branches"] if x["name"] == auth), None)
         if b and b.get("pushed") and b.get("commits_ahead", 0) > 0:
             n = b["commits_ahead"]
@@ -1228,9 +1233,10 @@ def main():
         for name, pipe in branch_pipelines(args.repo).items():
             if name in branches:
                 branches[name]["pipeline"] = pipe
+    mrs_known = not args.no_mr and mr_error is None
     sessions = session_index(args.projects)
     arcs, unattached = build_arcs(branches, stashes, mrs, sessions, args.main,
-                                  cluster_assign, args.repo)
+                                  cluster_assign, args.repo, mrs_known)
 
     # File overlap cannot separate two tickets that edit the same module -- measured,
     # UB-6938 migrating the metric catalogs and UL-1634 hardening a lint rule over those
@@ -1243,7 +1249,7 @@ def main():
         if refined:
             cluster_assign = {**cluster_assign, **refined}
             arcs, unattached = build_arcs(branches, stashes, mrs, sessions, args.main,
-                                          cluster_assign, args.repo)
+                                          cluster_assign, args.repo, mrs_known)
 
     if args.authoritative:
         set_override(arcs, args.authoritative)
