@@ -488,6 +488,9 @@ def main():
                    help="recompute every brief, ignoring cached ones")
     p.add_argument("--limit", type=int, default=0,
                    help="only brief the N most-engaged arcs (0 = all)")
+    p.add_argument("--active", type=int, default=0, metavar="DAYS",
+                   help="only brief arcs idle at most this long -- match arcs-page's "
+                        "--focus so every card it renders has a description")
     p.add_argument("--jobs", type=int, default=6, help="concurrent model calls")
     p.add_argument("--timeout", type=int, default=180, help="seconds per model call")
     p.add_argument("--out", type=Path, default=None, help="write here instead of stdout")
@@ -518,6 +521,8 @@ def main():
     extra = [a for a in (data.get("gap") or {}).get("unticketed_work", [])
              if not any(a is x for x in arcs)]
     todo = sorted(arcs, key=lambda a: -a.get("engagement", 0))
+    if args.active:
+        todo = [a for a in todo if a.get("age_days", 999) <= args.active]
     if args.limit:
         todo = todo[:args.limit]
     todo += extra

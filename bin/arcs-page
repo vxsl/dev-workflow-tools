@@ -335,6 +335,8 @@ def render(data, lede, focus_days, limit):
     a = out.append
     arcs = [x for x in data.get("arcs", []) if x.get("age_days", 999) <= focus_days]
     arcs.sort(key=lambda x: (-x.get("engagement", 0), x.get("age_days", 999)))
+    shown = arcs[:limit] if limit else arcs
+    hidden = arcs[len(shown):]
     gap = data.get("gap") or {}
 
     try:
@@ -349,8 +351,9 @@ def render(data, lede, focus_days, limit):
     a("<h1>Work Arcs</h1>")
     a('<div class="stamp">')
     a(f"<span>{esc(stamp)}</span><span>{esc(data.get('repo',''))}</span>")
-    a(f"<span>{data.get('arc_count',0)} arcs</span>")
-    a(f"<span>active &le; {focus_days}d</span>")
+    a(f"<span>{data.get('arc_count',0)} arcs, {len(arcs)} active &le; {focus_days}d</span>")
+    if len(shown) != len(arcs):
+        a(f"<span>{len(shown)} shown</span>")
     a("</div>")
     lede = lede or derive_lede(data, focus_days)
     if lede:
@@ -368,7 +371,7 @@ def render(data, lede, focus_days, limit):
     def plural(n, word):
         return f"{n} {word}" + ("" if n == 1 else "s")
 
-    for arc in arcs[:limit]:
+    for arc in shown:
         c = arc.get("counts", {})
         brief = arc.get("brief") or {}
         a(f'<div class="arc is-{heat(arc)}">')
@@ -382,7 +385,10 @@ def render(data, lede, focus_days, limit):
         keys = [i.get("key", "") for i in arc.get("issues", [])[:3]]
         if keys:
             sub.append(f'<span class="key">{esc(" · ".join(keys))}</span>')
-        elif brief.get("name"):
+        elif not brief.get("name"):
+            # Only worth showing when it is standing in for a name. Since arc-brief
+            # started splitting arcs the label is itself a derived phrase, so printing
+            # it under the heading just said the same thing twice.
             sub.append(f'<span>{esc(arc.get("label","?"))}</span>')
         if arc.get("state"):
             sub.append(f'<span class="arc-state">{esc(arc["state"])}</span>')
@@ -413,7 +419,18 @@ def render(data, lede, focus_days, limit):
             a(f"<span>{plural(c['stashes'],'stash').replace('stashs','stashes')}</span>")
         a(f"<span>{arc.get('age_days','?')}d idle</span>")
         a("</div></div>")
-    a("</div></section>")
+    a("</div>")
+    # A cap that hides more risk than it shows is not a display choice. At 12 cards this
+    # page was concealing 35 active arcs holding 282 unpushed commits -- more than the
+    # single heaviest arc its own lede named. If anything is held back now, it says so
+    # and says what it costs.
+    if hidden:
+        lost = sum(a_.get("unpushed", 0) for a_ in hidden)
+        a(f'<p class="note">{len(hidden)} further active '
+          f'arc{"s" if len(hidden) != 1 else ""} not shown'
+          + (f", holding {lost} unpushed commits" if lost else "")
+          + ". Raise <code>--limit</code>, or drop it to show every one.</p>")
+    a("</section>")
 
     # --- where Jira disagrees with the code --------------------------------
     if gap:
@@ -486,7 +503,8 @@ def main():
                    help="override the derived opening sentence (normally unnecessary — "
                         "it is composed from the data so it cannot go stale)")
     p.add_argument("--focus", type=int, default=14, help="arcs idle at most this long")
-    p.add_argument("--limit", type=int, default=12, help="arc cards to show")
+    p.add_argument("--limit", type=int, default=0,
+                   help="cap the cards shown (0 = every active arc)")
     p.add_argument("--out", type=Path)
     args = p.parse_args()
     try:
