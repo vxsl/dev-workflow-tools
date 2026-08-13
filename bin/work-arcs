@@ -33,6 +33,7 @@ Read-only. Runs git and glab, writes nothing.
 import argparse
 import base64
 import concurrent.futures as futures
+import hashlib
 import json
 import os
 import re
@@ -707,6 +708,72 @@ def apply_overrides(arcs, store):
     return stale
 
 
+PARKED = (Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
+          / "work-arcs" / "parked.json")
+
+
+def apply_parked(arcs):
+    """Workstreams deliberately set aside, and the evidence that says they still are.
+
+    The one thing this cannot derive. "I have unpublished work but I am not planning to do
+    anything with it soon" is a statement about intent, and nothing in git or Jira knows it
+    -- it is exactly the distinction between deliberately parked and forgotten that the
+    forgotten-work detection needs and cannot make on its own.
+
+    Persisted in the only safe form: keyed to a fingerprint of the arc's branch tips, so a
+    single new commit expires it and the workstream comes back on its own. Parked is a rung,
+    not a filter -- these stay on the page, counted, in their own section.
+
+    Returns the entries whose fingerprint no longer matches, so the page can say so.
+    """
+    store = {}
+    if PARKED.exists():
+        try:
+            store = json.loads(PARKED.read_text()) or {}
+        except (OSError, ValueError):
+            store = {}
+    stale = []
+    for arc in arcs:
+        entry = store.get(arc.get("label")) or store.get(arc.get("id"))
+        if not entry or arc.get("settled"):
+            continue
+        if entry.get("fingerprint") != arc.get("fingerprint"):
+            stale.append({"label": arc.get("label"),
+                          "why": "the work has moved since you parked it"})
+            continue
+        arc["parked"] = {"at": entry.get("at"), "note": entry.get("note", "")}
+        arc["stage"] = "parked"
+        arc["state"] = "parked" + (f" — {entry['note']}" if entry.get("note") else "")
+    return stale
+
+
+def set_parked(arcs, spec, unpark=False):
+    """`--park ARC[=note]`, stamped with the fingerprint it is a claim about."""
+    label, _, note = spec.partition("=")
+    label = label.strip()
+    match = [a for a in arcs if a.get("label") == label or a.get("id") == label]
+    if not match:
+        sys.exit(f"work-arcs: no workstream named {label!r}")
+    arc = match[0]
+    store = {}
+    if PARKED.exists():
+        try:
+            store = json.loads(PARKED.read_text()) or {}
+        except (OSError, ValueError):
+            store = {}
+    if unpark:
+        store.pop(label, None)
+        print(f"✓ {label} is back in the run of play", file=sys.stderr)
+    else:
+        store[label] = {"fingerprint": arc["fingerprint"], "at": int(time.time()),
+                        "note": note.strip()}
+        print(f"✓ parked {label}", file=sys.stderr)
+        print(f"  comes back on its own as soon as a commit lands on it — {PARKED}",
+              file=sys.stderr)
+    PARKED.parent.mkdir(parents=True, exist_ok=True)
+    PARKED.write_text(json.dumps(store, indent=1, sort_keys=True))
+
+
 def set_override(arcs, spec):
     """`--authoritative ARC=BRANCH`, stamped with what it is overriding."""
     label, _, branch = spec.partition("=")
@@ -1131,6 +1198,21 @@ STAGE_OF = {"conflict": "came-back", "threads": "came-back", "pipeline": "came-b
             "unpushed": "local-only", "unreviewed": "not-proposed"}
 
 
+def arc_fingerprint(arc):
+    """What this workstream is right now, as a short hash of its branch tips.
+
+    The expiry mechanism for parking. "I am not touching this for a while" is a claim about
+    the work as it stands, and it stops being true the moment a commit lands on it -- so the
+    park is keyed to the tips rather than to the arc's name, and adding a commit expires it
+    on its own. Same contract as the authoritative override: a declaration that carries what
+    it was declared about, so it cannot quietly outlive its evidence.
+    """
+    h = hashlib.sha256()
+    for b in sorted(arc.get("branches", []), key=lambda x: x["name"]):
+        h.update(f'{b["name"]}:{b["sha"]}\n'.encode())
+    return h.hexdigest()[:16]
+
+
 def own_activity(arc):
     """The last time you yourself did anything here, as an epoch.
 
@@ -1167,9 +1249,15 @@ def demands(arc):
     out = []
     for m in arc.get("mrs", []):
         ref = f"!{m.get('iid')}"
+        # `at` is when the thing happened, and it is what decides whether something is news
+        # or just a state. Conflicts and approvals carry no timestamp of their own, so the
+        # MR's own last-update stands in -- a proxy, and labelled as one rather than passed
+        # off as the moment the branch stopped merging.
+        mr_at = _day_epoch(m.get("updated", ""))
         if m.get("conflicts"):
             out.append({"kind": "conflict", "what": f"{ref} no longer merges into "
-                        f"{m.get('target') or 'main'} — rebase", "url": m.get("url", "")})
+                        f"{m.get('target') or 'main'} — rebase", "url": m.get("url", ""),
+                        "at": mr_at, "at_is_proxy": True})
         # One demand per MR, not per thread. Four threads produced four rows reading
         # "asked, unanswered since 2026-08-13" with only the quote to tell them
         # apart, which is a list of the same sentence. Who is waiting and since when is
@@ -1194,18 +1282,20 @@ def demands(arc):
                 what = (f"{ref}: {n} thread{'' if n == 1 else 's'} awaiting your reply — "
                         f"{', '.join(who)} spoke last"
                         + (f", oldest {oldest}" if oldest else ""))
+            newest = max((_day_epoch(t.get("last_at", "")) for t in group), default=0)
             out.append({"kind": kind, "what": what,
                         "quotes": [t["quote"] for t in group if t.get("quote")],
-                        "url": m.get("url", "")})
+                        "url": m.get("url", ""), "at": newest})
         pipe = m.get("pipeline") or {}
         if pipe.get("status") in ("failed", "canceled"):
             out.append({"kind": "pipeline",
                         "what": f"{ref} pipeline {pipe['status']} on {pipe.get('at','')}",
-                        "url": pipe.get("url") or m.get("url", "")})
+                        "url": pipe.get("url") or m.get("url", ""),
+                        "at": _day_epoch(pipe.get("at", ""))})
         if m.get("approved") and not m.get("draft"):
             out.append({"kind": "approved",
                         "what": f"{ref} is approved and still open — merge it",
-                        "url": m.get("url", "")})
+                        "url": m.get("url", ""), "at": mr_at, "at_is_proxy": True})
         if m.get("draft") and arc.get("age_days", 0) > 14:
             out.append({"kind": "draft",
                         "what": f"{ref} has been a draft for {arc['age_days']}d — nobody "
@@ -1361,6 +1451,14 @@ def finalize(arc, repo=None, main_ref="origin/main"):
     # either a rung of the ladder or the specific thing that came back.
     settled = arc.get("settled")
     arc["demands"] = [] if settled else demands(arc)
+    arc["fingerprint"] = arc_fingerprint(arc)
+    # News is a comparison, not a checkbox. Something that came back is news only while it
+    # postdates your own last commit or session here; work on it and it stops being news
+    # without anything being clicked or dismissed.
+    mine = own_activity(arc)
+    arc["own_activity"] = mine
+    arc["notify"] = [d for d in arc["demands"]
+                     if d.get("at", 0) > mine and STAGE_OF.get(d["kind"]) == "came-back"]
     # Ranks WITHIN a rung only. There is no defensible exchange rate between "a reviewer asked
     # question six days ago" and "79 commits exist nowhere but this laptop", so the page
     # never sorts one against the other -- see `stage`.
@@ -1456,6 +1554,10 @@ def main():
     p.add_argument("--shallow-mr", action="store_true",
                    help="skip the per-MR calls for unresolved review threads and pipeline "
                         "status; the list call alone still gives conflicts and approvals")
+    p.add_argument("--park", metavar="ARC[=NOTE]",
+                   help="set a workstream aside as backlog. Expires itself as soon as a "
+                        "commit lands on it, so it can never quietly outlive its reason")
+    p.add_argument("--unpark", metavar="ARC", help="put a parked workstream back in play")
     p.add_argument("--authoritative", metavar="ARC=BRANCH",
                    help="name the branch that IS an arc's work when the derivation gets it "
                         "wrong. Optional: it only corrects, nothing depends on it, and it "
@@ -1560,6 +1662,10 @@ def main():
             arcs, unattached = build_arcs(branches, stashes, mrs, sessions, args.main,
                                           cluster_assign, args.repo, mrs_known, own_tokens)
 
+    if args.park or args.unpark:
+        set_parked(arcs, args.park or args.unpark, unpark=bool(args.unpark))
+        return
+
     if args.authoritative:
         set_override(arcs, args.authoritative)
         return
@@ -1616,6 +1722,10 @@ def main():
               file=sys.stderr)
         return
 
+    stale_parks = apply_parked(arcs)
+    for s in stale_parks:
+        print(f"⚠ {s['label']} is no longer parked: {s['why']}", file=sys.stderr)
+
     stale_overrides = apply_overrides(arcs, load_overrides())
     for s in stale_overrides:
         print(f"⚠ ignoring authoritative={s['branch']} for {s['label']}: {s['why']}",
@@ -1649,6 +1759,7 @@ def main():
             "arcs": arcs,
             "unattached_stashes": unattached,
             "stale_overrides": stale_overrides,
+            "stale_parks": stale_parks,
             "gap": gap,
         }, sys.stdout, indent=1)
         print()

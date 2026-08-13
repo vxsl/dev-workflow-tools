@@ -232,6 +232,61 @@ details.parked>summary b{color:var(--ink);font-weight:600}
 
 .count{font-family:var(--mono);font-variant-numeric:tabular-nums}
 
+/* One line per workstream. Cards were inherited from the version of this page that showed
+   six things, and at twenty-eight they are a wall -- the same reason a list of branches was
+   a wall before arcs existed. The detail is not gone, it is one disclosure away. */
+.ws{border-bottom:1px solid var(--hairline)}
+.ws:last-of-type{border-bottom:none}
+.ws>summary{display:grid;grid-template-columns:6.5rem minmax(0,1fr) auto auto auto;
+  gap:.2rem .8rem;align-items:baseline;padding:.5rem .7rem;cursor:pointer;
+  list-style:none}
+.ws>summary::-webkit-details-marker{display:none}
+.ws>summary:hover{background:var(--surface-2)}
+.ws[open]>summary{background:var(--surface-2)}
+.ws .tkt{font-family:var(--mono);font-size:.72rem;color:var(--accent);white-space:nowrap}
+.ws .tkt.none{color:var(--warm);opacity:.75}
+.ws .nm{color:var(--ink);font-size:.9rem;min-width:0}
+.ws .st{font-family:var(--mono);font-size:.7rem;color:var(--ink-soft);white-space:nowrap;
+  font-variant-numeric:tabular-nums}
+.ws .ag{font-family:var(--mono);font-size:.7rem;color:var(--ink-faint);white-space:nowrap}
+.ws .body{padding:.2rem .7rem 1rem 7.2rem;display:flex;flex-direction:column;gap:.6rem}
+@media (max-width:52rem){
+  .ws>summary{grid-template-columns:minmax(0,1fr) auto;row-gap:.1rem}
+  .ws .tkt{grid-column:1}.ws .nm{grid-column:1}
+  .ws .body{padding-left:.7rem}
+}
+.wslist{border:1px solid var(--hairline);border-radius:4px;background:var(--surface);
+  overflow:hidden}
+
+/* Parking is a claim about intent, which is the one thing here that cannot be derived. The
+   control is a button rather than a checkbox because it is an action with a consequence, and
+   it says what it did. */
+.park{font-family:var(--mono);font-size:.63rem;text-transform:uppercase;
+  letter-spacing:.06em;padding:.15rem .4rem;border-radius:2px;cursor:pointer;
+  border:1px solid var(--hairline);background:transparent;color:var(--ink-faint)}
+.park:hover{border-color:var(--parked);color:var(--ink-soft)}
+.ws[data-parked="1"] .park{border-color:var(--parked);color:var(--parked)}
+.ws[data-parked="1"] .nm{color:var(--ink-soft)}
+.ws[data-parked="1"] .st{text-decoration:line-through;opacity:.6}
+#parkbar{position:sticky;bottom:0;margin-top:1rem;display:none;gap:.8rem;
+  align-items:center;flex-wrap:wrap;padding:.7rem .9rem;border:1px solid var(--parked);
+  border-radius:4px;background:var(--surface);font-size:.85rem;
+  box-shadow:0 -2px 12px rgba(0,0,0,.08)}
+#parkbar.on{display:flex}
+#parkbar button{font:inherit;padding:.3rem .7rem;border-radius:3px;cursor:pointer;
+  border:1px solid var(--accent);background:var(--accent);color:var(--surface)}
+#parkbar .muted{color:var(--ink-soft);font-size:.8rem}
+
+/* The one thing that came back and has not been looked at yet. Everything else on this page
+   is a state; this is news, and it stops being news by being worked on rather than clicked. */
+.news{border:1px solid var(--hot);border-radius:4px;background:var(--hot-wash);
+  padding:.9rem 1rem;display:flex;flex-direction:column;gap:.8rem;margin-bottom:1rem}
+.news h3{margin:0;font-family:var(--serif);font-size:1rem;font-weight:500}
+.news .item{display:flex;flex-direction:column;gap:.3rem;font-size:.85rem}
+.news .when{font-family:var(--mono);font-size:.68rem;color:var(--hot)}
+.quiet{color:var(--ink-soft);font-size:.85rem;padding:.7rem .9rem;
+  border:1px dashed var(--hairline);border-radius:4px}
+
 /* The conditions, as peers. There is no defensible exchange rate between "a reviewer asked a
    question six days ago" and "79 commits exist nowhere but this laptop" -- ranking them
    against each other invents one, and the swathe of unpublished work is a primary problem
@@ -260,6 +315,109 @@ details.parked>summary b{color:var(--ink);font-weight:600}
 h2:target{outline:2px solid var(--accent);outline-offset:.3rem;border-radius:2px}
 :focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 @media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
+"""
+
+
+# Parking is the one claim on this page that cannot be derived, so it is the one thing the
+# page has to accept as input. It persists in the frame's own localStorage: the artifact runs
+# on a per-artifact origin (`<uuid>.frame.claudeusercontent.com`), verified, so the store is
+# isolated from every other page AND survives republishing, since the uuid does not change
+# when the page is regenerated.
+#
+# Keyed on a fingerprint of the workstream's branch tips, never on its name. That is what
+# makes a declaration safe here: land one commit and the fingerprint no longer matches, the
+# park expires itself, and the row comes back. A park keyed on a name would be an assertion
+# that never self-heals -- the failure mode every persisted correction in this pipeline is
+# designed to avoid.
+#
+# Saving to disk is offered, not required: `work-arcs` computes its own counts and cannot see
+# this store, so the file is what makes the two agree.
+PARK_JS = r"""
+(function(){
+  var KEY='work-arcs:parked:v1', store={}, expired=[], warned=false;
+  function read(){ try{ return JSON.parse(localStorage.getItem(KEY)||'{}')||{}; }
+                   catch(e){ return {}; } }
+  function write(){ try{ localStorage.setItem(KEY,JSON.stringify(store)); return true; }
+                    catch(e){ return false; } }
+  store=read();
+  var list=document.getElementById('parkedlist'),
+      sec=document.getElementById('parkedsec'),
+      bar=document.getElementById('parkbar'), msg=document.getElementById('parkmsg'),
+      saveBtn=document.getElementById('parksave'), dirty=false;
+
+  function recount(){
+    document.querySelectorAll('[data-list]').forEach(function(el){
+      var n=el.querySelectorAll('.ws').length,
+          c=document.querySelector('[data-count="'+el.dataset.list+'"]');
+      if(c) c.textContent=n;
+      var head=document.querySelector('[data-bucket="'+el.dataset.list+'"]');
+      if(head) head.hidden=(n===0);
+      el.hidden=(n===0);
+    });
+    var pn=list?list.querySelectorAll('.ws').length:0,
+        pc=document.querySelector('[data-count="parked"]');
+    if(pc) pc.textContent=pn;
+    if(sec) sec.hidden=(pn===0);
+  }
+  function setBar(){
+    if(!bar) return;
+    bar.classList.toggle('on', dirty);
+    if(msg) msg.textContent=Object.keys(store).length+' parked in this browser'
+      +(warned?' — this browser could not save it, so it will not survive a reload':'');
+  }
+  // Apply what was parked before, and drop anything whose work has moved on since.
+  document.querySelectorAll('.ws').forEach(function(el){
+    var k=el.dataset.key, fp=el.dataset.fp;
+    if(!(k in store)) return;
+    if(store[k]!==fp){ expired.push(k); delete store[k]; return; }
+    park(el,true,true);
+  });
+  if(expired.length){ write();
+    var p=document.createElement('p'); p.className='note';
+    var one=expired.length===1;
+    p.textContent=expired.length+' parked workstream'+(one?'':'s')+' came back on '
+      +(one?'its':'their')+' own: the work has moved since you parked '+(one?'it':'them')+'.';
+    if(sec&&sec.parentNode) sec.parentNode.insertBefore(p,sec);
+  }
+  function park(el,on,quiet){
+    el.dataset.parked=on?'1':'0';
+    var btn=el.querySelector('.park');
+    if(btn) btn.textContent=on?'unpark':'park';
+    if(on&&list&&el.parentNode!==list) list.appendChild(el);
+    if(!on&&list&&el.parentNode===list){
+      var home=document.querySelector('[data-list]');
+      if(home) home.appendChild(el);   // reappears under the first bucket until the next run
+    }
+    if(!quiet){
+      if(on) store[el.dataset.key]=el.dataset.fp; else delete store[el.dataset.key];
+      if(!write()) warned=true;
+      dirty=true;
+    }
+    recount(); setBar();
+  }
+  document.addEventListener('click',function(ev){
+    var btn=ev.target.closest?ev.target.closest('.park'):null;
+    if(!btn) return;
+    ev.preventDefault(); ev.stopPropagation();   // do not toggle the disclosure
+    var el=btn.closest('.ws');
+    park(el, el.dataset.parked!=='1', false);
+  });
+  if(saveBtn) saveBtn.addEventListener('click',function(){
+    var out={}, now=Math.floor(Date.now()/1000);
+    Object.keys(store).forEach(function(k){ out[k]={fingerprint:store[k],at:now,note:''}; });
+    var data=JSON.stringify(out,null,1);
+    var dl=window.claude&&window.claude.downloads;
+    if(!dl){ if(msg) msg.textContent='Saving is not available in this view.'; return; }
+    dl.save({filename:'parked.json',data:data}).then(function(){
+      if(msg) msg.textContent='Saved. Move it to ~/.local/state/work-arcs/parked.json';
+      dirty=false; setBar();
+    }).catch(function(e){
+      if(msg) msg.textContent=(e&&e.code==='declined')?'Not saved.'
+        :('Could not save: '+((e&&e.code)||'unknown'));
+    });
+  });
+  recount(); setBar();
+})();
 """
 
 
@@ -528,6 +686,16 @@ def link(url, text, cls=""):
     return f'<a{c} href="{esc(url)}" target="_blank" rel="noopener">{text}</a>'
 
 
+def fmt_day(epoch):
+    """An epoch as a date a person reads, or a shrug when there is nothing to show."""
+    if not epoch:
+        return "no date recorded"
+    try:
+        return datetime.fromtimestamp(epoch).strftime("%-d %b")
+    except (ValueError, OSError, OverflowError):
+        return "no date recorded"
+
+
 def heat(arc):
     """Colour only where something is actually broken.
 
@@ -559,18 +727,26 @@ def render(data, lede, focus_days, limit):
     a = out.append
     base = data.get("project_url") or ""
     arcs = [x for x in data.get("arcs", []) if x.get("age_days", 999) <= focus_days]
-    # Ranked WITHIN a rung, never across. Urgency orders the things that came back; for
-    # unpublished work the meaningful order is how much of it there is and how deep you went.
     by_rung = {}
     for x in arcs:
         by_rung.setdefault(x.get("stage") or "local-only", []).append(x)
-    for k, v in by_rung.items():
-        if k == "came-back":
-            v.sort(key=lambda x: (x.get("urgency", 99), -x.get("engagement", 0)))
-        elif k in ("in-review", "landed", "abandoned"):
-            v.sort(key=lambda x: x.get("age_days", 999))
-        else:
-            v.sort(key=lambda x: (-x.get("unpushed_live", 0), -x.get("engagement", 0)))
+
+    # Time is the primary grouping now, because that is how the work is actually recalled --
+    # "what am I in the middle of" rather than "what state is everything in". The rungs stay
+    # as a per-row fact and as the aggregate at the top; they are no longer the spine.
+    BUCKETS = [("today", "Today", lambda d: d <= 0),
+               ("week", "Earlier this week", lambda d: 1 <= d <= 6),
+               ("lastweek", "Last week", lambda d: 7 <= d <= 13),
+               ("earlier", "Earlier", lambda d: d >= 14)]
+    live = [x for x in arcs
+            if x.get("stage") not in ("landed", "abandoned", "parked")]
+    buckets = []
+    for key, title, test in BUCKETS:
+        got = [x for x in live if test(x.get("age_days", 999))]
+        # Within a bucket, the biggest unfinished thing first. No cross-rung ordering.
+        got.sort(key=lambda x: (-x.get("unpushed_live", 0), -x.get("engagement", 0)))
+        if got:
+            buckets.append((key, title, got))
     gap = data.get("gap") or {}
 
     try:
@@ -586,11 +762,10 @@ def render(data, lede, focus_days, limit):
     a('<div class="stamp">')
     a(f"<span>{esc(stamp)}</span>")
     a(f"<span>{link(base, esc(data.get('repo','')))}</span>")
-    live = sum(len(v) for k, v in by_rung.items() if k not in ("landed", "abandoned"))
     total = data.get("arc_count", 0)
     a(f"<span>{len(arcs)} workstreams touched &le; {focus_days}d"
       + (f", of {total}" if total and total != len(arcs) else "") + "</span>")
-    a(f"<span>{live} still going, {len(arcs) - live} settled</span>")
+    a(f"<span>{len(live)} in play, {len(arcs) - len(live)} settled or parked</span>")
     a("</div>")
     lede = lede or derive_lede(data, focus_days)
     if lede:
@@ -761,85 +936,165 @@ def render(data, lede, focus_days, limit):
             card(arc)
         a("</div>")
 
+    def workstream_row(arc):
+        """One line, with everything else behind a disclosure."""
+        brief = arc.get("brief") or {}
+        c = arc.get("counts", {})
+        tkt = arc.get("ticket")
+        i = next((x for x in arc.get("issues", []) if x.get("key") == tkt), {})
+        nm = esc(brief.get("name") or arc.get("label", "?"))
+        age = arc.get("age_days", 0)
+        when = "today" if age <= 0 else (f"{age}d ago")
+        a(f'<details class="ws" data-key="{esc(arc.get("label",""))}" '
+          f'data-fp="{esc(arc.get("fingerprint",""))}" '
+          f'data-parked="{1 if arc.get("parked") else 0}">')
+        a("<summary>")
+        a(link(i.get("url", ""), esc(tkt), "tkt") if tkt
+          else '<span class="tkt none">no ticket</span>')
+        a(f'<span class="nm">{nm}</span>')
+        a(f'<span class="st">{esc(arc.get("state",""))}</span>')
+        a(f'<span class="ag">{esc(when)}</span>')
+        a('<button class="park" type="button" '
+          'aria-label="set this workstream aside as backlog">park</button>')
+        a("</summary>")
+        a('<div class="body">')
+        if brief.get("summary"):
+            a(f'<p class="arc-sum">{esc(brief["summary"])}</p>')
+        tautology = {"local-only": "unpushed", "not-proposed": "unreviewed"}.get(
+            arc.get("stage"))
+        shown_d = [d for d in arc.get("demands", []) if d["kind"] != tautology]
+        if shown_d:
+            a('<ul class="needs">')
+            for d in shown_d[:4]:
+                sev = DEMAND_SEV.get(d["kind"], 6)
+                lbl = DEMAND_LABEL.get(d["kind"], d["kind"])
+                a(f'<li><div class="row"><span class="chip sev-{sev}">{esc(lbl)}</span>'
+                  f'<span class="what">{link(d.get("url",""), esc(d["what"]))}</span></div>')
+                for q in (d.get("quotes") or ([d["quote"]] if d.get("quote") else []))[:3]:
+                    a(f"<blockquote>{esc(q)}</blockquote>")
+                a("</li>")
+            a("</ul>")
+        elif brief.get("blocker"):
+            a(f'<p class="blocker">{esc(brief["blocker"])}</p>')
+        for m in (arc.get("mrs") or [])[:3]:
+            a(f'<div class="arc-sub">{link(m.get("url",""), "!" + str(m.get("iid")))}'
+              f'<span>{esc(m.get("title",""))[:90]}</span></div>')
+        a(spawn_svg(arc, base=base))
+        a('<div class="metrics">')
+        lv = arc.get("unpushed_live", 0)
+        if lv and arc.get("stage") != "local-only":
+            a(f"<span><b>{lv}</b> unpushed</span>")
+        if arc.get("unpushed_only_on_copies"):
+            a(f"<span>{arc['unpushed_only_on_copies']} only on a superseded copy</span>")
+        a(f"<span>{plural(c.get('branches',0),'branch').replace('branchs','branches')}</span>")
+        if arc.get("superseded"):
+            a(f"<span>{arc['superseded']} superseded</span>")
+        if c.get("sessions"):
+            a(f"<span>{plural(c['sessions'],'session')}</span>")
+        a(f"<span>{esc(arc.get('authoritative') or '')}</span>")
+        a("</div></div></details>")
+
+    # --- what came back and has not been looked at -------------------------
+    # The only thing on this page that is news rather than a state. It leaves by being
+    # worked on: every entry postdates the last commit or session on its own arc, so
+    # touching the work removes it without anything being dismissed.
+    news = [x for x in arcs if x.get("notify")]
+    news.sort(key=lambda x: (x.get("urgency", 99), -x.get("engagement", 0)))
+    a("<section>")
+    a("<h2>Since you last touched them</h2>")
+    a('<p class="note">Things that came back after your last commit or session on them. '
+      "Nothing here needs dismissing — work on it and it leaves on its own. Everything "
+      "else on this page is a standing state, not news.</p>")
+    if not news:
+        a('<div class="quiet">Nothing has come back since you last worked on any of '
+          "these. Every open merge request is either untouched or already answered.</div>")
+    for arc in news:
+        brief = arc.get("brief") or {}
+        tkt = arc.get("ticket")
+        i = next((x for x in arc.get("issues", []) if x.get("key") == tkt), {})
+        a('<div class="news">')
+        a("<h3>" + (link(i.get("url", ""), esc(tkt), "tkt") + " &middot; " if tkt else "")
+          + esc(brief.get("name") or arc.get("label", "?")) + "</h3>")
+        for d in arc["notify"][:3]:
+            a('<div class="item">')
+            a(f'<span class="when">'
+              + (esc(fmt_day(d.get("at"))) + (" (from the merge request&rsquo;s own "
+                 "last update, which is the closest timestamp there is)"
+                 if d.get("at_is_proxy") else ""))
+              + "</span>")
+            a(f'<span>{link(d.get("url",""), esc(d["what"]))}</span>')
+            for q in (d.get("quotes") or [])[:3]:
+                a(f"<blockquote>{esc(q)}</blockquote>")
+            a("</div>")
+        a("</div>")
+    a("</section>")
+
     # --- the conditions, as peers ------------------------------------------
-    # This row is where the refusal to rank lives. Presented as equal tiles because there
-    # is no honest exchange rate between them, and a swathe of unpublished work is a
-    # first-class problem rather than a lesser stalled review.
+    # Still peers, still no hero figure and no severity hue: there is no honest exchange
+    # rate between a stalled review and a swathe of unpublished work. These are now an
+    # aggregate rather than the page's spine, since time became the grouping.
     loc = by_rung.get("local-only", [])
     back = by_rung.get("came-back", [])
     rev = by_rung.get("in-review", [])
     prop = by_rung.get("not-proposed", [])
+    parked = by_rung.get("parked", [])
     done = by_rung.get("landed", []) + by_rung.get("abandoned", [])
     tiles = [
-        ("local", len(loc), "workstreams exist only on this laptop",
+        (len(loc), "exist only on this laptop",
          f"{sum(x.get('unpushed_live',0) for x in loc)} commits, no remote has them"),
-        ("back", len(back), "have come back to you",
-         "a rebase, an unanswered question, a red pipeline, an unmerged approval"),
-        ("proposed", len(prop), "are pushed but were never proposed",
-         "no merge request exists"),
-        ("review", len(rev), "are out for review",
-         "nothing outstanding — a reviewer&rsquo;s clock"),
-        ("settled", len(done), "have landed or been abandoned",
-         "retired from the list below"),
+        (len(back), "have come back to you",
+         "a rebase, a question, a red pipeline, an unmerged approval"),
+        (len(prop), "are pushed but never proposed", "no merge request exists"),
+        (len(rev), "are out for review", "nothing outstanding — a reviewer&rsquo;s clock"),
+        (len(parked), "are parked", "set aside on purpose, not forgotten"),
+        (len(done), "have landed or been abandoned", "retired from the list below"),
     ]
     a('<ul class="conditions">')
-    for anchor, n, label, sub in tiles:
+    for n, label, sub in tiles:
         if not n:
             continue
-        a(f'<li><a href="#{anchor}"><span class="v">{n}</span>'
+        a(f'<li><a href="#play"><span class="v">{n}</span>'
           f'<span class="l">{label}</span><span class="sub">{sub}</span></a></li>')
     a("</ul>")
 
-    a('<p class="ladder-note">Below, workstreams are grouped by how far each has got — '
-      "from existing only here, to pushed, to proposed, to reviewed. That is the order of "
-      "the ladder, <strong>not</strong> an order of importance: nothing here claims a "
-      "review comment matters more than unpublished work, or less. Within a group, things "
-      "that came back are ordered by what blocks them and unpublished work by how much of "
-      "it there is.</p>")
+    # --- in play, by when you last touched it ------------------------------
+    a("<section>")
+    a('<div class="rung"><h2 id="play">In play</h2>'
+      f'<span class="n">{len(live)} workstreams</span></div>')
+    a('<p class="note">Grouped by when you last touched each one, and within a group by '
+      "how much unfinished work it holds. Each row says which rung it has reached — only "
+      "here, pushed, proposed, in review — but no rung is ranked against another: "
+      "unpublished work is a first-class problem, not a milder stalled review. Open a row "
+      "for what it is, what it needs, and how its branches relate. "
+      "<strong>Park</strong> sets one aside as backlog; it comes back on its own as soon "
+      "as a commit lands on it.</p>")
+    for key, title, got in buckets:
+        a(f'<div class="rung" data-bucket="{key}">'
+          f'<h2 id="{key}" style="font-size:1rem">{title}</h2>'
+          f'<span class="n" data-count="{key}">{len(got)}</span></div>')
+        a(f'<div class="wslist" data-list="{key}">')
+        for arc in got:
+            workstream_row(arc)
+        a("</div>")
+    a("</section>")
 
-    if loc:
-        a("<section>")
-        a(f'<div class="rung"><h2 id="local">Only on this laptop</h2>'
-          f'<span class="n">{len(loc)} workstreams · '
-          f'{sum(x.get("unpushed_live",0) for x in loc)} commits</span></div>')
-        a('<p class="note">No remote has these commits. Nothing here has been proposed to '
-          "anyone, and several have no ticket either — which is what makes them invisible "
-          "to Jira, to Trellis&rsquo;s capacity, and to anyone who might otherwise pick "
-          "them up. Every one is listed; the diagram on each shows which branch is the "
-          "work and which are copies of it.</p>")
-        cards(loc)
-        a("</section>")
+    # Always emitted, even empty: parking happens in the page, so the client needs somewhere
+    # to move a row to without inventing structure.
+    a(f'<section id="parkedsec"{"" if parked else " hidden"}>')
+    a('<div class="rung"><h2 id="parked">Parked</h2>'
+      f'<span class="n" data-count="parked">{len(parked)}</span></div>')
+    a('<p class="note">Set aside on purpose. Still counted, still here — the difference '
+      "between parked and forgotten is the whole point of saying so. Each returns to "
+      "<em>In play</em> by itself as soon as a commit lands on it, because the park is "
+      "keyed to the branch tips rather than to the name.</p>")
+    a('<div class="wslist" id="parkedlist">')
+    for arc in parked:
+        workstream_row(arc)
+    a("</div></section>")
 
-    if prop:
-        a("<section>")
-        a(f'<div class="rung"><h2 id="proposed">Pushed, never proposed</h2>'
-          f'<span class="n">{len(prop)}</span></div>')
-        a('<p class="note">Safe on a remote, but no merge request exists, so nobody knows '
-          "to look at it.</p>")
-        cards(prop)
-        a("</section>")
-
-    if back:
-        a("<section>")
-        a(f'<div class="rung"><h2 id="back">Came back to you</h2>'
-          f'<span class="n">{len(back)}</span></div>')
-        a('<p class="note">Proposed, and then returned: a branch that no longer merges, a '
-          "question nobody answered, a pipeline that went red, an approval nobody acted "
-          "on. Each names the thing, quotes the source where someone asked you something, "
-          "and links to it.</p>")
-        cards(back)
-        a("</section>")
-
-    if rev:
-        a("<section>")
-        a(f'<div class="rung"><h2 id="review">Out for review</h2>'
-          f'<span class="n">{len(rev)}</span></div>')
-        a('<p class="note">Your end of the deal is done and the clock is a '
-          "reviewer&rsquo;s. Listed in full rather than hidden, because a reviewer going "
-          "quiet is how work disappears — if one of these comes back it moves up on the "
-          "next run.</p>")
-        rows(rev, note_reviewers=True)
-        a("</section>")
+    for s in data.get("stale_parks") or []:
+        a(f'<p class="note">{esc(s.get("label",""))} is no longer parked: '
+          f'{esc(s.get("why",""))}.</p>')
 
     if done:
         a("<section>")
@@ -848,7 +1103,7 @@ def render(data, lede, focus_days, limit):
         a('<p class="note">Finished, and shown once so it is clear they were retired '
           "rather than lost. These stayed on the page for as long as this tool existed: "
           "every merge request here squash-merges, and a squash leaves the branch "
-          "unmerged by ancestry, which is the only test <code>git</code> was being "
+          "unmerged by ancestry, which was the only test <code>git</code> was being "
           "asked.</p>")
         rows(done)
         a("</section>")
@@ -916,6 +1171,13 @@ def render(data, lede, focus_days, limit):
                   f'<td class="d">{esc(i.get("summary",""))}</td>'
                   f'<td class="d">{esc(init)}</td></tr>')
             a("</tbody></table></div></section>")
+
+    a('<div id="parkbar"><span id="parkmsg"></span>'
+      '<button type="button" id="parksave">Save for the command line</button>'
+      '<span class="muted">Parking already applies here and survives reloads. Saving '
+      'writes <code>parked.json</code> for <code>work-arcs</code>, so its own counts '
+      'agree with this page.</span></div>')
+    a(f"<script>{PARK_JS}</script>")
 
     a("<footer>Derived, never declared — arcs come from the files your work "
       "touched, not from what branches were named, and which branch is the work comes "
