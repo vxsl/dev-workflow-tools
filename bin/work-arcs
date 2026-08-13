@@ -27,7 +27,9 @@ rename.
   work-arcs                        a summary, most recently touched first
   work-arcs --active 14            only arcs touched in the last 14 days
 
-Read-only. Runs git and glab, writes nothing.
+Read-only. Runs git and glab, writes nothing -- the one nuance is that an MR with no
+cached mergeability verdict gets a recompute requested (see collect_mrs), which changes
+no state anyone can see, only whether GitLab knows its own answer.
 """
 
 import argparse
@@ -479,6 +481,195 @@ def branch_pipelines(repo):
     return by_ref
 
 
+REVIEW_REQ_RE = re.compile(r"^requested review from", re.I)
+
+
+def _mr_notes(repo, iid):
+    return glab(repo, f"projects/:id/merge_requests/{iid}/notes?per_page=100&sort=asc") or []
+
+
+def _approved_by(repo, iid):
+    a = glab(repo, f"projects/:id/merge_requests/{iid}/approvals") or {}
+    return [(x.get("user") or {}).get("username", "") for x in a.get("approved_by") or []]
+
+
+def _asked_at(notes, who=None):
+    """When review was last requested, from the system note GitLab writes at that moment.
+
+    The MR's `updated_at` is not a substitute: your own push updates it, so it answers
+    "when did anything happen" when the question is "how long have they had it". The
+    request writes its own note -- "requested review from @a, @b and @c" -- and the last
+    one is the clock's start, because a re-request after changes honestly restarts it.
+    With `who`, only requests naming that person count.
+    """
+    asked = ""
+    for n in notes:
+        if not n.get("system") or not REVIEW_REQ_RE.match(n.get("body") or ""):
+            continue
+        if who and not re.search(rf"@{re.escape(who)}\b", n.get("body") or ""):
+            continue
+        asked = (n.get("created_at") or "")[:10]
+    return asked
+
+
+def _days_since(day):
+    epoch = _day_epoch(day)
+    return int((time.time() - epoch) // 86400) if epoch else None
+
+
+def ledger_they_owe(repo, mrs, me):
+    """Review you asked for and never got: the direction nobody's tooling reports.
+
+    A reviewer's silence is invisible by construction -- nothing fails, nothing turns
+    red, the MR just sits there aging while you believe it is being read. Per MR rather
+    than per reviewer, because reviewers here arrive five at a time from a default list:
+    "you asked brian, vadym, ajit, Matt and ella 7 days ago" five times over is noise,
+    and the operative fact is that NOBODY has responded.
+
+    Responded means: approved, or said anything a human says (a non-system note). Either
+    one, by anyone who is not you, and the MR is attended -- the threads machinery takes
+    over from there. Only total silence lands in the ledger.
+    """
+    asked_for = [m for m in mrs if m.get("reviewers") and not m.get("draft")]
+
+    def one(m):
+        # Notes first, approvals only when the notes leave it open: a note already
+        # proves the MR is attended, and each skipped call is real wall clock here.
+        notes = _mr_notes(repo, m["iid"])
+        spoke = {(n.get("author") or {}).get("username", "")
+                 for n in notes if not n.get("system")} - {me, ""}
+        if spoke:
+            return None
+        if set(_approved_by(repo, m["iid"])) - {me, ""}:
+            return None
+        asked = _asked_at(notes)
+        entry = {"kind": "review-silence", "ref": f"!{m['iid']}",
+                 "title": m.get("title", ""), "who": m.get("reviewers", []),
+                 "url": m.get("url", "")}
+        if asked:
+            entry["asked"] = asked
+        else:
+            # Reviewers set at creation write no request note; the MR's birth is then
+            # the honest clock, and it is labelled as the proxy it is.
+            entry["asked"] = (m.get("updated") or "")[:10]
+            entry["asked_is_proxy"] = True
+        entry["days"] = _days_since(entry["asked"])
+        return entry
+
+    with futures.ThreadPoolExecutor(max_workers=16) as pool:
+        return [e for e in pool.map(one, asked_for) if e]
+
+
+def ledger_you_owe(repo, me):
+    """Their merge requests waiting on your review, with how long you have had them.
+
+    `reviewer_username=me` over the project's open MRs is the queue; what the list call
+    cannot say is whether you already dealt with each one. Dealt with means the same two
+    things in reverse: you approved it, or you said anything on it. Either and the row
+    vanishes -- which is the property that keeps this from rotting, no checkbox required.
+
+    An MR somebody else already approved is dropped too, but counted: this project needs
+    one approval, so your review is no longer the thing between the author and a merge.
+    """
+    raw = glab(repo, "projects/:id/merge_requests?state=opened&per_page=100"
+                     f"&reviewer_username={urllib.parse.quote(me, safe='')}")
+    queue = [m for m in raw or []
+             if not (m.get("draft") or m.get("work_in_progress"))
+             and (m.get("author") or {}).get("username") != me]
+    out, covered = [], 0
+
+    def one(m):
+        iid = m.get("iid")
+        notes = _mr_notes(repo, iid)
+        i_spoke = any((n.get("author") or {}).get("username") == me
+                      for n in notes if not n.get("system"))
+        if i_spoke or _approved_by(repo, iid):
+            return None
+        asked = _asked_at(notes, who=me) or (m.get("created_at") or "")[:10]
+        return {"kind": "review-owed", "ref": f"!{iid}", "title": m.get("title", ""),
+                "who": (m.get("author") or {}).get("username", "?"),
+                "asked": asked, "days": _days_since(asked),
+                "url": m.get("web_url", "")}
+
+    with futures.ThreadPoolExecutor(max_workers=16) as pool:
+        for entry in pool.map(one, queue):
+            if entry:
+                out.append(entry)
+            else:
+                covered += 1
+    return out, covered
+
+
+def ledger_jira_stalled(days_min=None):
+    """Tickets you filed that now sit with someone else, and how long they have sat.
+
+    The todo.md entries this replaces were `blocked by neville` and `waiting on Logan`
+    -- social debts recorded nowhere on the machine. This is the derivable core of them:
+    reporter is you, assignee is not, still open, and nothing has happened for a while.
+    The threshold exists because a ticket somebody touched this week is moving, not owed.
+    """
+    days_min = days_min or int(os.environ.get("WORK_ARCS_STALL_DAYS", "7"))
+    domain = os.environ.get("JIRA_DOMAIN")
+    email = os.environ.get("JIRA_EMAIL")
+    token = os.environ.get("JIRA_API_TOKEN")
+    if not (domain and email and token):
+        return []
+    jql = ("reporter = currentUser() AND assignee != currentUser() AND "
+           "assignee is not EMPTY AND statusCategory != Done ORDER BY updated ASC")
+    url = (f"https://{domain}/rest/api/3/search/jql?jql=" + urllib.parse.quote(jql)
+           + "&fields=key,summary,status,assignee,updated&maxResults=50")
+    req = urllib.request.Request(url, headers={"Accept": "application/json"})
+    auth = base64.b64encode(f"{email}:{token}".encode()).decode()
+    req.add_header("Authorization", f"Basic {auth}")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            raw = json.load(r)
+    except (urllib.error.URLError, json.JSONDecodeError, TimeoutError):
+        return []
+    out = []
+    for i in raw.get("issues", []):
+        f = i.get("fields", {})
+        updated = (f.get("updated") or "")[:10]
+        days = _days_since(updated)
+        if days is None or days < days_min:
+            continue
+        out.append({"kind": "ticket-stalled", "ref": i.get("key", ""),
+                    "title": " ".join((f.get("summary") or "").split()),
+                    "who": (f.get("assignee") or {}).get("displayName", "?"),
+                    "status": (f.get("status") or {}).get("name", ""),
+                    "asked": updated, "days": days,
+                    "url": f"https://{domain}/browse/{i.get('key','')}"})
+    return out
+
+
+def build_ledger(repo, mrs):
+    """The waiting-on ledger, both directions, every row a counterparty and a clock.
+
+    This is what todo.md was actually for. The load-bearing entries there were `blocked
+    by neville` and `waiting on Logan` -- open loops with a person on the other end --
+    and the file rotted because the part worth writing by hand is exactly the part that
+    changes most often. Every row here is derived, so it vanishes the moment the other
+    person moves: Neville replies, the row is gone, and nothing was checked off.
+
+    GitLab and Jira only, deliberately -- facts, no model judgment, so no false-positive
+    risk on claims of the form "you owe X". Unanswered threads on your own MRs are
+    already demands on their arcs; the ledger does not restate them.
+    """
+    me = gitlab_me(repo)
+    # The three sources share nothing, so they run at once -- measured serially they cost
+    # 14s of wall clock, which is most of the whole tool's budget spent on one section.
+    with futures.ThreadPoolExecutor(max_workers=3) as pool:
+        f_they = pool.submit(ledger_they_owe, repo, mrs, me) if me else None
+        f_you = pool.submit(ledger_you_owe, repo, me) if me else None
+        f_jira = pool.submit(ledger_jira_stalled)
+        they = f_they.result() if f_they else []
+        you, covered = f_you.result() if f_you else ([], 0)
+        they += f_jira.result()
+    they.sort(key=lambda e: (-(e.get("days") or 0), e["ref"]))
+    you.sort(key=lambda e: (-(e.get("days") or 0), e["ref"]))
+    return {"they_owe": they, "you_owe": you, "you_owe_covered": covered}
+
+
 def annotate_stacks(repo, mrs, main_ref):
     """For an MR aimed at another branch rather than main: what it waits on, and whether it
     could simply go onto main instead.
@@ -607,9 +798,24 @@ def collect_mrs(repo, deep=True):
             mr["pipeline"] = {"status": pipes[0].get("status", ""),
                               "url": pipes[0].get("web_url", ""),
                               "at": (pipes[0].get("updated_at") or "")[:10]}
+        # The two-pass answer to `unchecked`. The flag on the LIST call was measured making
+        # things worse -- it discards every cached verdict and returns `checking`, turning
+        # !10391's known `conflict` into an unknown. But an MR that reads `unchecked` HAS no
+        # cached verdict to lose, so asking GitLab to compute one costs nothing and cannot
+        # lie. The response still says `checking`, so it is thrown away: the point is that
+        # the verdict exists by the NEXT run. A recheck triggered on one run is answerable
+        # on the next, which is the only shape of fix the measurement left open.
+        if mr.get("merge_state") in ("", "unchecked"):
+            glab(repo, f"projects/:id/merge_requests/{mr['iid']}"
+                       "?with_merge_status_recheck=true")
+            mr["recheck_requested"] = True
 
     with futures.ThreadPoolExecutor(max_workers=8) as pool:
         list(pool.map(enrich, mrs))
+    rechecked = sum(1 for m in mrs if m.get("recheck_requested"))
+    if rechecked:
+        print(f"  {rechecked} MR(s) had no cached mergeability verdict; a recheck was "
+              "requested, so the next run will know", file=sys.stderr)
     return mrs, None
 
 
@@ -1920,6 +2126,18 @@ def main():
                 branches[name]["pipeline"] = pipe
     own_tokens = own_name_tokens(args.repo)
     mrs_known = not args.no_mr and mr_error is None
+    # The waiting-on ledger wants the same depth of MR access the thread fetch needed, so
+    # it follows the same gate. Nothing downstream depends on it -- a None renders as an
+    # absent section, which is the honest degradation when GitLab was not asked. It is
+    # network-bound while everything from here to the output is git-bound, so it runs
+    # underneath the squash index and the session scan instead of after them: measured,
+    # that turns 9s of its own wall clock into none. The write-side commands skip it --
+    # --park does not need to know who owes whom.
+    writing = args.park or args.unpark or args.authoritative or args.jira_ify
+    ledger_f = None
+    if mrs_known and not args.shallow_mr and not writing:
+        ledger_f = futures.ThreadPoolExecutor(max_workers=1).submit(
+            build_ledger, args.repo, mrs)
     if mrs_known:
         for name, fate in branch_mr_states(args.repo).items():
             if name in branches:
@@ -2003,6 +2221,8 @@ def main():
             sys.exit(f"work-arcs: {arc['label']} already is a ticket")
         sys.exit(jira_ify(args.repo, arc, args.dry_run))
 
+    ledger = ledger_f.result() if ledger_f else None
+
     gap = None
     if args.gap or args.json:
         issues, jira_error = collect_jira()
@@ -2080,6 +2300,7 @@ def main():
             "mr_error": mr_error,
             "arc_count": len(arcs),
             "arcs": arcs,
+            "ledger": ledger,
             "unattached_stashes": unattached,
             "stale_overrides": stale_overrides,
             "stale_parks": stale_parks,
@@ -2090,6 +2311,22 @@ def main():
 
     if mr_error:
         print(f"⚠ {mr_error}", file=sys.stderr)
+    if ledger and (ledger["they_owe"] or ledger["you_owe"]):
+        print("── the ledger ───────────────────────────────────────────")
+        for e in ledger["they_owe"]:
+            who = ", ".join(e["who"]) if isinstance(e["who"], list) else e["who"]
+            what = ("no response from " + who if e["kind"] == "review-silence"
+                    else f"with {who} ({e.get('status','')})")
+            print(f"  they owe you  {e['ref']:<9} {e.get('days','?'):>4}d  {what}")
+            print(f"                          └ {e['title'][:58]}")
+        for e in ledger["you_owe"]:
+            print(f"  you owe them  {e['ref']:<9} {e.get('days','?'):>4}d  "
+                  f"{e['who']} asked for your review")
+            print(f"                          └ {e['title'][:58]}")
+        if ledger["you_owe_covered"]:
+            print(f"  (+{ledger['you_owe_covered']} review requests already handled — "
+                  "you spoke or someone approved)")
+        print()
     for a in arcs:
         c = a["counts"]
         bits = [f"{c['branches']}b"]
