@@ -729,7 +729,7 @@ def render(data, lede, focus_days, limit):
             bits = []
             if tkt:
                 bits.append(link(i.get("url", ""), esc(tkt)))
-            if arc.get("authoritative"):
+            if arc.get("authoritative") and arc["authoritative"] != tkt:
                 bits.append(esc(arc["authoritative"]))
             rev = sorted({r for m in mrs for r in (m.get("reviewers") or [])})
             if rev:
@@ -776,7 +776,11 @@ def render(data, lede, focus_days, limit):
                   f'<td class="d">{cc.get("branches",0)}</td>'
                   f'<td class="d">{cc.get("sessions",0)}</td>'
                   f'<td class="n">{x.get("unpushed_live",0) or ""}</td>'
-                  f'<td><code>work-arcs --jira-ify {esc(x.get("label","?"))}</code></td>'
+                  # Quoted: since arc-brief started deriving labels they are phrases, so
+                  # the command as printed was `--jira-ify SMP Neighborhoods ODX journeys`
+                  # and the shell would hand --jira-ify only the first word.
+                  f"<td><code>work-arcs --jira-ify "
+                  f"'{esc(x.get('label','?'))}'</code></td>"
                   "</tr>")
             a("</tbody></table></div></section>")
 

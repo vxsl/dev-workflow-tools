@@ -557,9 +557,10 @@ def reconcile(arcs, issues):
         # ticket that has 114 is the kind of overstatement that costs the whole page its
         # credibility -- and this row exists to tell someone their ticket is lying.
         if i["handed_off"] and a["unpushed_live"] > 0:
+            n = a["unpushed_live"]
             mismatched.append({"issue": i, "arc": a,
-                               "why": f"status '{i['status']}' but {a['unpushed_live']} "
-                                      "commits never pushed"})
+                               "why": f"status '{i['status']}' but {n} "
+                                      f"commit{'' if n == 1 else 's'} never pushed"})
         elif not i["handed_off"] and a["age_days"] > 21:
             mismatched.append({"issue": i, "arc": a,
                                "why": f"status '{i['status']}' but untouched {a['age_days']}d"})
