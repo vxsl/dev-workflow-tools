@@ -251,7 +251,14 @@ def evidence_for(arc, repo, main, turns):
             state = []
             if m.get("conflicts"):
                 state.append(f"NO LONGER MERGES into {m.get('target') or 'main'}")
-            if m.get("approved"):
+            if m.get("approved") and m.get("qualifying"):
+                # Both halves, because either alone misleads. "Approved and still open"
+                # had the model writing "approved and waiting to merge" about a branch
+                # QA was in the middle of testing; the status alone would lose that the
+                # review is finished and only the verdict is outstanding.
+                state.append(f"approved; QA has the branch ({m['qualifying']}) and the "
+                             "merge waits on their verdict")
+            elif m.get("approved"):
                 state.append("approved and still open")
             pipe = m.get("pipeline") or {}
             if pipe.get("status") and pipe["status"] != "success":

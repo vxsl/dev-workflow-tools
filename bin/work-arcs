@@ -619,6 +619,35 @@ def collect_mrs(repo, deep=True):
 HANDED_OFF = {"in review", "mr", "in qualification", "releasing", "ready for review",
               "code review", "qa", "in qa", "verifying"}
 
+# The subset of those where somebody is testing the branch *right now*, and the merge is
+# the thing they are testing towards. Here qualification happens before the merge, not
+# after it: of the eleven MRs merged in the last ten days, every ticket that reached
+# In Qualification reached it before its own merge, never after -- UL-1773's moved at
+# 19:41 on the 5th and its !10391 was approved at 23:04 the same evening. So an approval
+# on a ticket in this set is not a cue to merge; it is a cue to wait for a verdict.
+#
+# Deliberately not all of HANDED_OFF. `releasing` and `done` sit on the far side of the
+# merge, so an open MR under those is a real contradiction and still worth shouting
+# about, and `passed qa` is exactly the moment the ball comes back -- matched whole
+# rather than by substring so it does not get swept up with `qa`.
+QUALIFYING = {"in qualification", "qualification", "qa", "in qa", "verifying",
+              "in verification", "testing", "in testing"}
+
+
+def mr_ticket(mr):
+    """The ticket a merge request is about: its branch first, its title second.
+
+    Per-MR rather than per-arc, because an arc holds several of each. This one's arc
+    carries fifteen branches and two MRs, and asking "is this arc in QA" would have
+    silenced the Playwright MR's demands on the strength of a ticket that has nothing
+    to do with it.
+    """
+    for text in (mr.get("branch") or "", mr.get("title") or ""):
+        m = TICKET_RE.search(text.upper())
+        if m:
+            return m.group(0)
+    return None
+
 
 def collect_jira():
     """Open issues assigned to me. Jira is the declared picture of my work."""
@@ -1418,11 +1447,18 @@ def demands(arc):
                         "url": pipe.get("url") or m.get("url", ""),
                         "at": _day_epoch(pipe.get("at", ""))})
         stack = m.get("stack")
-        if m.get("approved") and not m.get("draft") and not stack:
+        # Not while QA has the branch. "!10391 is approved and still open — merge it" was
+        # the same shape of wrong as the stacked case below: an instruction to press a
+        # button that is not his to press yet. UL-1773 was approved, mergeable, targeting
+        # main and green -- and its ticket had moved to In Qualification, which in this
+        # workflow means somebody is testing that branch and the merge follows their
+        # verdict. Merging it would have pulled the thing out from under them.
+        if (m.get("approved") and not m.get("draft") and not stack
+                and not m.get("qualifying")):
             out.append({"kind": "approved",
                         "what": f"{ref} is approved and still open — merge it",
                         "url": m.get("url", ""), "at": mr_at, "at_is_proxy": True})
-        elif m.get("approved") and not m.get("draft"):
+        elif m.get("approved") and not m.get("draft") and stack:
             # Approved and unmergeable, which is a different obligation from approved and
             # ready. What it needs is a decision about the stack, and the demand carries the
             # evidence for that decision rather than sending you to the MR to work it out.
@@ -1616,6 +1652,15 @@ def finalize(arc, repo=None, main_ref="origin/main"):
     if not arc["ticket"] and arc.get("issues"):
         arc["ticket"] = arc["issues"][0]["key"]
 
+    # Which merge requests are out being qualified, joined per MR through its own ticket.
+    # Empty on the first pass, when no Jira call has happened yet -- like everything else
+    # here it is recomputed rather than added to, so the pass after reconcile is where it
+    # lands and nothing has to remember to clear it.
+    in_qa = {i["key"]: i.get("status") for i in arc.get("issues", [])
+             if (i.get("status") or "").strip().lower() in QUALIFYING}
+    for m in arc["mrs"]:
+        m["qualifying"] = in_qa.get(mr_ticket(m))
+
     # How far this workstream has got, which is a fact about it rather than a verdict on
     # it. The old vocabulary was `at risk` / `idle` / `active`, and `at risk` was correctly
     # called useless: it is a severity word standing where a fact should be, and it told you
@@ -1673,7 +1718,11 @@ def finalize(arc, repo=None, main_ref="origin/main"):
         # and rank first. It also used to be asserted from the MR's existence alone, which
         # is how work nobody had been asked to review reported as being reviewed.
         arc["stage"] = "in-review"
-        arc["state"] = "in review"
+        # The same rung either way -- somebody else has it -- but not the same somebody,
+        # and "in review" about work a reviewer has already approved is a step behind
+        # where it has got to. The ticket's own word is used rather than a word of ours.
+        qa = next((m["qualifying"] for m in arc["mrs"] if m.get("qualifying")), None)
+        arc["state"] = qa.lower() if qa else "in review"
     elif arc["unpushed_live"]:
         arc["stage"] = "local-only"
         n = arc["unpushed_live"]
