@@ -232,7 +232,7 @@ details.parked>summary b{color:var(--ink);font-weight:600}
 
 .count{font-family:var(--mono);font-variant-numeric:tabular-nums}
 
-/* The conditions, as peers. There is no defensible exchange rate between "ella asked a
+/* The conditions, as peers. There is no defensible exchange rate between "a reviewer asked a
    question six days ago" and "79 commits exist nowhere but this laptop" -- ranking them
    against each other invents one, and the swathe of unpublished work is a primary problem
    in its own right rather than a lesser version of a stalled review. So: no hero figure

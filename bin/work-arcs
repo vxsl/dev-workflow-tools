@@ -60,7 +60,7 @@ def _ticket_re():
 
 
 TICKET_RE = re.compile(r"\b([A-Z]{2,4})-(\d{2,5})\b")  # replaced after load_env()
-# Branch names like `6919-review` and `6802-kyle` carry the number but not the
+# Branch names like `6919-review` and `6802-<initials>` carry the number but not the
 # project, so they look unkeyed. They are resolved against the keys that do appear.
 BARE_NUM_RE = re.compile(r"(?:^|[^0-9A-Za-z])(\d{4,5})(?:[^0-9]|$)")
 
@@ -327,17 +327,17 @@ def unresolved_threads(repo, iid, me=""):
     """Review threads on your own MR that nobody has resolved.
 
     Unresolved is not the same as unanswered, and calling them the same was a wrong
-    reminder of the worst kind -- it told Kyle four of ella's questions on !10398 were
-    waiting on him when he had replied to every one. GitLab's `resolved` flag flips only
-    when somebody clicks Resolve; a reply does not set it, and on this project nothing
-    forces anyone to. All four threads read ella → kylegm → ella → kylegm.
+    reminder of the worst kind -- it reported four of a reviewer's questions on !10398 as
+    waiting on you when you had replied to every one. GitLab's `resolved` flag flips only
+    when somebody clicks Resolve, and nothing on this project forces that. All four
+    threads read reviewer → author → reviewer → author.
 
     So each thread also records who spoke last. If it was you, the thread is answered and
     merely unresolved, which needs nothing from you beyond perhaps a click. If it was them,
     you owe a reply. Those are different obligations and the page must not merge them.
 
     `blocking_discussions_resolved` is the field that looks like it answers this and it
-    does not: on !10398 it reads True while four of ella's threads sit unresolved, because
+    does not: on !10398 it reads True while four reviewer threads sit unresolved, because
     this project does not require resolution to merge. It reports mergeability, not whether
     anyone is waiting on you.
 
@@ -353,7 +353,7 @@ def unresolved_threads(repo, iid, me=""):
         first = notes[0]
         body = first.get("body") or ""
         # An inline attachment is most of a note's characters and none of its meaning:
-        # one of ella's questions spent 90 of its first 180 on
+        # one reviewer's question spent 90 of its first 180 characters on
         # `![image](/uploads/bc04.../image.png){width=200...}`, which pushed the actual
         # question out of the excerpt. The quote has to carry what was asked.
         body = re.sub(r"!?\[[^\]]*\]\([^)]*\)(\{[^}]*\})?", " ", body)
@@ -384,7 +384,7 @@ def branch_mr_states(repo, pages=8):
 
     Measured: of 183 branches on the page, 37 had a merged MR and 8 a closed one, and 9
     whole arcs consisted of nothing else -- finished work rendered as live. The page told
-    Kyle to open a merge request for UL-1835, which had merged as !10449.
+    you to open a merge request for UL-1835, which had merged as !10449.
 
     One paginated sweep of every MR he has ever opened (500 of them, ~2s) answers it
     outright, which is cheaper and far more certain than inferring it from the graph.
@@ -840,11 +840,32 @@ def ticket_of(name, known_projects):
 PREFIX_STOPWORDS = {
     "hotfix", "fix", "fixes", "review", "wip", "temp", "tmp", "test", "tests",
     "feat", "feature", "chore", "bak", "backup", "old", "new", "try", "spike",
-    "kyle", "misc", "draft", "release",
+    "misc", "draft", "release",
 }
 
 
-def prefix_of(name):
+def own_name_tokens(repo):
+    """Your own name as branch-name tokens, so `alice-backup/...` is not an arc called
+    "alice".
+
+    A personal prefix describes who owns the branch, never what the work is -- the same
+    reason `hotfix` is stopped. This used to be one hardcoded username in the set above,
+    which worked for exactly one person and silently did nothing for anyone else. Taken
+    from git's own config instead, so it is derived and it generalises.
+    """
+    out = set()
+    for key in ("user.name", "user.email"):
+        val = git(repo, "config", "--get", key).strip().lower()
+        if not val:
+            continue
+        val = val.split("@")[0]
+        for tok in re.split(r"[^a-z0-9]+", val):
+            if len(tok) >= 3 and not tok.isdigit():
+                out.add(tok)
+    return out
+
+
+def prefix_of(name, stop=frozenset()):
     """A provisional arc name for work that never got a ticket.
 
     Groups the `adaptive` / `adaptive-bak` / `adaptive-bak-bak-bak` family that a
@@ -853,13 +874,13 @@ def prefix_of(name):
     """
     for token in re.split(r"[-/_.]", name):
         t = token.lower()
-        if len(t) >= 4 and t not in PREFIX_STOPWORDS and not t.isdigit():
+        if len(t) >= 4 and t not in PREFIX_STOPWORDS and t not in stop and not t.isdigit():
             return t
     return None
 
 
 def build_arcs(branches, stashes, mrs, sessions, main_ref, cluster_assign=None,
-               repo=None, mrs_known=True):
+               repo=None, mrs_known=True, own_tokens=frozenset()):
     known_projects = set()
     for name in branches:
         m = TICKET_RE.search(name.upper())
@@ -879,7 +900,7 @@ def build_arcs(branches, stashes, mrs, sessions, main_ref, cluster_assign=None,
         if key:
             assign[name] = ("ticket", key)
         else:
-            p = prefix_of(name)
+            p = prefix_of(name, own_tokens)
             if p:
                 prefix_members[p].append(name)
             else:
@@ -902,7 +923,7 @@ def build_arcs(branches, stashes, mrs, sessions, main_ref, cluster_assign=None,
     branch_to_arc = {n: assign[n][1] for n in branches}
 
     # A stash belongs to the arc of the branch it was taken on. Stashes are a weak
-    # signal here by policy: Kyle keeps meaningful work unstashed, so a stash is
+    # signal here by policy: meaningful work is kept unstashed, so a stash is
     # usually scratch. One with no arc to belong to is listed as unattached rather
     # than promoted to an arc of its own -- inventing 97 single-stash arcs was the
     # tail wagging the dog.
@@ -1110,6 +1131,27 @@ STAGE_OF = {"conflict": "came-back", "threads": "came-back", "pipeline": "came-b
             "unpushed": "local-only", "unreviewed": "not-proposed"}
 
 
+def own_activity(arc):
+    """The last time you yourself did anything here, as an epoch.
+
+    The dismissal mechanism for notifications, and the reason none is needed. "It came back
+    and I have not looked at it yet" is a comparison, not a checkbox: once he commits or
+    opens a session on the arc after the event, he has engaged with it and it stops being
+    news. Derived, so it self-heals -- and it expires in the only direction that matters.
+    """
+    ts = [b.get("committed", 0) for b in arc.get("branches", [])]
+    ts += [s.get("last", 0) for s in arc.get("sessions", [])]
+    return max(ts) if ts else 0
+
+
+def _day_epoch(text):
+    """A YYYY-MM-DD from the API as an epoch. Day resolution is all these carry."""
+    try:
+        return int(datetime.strptime(text[:10], "%Y-%m-%d").timestamp())
+    except (ValueError, TypeError):
+        return 0
+
+
 def demands(arc):
     """What this arc needs from *you*, worst first. Empty means it is someone else's turn.
 
@@ -1129,11 +1171,11 @@ def demands(arc):
             out.append({"kind": "conflict", "what": f"{ref} no longer merges into "
                         f"{m.get('target') or 'main'} — rebase", "url": m.get("url", "")})
         # One demand per MR, not per thread. Four threads produced four rows reading
-        # "ella asked, unanswered since 2026-08-13" with only the quote to tell them
+        # "asked, unanswered since 2026-08-13" with only the quote to tell them
         # apart, which is a list of the same sentence. Who is waiting and since when is
         # the demand; the questions are its evidence.
         # Two different obligations, and merging them produced the worst kind of wrong
-        # reminder: four of ella's threads reported as awaiting Kyle when he had replied to
+        # reminder: four reviewer threads reported as awaiting you when you had replied to
         # every one. Whoever spoke last says whose turn it is.
         threads = m.get("threads", [])
         for answered, kind in ((False, "threads"), (True, "unresolved")):
@@ -1319,7 +1361,7 @@ def finalize(arc, repo=None, main_ref="origin/main"):
     # either a rung of the ladder or the specific thing that came back.
     settled = arc.get("settled")
     arc["demands"] = [] if settled else demands(arc)
-    # Ranks WITHIN a rung only. There is no defensible exchange rate between "ella asked a
+    # Ranks WITHIN a rung only. There is no defensible exchange rate between "a reviewer asked
     # question six days ago" and "79 commits exist nowhere but this laptop", so the page
     # never sorts one against the other -- see `stage`.
     arc["urgency"] = (DEMAND_RANK.get(arc["demands"][0]["kind"], 9)
@@ -1461,6 +1503,7 @@ def main():
         for name, pipe in branch_pipelines(args.repo).items():
             if name in branches:
                 branches[name]["pipeline"] = pipe
+    own_tokens = own_name_tokens(args.repo)
     mrs_known = not args.no_mr and mr_error is None
     if mrs_known:
         for name, fate in branch_mr_states(args.repo).items():
@@ -1483,9 +1526,26 @@ def main():
     for name, n in already_upstream(args.repo, unaccounted, args.main).items():
         branches[name]["mr_fate"] = {"state": "merged", "iid": None, "at": "",
                                      "url": "", "via": f"all {n} commits already in main"}
+    # Everything below a merged tip merged with it. `metadata-latlng-geometry-full` holds
+    # six commits that are the same shas as six of `UL-1801`'s eight -- it is an ancestor,
+    # not a copy, so supersession correctly left it alone, and `git cherry` could not see it
+    # either because !10422 squash-merged: main gained one commit whose patch equals the
+    # branch's combined diff, so no individual commit matches. Ancestry answers it outright
+    # and the edges are already derived. Repo-wide rather than per-arc, since a stack can
+    # straddle two arcs.
+    for name, b in list(branches.items()):
+        if (b.get("mr_fate") or {}).get("state") != "merged":
+            continue
+        for anc in b.get("parents") or []:
+            if anc in branches and not branches[anc].get("mr_fate"):
+                branches[anc]["mr_fate"] = {
+                    "state": "merged", "iid": (b["mr_fate"] or {}).get("iid"),
+                    "at": (b["mr_fate"] or {}).get("at", ""),
+                    "url": (b["mr_fate"] or {}).get("url", ""),
+                    "via": f"an ancestor of {name}, which merged"}
     sessions = session_index(args.projects)
     arcs, unattached = build_arcs(branches, stashes, mrs, sessions, args.main,
-                                  cluster_assign, args.repo, mrs_known)
+                                  cluster_assign, args.repo, mrs_known, own_tokens)
 
     # File overlap cannot separate two tickets that edit the same module -- measured,
     # UB-6938 migrating the metric catalogs and UL-1634 hardening a lint rule over those
@@ -1498,7 +1558,7 @@ def main():
         if refined:
             cluster_assign = {**cluster_assign, **refined}
             arcs, unattached = build_arcs(branches, stashes, mrs, sessions, args.main,
-                                          cluster_assign, args.repo, mrs_known)
+                                          cluster_assign, args.repo, mrs_known, own_tokens)
 
     if args.authoritative:
         set_override(arcs, args.authoritative)

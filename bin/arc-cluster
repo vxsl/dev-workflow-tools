@@ -70,7 +70,7 @@ STACK_SIM = float(os.environ.get("ARC_STACK_SIM", "0.9"))
 # one scores low purely because the big one is big -- `smp-selected-state` has 8 of its 10
 # files in the UL-1692 family, all of them feature-specific (NeighborhoodsMiniReport,
 # neighborhoodsMetricInstanceCatalog), and cosine still called it 0.375 while containment
-# calls it 0.973. Kyle identified that pair as one workstream; cosine could not.
+# calls it 0.973. The engineer identified that pair as one workstream; cosine could not.
 #
 # Containment alone is dangerous in exactly the way the plan documents: the recharts hotfix
 # scores 1.0 against UL-1773 on a single shared file. So it is gated on corroboration --
