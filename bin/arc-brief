@@ -35,6 +35,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -466,6 +467,18 @@ def parse_split(text, known):
     return out, ("; ".join(notes) if notes else None)
 
 
+# Voting nests a pool inside the arc pool, so `--jobs` has to mean what it says: without
+# this, 6 arcs in flight at 3 votes each is 18 concurrent model processes rather than the
+# 6 that were asked for. The outer pool stays wide so arcs keep moving; this caps what is
+# actually running.
+_MODEL_SLOTS = threading.BoundedSemaphore(6)
+
+
+def set_model_slots(n):
+    global _MODEL_SLOTS
+    _MODEL_SLOTS = threading.BoundedSemaphore(max(1, n))
+
+
 def ask_split_once(evidence, known, model, timeout, tries=2):
     prompt = SPLIT_PROMPT.replace("{evidence}", evidence)
     reason = "unknown"
@@ -473,9 +486,10 @@ def ask_split_once(evidence, known, model, timeout, tries=2):
         if attempt:
             time.sleep(2 * attempt)
         try:
-            r = headless_claude.run(
-                ["--model", model, "--dangerously-skip-permissions", prompt],
-                timeout=timeout)
+            with _MODEL_SLOTS:
+                r = headless_claude.run(
+                    ["--model", model, "--dangerously-skip-permissions", prompt],
+                    timeout=timeout)
         except (OSError, subprocess.SubprocessError) as e:
             reason = e.__class__.__name__
             continue
@@ -538,17 +552,35 @@ def consensus_bodies(runs, known):
     for n in sorted(known):
         groups[find(n)].append(n)
 
-    # Label each consensus group from whichever sampled body overlaps it most.
-    out = []
+    # Label each consensus group from whichever sampled body overlaps it most -- and
+    # never twice with the same name. Downstream, a body's name IS the arc it becomes:
+    # work-arcs groups branches by the label this returns, so two groups sharing a name
+    # are silently welded back into one and the split is computed and then thrown away.
+    # Seen for real on a 26-branch arc that consensus cut five ways and that named four
+    # of the five "Adaptive trend charts and metric time ranges".
+    out, used = [], set()
     for members in sorted(groups.values(), key=lambda g: (-len(g), g[0])):
         want = set(members)
-        best, score = "", -1
+        ranked = []
         for bodies in runs:
             for body in bodies:
+                nm = (body.get("name") or "").strip()
                 ov = len(want & set(body["branches"]))
-                if ov > score and body.get("name"):
-                    best, score = body["name"], ov
-        out.append({"name": best, "branches": members})
+                # Only names of bodies that actually contain some of these branches. A
+                # sibling group's label is not a fallback: it describes different work,
+                # and borrowing it to dodge a collision is worse than a collision.
+                if nm and ov:
+                    ranked.append((ov, nm))
+        ranked.sort(key=lambda x: (-x[0], x[1]))
+        name = next((nm for _, nm in ranked if nm not in used), "")
+        if not name:
+            # The name that fits is taken, so qualify it rather than reach for another
+            # group's: the branch is what a person would use to tell two slices of one
+            # sprawling effort apart.
+            base = ranked[0][1] if ranked else "unnamed"
+            name = f"{base} ({members[0]})"
+        used.add(name)
+        out.append({"name": name, "branches": members})
     return out
 
 
@@ -713,8 +745,11 @@ def do_split(data, repo, main_ref, args):
             work.append((arc, ev, fp, known))
 
     if work:
+        set_model_slots(args.jobs)
+        big = sum(1 for _, _, _, k in work if len(k) >= SPLIT_VOTE_AT)
         print(f"arc-brief --split: {hits} cached, {len(work)} to decide "
-              f"({args.model}, {args.jobs} at a time)", file=sys.stderr)
+              f"({args.model}, {args.jobs} at a time"
+              + (f", {big} voted ×{SPLIT_VOTES}" if big else "") + ")", file=sys.stderr)
         with futures.ThreadPoolExecutor(max_workers=max(1, args.jobs)) as pool:
             futs = {pool.submit(ask_split, ev, known, args.model, args.timeout):
                     (arc, fp, known) for arc, ev, fp, known in work}
