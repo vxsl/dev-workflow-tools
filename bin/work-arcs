@@ -469,6 +469,10 @@ def collect_mrs(repo, deep=True):
             "conflicts": bool(m.get("has_conflicts")) or state == "conflict",
             "approved": state == "mergeable",
             "reviewers": [r.get("username", "") for r in (m.get("reviewers") or [])],
+            # Assignees, because "who has this" is answered by either field and a project
+            # can use either. An MR nobody is named on is the thing worth knowing, and
+            # reading only one of the two fields would assert it on half the evidence.
+            "assignees": [x.get("username", "") for x in (m.get("assignees") or [])],
             "approvals": m.get("upvotes", 0),
             "threads": [],
             "pipeline": None,
@@ -1185,9 +1189,12 @@ def authoritative(arc):
 
 # The order is the whole point: what will bite you soonest, not what is biggest. Nothing
 # in this list is here because it is large -- each entry is a thing that cannot move until
-# you personally do something.
+# you personally do something. `unrequested` sits below `unpushed` and above `unreviewed`:
+# an MR nobody was asked to read is further along than a branch with no MR at all, and the
+# commits that exist nowhere but this laptop are the more basic problem than either.
 DEMAND_RANK = {"conflict": 0, "threads": 1, "pipeline": 2, "approved": 3,
-               "unpushed": 4, "unreviewed": 5, "draft": 6, "unresolved": 7}
+               "unpushed": 4, "unrequested": 5, "unreviewed": 6, "draft": 7,
+               "unresolved": 8}
 
 # Which rung a workstream sits on, decided by the worst thing outstanding. Derived from one
 # table so the ladder cannot drift from the demands it is meant to describe. `unresolved`
@@ -1195,7 +1202,8 @@ DEMAND_RANK = {"conflict": 0, "threads": 1, "pipeline": 2, "approved": 3,
 # it is a loose end on work that is still in someone else's hands.
 STAGE_OF = {"conflict": "came-back", "threads": "came-back", "pipeline": "came-back",
             "approved": "came-back", "draft": "came-back", "unresolved": "in-review",
-            "unpushed": "local-only", "unreviewed": "not-proposed"}
+            "unpushed": "local-only", "unreviewed": "not-proposed",
+            "unrequested": "no-reviewer"}
 
 
 def arc_fingerprint(arc):
@@ -1300,6 +1308,23 @@ def demands(arc):
             out.append({"kind": "draft",
                         "what": f"{ref} has been a draft for {arc['age_days']}d — nobody "
                                 "will review it", "url": m.get("url", "")})
+        # An open merge request nobody has been asked to look at. "In review" was asserted
+        # from the existence of the MR and nothing else, which made it the one claim on the
+        # page that could be false in the direction that costs days: work you believe is with
+        # a reviewer, that no reviewer has been told about. Measured here: of 18 open MRs, 5
+        # had no reviewer, no assignee and no comment, and every one was filed in the last
+        # three days -- the exact window in which you still think you handed it off.
+        #
+        # Narrow on purpose, because this accuses you of forgetting something. A draft is not
+        # meant to carry reviewers yet; an approval is proof somebody read it; a comment is
+        # proof somebody found it. Any of those and the MR is attended, whatever the reviewer
+        # field says.
+        if not (m.get("draft") or m.get("reviewers") or m.get("assignees")
+                or m.get("approvals") or m.get("notes")):
+            out.append({"kind": "unrequested",
+                        "what": f"{ref} has no reviewer and no comment — nobody has been "
+                                "asked to look at it",
+                        "url": m.get("url", ""), "at": mr_at, "at_is_proxy": True})
 
     for b in arc.get("branches", []):
         pipe = b.get("pipeline") or {}
@@ -1483,12 +1508,21 @@ def finalize(arc, repo=None, main_ref="origin/main"):
         n = arc["unpushed_live"]
         arc["state"] = (f"{n} commit exists" if n == 1 else f"{n} commits exist") + \
                        " only here"
+    elif worst == "unrequested":
+        # Its own rung, between "no merge request" and "out for review", because it is
+        # neither. The merge request is filed, so the work is not unproposed; no reviewer
+        # has it, so it is not under review. Collapsing it into either neighbour loses the
+        # only thing that makes it worth saying: this one looks handed off and is not.
+        arc["stage"] = "no-reviewer"
+        arc["state"] = "no reviewer asked"
     elif worst == "unreviewed":
         arc["stage"] = "not-proposed"
         arc["state"] = "pushed, no merge request"
     elif arc["mrs"]:
-        # An MR open with nothing outstanding: his end of the deal is done and the clock
-        # belongs to a reviewer. This used to read "waiting on review" and rank first.
+        # An MR open with nothing outstanding and somebody named on it: his end of the deal
+        # is done and the clock belongs to a reviewer. This used to read "waiting on review"
+        # and rank first. It also used to be asserted from the MR's existence alone, which
+        # is how work nobody had been asked to review reported as being reviewed.
         arc["stage"] = "in-review"
         arc["state"] = "in review"
     elif arc["unpushed_live"]:

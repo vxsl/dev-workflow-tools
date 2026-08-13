@@ -132,7 +132,7 @@ section{margin-bottom:3rem}
       letter-spacing:.07em;padding:.1rem .38rem;border-radius:2px;flex:none;
       border:1px solid currentColor;line-height:1.4}
 .chip.sev-0,.chip.sev-1,.chip.sev-2{color:var(--hot)}
-.chip.sev-3,.chip.sev-4,.chip.sev-5,.chip.sev-6{color:var(--warm)}
+.chip.sev-3,.chip.sev-4,.chip.sev-5,.chip.sev-6,.chip.sev-7{color:var(--warm)}
 .needs .what{color:var(--ink)}
 /* Anything asserting you owe someone an answer shows what they asked, verbatim. */
 blockquote{margin:.1rem 0 .1rem .2rem;padding:.35rem .6rem;background:var(--quote);
@@ -249,6 +249,19 @@ details.parked>summary b{color:var(--ink);font-weight:600}
 .ws .st{font-family:var(--mono);font-size:.7rem;color:var(--ink-soft);white-space:nowrap;
   font-variant-numeric:tabular-nums}
 .ws .ag{font-family:var(--mono);font-size:.7rem;color:var(--ink-faint);white-space:nowrap}
+
+/* Out for review with nothing outstanding, and somebody actually asked to read it: pushed,
+   proposed, handed over, nothing more to do from here for now. Every other row on this page
+   is a claim on his attention and this one is not, so it should not read at the same weight.
+   The green is not a severity — the rungs are still unranked against each other and still
+   uncoloured. It marks the one binary this page can honestly assert: whether the next move
+   is his. Muted name, calm state, calm edge; still open, still dated, still countable. */
+.ws[data-stage="in-review"]>summary{box-shadow:inset 3px 0 0 var(--calm)}
+.ws[data-stage="in-review"] .nm{color:var(--ink-soft)}
+.ws[data-stage="in-review"] .st{color:var(--calm)}
+/* And its opposite, which is what wearing that green undeservedly was hiding: a merge
+   request with nobody on it. Left neutral like every other rung — the words say it. */
+.ws[data-stage="no-reviewer"]>summary{box-shadow:inset 3px 0 0 var(--hairline)}
 .ws .body{padding:.2rem .7rem 1rem 7.2rem;display:flex;flex-direction:column;gap:.6rem}
 @media (max-width:52rem){
   .ws>summary{grid-template-columns:minmax(0,1fr) auto;row-gap:.1rem}
@@ -709,17 +722,24 @@ def heat(arc):
     So severity hue is reserved for the rung where something has demonstrably gone wrong --
     a branch that stopped merging, a question left hanging, a red pipeline. Every other rung
     is neutral, and its section heading already says what it is.
+
+    Calm is the one exception, and it is not a severity: work that is out for review with a
+    reviewer named on it is asking nothing of him. Whose move it is next is the only ranking
+    this page can make honestly, and it is worth making -- see the row styling, where the
+    same distinction is drawn.
     """
+    if arc.get("stage") == "in-review":
+        return "calm"
     if arc.get("stage") != "came-back":
         return "plain"
     return "hot" if arc.get("urgency", 99) <= 2 else "warm"
 
 
 DEMAND_LABEL = {"conflict": "rebase", "threads": "unanswered", "pipeline": "pipeline",
-                "approved": "merge it", "unpushed": "unpushed", "unreviewed": "no MR",
-                "draft": "draft"}
+                "approved": "merge it", "unpushed": "unpushed",
+                "unrequested": "no reviewer", "unreviewed": "no MR", "draft": "draft"}
 DEMAND_SEV = {"conflict": 0, "threads": 1, "pipeline": 2, "approved": 3,
-              "unpushed": 4, "unreviewed": 5, "draft": 6}
+              "unpushed": 4, "unrequested": 5, "unreviewed": 6, "draft": 7}
 
 
 def render(data, lede, focus_days, limit):
@@ -743,8 +763,13 @@ def render(data, lede, focus_days, limit):
     buckets = []
     for key, title, test in BUCKETS:
         got = [x for x in live if test(x.get("age_days", 999))]
-        # Within a bucket, the biggest unfinished thing first. No cross-rung ordering.
-        got.sort(key=lambda x: (-x.get("unpushed_live", 0), -x.get("engagement", 0)))
+        # Within a bucket: what still wants something from him, then the biggest unfinished
+        # thing. Still no ordering between rungs -- the only split applied here is whether the
+        # next move is his, and work that is genuinely out for review sinks below work that is
+        # not. That is a fact about whose clock is running, not a claim that review matters
+        # less; it is the same judgement that stopped "waiting on review" rendering hot.
+        got.sort(key=lambda x: (x.get("stage") == "in-review",
+                                -x.get("unpushed_live", 0), -x.get("engagement", 0)))
         if got:
             buckets.append((key, title, got))
     gap = data.get("gap") or {}
@@ -847,8 +872,8 @@ def render(data, lede, focus_days, limit):
         # A demand that merely restates the rung is noise. In "Only on this laptop" the
         # unpushed count was said three times on one card -- in the subhead, again as a
         # demand row, and again in the footer -- which is how a card stops being read.
-        tautology = {"local-only": "unpushed", "not-proposed": "unreviewed"}.get(
-            arc.get("stage"))
+        tautology = {"local-only": "unpushed", "not-proposed": "unreviewed",
+                     "no-reviewer": "unrequested"}.get(arc.get("stage"))
         shown_d = [d for d in arc.get("demands", []) if d["kind"] != tautology]
         if shown_d:
             a('<ul class="needs">')
@@ -947,6 +972,7 @@ def render(data, lede, focus_days, limit):
         when = "today" if age <= 0 else (f"{age}d ago")
         a(f'<details class="ws" data-key="{esc(arc.get("label",""))}" '
           f'data-fp="{esc(arc.get("fingerprint",""))}" '
+          f'data-stage="{esc(arc.get("stage") or "")}" '
           f'data-parked="{1 if arc.get("parked") else 0}">')
         a("<summary>")
         a(link(i.get("url", ""), esc(tkt), "tkt") if tkt
@@ -960,8 +986,8 @@ def render(data, lede, focus_days, limit):
         a('<div class="body">')
         if brief.get("summary"):
             a(f'<p class="arc-sum">{esc(brief["summary"])}</p>')
-        tautology = {"local-only": "unpushed", "not-proposed": "unreviewed"}.get(
-            arc.get("stage"))
+        tautology = {"local-only": "unpushed", "not-proposed": "unreviewed",
+                     "no-reviewer": "unrequested"}.get(arc.get("stage"))
         shown_d = [d for d in arc.get("demands", []) if d["kind"] != tautology]
         if shown_d:
             a('<ul class="needs">')
@@ -1036,6 +1062,7 @@ def render(data, lede, focus_days, limit):
     loc = by_rung.get("local-only", [])
     back = by_rung.get("came-back", [])
     rev = by_rung.get("in-review", [])
+    noask = by_rung.get("no-reviewer", [])
     prop = by_rung.get("not-proposed", [])
     parked = by_rung.get("parked", [])
     done = by_rung.get("landed", []) + by_rung.get("abandoned", [])
@@ -1045,7 +1072,10 @@ def render(data, lede, focus_days, limit):
         (len(back), "have come back to you",
          "a rebase, a question, a red pipeline, an unmerged approval"),
         (len(prop), "are pushed but never proposed", "no merge request exists"),
-        (len(rev), "are out for review", "nothing outstanding — a reviewer&rsquo;s clock"),
+        (len(noask), "have a merge request nobody was asked to read",
+         "open, no reviewer, no comment — it is not moving"),
+        (len(rev), "are out for review",
+         "nothing outstanding, somebody has it — a reviewer&rsquo;s clock"),
         (len(parked), "are parked", "set aside on purpose, not forgotten"),
         (len(done), "have landed or been abandoned", "retired from the list below"),
     ]
@@ -1063,9 +1093,12 @@ def render(data, lede, focus_days, limit):
       f'<span class="n">{len(live)} workstreams</span></div>')
     a('<p class="note">Grouped by when you last touched each one, and within a group by '
       "how much unfinished work it holds. Each row says which rung it has reached — only "
-      "here, pushed, proposed, in review — but no rung is ranked against another: "
-      "unpublished work is a first-class problem, not a milder stalled review. Open a row "
-      "for what it is, what it needs, and how its branches relate. "
+      "here, pushed, proposed, nobody asked, in review — but no rung is ranked against "
+      "another: unpublished work is a first-class problem, not a milder stalled review. "
+      "The one split the page does make is whether the next move is yours: a row in "
+      "<span style=\"color:var(--calm)\">green</span> is out for review with someone "
+      "named on it and wants nothing from you, so it sits at the foot of its group. "
+      "Open a row for what it is, what it needs, and how its branches relate. "
       "<strong>Park</strong> sets one aside as backlog; it comes back on its own as soon "
       "as a commit lands on it.</p>")
     for key, title, got in buckets:
