@@ -246,6 +246,7 @@ details.parked>summary b{color:var(--ink);font-weight:600}
 .ws .tkt{font-family:var(--mono);font-size:.72rem;color:var(--accent);white-space:nowrap}
 .ws .tkt.none{color:var(--warm);opacity:.75}
 .ws .nm{color:var(--ink);font-size:.9rem;min-width:0}
+.ws .onbr{font-family:var(--mono);font-size:.68rem;color:var(--ink-faint)}
 .ws .st{font-family:var(--mono);font-size:.7rem;color:var(--ink-soft);white-space:nowrap;
   font-variant-numeric:tabular-nums}
 .ws .ag{font-family:var(--mono);font-size:.7rem;color:var(--ink-faint);white-space:nowrap}
@@ -977,7 +978,13 @@ def render(data, lede, focus_days, limit):
         a("<summary>")
         a(link(i.get("url", ""), esc(tkt), "tkt") if tkt
           else '<span class="tkt none">no ticket</span>')
-        a(f'<span class="nm">{nm}</span>')
+        # The branch, where there is no ticket to identify the row. Four arcs came out with
+        # near-identical lat/lng-in-metadata names, two of them finished, and with no key and
+        # no branch on the row there was nothing on screen to tell them apart.
+        auth = arc.get("authoritative")
+        a(f'<span class="nm">{nm}'
+          + (f' <span class="onbr">{esc(auth)}</span>' if auth and not tkt else "")
+          + "</span>")
         a(f'<span class="st">{esc(arc.get("state",""))}</span>')
         a(f'<span class="ag">{esc(when)}</span>')
         a('<button class="park" type="button" '
@@ -1013,6 +1020,11 @@ def render(data, lede, focus_days, limit):
         if arc.get("unpushed_only_on_copies"):
             a(f"<span>{arc['unpushed_only_on_copies']} only on a superseded copy</span>")
         a(f"<span>{plural(c.get('branches',0),'branch').replace('branchs','branches')}</span>")
+        # Says outright that part of this arc is finished. Both of the "isn't this already
+        # done?" reports were arcs where some branches had merged and some had not, and
+        # nothing on the row admitted the mixture.
+        if arc.get("landed_branches"):
+            a(f"<span>{arc['landed_branches']} already merged</span>")
         if arc.get("superseded"):
             a(f"<span>{arc['superseded']} superseded</span>")
         if c.get("sessions"):

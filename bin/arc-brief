@@ -61,6 +61,11 @@ Read the branch annotations literally and do not go beyond them:
 
 - `[THE WORK]` marks the branch that IS this arc -- normally the source branch of its
   merge request. Describe the arc as that branch's change. The others are its history.
+- **Name the arc for what is still outstanding, not for what has finished.** A branch marked
+  ALREADY MERGED or ABANDONED is done; its commit subjects are here as context for what the
+  remaining work sits on top of. If the merged branches were about one thing and the
+  unmerged ones about another, the arc is named after the unmerged ones. An engineer reading
+  a name that describes finished work will believe the whole arc is finished.
 - A branch marked as a superseded copy holds commits that already exist on the branch
   named. It is a cherry-pick, a pre-squash remnant or an abandoned rebase. It is NOT a
   second piece of work, NOT work happening elsewhere, and NOT something left undone.
@@ -74,10 +79,14 @@ Return ONLY a JSON object, no prose and no code fence:
 
 {"name": "...", "summary": "...", "blocker": "..."}
 
-name     What this work IS, 3-7 words, in the engineer's own vocabulary as it appears in
-         the evidence. Not a ticket key, not a branch name, not a file path. Say the
-         subject matter. Good: "Dove catalog gating and dual-map neighborhoods". Bad:
+name     What the OUTSTANDING work IS, 3-7 words, in the engineer's own vocabulary as it
+         appears in the evidence. Not a ticket key, not a branch name, not a file path. Say
+         the subject matter. Good: "Dove catalog gating and dual-map neighborhoods". Bad:
          "UL-1632", "various fixes", "frontend work".
+         Be specific enough to tell this arc from a neighbouring one. Several arcs in this
+         repo touch lat/lng geometry in metadata, and generic names made four of them nearly
+         indistinguishable on the page -- two of which were finished. Name the particular
+         thing this arc does: which layer, which consumer, which stage of the change.
 summary  Two sentences on what this work is doing and where it stands. Concrete: name
          the actual behaviour being changed. Draw on the prompts -- they say what the
          engineer was chasing in a way branch names never do. Never restate the counts
@@ -196,6 +205,16 @@ def spawn_tree(branches):
         marks = []
         if b.get("authoritative"):
             marks.append("THE WORK")
+        fate = (b.get("mr_fate") or {}).get("state")
+        if fate == "merged":
+            # Without this the namer cannot tell finished branches from live ones, and it
+            # named an arc "Per-stream catalog gating with on-screen metadata first" after
+            # the two branches that had already merged -- while the four branches actually
+            # outstanding were about hydrating time filters and prioritising stream
+            # metadata. The card then read as work that was already done.
+            marks.append("ALREADY MERGED — finished, not outstanding")
+        elif fate == "closed":
+            marks.append("ABANDONED — its merge request was closed")
         if b.get("superseded_by") in names:
             marks.append(f"{b.get('superseded_kind', 'duplicate')} already on "
                          f"{b['superseded_by']} — a superseded copy, not separate work")
