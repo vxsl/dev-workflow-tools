@@ -430,6 +430,74 @@ def branch_pipelines(repo):
     return by_ref
 
 
+def annotate_stacks(repo, mrs, main_ref):
+    """For an MR aimed at another branch rather than main: what it waits on, and whether it
+    could simply go onto main instead.
+
+    "!10269 is approved and still open — merge it" was wrong advice, and wrong in the way
+    that costs a day rather than a click: merging it would have merged UL-1633 into
+    UL-1692, whose own MR !10398 is open, unapproved, and carrying four unresolved review
+    threads. Approved work sat there looking one button from landing while the button did
+    something else. The target branch was already being collected and never read.
+
+    The escape hatch is the part worth deriving automatically, because it is what nobody
+    checks by hand. A three-way merge with the current target as the base replays exactly
+    the commits this MR adds and nothing underneath them, so "could this be rebased onto
+    main" is answerable with no worktree, no checkout and no rebase attempted. Measured
+    here: !10269 is one commit and lands clean, !10398 is twenty-one and lands clean, and
+    !10419 hits three conflicts — which is the difference between "retarget it now" and
+    "this one really is stacked".
+
+    Nothing is asserted where the refs are missing: a target that is not on the remote
+    cannot be compared against, and an unknown is recorded as an unknown.
+
+    What it waits on is asked of GitLab rather than of the MR list already in hand. That
+    list is `scope=created_by_me`, and a branch you stacked onto is very often not yours --
+    !10398 waits on !10407 and !10419 on !10380, both somebody else's, and looking only at
+    your own open MRs reported each of them as blocked by nothing at all.
+    """
+    main_branch = main_ref.split("/")[-1]
+    by_source = {m.get("branch"): m for m in mrs}
+    for m in mrs:
+        tgt, src = m.get("target") or "", m.get("branch") or ""
+        if not tgt or not src or tgt == main_branch:
+            continue
+        src_ref, tgt_ref = f"origin/{src}", f"origin/{tgt}"
+        if not all(git(repo, "rev-parse", "--verify", "-q", r).strip()
+                   for r in (src_ref, tgt_ref)):
+            continue
+        blocker = by_source.get(tgt)
+        if blocker is None:
+            found = glab(repo, f"projects/:id/merge_requests?source_branch="
+                               f"{urllib.parse.quote(tgt, safe='')}&state=all&per_page=20")
+            # An open one is what is actually in the way; a merged one means the target has
+            # already landed and this MR is simply pointed at a stale branch.
+            for want in ("opened", "merged", "closed"):
+                hit = next((x for x in (found or []) if x.get("state") == want), None)
+                if hit:
+                    blocker = {"iid": hit.get("iid"),
+                               "approved": (hit.get("detailed_merge_status")
+                                            or "") == "mergeable",
+                               "state": want}
+                    break
+        r = subprocess.run(["git", "-C", str(repo), "merge-tree", "--write-tree",
+                            f"--merge-base={tgt_ref}", main_ref, src_ref],
+                           capture_output=True, text=True)
+        # 0 clean, 1 conflicted, anything else is git failing rather than answering.
+        clean = r.returncode == 0 if r.returncode in (0, 1) else None
+        paths = sorted({ln.split(" in ", 1)[-1].strip() for ln in r.stdout.splitlines()
+                        if ln.startswith("CONFLICT")})
+        m["stack"] = {
+            "target": tgt,
+            "blocked_by": blocker.get("iid") if blocker else None,
+            "blocker_approved": bool(blocker.get("approved")) if blocker else None,
+            "blocker_state": (blocker.get("state", "opened") if blocker else None),
+            "own": len(lines(git(repo, "rev-list", f"{tgt_ref}..{src_ref}"))),
+            "rebase_clean": clean,
+            "conflicts": paths[:8],
+        }
+
+
 def collect_mrs(repo, deep=True):
     """Open MRs of mine, with enough state to say whose court the ball is in.
 
@@ -1192,18 +1260,18 @@ def authoritative(arc):
 # you personally do something. `unrequested` sits below `unpushed` and above `unreviewed`:
 # an MR nobody was asked to read is further along than a branch with no MR at all, and the
 # commits that exist nowhere but this laptop are the more basic problem than either.
-DEMAND_RANK = {"conflict": 0, "threads": 1, "pipeline": 2, "approved": 3,
-               "unpushed": 4, "unrequested": 5, "unreviewed": 6, "draft": 7,
-               "unresolved": 8}
+DEMAND_RANK = {"conflict": 0, "threads": 1, "pipeline": 2, "approved": 3, "stacked": 4,
+               "unpushed": 5, "unrequested": 6, "unreviewed": 7, "draft": 8,
+               "unresolved": 9}
 
 # Which rung a workstream sits on, decided by the worst thing outstanding. Derived from one
 # table so the ladder cannot drift from the demands it is meant to describe. `unresolved`
 # maps to in-review because a thread you have already answered has not come back to you --
 # it is a loose end on work that is still in someone else's hands.
 STAGE_OF = {"conflict": "came-back", "threads": "came-back", "pipeline": "came-back",
-            "approved": "came-back", "draft": "came-back", "unresolved": "in-review",
-            "unpushed": "local-only", "unreviewed": "not-proposed",
-            "unrequested": "no-reviewer"}
+            "approved": "came-back", "stacked": "came-back", "draft": "came-back",
+            "unresolved": "in-review", "unpushed": "local-only",
+            "unreviewed": "not-proposed", "unrequested": "no-reviewer"}
 
 
 def arc_fingerprint(arc):
@@ -1300,9 +1368,39 @@ def demands(arc):
                         "what": f"{ref} pipeline {pipe['status']} on {pipe.get('at','')}",
                         "url": pipe.get("url") or m.get("url", ""),
                         "at": _day_epoch(pipe.get("at", ""))})
-        if m.get("approved") and not m.get("draft"):
+        stack = m.get("stack")
+        if m.get("approved") and not m.get("draft") and not stack:
             out.append({"kind": "approved",
                         "what": f"{ref} is approved and still open — merge it",
+                        "url": m.get("url", ""), "at": mr_at, "at_is_proxy": True})
+        elif m.get("approved") and not m.get("draft"):
+            # Approved and unmergeable, which is a different obligation from approved and
+            # ready. What it needs is a decision about the stack, and the demand carries the
+            # evidence for that decision rather than sending you to the MR to work it out.
+            if not stack.get("blocked_by"):
+                waits = f"{stack['target']} has to land first"
+            elif stack.get("blocker_state") == "opened":
+                waits = f"!{stack['blocked_by']} has to land first"
+            else:
+                # The target's own MR is already finished, so nothing is in the way at all
+                # -- the MR is just still pointed at a branch that has served its purpose.
+                waits = (f"its target's own !{stack['blocked_by']} already "
+                         f"{stack['blocker_state']}, so nothing is waiting on anything")
+            n = stack.get("own") or 0
+            if stack.get("rebase_clean") is True:
+                how = (f"rebasing its {n} commit onto main is clean" if n == 1
+                       else f"rebasing its {n} commits onto main is clean")
+                how += " — retarget it and merge today"
+            elif stack.get("rebase_clean") is False:
+                c = len(stack.get("conflicts") or [])
+                how = (f"rebasing onto main conflicts in {c} file"
+                       + ("" if c == 1 else "s") + ", so the stack is real")
+            else:
+                how = "whether it rebases onto main could not be determined"
+            out.append({"kind": "stacked",
+                        "what": f"{ref} is approved but targets {stack['target']}, not "
+                                f"main — {waits}; {how}",
+                        "quotes": stack.get("conflicts") or [],
                         "url": m.get("url", ""), "at": mr_at, "at_is_proxy": True})
         if m.get("draft") and arc.get("age_days", 0) > 14:
             out.append({"kind": "draft",
@@ -1499,7 +1597,9 @@ def finalize(arc, repo=None, main_ref="origin/main"):
         arc["state"] = {
             "conflict": "no longer merges", "threads": "awaiting your reply",
             "pipeline": "pipeline failed", "approved": "approved, not merged",
-            "draft": "still a draft",
+            # Not "approved, not merged", which reads as an oversight. Nothing was
+            # overlooked here: it is approved and it cannot be merged where it points.
+            "stacked": "approved, stacked", "draft": "still a draft",
         }[worst]
     elif worst == "unpushed":
         # The rung follows the worst thing outstanding, MR or no MR: an arc holding an open
@@ -1635,6 +1735,7 @@ def main():
     branches = collect_branches(args.repo, args.main)
     stashes = collect_stashes(args.repo)
     mrs, mr_error = ([], None) if args.no_mr else collect_mrs(args.repo, not args.shallow_mr)
+    annotate_stacks(args.repo, mrs, args.main)
     if not args.no_mr:
         for name, pipe in branch_pipelines(args.repo).items():
             if name in branches:

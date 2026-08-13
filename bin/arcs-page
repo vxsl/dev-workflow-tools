@@ -111,6 +111,9 @@ section{margin-bottom:3rem}
 .arc-sub .key-2nd{color:var(--ink-faint)}
 .arc-sub .label{font-style:italic;color:var(--ink-faint)}
 .arc-sub .auth{color:var(--ink-soft)}
+/* Where a merge request points, when that is not main. Warm rather than faint: an MR aimed
+   at another branch is a condition of the work, not a footnote about it. */
+.arc-sub .stack{color:var(--warm)}
 /* Text takes an ink token, never `--hue`. --hue exists to paint the card's top edge, and
    on a neutral card it is the hairline colour -- so borrowing it for the state and the
    blocker rendered both of them invisible against the surface. */
@@ -132,7 +135,7 @@ section{margin-bottom:3rem}
       letter-spacing:.07em;padding:.1rem .38rem;border-radius:2px;flex:none;
       border:1px solid currentColor;line-height:1.4}
 .chip.sev-0,.chip.sev-1,.chip.sev-2{color:var(--hot)}
-.chip.sev-3,.chip.sev-4,.chip.sev-5,.chip.sev-6,.chip.sev-7{color:var(--warm)}
+.chip.sev-3,.chip.sev-4,.chip.sev-5,.chip.sev-6,.chip.sev-7,.chip.sev-8{color:var(--warm)}
 .needs .what{color:var(--ink)}
 /* Anything asserting you owe someone an answer shows what they asked, verbatim. */
 blockquote{margin:.1rem 0 .1rem .2rem;padding:.35rem .6rem;background:var(--quote);
@@ -752,10 +755,10 @@ def heat(arc):
 
 
 DEMAND_LABEL = {"conflict": "rebase", "threads": "unanswered", "pipeline": "pipeline",
-                "approved": "merge it", "unpushed": "unpushed",
+                "approved": "merge it", "stacked": "stacked", "unpushed": "unpushed",
                 "unrequested": "no reviewer", "unreviewed": "no MR", "draft": "draft"}
-DEMAND_SEV = {"conflict": 0, "threads": 1, "pipeline": 2, "approved": 3,
-              "unpushed": 4, "unrequested": 5, "unreviewed": 6, "draft": 7}
+DEMAND_SEV = {"conflict": 0, "threads": 1, "pipeline": 2, "approved": 3, "stacked": 4,
+              "unpushed": 5, "unrequested": 6, "unreviewed": 7, "draft": 8}
 
 
 def render(data, lede, focus_days, limit):
@@ -1024,9 +1027,28 @@ def render(data, lede, focus_days, limit):
             a("</ul>")
         elif brief.get("blocker"):
             a(f'<p class="blocker">{esc(brief["blocker"])}</p>')
+        told = {d.get("url") for d in shown_d if d["kind"] == "stacked"}
         for m in (arc.get("mrs") or [])[:3]:
             a(f'<div class="arc-sub">{link(m.get("url",""), "!" + str(m.get("iid")))}'
-              f'<span>{esc(m.get("title",""))[:90]}</span></div>')
+              f'<span>{esc(m.get("title",""))[:90]}</span>')
+            # Where an MR points, whenever that is not main. It is a fact about every stacked
+            # MR and not only the approved one whose demand fires -- an MR aimed at a branch
+            # rather than at main cannot land until that branch does, and the row said
+            # nothing about it at all. Suppressed where the demand above already said it,
+            # since that one carries the same facts and an instruction besides.
+            st = m.get("stack")
+            if st and m.get("url") not in told:
+                bits = ["&rarr; " + esc(st.get("target", ""))]
+                if st.get("blocked_by"):
+                    bits.append("behind !" + str(st["blocked_by"]))
+                if st.get("rebase_clean") is True:
+                    bits.append("rebase onto main: clean")
+                elif st.get("rebase_clean") is False:
+                    n = len(st.get("conflicts") or [])
+                    bits.append(f"rebase onto main: {n} conflict"
+                                + ("" if n == 1 else "s"))
+                a(f'<span class="stack">{" &middot; ".join(bits)}</span>')
+            a("</div>")
         a(spawn_svg(arc, base=base))
         a('<div class="metrics">')
         lv = arc.get("unpushed_live", 0)
