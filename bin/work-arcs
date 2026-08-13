@@ -840,7 +840,11 @@ def build_arcs(branches, stashes, mrs, sessions, main_ref, cluster_assign=None,
         # Once per branch. Adding it per session multiplied a branch's mentions by
         # how many sessions mentioned it, which put a 109,272 on a five-branch arc.
         arcs[key]["engagement"] = arcs[key].get("engagement", 0) + info["entries"]
-        for p in info["paths"]:
+        # sorted(), because `paths` is a set of strings and set iteration order varies
+        # between processes. That randomness reached the brief: prompts are emitted in
+        # session order, so 16 of 55 arcs produced different evidence text on two
+        # back-to-back runs and re-briefed for no reason at all.
+        for p in sorted(info["paths"]):
             if p in seen_session[key]:
                 continue
             seen_session[key].add(p)
@@ -1154,9 +1158,13 @@ def finalize(arc, repo=None, main_ref="origin/main"):
         "mrs": len(arc["mrs"]),
         "sessions": len(arc["sessions"]),
     }
-    arc["branches"].sort(key=lambda b: (-b["unpushed"], b["age_days"]))
-    arc["stashes"].sort(key=lambda s: -s["src_count"])
-    arc["sessions"].sort(key=lambda s: s["age_days"])
+    # Every ordering here needs a total tiebreak, because arc-brief fingerprints the
+    # evidence text and these orders decide it. `age_days` is a coarse integer, so ties are
+    # the common case rather than the exception, and a stable sort then preserves whatever
+    # order the input happened to arrive in.
+    arc["branches"].sort(key=lambda b: (-b["unpushed"], b["age_days"], b["name"]))
+    arc["stashes"].sort(key=lambda s: (-s["src_count"], s["ref"]))
+    arc["sessions"].sort(key=lambda s: (-s["last"], s["id"]))
 
 
 def main():
