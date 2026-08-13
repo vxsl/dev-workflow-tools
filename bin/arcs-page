@@ -89,8 +89,18 @@ section{margin-bottom:3rem}
 .arc.is-hot{--hue:var(--hot);background:var(--hot-wash)}
 .arc.is-warm{--hue:var(--warm)}
 .arc.is-calm{--hue:var(--calm)}
+/* The default. A rung is not a severity, so it gets no colour -- the heading says what it
+   is, and the hairline top edge keeps the card's shape without making a claim. */
+.arc.is-plain{--hue:var(--hairline)}
 .arc-name{font-family:var(--serif);font-size:1.12rem;line-height:1.3;color:var(--ink);
           letter-spacing:-.01em;text-wrap:balance;margin:0}
+/* The ticket key is part of the name, not metadata about it. Mono against the serif so
+   the identifier reads as an identifier, at the same size so neither outranks the other. */
+.arc-name .tkt{font-family:var(--mono);font-size:.86em;color:var(--accent);
+               text-decoration:none}
+.arc-name .tkt:hover{text-decoration:underline}
+.arc-name .sep{color:var(--ink-faint);margin:0 .38em;font-weight:400}
+.arc-sub .noticket{color:var(--warm)}
 .arc-sub{display:flex;flex-wrap:wrap;align-items:baseline;gap:.2rem .55rem;
          font-family:var(--mono);font-size:.72rem;color:var(--ink-faint)}
 /* Three different things used to share one grey run-on line: the ticket the work is
@@ -101,12 +111,17 @@ section{margin-bottom:3rem}
 .arc-sub .key-2nd{color:var(--ink-faint)}
 .arc-sub .label{font-style:italic;color:var(--ink-faint)}
 .arc-sub .auth{color:var(--ink-soft)}
-.arc-state{text-transform:uppercase;letter-spacing:.06em;color:var(--hue,var(--ink-faint))}
+/* Text takes an ink token, never `--hue`. --hue exists to paint the card's top edge, and
+   on a neutral card it is the hairline colour -- so borrowing it for the state and the
+   blocker rendered both of them invisible against the surface. */
+.arc-state{text-transform:uppercase;letter-spacing:.06em;color:var(--ink-soft)}
+.arc.is-hot .arc-state,.arc.is-warm .arc-state{color:var(--hue)}
 .arc-sum{font-size:.87rem;line-height:1.5;color:var(--ink-soft);margin:0;
          text-wrap:pretty}
-.blocker{font-size:.8rem;color:var(--hue,var(--ink-soft));display:flex;gap:.4rem;
+.blocker{font-size:.8rem;color:var(--ink-soft);display:flex;gap:.4rem;
          align-items:baseline;margin:0}
-.blocker::before{content:"▲";font-size:.6rem;flex:none;opacity:.8}
+.arc.is-hot .blocker,.arc.is-warm .blocker{color:var(--hue)}
+.blocker::before{content:"▲";font-size:.6rem;flex:none;opacity:.8;color:var(--ink-faint)}
 
 /* What the arc needs from you, in form as well as words. The stripe colour and the chip
    agree, so severity survives being skimmed. */
@@ -216,6 +231,33 @@ details.parked>summary b{color:var(--ink);font-weight:600}
   color:var(--ink-faint)}
 
 .count{font-family:var(--mono);font-variant-numeric:tabular-nums}
+
+/* The conditions, as peers. There is no defensible exchange rate between "ella asked a
+   question six days ago" and "79 commits exist nowhere but this laptop" -- ranking them
+   against each other invents one, and the swathe of unpublished work is a primary problem
+   in its own right rather than a lesser version of a stalled review. So: no hero figure
+   (that would name one of them THE number), no severity hue (that would rank them by
+   colour), equal tiles. Each states a condition and how much of it there is. */
+.conditions{display:grid;grid-template-columns:repeat(auto-fit,minmax(11rem,1fr));
+  gap:.55rem;margin:0 0 2.5rem;list-style:none;padding:0}
+.conditions a{display:flex;flex-direction:column;gap:.1rem;text-decoration:none;
+  background:var(--surface);border:1px solid var(--hairline);border-radius:4px;
+  padding:.7rem .8rem;height:100%}
+.conditions a:hover{border-color:var(--accent)}
+/* Proportional figures, deliberately: tabular-nums gives every digit the width of a 0,
+   which makes a value like 740 look loose at display size. Tabular is for columns. */
+.conditions .v{font-family:var(--sans);font-size:1.6rem;font-weight:600;line-height:1.1;
+  color:var(--ink);letter-spacing:-.02em}
+.conditions .l{font-size:.78rem;color:var(--ink-soft);line-height:1.35;text-wrap:pretty}
+.conditions .sub{font-family:var(--mono);font-size:.68rem;color:var(--ink-faint)}
+
+.rung{display:flex;flex-wrap:wrap;align-items:baseline;gap:.2rem .6rem;margin:0 0 .2rem}
+.rung h2{margin:0}
+.rung .n{font-family:var(--mono);font-size:.75rem;color:var(--ink-faint);
+  font-variant-numeric:tabular-nums}
+.ladder-note{color:var(--ink-faint);font-size:.78rem;max-width:54em;margin:0 0 2rem;
+  padding-left:.7rem;border-left:2px solid var(--hairline)}
+h2:target{outline:2px solid var(--accent);outline-offset:.3rem;border-radius:2px}
 :focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 @media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
 """
@@ -238,18 +280,11 @@ def derive_lede(data, focus_days):
     arcs = [a for a in data.get("arcs", []) if a.get("age_days", 999) <= focus_days]
     bits = []
 
-    sharp = [a for a in arcs if a.get("urgency", 99) <= 3]
-    if sharp:
-        worst = min(sharp, key=lambda a: a["urgency"])
-        d = worst["demands"][0]
-        name = (worst.get("brief") or {}).get("name") or worst.get("label", "?")
-        others = len(sharp) - 1
-        bits.append(
-            f'<em>{esc(name)}</em> needs you: {esc(d["what"])}'
-            + (f", and {others} other arc{'s' if others != 1 else ''} "
-               f"{'are' if others != 1 else 'is'} waiting on something only you can do"
-               if others else "") + ".")
-
+    # Says what the tiles above it cannot. The tiles already carry every count, so opening
+    # with "411 commits across 23 workstreams" made the first paragraph a second reading of
+    # the row directly above -- and it quoted a different no-ticket number than the gap
+    # section further down, because the two count different things. Prose earns its place
+    # here only by stating the contradictions, which no tile can hold.
     mism = gap.get("status_mismatch") or []
     if mism:
         worst = max(mism, key=lambda m: m.get("arc", {}).get("unpushed_live", 0))
@@ -266,25 +301,22 @@ def derive_lede(data, focus_days):
     if unt:
         hidden = sum(a.get("unpushed_live", 0) for a in unt)
         bits.append(
-            f"{len(unt)} arc{'s' if len(unt) != 1 else ''} of real work "
+            f"{len(unt)} workstream{'s' if len(unt) != 1 else ''} of real work "
             f"{'have' if len(unt) != 1 else 'has'} no ticket at all"
             + (f", carrying {hidden} unpushed commits" if hidden else "")
             + " — invisible to Jira, and so absent from Trellis&rsquo;s capacity, "
               "burndown and every initiative rollup.")
 
-    if arcs and not sharp:
-        top = max(arcs, key=lambda a: a.get("unpushed_live", a.get("unpushed", 0)))
-        live = top.get("unpushed_live", top.get("unpushed", 0))
-        if live > 0:
-            c = top.get("counts", {})
-            name = (top.get("brief") or {}).get("name") or top.get("label", "?")
-            bits.append(
-                f'The heaviest is <em>{esc(name)}</em>: '
-                f'{live} unpushed across {c.get("branches",0)} branches '
-                f'and {c.get("sessions",0)} sessions.')
-
-    return " ".join(bits) if bits else (
-        "Nothing outstanding — every arc is pushed, ticketed, and says what it is.")
+    if bits:
+        return " ".join(bits)
+    # Only when Jira and the code agree, so the tiles are all there is to report.
+    loc = [a for a in arcs if a.get("stage") == "local-only"]
+    if loc:
+        n = sum(a.get("unpushed_live", 0) for a in loc)
+        return (f"Jira and the code agree on everything they both know about. What Jira "
+                f"does not know about is <em>{n} commits</em> across {len(loc)} "
+                f"workstreams that no remote has.")
+    return "Nothing outstanding — every workstream is pushed, ticketed, and says what it is."
 
 
 ROW, INDENT, PAD = 17, 15, 4
@@ -497,25 +529,22 @@ def link(url, text, cls=""):
 
 
 def heat(arc):
-    """Emphasis by what the arc needs from *you*, which is the opposite of what this did.
+    """Colour only where something is actually broken.
 
-    It used to mark "waiting on review" as hot, and that is exactly backwards: getting a
-    discrete piece of work up for review is most of the hard part done, and the clock that
-    is now running belongs to a reviewer. Meanwhile a branch that no longer merges, four
-    unanswered questions from ella, or an approved MR nobody pressed merge on all rendered
-    the same as everything else -- so the page's loudest signal was firing on the arcs that
-    needed nothing.
+    Two wrong versions preceded this. The first marked "waiting on review" hot, which is
+    backwards -- getting work up for review is most of the hard part done and the clock is
+    then a reviewer's. The second coloured by `urgency`, which painted every unpublished
+    workstream amber and so asserted that a swathe of local-only work is a milder form of a
+    stalled review. It is not a milder form of anything; it is a different problem, and the
+    page does not get to rank them.
 
-    Rank now follows `urgency`, which work-arcs derives from the same demand list the card
-    prints, so the colour and the words can never disagree. Nothing is downranked out of
-    sight: arcs with no demands get their own tier, counted and linked.
+    So severity hue is reserved for the rung where something has demonstrably gone wrong --
+    a branch that stopped merging, a question left hanging, a red pipeline. Every other rung
+    is neutral, and its section heading already says what it is.
     """
-    u = arc.get("urgency", 99)
-    if u <= 2:      # no longer merges / unanswered thread / failed pipeline
-        return "hot"
-    if u <= 6:      # approved-unmerged / unpushed / unreviewed / stale draft
-        return "warm"
-    return "calm"
+    if arc.get("stage") != "came-back":
+        return "plain"
+    return "hot" if arc.get("urgency", 99) <= 2 else "warm"
 
 
 DEMAND_LABEL = {"conflict": "rebase", "threads": "unanswered", "pipeline": "pipeline",
@@ -530,14 +559,18 @@ def render(data, lede, focus_days, limit):
     a = out.append
     base = data.get("project_url") or ""
     arcs = [x for x in data.get("arcs", []) if x.get("age_days", 999) <= focus_days]
-    # Urgency first, engagement second. Engagement alone answered "what have you been
-    # doing", which is not the question you open this page with.
-    arcs.sort(key=lambda x: (x.get("urgency", 99), -x.get("engagement", 0),
-                             x.get("age_days", 999)))
-    needs = [x for x in arcs if x.get("demands")]
-    parked = [x for x in arcs if not x.get("demands")]
-    shown = needs[:limit] if limit else needs
-    hidden = needs[len(shown):]
+    # Ranked WITHIN a rung, never across. Urgency orders the things that came back; for
+    # unpublished work the meaningful order is how much of it there is and how deep you went.
+    by_rung = {}
+    for x in arcs:
+        by_rung.setdefault(x.get("stage") or "local-only", []).append(x)
+    for k, v in by_rung.items():
+        if k == "came-back":
+            v.sort(key=lambda x: (x.get("urgency", 99), -x.get("engagement", 0)))
+        elif k in ("in-review", "landed", "abandoned"):
+            v.sort(key=lambda x: x.get("age_days", 999))
+        else:
+            v.sort(key=lambda x: (-x.get("unpushed_live", 0), -x.get("engagement", 0)))
     gap = data.get("gap") or {}
 
     try:
@@ -553,10 +586,11 @@ def render(data, lede, focus_days, limit):
     a('<div class="stamp">')
     a(f"<span>{esc(stamp)}</span>")
     a(f"<span>{link(base, esc(data.get('repo','')))}</span>")
-    a(f"<span>{data.get('arc_count',0)} arcs, {len(arcs)} active &le; {focus_days}d</span>")
-    a(f"<span>{len(needs)} need you, {len(parked)} in someone else&rsquo;s court</span>")
-    if len(shown) != len(needs):
-        a(f"<span>{len(shown)} shown</span>")
+    live = sum(len(v) for k, v in by_rung.items() if k not in ("landed", "abandoned"))
+    total = data.get("arc_count", 0)
+    a(f"<span>{len(arcs)} workstreams touched &le; {focus_days}d"
+      + (f", of {total}" if total and total != len(arcs) else "") + "</span>")
+    a(f"<span>{live} still going, {len(arcs) - live} settled</span>")
     a("</div>")
     lede = lede or derive_lede(data, focus_days)
     if lede:
@@ -570,33 +604,41 @@ def render(data, lede, focus_days, limit):
     def plural(n, word):
         return f"{n} {word}" + ("" if n == 1 else "s")
 
-    def subhead(arc, brief):
-        """The ticket, the other tickets, and the derived label — told apart.
+    def heading(arc, brief):
+        """The ticket belongs in the title, linked — it is half the name of the work.
 
-        These were one undifferentiated grey line, so an arc showed either a run of Jira
-        keys or a cluster label with nothing to say which was which, and many showed
-        neither. A key is an identifier other people share; a label is a phrase this
-        pipeline invented. Reading them the same way is how you come to trust a label as a
-        ticket number.
+        It used to sit in the grey subhead below, which read as metadata about the card
+        rather than as what the card is called. `UL-1692 · SMP Neighborhoods per-map
+        selected state` is how the work is referred to in speech, in Slack and in the MR
+        title, so it is how the card should be titled. Absence carries information too: a
+        heading with no key is a workstream nobody has filed.
         """
+        name = esc(brief.get("name") or arc.get("label", "?"))
+        tkt = arc.get("ticket")
+        if not tkt:
+            return f'<h3 class="arc-name">{name}</h3>'
+        i = next((x for x in arc.get("issues", []) if x.get("key") == tkt), {})
+        return ('<h3 class="arc-name">'
+                + link(i.get("url", ""), esc(tkt), "tkt")
+                + f'<span class="sep">·</span>{name}</h3>')
+
+    def subhead(arc, brief):
+        """What is left once the ticket has moved into the title: the other tickets it
+        touches, the branch that IS the work, and the state it has reached."""
         sub = []
         issues = {i.get("key"): i for i in arc.get("issues", [])}
         tkt = arc.get("ticket")
-        if tkt:
-            i = issues.get(tkt) or {}
-            sub.append(link(i.get("url", ""), esc(tkt), "key"))
         rest = [k for k in issues if k != tkt][:3]
         if rest:
             sub.append('<span class="key-2nd">also '
                        + " ".join(link(issues[k].get("url", ""), esc(k)) for k in rest)
                        + "</span>")
-        if not tkt and not brief.get("name"):
-            # Only worth showing when it is standing in for a name. Since arc-brief
-            # started splitting arcs the label is itself a derived phrase, so printing
-            # it under the heading just said the same thing twice.
-            sub.append(f'<span class="label" title="a label this pipeline derived from '
-                       f'the files these branches touched — not a ticket">'
-                       f'{esc(arc.get("label","?"))}</span>')
+        if not tkt:
+            # Said plainly rather than left to be inferred from a missing key. This is the
+            # invisible-work case the whole tool exists to surface, so it gets words.
+            sub.append('<span class="noticket" title="no Jira ticket names this work, so '
+                       'it is absent from Trellis, capacity and every rollup">'
+                       "no ticket</span>")
         if arc.get("authoritative"):
             mr = next((m for m in arc.get("mrs", [])
                        if m.get("branch") == arc["authoritative"]), None)
@@ -621,15 +663,21 @@ def render(data, lede, focus_days, limit):
         # The name the model derived, not the cluster label: `DE-3101` is what the
         # deterministic namer picked for an arc that is really the impedance work, and
         # a heading that misnames its own contents is worse than a terse one.
-        a(f'<h3 class="arc-name">{esc(brief.get("name") or arc.get("label","?"))}</h3>')
+        a(heading(arc, brief))
         a(subhead(arc, brief))
 
         if brief.get("summary"):
             a(f'<p class="arc-sum">{esc(brief["summary"])}</p>')
 
-        if arc.get("demands"):
+        # A demand that merely restates the rung is noise. In "Only on this laptop" the
+        # unpushed count was said three times on one card -- in the subhead, again as a
+        # demand row, and again in the footer -- which is how a card stops being read.
+        tautology = {"local-only": "unpushed", "not-proposed": "unreviewed"}.get(
+            arc.get("stage"))
+        shown_d = [d for d in arc.get("demands", []) if d["kind"] != tautology]
+        if shown_d:
             a('<ul class="needs">')
-            for d in arc["demands"][:4]:
+            for d in shown_d[:4]:
                 sev = DEMAND_SEV.get(d["kind"], 6)
                 lbl = DEMAND_LABEL.get(d["kind"], d["kind"])
                 what = link(d.get("url", ""), esc(d["what"]))
@@ -657,7 +705,7 @@ def render(data, lede, focus_days, limit):
 
         a('<div class="metrics">')
         live = arc.get("unpushed_live", arc.get("unpushed", 0))
-        if live:
+        if live and arc.get("stage") != "local-only":
             a(f"<span><b>{live}</b> unpushed</span>")
         dead = arc.get("unpushed_only_on_copies", 0)
         if dead:
@@ -672,72 +720,138 @@ def render(data, lede, focus_days, limit):
         a(f"<span>{arc.get('age_days','?')}d idle</span>")
         a("</div></div>")
 
-    # --- what needs you ----------------------------------------------------
-    a("<section>")
-    a("<h2>Needs you</h2>")
-    a('<p class="note">Ordered by what will bite soonest, not by what is biggest: a branch '
-      "that no longer merges, then a review question nobody answered, then a red pipeline, "
-      "an approval nobody acted on, and commits that exist only here. Every name and "
-      "description is derived from the arc&rsquo;s own evidence — its commits, tickets, "
-      "merge requests and the prompts you typed — and the diagram under each shows which "
-      "branch is the work.</p>")
-    a('<div class="arcs">')
-    for arc in shown:
-        card(arc)
-    a("</div>")
-    # A cap that hides more risk than it shows is not a display choice. At 12 cards this
-    # page was concealing 35 active arcs holding 282 unpushed commits -- more than the
-    # single heaviest arc its own lede named. If anything is held back now, it says so
-    # and says what it costs.
-    if hidden:
-        lost = sum(x.get("unpushed_live", 0) for x in hidden)
-        a(f'<p class="note">{len(hidden)} further '
-          f'arc{"s" if len(hidden) != 1 else ""} that need you, not shown'
-          + (f", holding {lost} unpushed commits" if lost else "")
-          + ". Raise <code>--limit</code>, or drop it to show every one.</p>")
-    a("</section>")
-
-    # --- what is out of your hands -----------------------------------------
-    # Downranked, and saying so. Every one of these is still on the page, counted, with a
-    # link to its MR -- the last time this page held work back it concealed 35 arcs and 282
-    # unpushed commits behind a `--limit`, and de-emphasis is not licence to repeat that.
-    if parked:
-        mr_n = sum(len(x.get("mrs") or []) for x in parked)
-        a("<section>")
-        a("<h2>In someone else&rsquo;s court</h2>")
-        a('<p class="note">Nothing here is waiting on you. Your end of the deal is done — '
-          "the work is up for review, nothing conflicts, no thread is unanswered, no "
-          "pipeline is red. Listed in full rather than hidden, because a reviewer going "
-          "quiet is how work disappears; if one of these comes back to you it moves up "
-          "into <em>Needs you</em> on the next run.</p>")
-        a("<details class=\"parked\"><summary>"
-          f"<b>{len(parked)}</b> arc{'s' if len(parked) != 1 else ''} handed off"
-          + (f", carrying <b>{mr_n}</b> open merge request"
-             f"{'s' if mr_n != 1 else ''}" if mr_n else "")
-          + "</summary>")
+    def rows(bucket, note_reviewers=False):
+        """The compact form: one line per workstream, for rungs where a card would
+        overstate. Never a truncation — every member of the rung is here."""
         a('<ul class="parked-list">')
-        for arc in parked:
+        for arc in bucket:
             brief = arc.get("brief") or {}
             nm = esc(brief.get("name") or arc.get("label", "?"))
             mrs = arc.get("mrs") or []
-            ref = " ".join(link(m.get("url", ""), "!" + str(m.get("iid"))) for m in mrs[:3])
+            ref = " ".join(link(m.get("url", ""), "!" + str(m.get("iid")))
+                           for m in mrs[:3])
+            if not ref and arc.get("settled"):
+                f = next((b.get("mr_fate") for b in arc.get("branches", [])
+                          if b.get("mr_fate")), None) or {}
+                ref = link(f.get("url", ""), "!" + str(f.get("iid", "?")))
             tkt = arc.get("ticket")
             i = next((x for x in arc.get("issues", []) if x.get("key") == tkt), {})
-            a(f'<li><span class="nm">{nm}</span>'
+            a("<li><span class=\"nm\">"
+              + (link(i.get("url", ""), esc(tkt), "key") + " " if tkt else "")
+              + f'{nm}</span>'
               f'<span class="mr">{ref or "&mdash;"}</span>'
               f'<span class="ag">{arc.get("age_days","?")}d</span>')
             bits = []
-            if tkt:
-                bits.append(link(i.get("url", ""), esc(tkt)))
             if arc.get("authoritative") and arc["authoritative"] != tkt:
                 bits.append(esc(arc["authoritative"]))
-            rev = sorted({r for m in mrs for r in (m.get("reviewers") or [])})
-            if rev:
-                bits.append("with " + esc(", ".join(rev[:5])))
+            if note_reviewers:
+                rev = sorted({r for m in mrs for r in (m.get("reviewers") or [])})
+                if rev:
+                    bits.append("with " + esc(", ".join(rev[:5])))
+            if arc.get("state"):
+                bits.append(esc(arc["state"]))
             if bits:
                 a(f'<span class="sub">{" · ".join(bits)}</span>')
             a("</li>")
-        a("</ul></details></section>")
+        a("</ul>")
+
+    def cards(bucket):
+        a('<div class="arcs">')
+        for arc in bucket:
+            card(arc)
+        a("</div>")
+
+    # --- the conditions, as peers ------------------------------------------
+    # This row is where the refusal to rank lives. Presented as equal tiles because there
+    # is no honest exchange rate between them, and a swathe of unpublished work is a
+    # first-class problem rather than a lesser stalled review.
+    loc = by_rung.get("local-only", [])
+    back = by_rung.get("came-back", [])
+    rev = by_rung.get("in-review", [])
+    prop = by_rung.get("not-proposed", [])
+    done = by_rung.get("landed", []) + by_rung.get("abandoned", [])
+    tiles = [
+        ("local", len(loc), "workstreams exist only on this laptop",
+         f"{sum(x.get('unpushed_live',0) for x in loc)} commits, no remote has them"),
+        ("back", len(back), "have come back to you",
+         "a rebase, an unanswered question, a red pipeline, an unmerged approval"),
+        ("proposed", len(prop), "are pushed but were never proposed",
+         "no merge request exists"),
+        ("review", len(rev), "are out for review",
+         "nothing outstanding — a reviewer&rsquo;s clock"),
+        ("settled", len(done), "have landed or been abandoned",
+         "retired from the list below"),
+    ]
+    a('<ul class="conditions">')
+    for anchor, n, label, sub in tiles:
+        if not n:
+            continue
+        a(f'<li><a href="#{anchor}"><span class="v">{n}</span>'
+          f'<span class="l">{label}</span><span class="sub">{sub}</span></a></li>')
+    a("</ul>")
+
+    a('<p class="ladder-note">Below, workstreams are grouped by how far each has got — '
+      "from existing only here, to pushed, to proposed, to reviewed. That is the order of "
+      "the ladder, <strong>not</strong> an order of importance: nothing here claims a "
+      "review comment matters more than unpublished work, or less. Within a group, things "
+      "that came back are ordered by what blocks them and unpublished work by how much of "
+      "it there is.</p>")
+
+    if loc:
+        a("<section>")
+        a(f'<div class="rung"><h2 id="local">Only on this laptop</h2>'
+          f'<span class="n">{len(loc)} workstreams · '
+          f'{sum(x.get("unpushed_live",0) for x in loc)} commits</span></div>')
+        a('<p class="note">No remote has these commits. Nothing here has been proposed to '
+          "anyone, and several have no ticket either — which is what makes them invisible "
+          "to Jira, to Trellis&rsquo;s capacity, and to anyone who might otherwise pick "
+          "them up. Every one is listed; the diagram on each shows which branch is the "
+          "work and which are copies of it.</p>")
+        cards(loc)
+        a("</section>")
+
+    if prop:
+        a("<section>")
+        a(f'<div class="rung"><h2 id="proposed">Pushed, never proposed</h2>'
+          f'<span class="n">{len(prop)}</span></div>')
+        a('<p class="note">Safe on a remote, but no merge request exists, so nobody knows '
+          "to look at it.</p>")
+        cards(prop)
+        a("</section>")
+
+    if back:
+        a("<section>")
+        a(f'<div class="rung"><h2 id="back">Came back to you</h2>'
+          f'<span class="n">{len(back)}</span></div>')
+        a('<p class="note">Proposed, and then returned: a branch that no longer merges, a '
+          "question nobody answered, a pipeline that went red, an approval nobody acted "
+          "on. Each names the thing, quotes the source where someone asked you something, "
+          "and links to it.</p>")
+        cards(back)
+        a("</section>")
+
+    if rev:
+        a("<section>")
+        a(f'<div class="rung"><h2 id="review">Out for review</h2>'
+          f'<span class="n">{len(rev)}</span></div>')
+        a('<p class="note">Your end of the deal is done and the clock is a '
+          "reviewer&rsquo;s. Listed in full rather than hidden, because a reviewer going "
+          "quiet is how work disappears — if one of these comes back it moves up on the "
+          "next run.</p>")
+        rows(rev, note_reviewers=True)
+        a("</section>")
+
+    if done:
+        a("<section>")
+        a(f'<div class="rung"><h2 id="settled">Landed or abandoned</h2>'
+          f'<span class="n">{len(done)}</span></div>')
+        a('<p class="note">Finished, and shown once so it is clear they were retired '
+          "rather than lost. These stayed on the page for as long as this tool existed: "
+          "every merge request here squash-merges, and a squash leaves the branch "
+          "unmerged by ancestry, which is the only test <code>git</code> was being "
+          "asked.</p>")
+        rows(done)
+        a("</section>")
 
     # --- where Jira disagrees with the code --------------------------------
     if gap:
