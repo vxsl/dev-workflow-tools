@@ -77,6 +77,45 @@ Evidence:
 {evidence}
 """
 
+SPLIT_CACHE = STATE / "splits.json"
+
+SPLIT_PROMPT = """\
+You are deciding whether a group of git branches is one body of work or several.
+
+They were grouped because they edit the same files, and that signal has a limit it
+cannot pass: two tickets that touch the same module look identical by files however the
+weights are set. Measured case -- one branch migrated the metric catalogs onto a new
+adaptive-trend constructor while another hardened a lint rule about reference stability
+in those same catalogs. Same files, unrelated intentions. Only the content of the changes
+separates them, which is why you are being asked.
+
+Below is each branch with its commit subjects and any ticket it names.
+
+Return ONLY a JSON object, no prose and no code fence:
+
+{"bodies": [{"name": "...", "branches": ["...", "..."]}]}
+
+- **One body is the default and usually correct.** These branches were grouped by real
+  evidence; you are the last check on it, not a second opinion. Answer with one body
+  unless a branch is clearly about something else. Splitting work that belongs together
+  is as damaging as merging work that does not.
+- Do NOT split a stack, a rebase, or the variants of one change. `x-bak`,
+  `x-before-squash`, `backup/x`, `x-preX`, `x-wip` are the SAME work as `x`. Successive
+  refinements of one feature are one body however many branches they took.
+- Do NOT split because branches touch different files or different parts of a feature.
+  Work spreads across a codebase; that is normal and not a second body.
+- DO split when a branch's commits are plainly in service of a different goal -- another
+  ticket that merely visits the same module, an unrelated hotfix, a drive-by fix
+  committed while something else was checked out.
+- If a split would leave a body of one branch, be sure that branch really is separate
+  work rather than a stray commit belonging to the main body.
+- Every branch listed must appear in exactly one body. Use branch names exactly as given.
+- name: 3-7 words saying what that body IS, in the vocabulary of its own commits.
+
+Branches:
+{evidence}
+"""
+
 
 def load_turns():
     """Session id -> the prompts typed in it. The richest description source there is.
@@ -183,7 +222,80 @@ def evidence_for(arc, repo, main, turns):
     return "\n".join(out)
 
 
-def fingerprint(evidence, model):
+def split_evidence(arc, repo, main, limit=20):
+    """Each branch as its own commits, which is what tells two intentions apart."""
+    out = []
+    for b in arc.get("branches", [])[:limit]:
+        subs = commit_subjects(repo, b["name"], main, limit=5)
+        out.append(f"  {b['name']}")
+        for s in subs:
+            out.append(f"      {s}")
+        if not subs:
+            out.append("      (no commits ahead of main)")
+    return "\n".join(out)
+
+
+def parse_split(text, known):
+    """Take the partition only if it accounts for every branch exactly once.
+
+    A split that drops or duplicates a branch would silently lose work from the page,
+    so a malformed answer is discarded in favour of leaving the arc alone.
+    """
+    text = text.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+    try:
+        obj = json.loads(text)
+    except json.JSONDecodeError:
+        m = re.search(r"\{.*\}", text, re.S)
+        if not m:
+            return None
+        try:
+            obj = json.loads(m.group(0))
+        except json.JSONDecodeError:
+            return None
+    bodies = obj.get("bodies") if isinstance(obj, dict) else None
+    if not isinstance(bodies, list) or not bodies:
+        return None
+    seen, out = set(), []
+    for body in bodies:
+        if not isinstance(body, dict):
+            return None
+        names = [b for b in (body.get("branches") or []) if b in known]
+        if not names or seen & set(names):
+            return None
+        seen.update(names)
+        out.append({"name": str(body.get("name") or "").strip(), "branches": names})
+    if seen != known:
+        return None
+    return out
+
+
+def ask_split(evidence, known, model, timeout, tries=2):
+    prompt = SPLIT_PROMPT.replace("{evidence}", evidence)
+    reason = "unknown"
+    for attempt in range(tries):
+        if attempt:
+            time.sleep(2 * attempt)
+        try:
+            r = headless_claude.run(
+                ["--model", model, "--dangerously-skip-permissions", prompt],
+                timeout=timeout)
+        except (OSError, subprocess.SubprocessError) as e:
+            reason = e.__class__.__name__
+            continue
+        if r.returncode != 0:
+            reason = f"exit {r.returncode}"
+            continue
+        bodies = parse_split(r.stdout, known)
+        if bodies:
+            return bodies, None
+        reason = "reply did not partition the branches"
+    return None, reason
+
+
+def fingerprint(evidence, model, prompt=""):
     """What the brief was derived from, so a stale one is detectable and not just old.
 
     Cached inference is only safe if it is recomputable and auditable. Keying on the
@@ -192,6 +304,11 @@ def fingerprint(evidence, model):
     """
     h = hashlib.sha256()
     h.update(model.encode())
+    h.update(b"\0")
+    # The prompt is part of what produced the answer. Leaving it out meant a reworded
+    # question silently reused the old reply, which is the one way a cache keyed on
+    # evidence can still go stale.
+    h.update(prompt.encode())
     h.update(b"\0")
     h.update(evidence.encode())
     return h.hexdigest()[:20]
@@ -275,6 +392,89 @@ def save_cache(cache):
     tmp.replace(CACHE)
 
 
+def do_split(data, repo, main_ref, args):
+    """Ask which arcs hold more than one body of work, and emit the refined assignment.
+
+    File overlap has a resolution limit: two tickets that edit the same module are
+    structurally identical however the weights are set. Four independent rules already
+    guard membership and the errors that survive all have this shape, so the last
+    discriminator has to be the content of the changes -- which is exactly what the
+    model is already reading in order to name the arc.
+
+    Output is a branch -> arc-label map on stdout, for work-arcs to apply. Splitting
+    here rather than partitioning the finished arcs keeps every count computed in one
+    place; work-arcs simply clusters into more groups than it otherwise would.
+    """
+    cache = {}
+    if SPLIT_CACHE.exists() and not args.refresh:
+        try:
+            cache = json.loads(SPLIT_CACHE.read_text()) or {}
+        except (OSError, ValueError):
+            cache = {}
+
+    candidates = [a for a in data.get("arcs", []) if len(a.get("branches", [])) > 1]
+    work, mapping, hits = [], {}, 0
+    for arc in candidates:
+        known = {b["name"] for b in arc["branches"]}
+        ev = split_evidence(arc, repo, main_ref)
+        fp = fingerprint(ev, args.model + ":split", SPLIT_PROMPT)
+        cached = cache.get(fp)
+        if cached:
+            hits += 1
+            for body in cached:
+                for name in body["branches"]:
+                    mapping[name] = body["name"]
+        else:
+            work.append((arc, ev, fp, known))
+
+    if work:
+        print(f"arc-brief --split: {hits} cached, {len(work)} to decide "
+              f"({args.model}, {args.jobs} at a time)", file=sys.stderr)
+        with futures.ThreadPoolExecutor(max_workers=max(1, args.jobs)) as pool:
+            futs = {pool.submit(ask_split, ev, known, args.model, args.timeout):
+                    (arc, fp, known) for arc, ev, fp, known in work}
+            for fut in futures.as_completed(futs):
+                arc, fp, known = futs[fut]
+                bodies, reason = fut.result()
+                if not bodies:
+                    print(f"  ! left whole: {arc.get('label','?')} — {reason}",
+                          file=sys.stderr)
+                    continue
+                cache[fp] = bodies
+                if len(bodies) > 1:
+                    print(f"  split {arc.get('label','?')} ({len(known)} branches) → "
+                          + " | ".join(f"{b['name']} ×{len(b['branches'])}"
+                                       for b in bodies), file=sys.stderr)
+                for body in bodies:
+                    for name in body["branches"]:
+                        mapping[name] = body["name"]
+        try:
+            SPLIT_CACHE.parent.mkdir(parents=True, exist_ok=True)
+            tmp = SPLIT_CACHE.with_suffix(".tmp")
+            tmp.write_text(json.dumps(cache, indent=1, sort_keys=True))
+            tmp.replace(SPLIT_CACHE)
+        except OSError:
+            pass
+    else:
+        print(f"arc-brief --split: {hits} cached, nothing to decide", file=sys.stderr)
+
+    # Two arcs can independently be named the same thing; keep them apart.
+    seen = {}
+    out = {}
+    for arc in candidates:
+        for b in arc["branches"]:
+            label = mapping.get(b["name"])
+            if not label:
+                continue
+            key = (arc.get("label"), label)
+            if label in seen and seen[label] != key:
+                label = f"{label} ({len(seen)})"
+            seen.setdefault(label, key)
+            out[b["name"]] = label
+    json.dump(out, sys.stdout, indent=1)
+    print()
+
+
 def main():
     p = argparse.ArgumentParser(
         description="Give each arc a name and a description derived from its evidence.")
@@ -291,6 +491,9 @@ def main():
     p.add_argument("--jobs", type=int, default=6, help="concurrent model calls")
     p.add_argument("--timeout", type=int, default=180, help="seconds per model call")
     p.add_argument("--out", type=Path, default=None, help="write here instead of stdout")
+    p.add_argument("--split", action="store_true",
+                   help="emit a branch->arc map splitting arcs that hold several "
+                        "bodies of work; for work-arcs to consume, not the page")
     args = p.parse_args()
 
     raw = args.src.read_text() if args.src else sys.stdin.read()
@@ -306,6 +509,9 @@ def main():
         print("arc-brief: no prompt log at "
               f"{TURNS} -- run arc-backfill for better names", file=sys.stderr)
 
+    if args.split:
+        return do_split(data, repo, main_ref, args)
+
     arcs = data.get("arcs", [])
     # The gap report embeds the same arc objects, so briefing `arcs` names them there
     # too. Anything only reachable through the gap still needs doing explicitly.
@@ -320,7 +526,7 @@ def main():
     work, hits = [], 0
     for arc in todo:
         ev = evidence_for(arc, repo, main_ref, turns)
-        fp = fingerprint(ev, args.model)
+        fp = fingerprint(ev, args.model, PROMPT)
         cached = None if args.refresh else cache.get(fp)
         if cached:
             arc["brief"] = cached

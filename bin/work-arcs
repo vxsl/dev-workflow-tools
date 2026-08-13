@@ -451,6 +451,35 @@ def load_clusters(repo, main, resolution):
     return assign, sessions
 
 
+def split_assignment(arcs, args):
+    """arc-brief's verdict on which arcs hold more than one body of work.
+
+    Degrades the same way every other step does: no arc-brief, no model, or a reply that
+    fails to account for every branch leaves the clustering exactly as it was.
+    """
+    tool = Path(__file__).resolve().parent / "arc-brief"
+    if not tool.exists():
+        return {}
+    payload = json.dumps({"repo": str(args.repo), "main": args.main, "arcs": arcs})
+    cmd = [str(tool), "--split", "--jobs", str(args.split_jobs)]
+    if args.split_model:
+        cmd += ["--model", args.split_model]
+    try:
+        r = subprocess.run(cmd, input=payload, capture_output=True, text=True,
+                           timeout=args.split_timeout)
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    if r.stderr:
+        print(r.stderr.rstrip(), file=sys.stderr)
+    if r.returncode != 0:
+        return {}
+    try:
+        out = json.loads(r.stdout)
+    except json.JSONDecodeError:
+        return {}
+    return out if isinstance(out, dict) else {}
+
+
 def ticket_of(name, known_projects):
     """The arc a branch name declares, if it declares one."""
     m = TICKET_RE.search(name.upper())
@@ -640,6 +669,14 @@ def main():
     p.add_argument("--resolution", type=float, default=3.0,
                    help="arc-cluster granularity passed through")
     p.add_argument("--no-mr", action="store_true", help="skip the GitLab call")
+    p.add_argument("--no-split", action="store_true",
+                   help="skip arc-brief's pass over arcs that hold several bodies of "
+                        "work; file overlap alone decides membership")
+    p.add_argument("--split-model", default=None, help="model alias for the split pass")
+    p.add_argument("--split-jobs", type=int, default=6,
+                   help="concurrent model calls in the split pass")
+    p.add_argument("--split-timeout", type=int, default=900,
+                   help="seconds for the whole split pass")
     p.add_argument("--gap", action="store_true",
                    help="where Jira and reality disagree: work with no ticket, "
                         "tickets with no work, tickets claiming to be handed off")
@@ -674,6 +711,19 @@ def main():
     sessions = session_index(args.projects)
     arcs, unattached = build_arcs(branches, stashes, mrs, sessions, args.main,
                                   cluster_assign)
+
+    # File overlap cannot separate two tickets that edit the same module -- measured,
+    # UB-6938 migrating the metric catalogs and UL-1634 hardening a lint rule over those
+    # same catalogs are structurally identical. The last discriminator is what the
+    # changes say they are for, so arc-brief reads the commit subjects and returns a
+    # refined assignment. Applied by re-clustering rather than by carving up finished
+    # arcs, so every count stays computed in one place.
+    if not args.no_split:
+        refined = split_assignment(arcs, args)
+        if refined:
+            cluster_assign = {**cluster_assign, **refined}
+            arcs, unattached = build_arcs(branches, stashes, mrs, sessions, args.main,
+                                          cluster_assign)
 
     if args.jira_ify:
         match = [a for a in arcs if a["label"] == args.jira_ify or a["id"] == args.jira_ify]
