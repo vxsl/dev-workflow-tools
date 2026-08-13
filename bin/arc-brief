@@ -210,7 +210,9 @@ def spawn_tree(branches):
 def evidence_for(arc, repo, main, turns):
     """Everything known about one arc, in a stable order so the fingerprint is stable."""
     out = []
-    branches = arc.get("branches", [])[:14]
+    # 14 meant a 39-branch arc was described from a third of itself, and the branch list is
+    # where the stacking, the variants and the duplicates live -- the part a name most needs.
+    branches = arc.get("branches", [])[:30]
 
     if arc.get("issues"):
         out.append("Jira tickets:")
@@ -282,7 +284,16 @@ def evidence_for(arc, repo, main, turns):
     return "\n".join(out)
 
 
-def split_evidence(arc, repo, main, limit=20):
+# How many branches the split pass may see. The cap used to be 20 while the completeness
+# check demanded a verdict on every branch in the arc, so for anything larger the two
+# disagreed by construction and the answer was rejected every time -- "accounted for only 20
+# of 39". The four biggest arcs on the page were never once split, and the failure read as
+# the model being unable to count. Raised, and `known` is now derived from the same constant,
+# so the check can only ever ask about branches that were actually shown.
+SPLIT_BRANCHES = int(os.environ.get("ARC_SPLIT_BRANCHES", "60"))
+
+
+def split_evidence(arc, repo, main, limit=SPLIT_BRANCHES):
     """Each branch as its own commits, which is what tells two intentions apart.
 
     A superseded copy is the one case where identical commits are not evidence of two
@@ -310,11 +321,25 @@ def split_evidence(arc, repo, main, limit=20):
 
 
 def parse_split(text, known):
-    """Take the partition only if it accounts for every branch exactly once.
+    """Take the partition, repairing it rather than discarding it over a bookkeeping slip.
 
-    A split that drops or duplicates a branch would silently lose work from the page,
-    so a malformed answer is discarded in favour of leaving the arc alone.
+    The invariant that matters is that no branch is lost off the page. That was enforced by
+    rejecting any reply which failed to account for every branch exactly once -- and the
+    cost of that strictness was the opposite of what it was for: the four largest arcs, 39,
+    33, 26 and 22 branches, were all left whole because a reply mislaid one name out of
+    dozens. The arcs most likely to hold several workstreams are the ones a model is most
+    likely to miscount, so the check was failing hardest exactly where it mattered, and
+    "left whole" means a 39-branch blob on the page.
+
+    So enforce the invariant instead of testing for it. A duplicate keeps its first
+    mention; an unmentioned branch joins the largest body, which is the same direction as
+    the prompt's own prior that one body is the default. A reply that has lost track of a
+    fifth of the arc is not a bookkeeping slip and is still rejected.
+
+    Returns (bodies, note) -- note describes any repair, so it is reported rather than
+    done quietly.
     """
+    COVER_MIN = 0.8
     text = text.strip()
     if text.startswith("```"):
         text = re.sub(r"^```(?:json)?\s*", "", text)
@@ -324,26 +349,44 @@ def parse_split(text, known):
     except json.JSONDecodeError:
         m = re.search(r"\{.*\}", text, re.S)
         if not m:
-            return None
+            return None, "no JSON in reply"
         try:
             obj = json.loads(m.group(0))
         except json.JSONDecodeError:
-            return None
+            return None, "unparseable JSON"
     bodies = obj.get("bodies") if isinstance(obj, dict) else None
     if not isinstance(bodies, list) or not bodies:
-        return None
-    seen, out = set(), []
+        return None, "no bodies in reply"
+
+    seen, out, dupes = set(), [], 0
     for body in bodies:
         if not isinstance(body, dict):
-            return None
-        names = [b for b in (body.get("branches") or []) if b in known]
-        if not names or seen & set(names):
-            return None
-        seen.update(names)
-        out.append({"name": str(body.get("name") or "").strip(), "branches": names})
-    if seen != known:
-        return None
-    return out
+            return None, "a body was not an object"
+        names = []
+        for b in body.get("branches") or []:
+            if b not in known:
+                continue
+            if b in seen:
+                dupes += 1
+                continue
+            seen.add(b)
+            names.append(b)
+        if names:
+            out.append({"name": str(body.get("name") or "").strip(), "branches": names})
+    if not out:
+        return None, "no known branches in reply"
+
+    notes = []
+    if dupes:
+        notes.append(f"{dupes} branch(es) listed twice, first mention kept")
+    missing = known - seen
+    if missing:
+        if len(seen) < COVER_MIN * len(known):
+            return None, (f"accounted for only {len(seen)} of {len(known)} branches")
+        biggest = max(out, key=lambda b: len(b["branches"]))
+        biggest["branches"].extend(sorted(missing))
+        notes.append(f"{len(missing)} unlisted branch(es) put with '{biggest['name']}'")
+    return out, ("; ".join(notes) if notes else None)
 
 
 def ask_split(evidence, known, model, timeout, tries=2):
@@ -362,10 +405,10 @@ def ask_split(evidence, known, model, timeout, tries=2):
         if r.returncode != 0:
             reason = f"exit {r.returncode}"
             continue
-        bodies = parse_split(r.stdout, known)
+        bodies, note = parse_split(r.stdout, known)
         if bodies:
-            return bodies, None
-        reason = "reply did not partition the branches"
+            return bodies, note
+        reason = note or "reply did not partition the branches"
     return None, reason
 
 
@@ -489,7 +532,8 @@ def do_split(data, repo, main_ref, args):
     candidates = [a for a in data.get("arcs", []) if len(a.get("branches", [])) > 1]
     work, mapping, hits = [], {}, 0
     for arc in candidates:
-        known = {b["name"] for b in arc["branches"]}
+        # Exactly the branches the model is shown -- see SPLIT_BRANCHES.
+        known = {b["name"] for b in arc["branches"][:SPLIT_BRANCHES]}
         ev = split_evidence(arc, repo, main_ref)
         fp = fingerprint(ev, args.model + ":split", SPLIT_PROMPT)
         cached = cache.get(fp)
@@ -514,6 +558,10 @@ def do_split(data, repo, main_ref, args):
                     print(f"  ! left whole: {arc.get('label','?')} — {reason}",
                           file=sys.stderr)
                     continue
+                if reason:
+                    # A repaired partition is still a judgement about the arc, so say what
+                    # was patched rather than let it pass as a clean answer.
+                    print(f"  ~ repaired {arc.get('label','?')}: {reason}", file=sys.stderr)
                 cache[fp] = bodies
                 if len(bodies) > 1:
                     print(f"  split {arc.get('label','?')} ({len(known)} branches) → "

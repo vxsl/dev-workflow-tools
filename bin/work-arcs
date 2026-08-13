@@ -1282,8 +1282,9 @@ def main():
                         "Jira calls, so opt-in)")
     p.add_argument("--no-cluster", action="store_true",
                    help="fall back to branch-name grouping (the old, wrong way)")
-    p.add_argument("--resolution", type=float, default=3.0,
-                   help="arc-cluster granularity passed through")
+    p.add_argument("--resolution", type=float, default=2.0,
+                   help="arc-cluster granularity passed through (see arc-cluster for why "
+                        "2.0 rather than the 3.0 that predated session segments)")
     p.add_argument("--no-mr", action="store_true", help="skip the GitLab call")
     p.add_argument("--shallow-mr", action="store_true",
                    help="skip the per-MR calls for unresolved review threads and pipeline "

@@ -65,6 +65,21 @@ MIN_SHARED = int(os.environ.get("ARC_MIN_SHARED", "2"))
 # file-overlap score, because ancestry is a fact and overlap is an inference.
 STACK_SIM = float(os.environ.get("ARC_STACK_SIM", "0.9"))
 
+# Containment: how much of the SMALLER branch's distinctive weight sits inside the larger.
+# Cosine is symmetric and divides by both magnitudes, so a small branch wholly inside a big
+# one scores low purely because the big one is big -- `smp-selected-state` has 8 of its 10
+# files in the UL-1692 family, all of them feature-specific (NeighborhoodsMiniReport,
+# neighborhoodsMetricInstanceCatalog), and cosine still called it 0.375 while containment
+# calls it 0.973. Kyle identified that pair as one workstream; cosine could not.
+#
+# Containment alone is dangerous in exactly the way the plan documents: the recharts hotfix
+# scores 1.0 against UL-1773 on a single shared file. So it is gated on corroboration --
+# strictly more than MIN_SHARED, because a floor this strong should need better evidence
+# than an ordinary edge -- and applied only between branches, since it is a claim about one
+# branch's changes sitting inside another's.
+CONTAIN_AT = float(os.environ.get("ARC_CONTAIN_AT", "0.6"))
+CONTAIN_MIN_SHARED = int(os.environ.get("ARC_CONTAIN_MIN_SHARED", "3"))
+
 # How much of a child's history must be its parent's before the two count as one stack.
 # Below this the parent is just the base that happened to be checked out.
 STACK_INHERIT = float(os.environ.get("ARC_STACK_INHERIT", "0.5"))
@@ -366,9 +381,29 @@ def cluster(ents, k, min_sim, stacks=()):
         if n < MIN_SHARED:
             del sim[pair]
 
+    raw = dict(sim)
     for pair in list(sim):
         a, b = pair
         sim[pair] /= (norm[a] * norm[b])
+
+    # Containment, as a floor rather than a contribution -- the same shape as the ancestry
+    # floor below, and for the same reason: "this branch's changes are inside that one's" is
+    # closer to a fact than to a similarity. It is the asymmetric case cosine cannot see,
+    # and it also recovers stacks on its own (UB-6938/UB-6939 score 0.898 here against a
+    # cosine of 0.187), which is evidence the measure is picking up real structure rather
+    # than being tuned to one example.
+    for pair, w in raw.items():
+        a, b = pair
+        if a[0] != "branch" or b[0] != "branch":
+            continue
+        if shared[pair] < CONTAIN_MIN_SHARED:
+            continue
+        small = min(norm[a], norm[b]) ** 2
+        if small <= 0:
+            continue
+        ov = w / small
+        if ov >= CONTAIN_AT:
+            sim[pair] = max(sim[pair], min(ov, 1.0))
 
     # Ancestry outranks anything the filenames can say, so it is applied after
     # normalisation and as a floor rather than a contribution: a branch cut from
@@ -516,8 +551,15 @@ def main():
                         "global-k approximation, kept for comparison")
     # Measured: 1.6 → largest 11%, TDAT across 2. 3.0 → largest 6%, TDAT across 1.
     # 4.0 → largest 5%, but starts shaving genuine members off real arcs.
-    p.add_argument("--resolution", type=float, default=3.0,
-                   help="louvain granularity; higher splits more (default 3.0)")
+    # 3.0 was tuned before session segments existed, and segments made Louvain stricter at
+    # any fixed resolution -- more total edge weight raises the bar a community must clear.
+    # Nobody re-tuned after they landed, and the cost was real: at 3.0 the smp-selected-state
+    # family sat in a different arc from the UL-1692 branch carrying its merge request, and
+    # the UB-6938/UB-6939 stack came apart. The direction matters more than the number: the
+    # split pass can only ever cut an arc, never join two, so a clusterer that separates one
+    # workstream creates an error nothing downstream can repair. Recall first; the model cuts.
+    p.add_argument("--resolution", type=float, default=2.0,
+                   help="louvain granularity; higher splits more (default 2.0)")
     p.add_argument("--json", action="store_true")
     p.add_argument("--explain", metavar="NAME", help="why this branch landed where it did")
     p.add_argument("--why", nargs=2, metavar=("A", "B"),
