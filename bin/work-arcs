@@ -1180,16 +1180,47 @@ def jira_ify(repo, arc, dry_run):
     return subprocess.run(cmd).returncode
 
 
+CLUSTER_CACHE = (Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
+                 / "work-arcs" / "cluster-cache.json")
+
+
 def load_clusters(repo, main, resolution):
     """Arc membership from arc-cluster, i.e. from what the work touched.
 
     Branch names are a fallback now, not the mechanism. A name describes the change;
     the files describe the intent, which is why one investigation used to come out as
     nine arcs. Returns {branch_name: arc_label} plus each arc's session ids.
+
+    Cached on everything the clustering reads: the branch tips, where main is, the turn
+    log, the tuning knobs, and the tool's own mtime. arc-cluster was ~4s of a 9.5s run
+    recomputing an answer whose inputs had not moved -- and between two runs of a morning
+    they almost never have. Anything moves and the key no longer matches, so the cache
+    can be wrong in only one direction: slower than it had to be, never stale.
     """
     tool = Path(__file__).resolve().parent / "arc-cluster"
     if not tool.exists():
         return {}, {}
+    turns = CLUSTER_CACHE.parent / "turns.jsonl"
+    try:
+        st = turns.stat()
+        turn_sig = f"{st.st_mtime_ns}:{st.st_size}"
+    except OSError:
+        turn_sig = "no turn log"
+    knobs = ":".join(os.environ.get(k, "") for k in
+                     ("ARC_HUB_SHARE", "ARC_MIN_SHARED", "ARC_STACK_SIM",
+                      "ARC_CONTAIN_AT"))
+    key = hashlib.sha256("\n".join([
+        git(repo, "for-each-ref", "--format=%(refname:short) %(objectname)",
+            "refs/heads"),
+        git(repo, "rev-parse", main).strip(),
+        turn_sig, str(resolution), knobs, str(tool.stat().st_mtime_ns),
+    ]).encode()).hexdigest()
+    try:
+        cached = json.loads(CLUSTER_CACHE.read_text())
+        if cached.get("key") == key:
+            return cached["assign"], cached["sessions"]
+    except (OSError, ValueError, KeyError):
+        pass
     try:
         r = subprocess.run(
             [str(tool), "--repo", str(repo), "--main", main,
@@ -1209,6 +1240,13 @@ def load_clusters(repo, main, resolution):
         sessions[label] = arc.get("sessions", [])
         for b in arc.get("branches", []):
             assign[b] = label
+    if assign:
+        try:
+            CLUSTER_CACHE.parent.mkdir(parents=True, exist_ok=True)
+            CLUSTER_CACHE.write_text(json.dumps(
+                {"key": key, "assign": assign, "sessions": sessions}))
+        except OSError:
+            pass  # a cache that cannot be written is just a cache miss next time
     return assign, sessions
 
 

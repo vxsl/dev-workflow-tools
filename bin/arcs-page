@@ -235,6 +235,30 @@ details.parked>summary b{color:var(--ink);font-weight:600}
 
 .count{font-family:var(--mono);font-variant-numeric:tabular-nums}
 
+/* The waiting-on ledger: open loops with a person on the other end, ranked by how long
+   they have been open. Age is the one dimension these rows share, so it is the one thing
+   the column sorts by and the one thing allowed a colour: two weeks of silence is a loop
+   that has demonstrably failed, not merely an old row. */
+.ledger{display:grid;grid-template-columns:repeat(auto-fit,minmax(23rem,1fr));gap:1rem;
+  align-items:start}
+.ledger .side{background:var(--surface);border:1px solid var(--hairline);
+  border-radius:4px;padding:1rem 1.1rem;display:flex;flex-direction:column;gap:.6rem}
+.ledger h3{margin:0;font-family:var(--serif);font-weight:500;font-size:1.05rem;
+  display:flex;align-items:baseline;gap:.5rem}
+.ledger h3 .n{font-family:var(--mono);font-size:.75rem;color:var(--ink-faint);
+  font-weight:400}
+.ledger ul{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;
+  gap:.6rem}
+.ledger li{display:flex;gap:.65rem;align-items:baseline;font-size:.85rem;min-width:0}
+.ledger .clk{font-family:var(--mono);font-size:.78rem;color:var(--ink-soft);flex:none;
+  min-width:2.8rem;text-align:right;font-variant-numeric:tabular-nums}
+.ledger .clk.hot{color:var(--hot);font-weight:700}
+.ledger .what{min-width:0}
+.ledger .ref{font-family:var(--mono);font-size:.78rem}
+.ledger .who{display:block;font-size:.74rem;color:var(--ink-faint)}
+.ledger .covered{margin:0;font-size:.76rem;color:var(--ink-faint);
+  border-top:1px solid var(--hairline);padding-top:.55rem}
+
 /* One line per workstream. Cards were inherited from the version of this page that showed
    six things, and at twenty-eight they are a wall -- the same reason a list of branches was
    a wall before arcs existed. The detail is not gone, it is one disclosure away. */
@@ -1103,6 +1127,81 @@ def render(data, lede, focus_days, limit):
             a("</div>")
         a("</div>")
     a("</section>")
+
+    # --- the waiting-on ledger ----------------------------------------------
+    # Both directions of "who is waiting on whom", which is what todo.md was for and
+    # never kept up with. Absent entirely when GitLab was not asked -- an empty ledger
+    # and an unconsulted one are different claims.
+    ledger = data.get("ledger")
+    if ledger is not None:
+        they = ledger.get("they_owe") or []
+        you = ledger.get("you_owe") or []
+        covered = ledger.get("you_owe_covered") or 0
+        a("<section>")
+        a("<h2>The ledger</h2>")
+        a('<p class="note">Open loops with a person on the other end, longest open '
+          "first. Every row is derived — from a review request&rsquo;s own timestamp, "
+          "an approval, a comment, a ticket&rsquo;s assignee — so it closes itself the "
+          "moment the other person moves, and nothing is ever checked off. Questions "
+          "you owe answers to are demands on their own workstreams below; this is "
+          "everything else.</p>")
+        a('<div class="ledger">')
+
+        def clock(e):
+            d = e.get("days")
+            if d is None:
+                return '<span class="clk"></span>'
+            hot = " hot" if d >= 14 else ""
+            return f'<span class="clk{hot}">{d}d</span>'
+
+        a('<div class="side">')
+        a(f'<h3>You owe them <span class="n">{len(you)}</span></h3>')
+        if you:
+            a("<ul>")
+            for e in you:
+                a("<li>" + clock(e) + '<div class="what">'
+                  + link(e.get("url", ""), esc(e.get("ref", "")), "ref")
+                  + f' {esc(e.get("title",""))}'
+                  f'<span class="who">{esc(e.get("who","?"))} asked for your review'
+                  + (f' on {esc(e["asked"])}' if e.get("asked") else "")
+                  + "</span></div></li>")
+            a("</ul>")
+        else:
+            a('<div class="quiet">Nobody is waiting on a review from you.</div>')
+        if covered:
+            a(f'<p class="covered">{covered} more review request'
+              f'{"" if covered == 1 else "s"} already handled — you spoke, or someone '
+              "approved before you got there.</p>")
+        a("</div>")
+
+        a('<div class="side">')
+        a(f'<h3>They owe you <span class="n">{len(they)}</span></h3>')
+        if they:
+            a("<ul>")
+            for e in they:
+                who = e.get("who")
+                who = ", ".join(who) if isinstance(who, list) else (who or "?")
+                if e.get("kind") == "review-silence":
+                    sub = esc(f"no response from {who} since {e.get('asked','?')}")
+                    if e.get("asked_is_proxy"):
+                        sub += (" (clock from the merge request&rsquo;s last update "
+                                "&mdash; no request note exists)")
+                else:
+                    sub = esc(f"with {who}"
+                              + (f" · {e['status']}" if e.get("status") else "")
+                              + f", untouched since {e.get('asked','?')}")
+                a("<li>" + clock(e) + '<div class="what">'
+                  + link(e.get("url", ""), esc(e.get("ref", "")), "ref")
+                  + f' {esc(e.get("title",""))}'
+                  + f'<span class="who">{sub}</span>'
+                  "</div></li>")
+            a("</ul>")
+        else:
+            a('<div class="quiet">Nobody owes you anything — no silent reviews, '
+              "no stalled hand-offs.</div>")
+        a("</div>")
+
+        a("</div></section>")
 
     # --- the conditions, as peers ------------------------------------------
     # Still peers, still no hero figure and no severity hue: there is no honest exchange
