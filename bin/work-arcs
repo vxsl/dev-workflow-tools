@@ -1279,6 +1279,47 @@ def mark_duplicates(arc, repo=None, main_ref="origin/main"):
             break
 
 
+def mark_predates_landing(arc):
+    """Branches whose last commit is older than a sibling's merge: drafts from before it.
+
+    The case no content test can reach. Kyle twice named a workstream as already done and
+    twice the evidence said otherwise, because the landing was a RESHAPE rather than a
+    carry-over -- same intent, different diff, so no patch-id matches anywhere and both
+    `git cherry` and the squash index are blind by construction.
+
+    Dates settle what content cannot. In the Dove catalog-gating arc the surviving branches
+    are 14-15 July and the slices that landed merged on 8 August; in the AOI geo_filter arc
+    every survivor predates !10417's merge on 11 August. Work does not flow backwards, so a
+    branch that stopped before its sibling landed is a draft from before the landing, not
+    outstanding work that the landing left undone.
+
+    Recorded as a fact -- "older than the merge of X" -- rather than as a verdict that the
+    branch is finished. Kyle's own instruction: this is a valuable signal and must not be
+    papered over to force the rows out of sight. Two branches can share an arc without
+    sharing a fate, and where the derivation is only probably right the page should say what
+    it measured and let a person conclude.
+    """
+    landings = [(b["name"], (b.get("mr_fate") or {}))
+                for b in arc.get("branches", [])
+                if (b.get("mr_fate") or {}).get("state") == "merged"
+                and (b.get("mr_fate") or {}).get("at")]
+    if not landings:
+        for b in arc.get("branches", []):
+            b.pop("predates_landing", None)
+        return
+    # The most recent landing: a branch older than that is older than every landing here.
+    newest = max(landings, key=lambda x: x[1]["at"])
+    when = _day_epoch(newest[1]["at"])
+    for b in arc.get("branches", []):
+        b.pop("predates_landing", None)
+        if b.get("mr_fate") or b.get("superseded_by"):
+            continue
+        if when and b.get("committed", 0) < when:
+            b["predates_landing"] = {"branch": newest[0], "at": newest[1]["at"],
+                                     "iid": newest[1].get("iid"),
+                                     "url": newest[1].get("url", "")}
+
+
 def authoritative(arc):
     """Which single branch IS this work, and on what evidence.
 
@@ -1559,6 +1600,7 @@ def finalize(arc, repo=None, main_ref="origin/main"):
     arc["mrs"].sort(key=lambda m: m.get("draft", False))
 
     mark_duplicates(arc, repo, main_ref)
+    mark_predates_landing(arc)
 
     # Two different ages, because they answer different questions. The newest
     # touch says "is this live"; the median says "how much of this has gone cold".
@@ -1682,10 +1724,28 @@ def finalize(arc, repo=None, main_ref="origin/main"):
     arc["urgency"] = (DEMAND_RANK.get(arc["demands"][0]["kind"], 9)
                       if arc["demands"] else 99)
 
+    # Every surviving branch older than the landing, and at least one landing: the work
+    # shipped as a reshape and what is left are drafts from before it. Its own rung, above
+    # `landed` in the ladder but distinctly not it -- these branches are residue you can
+    # probably delete, which is a different statement from "this is finished" and a very
+    # different one from "this is outstanding". Not hidden: the whole reason to derive it is
+    # that it is a signal, and papering over it was explicitly not wanted.
+    live_b = [b for b in arc["branches"]
+              if not b.get("mr_fate") and not b.get("superseded_by")]
+    arc["predates_landing"] = sum(1 for b in live_b if b.get("predates_landing"))
+    stale_draft = bool(live_b) and all(b.get("predates_landing") for b in live_b)
+
     worst = arc["demands"][0]["kind"] if arc["demands"] else None
     if settled:
         arc["stage"] = settled
         arc["state"] = {"landed": "landed", "abandoned": "abandoned"}[settled]
+    elif stale_draft:
+        arc["stage"] = "pre-landing"
+        ref = next(b["predates_landing"] for b in live_b if b.get("predates_landing"))
+        n = len(live_b)
+        arc["state"] = (f"{n} branch{'' if n == 1 else 'es'} older than "
+                        + (f"!{ref['iid']}" if ref.get("iid") else ref["branch"])
+                        + f", merged {ref['at']}")
     elif STAGE_OF.get(worst) == "came-back":
         arc["stage"] = "came-back"
         arc["state"] = {
