@@ -29,6 +29,7 @@ or a repo. Anything outward-facing happens only when you run it yourself.
   arc-cluster                 the arcs, largest first
   arc-cluster --json          the full graph
   arc-cluster --explain NAME  why a branch landed where it did
+  arc-cluster --why A B       the chain of evidence joining two branches
 
 Reads $XDG_STATE_HOME/work-arcs/turns.jsonl (see arc-backfill) and git. Read-only.
 """
@@ -246,6 +247,29 @@ def load_entities(repo, main, max_files):
     else:
         load_entities.meta = {}
     return ents
+
+
+def attach_sessions(comp, ents, sim):
+    """Put each session in the one arc it most resembles, joining nothing.
+
+    Sessions carry the best evidence of what work was *about* -- the prompts are how the
+    arc gets named -- so they belong in an arc. They are simply not allowed to decide
+    which branches share one, because a thread that wandered would otherwise merge
+    everything it wandered across.
+    """
+    home = {m: root for root, members in comp.items() for m in members}
+    out = collections.defaultdict(list, {r: list(ms) for r, ms in comp.items()})
+    for key in ents:
+        if key[0] != "session":
+            continue
+        score = collections.defaultdict(float)
+        for other, root in home.items():
+            s = sim.get((key, other) if key < other else (other, key), 0)
+            if s:
+                score[root] += s
+        if score:
+            out[max(score, key=score.get)].append(key)
+    return out
 
 
 def enforce_stacks(comp, stacks, present):
@@ -496,6 +520,8 @@ def main():
                    help="louvain granularity; higher splits more (default 3.0)")
     p.add_argument("--json", action="store_true")
     p.add_argument("--explain", metavar="NAME", help="why this branch landed where it did")
+    p.add_argument("--why", nargs=2, metavar=("A", "B"),
+                   help="the chain of evidence putting A and B in one arc")
     args = p.parse_args()
 
     ents = load_entities(args.repo, args.main, args.max_files)
@@ -523,7 +549,21 @@ def main():
             ents[key] = own
     comp, sim, idf, keys = cluster(ents, args.k, args.min_sim, stacks)
     if args.method == "louvain":
-        comp = louvain(keys, sim, args.resolution)
+        # Branches decide the arcs; sessions only join one. A session is a thread of
+        # thought and thought drifts: session 8a4dc542 opens on roadMonitoring chart
+        # renames, notices a reference-stability problem eight turns later, and ends on
+        # the eslint rule that became UL-1634. Every consecutive turn overlaps the last,
+        # so segmentation never cuts it, and as one entity it linked UL-1634 to UB-6938
+        # across two hops -- the same chaining that fused 313 branches, one level down.
+        #
+        # That the two came out of one conversation is true and worth keeping. What it
+        # is evidence *of* is that one spawned the other, not that they are the same
+        # work, so a session may attach to an arc but never merge two.
+        bkeys = [k for k in keys if k[0] == "branch"]
+        bsim = {(a, b): s for (a, b), s in sim.items()
+                if a[0] == "branch" and b[0] == "branch"}
+        comp = louvain(bkeys, bsim, args.resolution)
+        comp = attach_sessions(comp, ents, sim)
     comp = enforce_stacks(comp, stacks, set(ents))
 
     arcs = []
@@ -552,6 +592,63 @@ def main():
         for s, other in pairs:
             shared = sorted(ents[me] & ents[other], key=lambda f: -idf.get(f, 0))[:4]
             print(f"  {s:.3f}  {other[0]}:{other[1][:44]}  ← {', '.join(shared)}")
+        return
+
+    if args.why:
+        a_key, b_key = None, None
+        for kind, n in ents:
+            if n == args.why[0]:
+                a_key = (kind, n)
+            if n == args.why[1]:
+                b_key = (kind, n)
+        if not a_key or not b_key:
+            sys.exit(f"arc-cluster: not in scope: "
+                     f"{args.why[0] if not a_key else args.why[1]}")
+
+        home = {m: root for root, ms in comp.items() for m in ms}
+        if home.get(a_key) != home.get(b_key):
+            print(f"{args.why[0]} and {args.why[1]} are in different arcs.")
+            return
+
+        # The widest path: of every chain joining the two, the one whose weakest link
+        # is strongest. "Why are these together" is answered by that weakest link --
+        # it is the single edge that, removed, would separate them along this route.
+        adj = collections.defaultdict(list)
+        for (x, y), s in sim.items():
+            if home.get(x) == home.get(a_key) and home.get(y) == home.get(a_key):
+                adj[x].append((s, y))
+                adj[y].append((s, x))
+        best = {a_key: float("inf")}
+        prev, seen = {}, set()
+        while True:
+            cur = max((k for k in best if k not in seen), key=lambda k: best[k],
+                      default=None)
+            if cur is None or cur == b_key:
+                break
+            seen.add(cur)
+            for s, nxt in adj.get(cur, ()):
+                w = min(best[cur], s)
+                if w > best.get(nxt, 0):
+                    best[nxt] = w
+                    prev[nxt] = cur
+        if b_key not in best:
+            print(f"{args.why[0]} and {args.why[1]} share an arc but no similarity "
+                  f"path — they were joined by an ancestry constraint.")
+            return
+
+        chain = [b_key]
+        while chain[-1] != a_key:
+            chain.append(prev[chain[-1]])
+        chain.reverse()
+        print(f"{args.why[0]} → {args.why[1]}: {len(chain) - 1} hops, "
+              f"weakest link {best[b_key]:.3f}")
+        for x, y in zip(chain, chain[1:]):
+            s = sim.get((x, y) if x < y else (y, x), 0)
+            shared = sorted(ents[x] & ents[y], key=lambda f: -idf.get(f, 0))
+            mark = " ←weakest" if abs(s - best[b_key]) < 1e-9 else ""
+            print(f"  {s:.3f}  {x[1][:36]:38s} → {y[1][:36]:38s} "
+                  f"{len(shared)} shared{mark}")
+            print(f"         {', '.join(shared[:5])}")
         return
 
     if args.json:
