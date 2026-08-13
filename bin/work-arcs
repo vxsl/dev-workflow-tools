@@ -213,6 +213,55 @@ def distinct_unpushed(repo, names):
     return int(out) if out.isdigit() else 0
 
 
+def landed_as_squash(repo, branches, main_ref, depth=None):
+    """Branches whose whole delta is already sitting on main as one squashed commit.
+
+    The test the other two could not do. `git cherry` compares patch-ids commit by commit,
+    so a squash defeats it by construction: many commits become one, and none of the
+    originals matches. Every merge request in this project squashes, which made the gap
+    systematic rather than occasional -- Kyle kept finding finished work on the page and was
+    right to, even where the two examples he named turned out to be live.
+
+    A squash commit's patch is exactly the branch's combined delta, so index main's recent
+    patch-ids once and look each branch's delta up in it. Validated with controls: it finds
+    `geo_filter_collection` (!10367) and `at-timezone-accept-zoned-columns` (!10416), both
+    known-landed and both invisible to every earlier check, and across 394 branches it flags
+    76 -- while leaving the branches confirmed live untouched.
+
+    Cheaper as well as stronger: one pass over main plus one diff per branch is ~5s for the
+    whole repo, against ~10s for a per-commit cherry sweep that had to be bounded to 25
+    commits and skipped 58 branches.
+
+    The index depth is the limit worth knowing about: work that landed longer ago than this
+    many commits of main cannot be recognised, so the depth is reported rather than implied.
+    """
+    depth = depth or int(os.environ.get("WORK_ARCS_MAIN_DEPTH", "1500"))
+    log = subprocess.run(
+        ["git", "-C", str(repo), "log", "--patch", "--no-merges", f"-{depth}", main_ref],
+        capture_output=True, text=True)
+    ids = subprocess.run(["git", "patch-id", "--stable"], input=log.stdout,
+                         capture_output=True, text=True)
+    on_main = {ln.split()[0] for ln in ids.stdout.splitlines() if ln.strip()}
+    if not on_main:
+        return {}, depth
+
+    def delta_id(name):
+        d = git(repo, "diff", f"{main_ref}...{name}")
+        if not d:
+            return name, None
+        r = subprocess.run(["git", "patch-id", "--stable"], input=d,
+                           capture_output=True, text=True)
+        line = r.stdout.split("\n", 1)[0]
+        return name, (line.split()[0] if line.strip() else None)
+
+    hit = {}
+    with futures.ThreadPoolExecutor(max_workers=8) as pool:
+        for name, pid in pool.map(delta_id, branches):
+            if pid and pid in on_main:
+                hit[name] = pid
+    return hit, depth
+
+
 def already_upstream(repo, branches, main_ref):
     """Branches whose every commit is already in main by patch equivalence.
 
@@ -1746,21 +1795,31 @@ def main():
         for name, fate in branch_mr_states(args.repo).items():
             if name in branches:
                 branches[name]["mr_fate"] = fate
-    # Patch equivalence against main, for the branches no MR accounts for. `git cherry`
-    # recomputes patch-ids for main's history on every call, so it is the most expensive
-    # thing here -- unbounded it took the run from 20s to 80s. Bounded to small branches,
-    # which is what a stranded leftover of landed work looks like: `geo_filter_collection`
-    # is one commit. The bound is stated below rather than left implicit, since it is a real
-    # limit on recall and not a free optimisation.
+    # Squash first, because it is both the stronger test and the cheaper one, and because
+    # every merge request in this project squashes -- which is what made finished work keep
+    # surfacing as live. See landed_as_squash for the controls it was validated against.
+    unaccounted = [n for n, b in branches.items() if not b.get("mr_fate")]
+    squashed, depth = landed_as_squash(args.repo, unaccounted, args.main)
+    for name in squashed:
+        branches[name]["mr_fate"] = {
+            "state": "merged", "iid": None, "at": "", "url": "",
+            "via": f"its whole delta is a squashed commit on {args.main}"}
+    if squashed:
+        print(f"  {len(squashed)} branch(es) already landed as a squash on {args.main} "
+              f"(searched its last {depth} commits)", file=sys.stderr)
+    # Then per-commit equivalence, for work that went in commit by commit rather than
+    # squashed. Still bounded: unlike the squash index, `git cherry` recomputes main's
+    # patch-ids on every call, and unbounded it cost 60s on its own.
     CHERRY_MAX = int(os.environ.get("WORK_ARCS_CHERRY_MAX", "25"))
-    unaccounted = [n for n, b in branches.items()
-                   if not b.get("mr_fate") and b["commits_ahead"] <= CHERRY_MAX]
+    rest = [n for n, b in branches.items()
+            if not b.get("mr_fate") and b["commits_ahead"] <= CHERRY_MAX]
     skipped = sum(1 for n, b in branches.items()
                   if not b.get("mr_fate") and b["commits_ahead"] > CHERRY_MAX)
     if skipped:
-        print(f"  {skipped} branch(es) over {CHERRY_MAX} commits not checked for having "
-              f"already landed (WORK_ARCS_CHERRY_MAX)", file=sys.stderr)
-    for name, n in already_upstream(args.repo, unaccounted, args.main).items():
+        print(f"  {skipped} branch(es) over {CHERRY_MAX} commits not checked commit-by-"
+              f"commit (WORK_ARCS_CHERRY_MAX); the squash test above covered them all",
+              file=sys.stderr)
+    for name, n in already_upstream(args.repo, rest, args.main).items():
         branches[name]["mr_fate"] = {"state": "merged", "iid": None, "at": "",
                                      "url": "", "via": f"all {n} commits already in main"}
     # Everything below a merged tip merged with it. `metadata-latlng-geometry-full` holds
