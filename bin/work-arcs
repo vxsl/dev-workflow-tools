@@ -32,6 +32,7 @@ Read-only. Runs git and glab, writes nothing.
 
 import argparse
 import base64
+import concurrent.futures as futures
 import json
 import os
 import re
@@ -67,6 +68,14 @@ SRC_SUFFIXES = (
     ".rs", ".ts", ".tsx", ".js", ".jsx", ".py", ".sql", ".go",
     ".java", ".kt", ".swift", ".c", ".cc", ".cpp", ".h", ".hpp",
 )
+
+# Names that announce a branch is a copy of another rather than work of its own. Only
+# ever a tie-break: a branch is called superseded because its commits are already
+# somewhere else, never because of what it is called. `UB-6938-preX` is a variant and
+# `hotfix/query-telemetry-to-thor` is not, and no regex can be trusted with that call.
+VARIANT_RE = re.compile(
+    r"(?:^|[-/_.])(bak|backup|old|orig|copy|before[-_]?squash|pre[-_]?squash"
+    r"|pre\d+|wip|tmp|temp|squash|stash)(?:[-/_.]|\d*$)", re.I)
 
 
 ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
@@ -179,7 +188,44 @@ def collect_branches(repo, main_ref):
             "--format=%(refname:short)", "refs/heads",
         ))
         b["parents"] = [p for p in parents if p != name]
+        # What the branch's commits say they did. Carried here rather than fetched per
+        # arc because it is what tells a superseded copy from live work, and every
+        # consumer downstream -- the duplicate pass, the split prompt, the brief --
+        # wants the same list. 394 branches cost ~1.1s, once.
+        b["subjects"] = lines(git(repo, "log", "--format=%s", "-20",
+                                  f"{main_ref}..{name}"))
     return branches
+
+
+def distinct_unpushed(repo, names):
+    """How many commits an arc actually has on no remote, counted once each.
+
+    Summing per branch double-counts every stack: `dove-boot-churn-backup` is an ancestor
+    of `dove-boot-churn`, so its 32 unpushed commits ARE 32 of that branch's, and adding
+    them made one arc claim 130 where the truth is 98. Union first, then count -- which is
+    what rev-list does natively given every tip at once.
+    """
+    names = [n for n in names if not n.startswith("-")]
+    if not names:
+        return 0
+    out = git(repo, "rev-list", "--count", *names, "--not", "--remotes").strip()
+    return int(out) if out.isdigit() else 0
+
+
+def patch_ids(repo, branch, main_ref, limit=20):
+    """The content-identity of each commit, independent of its sha.
+
+    Two branches can carry byte-identical commit subjects over different changes -- a
+    cherry-pick that was then amended reads exactly like its original. Subjects find the
+    candidate pair; this is what says whether the copy is truly redundant or whether it
+    holds a version of the change that the other branch does not.
+    """
+    out = git(repo, "log", "--patch", f"-{limit}", f"{main_ref}..{branch}")
+    if not out:
+        return set()
+    r = subprocess.run(["git", "patch-id", "--stable"],
+                       input=out, capture_output=True, text=True)
+    return {line.split()[0] for line in r.stdout.splitlines() if line.strip()}
 
 
 def collect_stashes(repo):
@@ -206,32 +252,147 @@ def collect_stashes(repo):
     return stashes
 
 
-def collect_mrs(repo):
-    """Open MRs of mine, with comment counts. One API call gets what list cannot."""
+def project_url(repo, mrs):
+    """The project's web root, so commits and branches can be linked.
+
+    Taken off an MR's own URL where there is one -- it is already fetched, and it is the
+    authority on where this project lives. The remote is the fallback and needs unpicking:
+    `git@host:group/proj.git` is not a URL.
+    """
+    for m in mrs:
+        url = m.get("url") or ""
+        if "/-/merge_requests/" in url:
+            return url.split("/-/merge_requests/")[0]
+    remote = git(repo, "remote", "get-url", "origin").strip()
+    if not remote:
+        return ""
+    remote = re.sub(r"\.git$", "", remote)
+    m = re.match(r"^(?:ssh://)?git@([^:/]+)[:/](.+)$", remote)
+    if m:
+        return f"https://{m.group(1)}/{m.group(2)}"
+    return remote if remote.startswith("http") else ""
+
+
+def glab(repo, path, timeout=40):
+    """One GitLab call, returning parsed JSON or None. Failures are survivable here."""
+    try:
+        r = subprocess.run(["glab", "api", path], capture_output=True, text=True,
+                           cwd=str(repo), timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode != 0 or not r.stdout.strip():
+        return None
+    try:
+        return json.loads(r.stdout)
+    except json.JSONDecodeError:
+        return None
+
+
+def unresolved_threads(repo, iid):
+    """Review threads on your own MR that nobody has resolved.
+
+    `blocking_discussions_resolved` is the field that looks like it answers this and it
+    does not: on !10398 it reads True while four of ella's threads sit unresolved, because
+    this project does not require resolution to merge. It reports mergeability, not whether
+    anyone is waiting on you.
+
+    So the threads have to be read. Only the first note of each is kept, quoted, because
+    anything claiming you owe someone an answer has to show what they asked.
+    """
+    threads = glab(repo, f"projects/:id/merge_requests/{iid}/discussions?per_page=100")
+    open_ = []
+    for t in threads or []:
+        notes = [n for n in (t.get("notes") or []) if n.get("resolvable")]
+        if not notes or all(n.get("resolved") for n in notes):
+            continue
+        first = notes[0]
+        body = " ".join((first.get("body") or "").split())
+        open_.append({
+            "author": (first.get("author") or {}).get("username", "?"),
+            "quote": body[:180] + ("…" if len(body) > 180 else ""),
+            "notes": len(notes),
+            "at": (first.get("created_at") or "")[:10],
+        })
+    return open_
+
+
+def branch_pipelines(repo):
+    """Latest pipeline per ref, from one sweep of the project's recent pipelines.
+
+    Cheap and partial by design. The window covers about a day and a half, so it finds a
+    failure on a branch you were just on -- `UL-1774` failed here with no MR to hang it
+    off -- and says nothing about older refs. MR pipelines are fetched per MR instead,
+    because those matter whatever their age.
+    """
+    pipes = glab(repo, "projects/:id/pipelines?per_page=100&order_by=updated_at&sort=desc")
+    by_ref = {}
+    for p in pipes or []:
+        ref = p.get("ref") or ""
+        if ref.startswith("refs/"):
+            continue
+        by_ref.setdefault(ref, {"status": p.get("status", ""),
+                                "url": p.get("web_url", ""),
+                                "at": (p.get("updated_at") or "")[:10]})
+    return by_ref
+
+
+def collect_mrs(repo, deep=True):
+    """Open MRs of mine, with enough state to say whose court the ball is in.
+
+    The list call already carries most of it -- conflicts, merge state, reviewers,
+    approvals -- and the previous version read four fields out of forty-eight. What it
+    cannot carry is unresolved threads and pipeline status, so those are fetched per MR,
+    threaded, and gated: threads only where the MR has user notes at all, which on 19 open
+    MRs is 3 of them.
+
+    `with_merge_status_recheck=true` is deliberately NOT passed. It looks like the way to
+    resolve the eight MRs reading `unchecked`, and instead it discards the cached verdict
+    and returns `checking` -- measured, it turned !10391's known `conflict` into an
+    unknown. An unknown is reported as unknown rather than guessed at.
+    """
     if not shutil.which("glab"):
         return [], "glab not installed"
-    r = subprocess.run(
-        ["glab", "api",
-         "projects/:id/merge_requests?scope=created_by_me&state=opened&per_page=100"],
-        capture_output=True, text=True, cwd=str(repo), timeout=40,
-    )
-    if r.returncode != 0 or not r.stdout.strip():
+    raw = glab(repo,
+               "projects/:id/merge_requests?scope=created_by_me&state=opened&per_page=100")
+    if raw is None:
         return [], "glab could not read merge requests"
-    try:
-        raw = json.loads(r.stdout)
-    except json.JSONDecodeError:
-        return [], "unreadable response from glab"
     mrs = []
     for m in raw:
+        state = m.get("detailed_merge_status") or m.get("merge_status") or ""
         mrs.append({
             "iid": m.get("iid"),
             "title": m.get("title", ""),
             "branch": m.get("source_branch", ""),
+            "target": m.get("target_branch", ""),
             "notes": m.get("user_notes_count", 0),
             "draft": bool(m.get("draft") or m.get("work_in_progress")),
             "updated": m.get("updated_at", ""),
             "url": m.get("web_url", ""),
+            "sha": (m.get("sha") or "")[:9],
+            "merge_state": state,
+            # A conflict is asserted by either field; `has_conflicts` was False on
+            # !10391 while detailed_merge_status already said `conflict`.
+            "conflicts": bool(m.get("has_conflicts")) or state == "conflict",
+            "approved": state == "mergeable",
+            "reviewers": [r.get("username", "") for r in (m.get("reviewers") or [])],
+            "approvals": m.get("upvotes", 0),
+            "threads": [],
+            "pipeline": None,
         })
+    if not deep or not mrs:
+        return mrs, None
+
+    def enrich(mr):
+        if mr["notes"]:
+            mr["threads"] = unresolved_threads(repo, mr["iid"])
+        pipes = glab(repo, f"projects/:id/merge_requests/{mr['iid']}/pipelines?per_page=1")
+        if pipes:
+            mr["pipeline"] = {"status": pipes[0].get("status", ""),
+                              "url": pipes[0].get("web_url", ""),
+                              "at": (pipes[0].get("updated_at") or "")[:10]}
+
+    with futures.ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(enrich, mrs))
     return mrs, None
 
 
@@ -271,6 +432,10 @@ def collect_jira():
             "status": status,
             "handed_off": status.strip().lower() in HANDED_OFF,
             "updated": (f.get("updated") or "")[:10],
+            # The link belongs with the ticket, not with whatever renders it. Only this
+            # function knows the Jira domain, and a page that has to reconstruct the URL
+            # from a key is a page that will get it wrong for one project.
+            "url": f"https://{domain}/browse/{i.get('key','')}",
         })
     return issues, None
 
@@ -389,6 +554,79 @@ def reconcile(arcs, issues):
                                "why": f"status '{i['status']}' but untouched {a['age_days']}d"})
     return {"unticketed_work": unticketed, "tickets_without_work": no_work,
             "status_mismatch": mismatched}
+
+
+OVERRIDES = (Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
+             / "work-arcs" / "authoritative.json")
+
+
+def load_overrides():
+    if not OVERRIDES.exists():
+        return {}
+    try:
+        data = json.loads(OVERRIDES.read_text())
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def apply_overrides(arcs, store):
+    """Let a human name the authoritative branch, in the one form that cannot rot.
+
+    Nothing here may DEPEND on this: 0 of 38 open tickets carry an estimate, which is the
+    measured fate of every optional field, so the derivation has to be right on its own
+    and this only ever corrects it. That is also why the override is not simply an
+    assertion. It records what it was overriding at the time, and it applies only while
+    that is still what the derivation says. Once the evidence moves -- an MR opens, a
+    branch is squashed -- the override has been overtaken by facts it never saw, and it
+    reports itself stale instead of quietly outvoting them.
+
+    Returns the labels whose override was ignored, so the page can say so.
+    """
+    stale = []
+    for arc in arcs:
+        entry = store.get(arc.get("label")) or store.get(arc.get("id"))
+        if not entry:
+            continue
+        want = entry.get("branch")
+        if want not in {b["name"] for b in arc.get("branches", [])}:
+            stale.append({"label": arc.get("label"), "branch": want,
+                          "why": "that branch is no longer in this arc"})
+            continue
+        was = entry.get("over")
+        if was and was != arc.get("authoritative"):
+            stale.append({"label": arc.get("label"), "branch": want,
+                          "why": f"derivation moved from {was} to "
+                                 f"{arc.get('authoritative')} since you set this"})
+            continue
+        arc["authoritative"] = want
+        arc["authoritative_via"] = "set by hand"
+        for b in arc["branches"]:
+            b["authoritative"] = b["name"] == want
+        arc["demands"] = demands(arc)
+    return stale
+
+
+def set_override(arcs, spec):
+    """`--authoritative ARC=BRANCH`, stamped with what it is overriding."""
+    label, _, branch = spec.partition("=")
+    label, branch = label.strip(), branch.strip()
+    match = [a for a in arcs if a.get("label") == label or a.get("id") == label]
+    if not match:
+        sys.exit(f"work-arcs: no arc named {label!r}")
+    arc = match[0]
+    names = [b["name"] for b in arc["branches"]]
+    if branch not in names:
+        sys.exit(f"work-arcs: {branch!r} is not a branch of {label!r}\n  "
+                 + "\n  ".join(names))
+    store = load_overrides()
+    store[label] = {"branch": branch, "over": arc.get("authoritative"),
+                    "at": int(time.time())}
+    OVERRIDES.parent.mkdir(parents=True, exist_ok=True)
+    OVERRIDES.write_text(json.dumps(store, indent=1, sort_keys=True))
+    print(f"✓ {label}: authoritative branch is {branch} "
+          f"(was deriving {arc.get('authoritative')})", file=sys.stderr)
+    print(f"  expires itself if that derivation changes — {OVERRIDES}", file=sys.stderr)
 
 
 def jira_ify(repo, arc, dry_run):
@@ -520,7 +758,8 @@ def prefix_of(name):
     return None
 
 
-def build_arcs(branches, stashes, mrs, sessions, main_ref, cluster_assign=None):
+def build_arcs(branches, stashes, mrs, sessions, main_ref, cluster_assign=None,
+               repo=None):
     known_projects = set()
     for name in branches:
         m = TICKET_RE.search(name.upper())
@@ -602,12 +841,208 @@ def build_arcs(branches, stashes, mrs, sessions, main_ref, cluster_assign=None):
             })
 
     for arc in arcs.values():
-        finalize(arc)
+        finalize(arc, repo, main_ref)
     ordered = sorted(arcs.values(), key=lambda a: (a["age_days"], -a["at_risk"]))
     return ordered, unattached
 
 
-def finalize(arc):
+def mark_duplicates(arc, repo=None, main_ref="origin/main"):
+    """Say which branches in an arc are copies of another rather than work of their own.
+
+    An arc has always been a bag of branches with no notion of which one IS the work, and
+    the cost of that is not cosmetic. Measured: the brief for UL-1634 asserted "the lint
+    work is on a separate branch that isn't stacked onto the fix", and the truth is the
+    opposite -- all four commits of the MR ARE the lint work, while
+    `lint-metric-instance-stability` holds a single commit whose subject is byte-identical
+    to one of them. A superseded cherry-pick drawn as an independent root reads as a second
+    piece of work, and the model read it exactly that way.
+
+    The test is containment: if every commit subject on B also appears on a branch ranked
+    above it, B adds nothing. Ranking first is what keeps this acyclic -- a branch can only
+    ever be superseded by a stronger one. Patch-ids then say whether the copy is redundant
+    to the byte or merely reads the same, which is the difference between "delete this" and
+    "check what diverched".
+
+    Containment alone is not enough, and the difference is the whole distinction being
+    drawn. A stack parent's commits are contained in its child too -- measured, `UB-6829`
+    is an ancestor of `dove-test-utils`, so subject containment alone called the ticket
+    branch a duplicate of the branch stacked on top of it. Same commits, same shas: that is
+    a stack, it is already drawn as an edge, and it is not supersession. A superseded copy
+    is the other case -- the same *content* under different shas, which is what a
+    cherry-pick, a rebase or a squash leaves behind.
+    """
+    branches = arc.get("branches", [])
+    if len(branches) < 2:
+        return
+    mr_branches = {m.get("branch") for m in arc.get("mrs", [])}
+
+    def rank(b):
+        # Name before size, and the order is load-bearing. A `-before-squash` branch has
+        # more commits than the squashed version by construction, so ranking on commit
+        # count first nominates the pre-squash copy as the canonical branch and then
+        # declares the real one a duplicate of it. The name only ever picks which of two
+        # branches is canonical; what makes one superseded at all is its content.
+        return (b["name"] in mr_branches, not VARIANT_RE.search(b["name"]),
+                b.get("commits_ahead", 0), b.get("pushed", False),
+                -b.get("age_days", 999), b["name"])
+
+    ordered = sorted(branches, key=rank, reverse=True)
+    for b in ordered:
+        # Recomputed from scratch, never accumulated: finalize runs again once tickets are
+        # joined on, and a mark left over from the previous pass would outlive its reason.
+        b.pop("superseded_by", None)
+        b.pop("superseded_kind", None)
+    ids = {}
+
+    def pids(name):
+        if name not in ids:
+            ids[name] = patch_ids(repo, name, main_ref) if repo is not None else set()
+        return ids[name]
+
+    for i, b in enumerate(ordered):
+        subs = set(b.get("subjects") or [])
+        if not subs:
+            continue
+        for a in ordered[:i]:
+            asubs = set(a.get("subjects") or [])
+            if not asubs or not subs <= asubs:
+                continue
+            if b["name"] in (a.get("parents") or []):
+                continue  # a stack edge, drawn as one; not a copy
+            kind = "same subjects"
+            if repo is not None and len(subs) <= 20 and len(asubs) <= 20:
+                mine = pids(b["name"])
+                if mine and mine <= pids(a["name"]):
+                    kind = "identical content"
+            b["superseded_by"] = a["name"]
+            b["superseded_kind"] = kind
+            break
+
+
+def authoritative(arc):
+    """Which single branch IS this work, and on what evidence.
+
+    Three sources, strongest first, and the reason is recorded with the answer because
+    they are not equally trustworthy. An open MR's source branch is a fact -- it is the
+    branch under review, which is what "the work" means once it has left your hands. A
+    branch naming the arc's ticket is nearly as good and only usable when exactly one
+    does. Falling back to the deepest surviving branch is a guess, and saying so is the
+    difference between a derivation and an assertion.
+    """
+    branches = [b for b in arc.get("branches", []) if not b.get("superseded_by")]
+    if not branches:
+        branches = arc.get("branches", [])
+    if not branches:
+        return None, None
+    by_name = {b["name"]: b for b in branches}
+
+    # An arc can hold several MRs, and then the question is which one the work is currently
+    # about. finalize has already ordered them most-recently-updated first with drafts
+    # last, which is a better answer than the highest number -- that just means newest filed.
+    for m in arc.get("mrs", []):
+        if m.get("branch") in by_name:
+            return m["branch"], f"source of !{m.get('iid')}"
+
+    for i in arc.get("issues", []):
+        named = [b["name"] for b in branches
+                 if TICKET_RE.search(b["name"].upper())
+                 and TICKET_RE.search(b["name"].upper()).group(0) == i["key"]]
+        if len(named) == 1:
+            return named[0], f"names {i['key']}"
+
+    best = max(branches, key=lambda b: (not VARIANT_RE.search(b["name"]),
+                                        b.get("commits_ahead", 0),
+                                        b.get("pushed", False),
+                                        -b.get("age_days", 999)))
+    return best["name"], "deepest branch, no MR"
+
+
+# The order is the whole point: what will bite you soonest, not what is biggest. Nothing
+# in this list is here because it is large -- each entry is a thing that cannot move until
+# you personally do something.
+DEMAND_RANK = {"conflict": 0, "threads": 1, "pipeline": 2, "approved": 3,
+               "unpushed": 4, "unreviewed": 5, "draft": 6}
+
+
+def demands(arc):
+    """What this arc needs from *you*, worst first. Empty means it is someone else's turn.
+
+    The correction this makes: an arc whose only state is "up for review" was rendering as
+    the hottest thing on the page, level with work that is genuinely stuck. Getting a
+    discrete piece of work up for review is most of the job done -- the counterparty is a
+    reviewer and the clock is theirs. It belongs at the bottom.
+
+    What belongs at the top is the small set of things where the work has come back: a
+    branch that no longer merges, a question nobody answered, a pipeline that went red, an
+    approval that never turned into a merge, and commits that exist on this laptop only.
+    """
+    out = []
+    for m in arc.get("mrs", []):
+        ref = f"!{m.get('iid')}"
+        if m.get("conflicts"):
+            out.append({"kind": "conflict", "what": f"{ref} no longer merges into "
+                        f"{m.get('target') or 'main'} — rebase", "url": m.get("url", "")})
+        for t in m.get("threads", []):
+            out.append({"kind": "threads",
+                        "what": f"{ref}: {t['author']} asked, unanswered since {t['at']}",
+                        "quote": t.get("quote", ""), "url": m.get("url", "")})
+        pipe = m.get("pipeline") or {}
+        if pipe.get("status") in ("failed", "canceled"):
+            out.append({"kind": "pipeline",
+                        "what": f"{ref} pipeline {pipe['status']} on {pipe.get('at','')}",
+                        "url": pipe.get("url") or m.get("url", "")})
+        if m.get("approved") and not m.get("draft"):
+            out.append({"kind": "approved",
+                        "what": f"{ref} is approved and still open — merge it",
+                        "url": m.get("url", "")})
+        if m.get("draft") and arc.get("age_days", 0) > 14:
+            out.append({"kind": "draft",
+                        "what": f"{ref} has been a draft for {arc['age_days']}d — nobody "
+                                "will review it", "url": m.get("url", "")})
+
+    for b in arc.get("branches", []):
+        pipe = b.get("pipeline") or {}
+        if pipe.get("status") == "failed" and not b.get("superseded_by"):
+            out.append({"kind": "pipeline",
+                        "what": f"{b['name']} pipeline failed on {pipe.get('at','')}",
+                        "url": pipe.get("url", "")})
+
+    # Only commits that are the live work. A superseded copy's commits already exist on
+    # the branch that supersedes it, so counting them as at-risk invents risk: the one
+    # unpushed commit on `lint-metric-instance-stability` is a cherry-pick of a commit
+    # that is pushed, reviewed and in an MR.
+    if arc.get("unpushed_live"):
+        n = arc["unpushed_live"]
+        out.append({"kind": "unpushed",
+                    "what": (f"{n} commit exists" if n == 1 else f"{n} commits exist")
+                            + " nowhere but this laptop"})
+
+    auth = arc.get("authoritative")
+    if auth and not arc.get("mrs"):
+        b = next((x for x in arc["branches"] if x["name"] == auth), None)
+        if b and b.get("pushed") and b.get("commits_ahead", 0) > 0:
+            n = b["commits_ahead"]
+            out.append({"kind": "unreviewed",
+                        "what": f"{auth} is pushed with {n} "
+                                f"commit{'' if n == 1 else 's'} and has no merge request"})
+
+    out.sort(key=lambda d: DEMAND_RANK.get(d["kind"], 9))
+    return out
+
+
+def finalize(arc, repo=None, main_ref="origin/main"):
+    # Runs twice: once as arcs are built, and again after Jira issues are joined on, since
+    # which branch is authoritative can depend on which ticket the arc owns. Every field
+    # here is recomputed rather than added to, so the second pass is a no-op where nothing
+    # changed and a correction where something did.
+    # Most recently updated first, drafts last: on an arc holding several MRs that is the
+    # one the work is currently about, and everything downstream reads mrs[0] as the one
+    # that speaks for the arc. Two stable sorts rather than one composite key.
+    arc["mrs"].sort(key=lambda m: m.get("updated") or "", reverse=True)
+    arc["mrs"].sort(key=lambda m: m.get("draft", False))
+
+    mark_duplicates(arc, repo, main_ref)
+
     # Two different ages, because they answer different questions. The newest
     # touch says "is this live"; the median says "how much of this has gone cold".
     # Min alone made every large arc look active: one commit today in a 17-branch
@@ -619,17 +1054,57 @@ def finalize(arc):
     arc["age_days"] = ages[0] if ages else 999
     arc["median_age_days"] = ages[len(ages) // 2] if ages else 999
 
+    # Two numbers, because they answer different questions. `unpushed` is the per-branch
+    # sum -- the fact about the refs, and what every earlier version of this reported.
+    # `unpushed_live` is how many commits are genuinely only here: counted once each rather
+    # than once per branch that contains them, and over live branches only, since a
+    # superseded copy's commits already exist on the branch that supersedes it. The gap
+    # between the two is how much of this arc's apparent risk is the same work recounted.
     arc["unpushed"] = sum(b["unpushed"] for b in arc["branches"])
+    live = [b["name"] for b in arc["branches"]
+            if b["unpushed"] and not b.get("superseded_by")]
+    arc["unpushed_live"] = (distinct_unpushed(repo, live) if repo is not None
+                            else sum(b["unpushed"] for b in arc["branches"]
+                                     if not b.get("superseded_by")))
+    arc["superseded"] = sum(1 for b in arc["branches"] if b.get("superseded_by"))
     # Stashes contribute a token amount: they break ties, they do not set priority.
-    arc["at_risk"] = arc["unpushed"] + min(sum(s["src_count"] for s in arc["stashes"]), 3)
+    arc["at_risk"] = arc["unpushed_live"] + min(
+        sum(s["src_count"] for s in arc["stashes"]), 3)
     arc["stacked"] = sum(1 for b in arc["branches"] if b["parents"])
 
-    if arc["mrs"] and any(m["notes"] == 0 for m in arc["mrs"]):
-        arc["state"] = "waiting on review"
+    auth, via = authoritative(arc)
+    arc["authoritative"], arc["authoritative_via"] = auth, via
+    for b in arc["branches"]:
+        b["authoritative"] = b["name"] == auth
+    # The ticket the work is filed under, kept apart from the rest. An arc can carry five
+    # keys; exactly one of them is the one this branch is answering, and a subhead that
+    # prints all five with no distinction between them says nothing about which.
+    arc["ticket"] = None
+    if auth:
+        m = TICKET_RE.search(auth.upper())
+        if m:
+            arc["ticket"] = m.group(0)
+    if not arc["ticket"] and arc.get("issues"):
+        arc["ticket"] = arc["issues"][0]["key"]
+
+    arc["demands"] = demands(arc)
+    # One number for "how much does this need me", so every consumer ranks the same way.
+    # The page used to hold its own opinion about severity and it disagreed with this one.
+    arc["urgency"] = (DEMAND_RANK.get(arc["demands"][0]["kind"], 9)
+                      if arc["demands"] else 99)
+    if arc["demands"]:
+        arc["state"] = {
+            "conflict": "needs rebase", "threads": "unanswered review",
+            "pipeline": "pipeline failed", "approved": "approved, unmerged",
+            "unpushed": "at risk", "unreviewed": "no merge request",
+            "draft": "stale draft",
+        }.get(arc["demands"][0]["kind"], "needs you")
+    elif arc["mrs"]:
+        # Nothing outstanding and an MR open: your end of the deal is done. This used to
+        # read "waiting on review" and rank first.
+        arc["state"] = "in review"
     elif arc["age_days"] <= 3:
         arc["state"] = "active"
-    elif arc["unpushed"]:
-        arc["state"] = "at risk"
     else:
         arc["state"] = "idle"
 
@@ -669,6 +1144,13 @@ def main():
     p.add_argument("--resolution", type=float, default=3.0,
                    help="arc-cluster granularity passed through")
     p.add_argument("--no-mr", action="store_true", help="skip the GitLab call")
+    p.add_argument("--shallow-mr", action="store_true",
+                   help="skip the per-MR calls for unresolved review threads and pipeline "
+                        "status; the list call alone still gives conflicts and approvals")
+    p.add_argument("--authoritative", metavar="ARC=BRANCH",
+                   help="name the branch that IS an arc's work when the derivation gets it "
+                        "wrong. Optional: it only corrects, nothing depends on it, and it "
+                        "expires itself once the derivation changes underneath")
     p.add_argument("--no-split", action="store_true",
                    help="skip arc-brief's pass over arcs that hold several bodies of "
                         "work; file overlap alone decides membership")
@@ -707,10 +1189,14 @@ def main():
 
     branches = collect_branches(args.repo, args.main)
     stashes = collect_stashes(args.repo)
-    mrs, mr_error = ([], None) if args.no_mr else collect_mrs(args.repo)
+    mrs, mr_error = ([], None) if args.no_mr else collect_mrs(args.repo, not args.shallow_mr)
+    if not args.no_mr:
+        for name, pipe in branch_pipelines(args.repo).items():
+            if name in branches:
+                branches[name]["pipeline"] = pipe
     sessions = session_index(args.projects)
     arcs, unattached = build_arcs(branches, stashes, mrs, sessions, args.main,
-                                  cluster_assign)
+                                  cluster_assign, args.repo)
 
     # File overlap cannot separate two tickets that edit the same module -- measured,
     # UB-6938 migrating the metric catalogs and UL-1634 hardening a lint rule over those
@@ -723,7 +1209,11 @@ def main():
         if refined:
             cluster_assign = {**cluster_assign, **refined}
             arcs, unattached = build_arcs(branches, stashes, mrs, sessions, args.main,
-                                          cluster_assign)
+                                          cluster_assign, args.repo)
+
+    if args.authoritative:
+        set_override(arcs, args.authoritative)
+        return
 
     if args.jira_ify:
         match = [a for a in arcs if a["label"] == args.jira_ify or a["id"] == args.jira_ify]
@@ -739,6 +1229,12 @@ def main():
     if args.gap or args.json:
         issues, jira_error = collect_jira()
         gap = reconcile(arcs, issues) if not jira_error else None
+        if gap is not None:
+            # Which branch is authoritative can depend on which ticket the arc owns, and
+            # reconcile is where tickets arrive. Recomputing beats guessing earlier from
+            # branch names alone.
+            for arc in arcs:
+                finalize(arc, args.repo, args.main)
         if gap and args.initiatives:
             i2i, inits = collect_initiatives(issues)
             gap["initiatives"] = inits
@@ -771,6 +1267,11 @@ def main():
               file=sys.stderr)
         return
 
+    stale_overrides = apply_overrides(arcs, load_overrides())
+    for s in stale_overrides:
+        print(f"⚠ ignoring authoritative={s['branch']} for {s['label']}: {s['why']}",
+              file=sys.stderr)
+
     if args.active is not None:
         arcs = [a for a in arcs if a["age_days"] <= args.active]
 
@@ -787,10 +1288,12 @@ def main():
             "generated": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             "repo": args.repo.name,
             "main": args.main,
+            "project_url": project_url(args.repo, mrs),
             "mr_error": mr_error,
             "arc_count": len(arcs),
             "arcs": arcs,
             "unattached_stashes": unattached,
+            "stale_overrides": stale_overrides,
             "gap": gap,
         }, sys.stdout, indent=1)
         print()
@@ -811,9 +1314,13 @@ def main():
             bits.append(f"{a['stacked']}stacked")
         if a["engagement"]:
             bits.append(f"{a['engagement']}ref")
-        risk = f"  {a['unpushed']} unpushed" if a["unpushed"] else ""
+        if a["superseded"]:
+            bits.append(f"{a['superseded']}dup")
+        risk = f"  {a['unpushed_live']} unpushed" if a["unpushed_live"] else ""
         print(f"{a['age_days']:>4}d  {a['state']:<18} {a['label']:<28} "
               f"{','.join(bits):<28}{risk}")
+        for d in a["demands"][:2]:
+            print(f"        └ {d['what']}")
     print(f"\n✓ {len(arcs)} arcs from {len(branches)} branches, "
           f"{len(mrs)} MRs; {len(unattached)} stashes attached to no arc",
           file=sys.stderr)

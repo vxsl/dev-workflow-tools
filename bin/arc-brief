@@ -57,6 +57,19 @@ commit subjects, merge request titles, Jira tickets, stashed file paths, and pro
 engineer typed while working on it. These artifacts were grouped together because they
 touch the same files -- the grouping is reliable, the existing label is not.
 
+Read the branch annotations literally and do not go beyond them:
+
+- `[THE WORK]` marks the branch that IS this arc -- normally the source branch of its
+  merge request. Describe the arc as that branch's change. The others are its history.
+- A branch marked as a superseded copy holds commits that already exist on the branch
+  named. It is a cherry-pick, a pre-squash remnant or an abandoned rebase. It is NOT a
+  second piece of work, NOT work happening elsewhere, and NOT something left undone.
+- `(no parent in this arc)` means only that git records no ancestry. It does NOT mean the
+  branch is unrelated to the others, and it is not evidence that work was done separately
+  or left unstacked. Never infer separation from a missing edge.
+- Where the same commit subject appears against two branches, that is one change written
+  down twice. Say what the change is, once.
+
 Return ONLY a JSON object, no prose and no code fence:
 
 {"name": "...", "summary": "...", "blocker": "..."}
@@ -69,9 +82,12 @@ summary  Two sentences on what this work is doing and where it stands. Concrete:
          the actual behaviour being changed. Draw on the prompts -- they say what the
          engineer was chasing in a way branch names never do. Never restate the counts
          you were given; the reader can already see them.
-blocker  One short clause naming the single thing most in the way -- unpushed work, a
-         stalled review, a rebase that never landed, an abandoned variant. Empty string
-         if nothing stands out. No hedging, no advice.
+blocker  One short clause naming the single thing most in the way, and only what the
+         evidence states. If a merge request is marked as no longer merging, that is the
+         blocker. If a thread is quoted as unresolved, that is the blocker. Prefer whatever
+         needs the engineer personally over anything waiting on a reviewer: an MR sitting
+         in review with nothing outstanding is not a blocker, it is the normal end state.
+         Empty string if nothing stands out. No hedging, no advice.
 
 Evidence:
 {evidence}
@@ -102,6 +118,12 @@ Return ONLY a JSON object, no prose and no code fence:
 - Do NOT split a stack, a rebase, or the variants of one change. `x-bak`,
   `x-before-squash`, `backup/x`, `x-preX`, `x-wip` are the SAME work as `x`. Successive
   refinements of one feature are one body however many branches they took.
+- A branch annotated as a copy of another has been VERIFIED to hold commits that already
+  exist on that branch. Keep it with the branch it copies, always. Repeated commit subjects
+  across branches mean one change recorded twice, never two efforts at the same goal.
+- `[the branch under review]` marks the branch carrying the merge request. Whatever it does
+  is the main body of this group; put a branch elsewhere only if its commits serve a
+  different goal from that one.
 - Do NOT split because branches touch different files or different parts of a feature.
   Work spreads across a codebase; that is normal and not a second body.
 - DO split when a branch's commits are plainly in service of a different goal -- another
@@ -157,15 +179,31 @@ def spawn_tree(branches):
     work-arcs derives `parents` for every branch and the page throws it away. An arc is
     not a bag of branches -- it is a few chains and some orphans, and which is which is
     most of what you want to know about it.
+
+    Two more relations belong here, and leaving them out produced a brief that was
+    confidently wrong. For UL-1634 this printed "(no parent in this arc)" against both the
+    MR branch and a one-commit cherry-pick of one of its commits, and the model read the
+    absence of an edge as evidence of independence: it reported "the lint work on a separate
+    branch that isn't stacked onto the fix" when all four commits of the MR *are* the lint
+    work. Neither branch is a parent of the other; they are the same change twice. So say
+    which branch is the work, and say which branches are copies -- absence of a parent means
+    only that, and the model should not have to infer the rest.
     """
     names = {b["name"] for b in branches}
     lines_out = []
     for b in branches:
         parents = [p for p in (b.get("parents") or []) if p in names and p != b["name"]]
+        marks = []
+        if b.get("authoritative"):
+            marks.append("THE WORK")
+        if b.get("superseded_by") in names:
+            marks.append(f"{b.get('superseded_kind', 'duplicate')} already on "
+                         f"{b['superseded_by']} — a superseded copy, not separate work")
+        tail = f"  [{'; '.join(marks)}]" if marks else ""
         if parents:
-            lines_out.append(f"  {b['name']} <- cut from {', '.join(parents[:3])}")
+            lines_out.append(f"  {b['name']} <- cut from {', '.join(parents[:3])}{tail}")
         else:
-            lines_out.append(f"  {b['name']} (no parent in this arc)")
+            lines_out.append(f"  {b['name']} (no parent in this arc){tail}")
     return lines_out
 
 
@@ -183,7 +221,29 @@ def evidence_for(arc, repo, main, turns):
         out.append("Merge requests:")
         for m in arc["mrs"][:5]:
             draft = " (draft)" if m.get("draft") else ""
-            out.append(f"  !{m.get('iid','?')}{draft} {m.get('title','')}")
+            out.append(f"  !{m.get('iid','?')}{draft} {m.get('title','')}"
+                       f" [branch {m.get('branch','?')}]")
+            # The state that says whose turn it is. A blocker naming a stalled review when
+            # the MR is actually unmergeable, or unpushed commits when the real hold-up is
+            # four unanswered questions, is a wrong blocker -- and one wrong reminder costs
+            # more than ten right ones earn.
+            state = []
+            if m.get("conflicts"):
+                state.append(f"NO LONGER MERGES into {m.get('target') or 'main'}")
+            if m.get("approved"):
+                state.append("approved and still open")
+            pipe = m.get("pipeline") or {}
+            if pipe.get("status") and pipe["status"] != "success":
+                state.append(f"pipeline {pipe['status']}")
+            if state:
+                out.append(f"      {'; '.join(state)}")
+            for t in m.get("threads", []):
+                out.append(f"      unresolved thread from {t['author']} ({t['at']}): "
+                           f"{t['quote']}")
+
+    if arc.get("authoritative"):
+        out.append(f"The branch that IS this work: {arc['authoritative']} "
+                   f"({arc.get('authoritative_via','')})")
 
     out.append("Branches and how they stack:")
     out += spawn_tree(branches)
@@ -223,11 +283,25 @@ def evidence_for(arc, repo, main, turns):
 
 
 def split_evidence(arc, repo, main, limit=20):
-    """Each branch as its own commits, which is what tells two intentions apart."""
+    """Each branch as its own commits, which is what tells two intentions apart.
+
+    A superseded copy is the one case where identical commits are not evidence of two
+    bodies of work -- they are evidence of one, written down twice. Left unmarked it reads
+    as a second branch pursuing the same goal, which is exactly the shape the prompt is
+    told to split on.
+    """
     out = []
-    for b in arc.get("branches", [])[:limit]:
+    shown = arc.get("branches", [])[:limit]
+    names = {b["name"] for b in shown}
+    for b in shown:
+        marks = []
+        if b.get("authoritative"):
+            marks.append("the branch under review")
+        if b.get("superseded_by") in names:
+            marks.append(f"{b.get('superseded_kind','duplicate')} of "
+                         f"{b['superseded_by']} — same work, not a second body")
         subs = commit_subjects(repo, b["name"], main, limit=5)
-        out.append(f"  {b['name']}")
+        out.append(f"  {b['name']}" + (f"  [{'; '.join(marks)}]" if marks else ""))
         for s in subs:
             out.append(f"      {s}")
         if not subs:
