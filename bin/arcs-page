@@ -256,10 +256,25 @@ details.parked>summary b{color:var(--ink);font-weight:600}
    is a claim on his attention and this one is not, so it should not read at the same weight.
    The green is not a severity — the rungs are still unranked against each other and still
    uncoloured. It marks the one binary this page can honestly assert: whether the next move
-   is his. Muted name, calm state, calm edge; still open, still dated, still countable. */
-.ws[data-stage="in-review"]>summary{box-shadow:inset 3px 0 0 var(--calm)}
-.ws[data-stage="in-review"] .nm{color:var(--ink-soft)}
+   is his.
+
+   The whole row recedes, not just its name. Muting the name alone left the row reading at
+   full strength anyway, because the loudest thing in it is the accent-blue ticket link and
+   that was untouched — so the ticket, the age and the park control all drop back with it,
+   and the state is the only thing that keeps a colour. Hover or open restores it in full:
+   this is de-emphasis, not concealment, and it is still open, dated, linked and countable.
+   The green edge sits on the row rather than on its summary so it stays at full strength
+   through the fade, and runs the height of the disclosure when the row is opened. */
+.ws[data-stage="in-review"]{box-shadow:inset 3px 0 0 var(--calm)}
+.ws[data-stage="in-review"]>summary{opacity:.72}
+.ws[data-stage="in-review"]>summary:hover,
+.ws[data-stage="in-review"][open]>summary{opacity:1}
+.ws[data-stage="in-review"] .tkt{color:var(--ink-faint)}
+.ws[data-stage="in-review"] .nm{color:var(--ink-faint)}
 .ws[data-stage="in-review"] .st{color:var(--calm)}
+.ws[data-stage="in-review"] .park{opacity:.45}
+.ws[data-stage="in-review"]>summary:hover .tkt{color:var(--accent)}
+.ws[data-stage="in-review"]>summary:hover .park{opacity:1}
 /* And its opposite, which is what wearing that green undeservedly was hiding: a merge
    request with nobody on it. Left neutral like every other rung — the words say it. */
 .ws[data-stage="no-reviewer"]>summary{box-shadow:inset 3px 0 0 var(--hairline)}
