@@ -446,6 +446,11 @@ case "${1:-}" in
     *)             echo "arcs-refresh: unknown argument '$1' (try --help)" >&2; exit 2 ;;
 esac
 
+# On the way out however we leave, because every exit past this point has written a line
+# and the skips are the ones that repeat: a month of "another run holds the lock" would
+# otherwise grow the log without any run ever reaching the trim at the end.
+trap trim_log EXIT
+
 # Non-blocking, and a held lock is reported rather than waited on. Waiting would mean two
 # runs of a 40-second pipeline queued behind each other for no gain -- the second one would
 # rebuild a page the first had just rebuilt -- and the interesting case is not "later" but
@@ -458,5 +463,4 @@ fi
 
 rc=0
 do_run "$force" || rc=$?
-trim_log
 exit "$rc"

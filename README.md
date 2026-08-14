@@ -504,6 +504,42 @@ board picker, because UL vs UB is a judgment call. Add `--dry-run` to see it fir
 Env: `WORK_ARCS_REPO` (default `~/work/repos/ul`), `WORK_ARCS_MAIN` (`origin/main`),
 `WORK_ARCS_PROJECTS` (`~/.claude/projects`), plus the `JIRA_*` vars for `--gap`.
 
+### `arcs-refresh`
+`arcs` rebuilds the work-arcs page; this runs it at 07:10 so the page is already fresh
+when you sit down, which was the point of the thing and was still a command you had to
+remember to type.
+
+```bash
+arcs-refresh --install-cron         # daily at 07:10
+arcs-refresh --install-cron 06:30   # or whenever
+arcs-refresh --uninstall-cron       # removes only its own line
+arcs-refresh --check-quota          # what the guard currently thinks
+arcs-refresh --hook                 # the arc-record Stop hook block, not installed for you
+```
+
+**It stands down rather than spend.** `extra_usage` is enabled on this account, so 100%
+of the weekly quota is where charging starts, not where anything stops. The run reads
+the utilisation first and skips above 80% of the 5-hour window or 90% of the 7-day one
+(`WORK_ARCS_REFRESH_MAX_5H`, `WORK_ARCS_REFRESH_MAX_7D`), and skips when it cannot read
+them at all — a stale page costs one `/arcs`, a blind run can cost money. Set
+`WORK_ARCS_REFRESH_ON_UNKNOWN=run` if you would rather it guessed.
+
+**You only hear from it when it didn't run.** A daily "it worked" is training to ignore
+notifications. Everything goes to `~/.local/state/work-arcs/refresh.log` (ring-trimmed);
+the desktop notification fires only on a skip or a failure. `flock` keeps it from racing
+a manual `arcs` — both would move the run-over-run snapshot baseline.
+
+**It builds; it does not publish.** The page is a Claude Code artifact and only a Claude
+session can write to that URL. The gain is that `/arcs` becomes upload-only against a
+page that is minutes old.
+
+Written for cron's environment rather than a login shell's, which is not cosmetic:
+`claude` lives in `~/.local/bin` and `lib/headless_claude.py` calls it by bare name, so
+with cron's `PATH=/usr/bin:/bin` every model call raises `FileNotFoundError`, each one is
+caught, and the pipeline exits 0 having built a page with no arc names on it. Preflight
+refuses to start when a required program is missing, and `could not run claude` in the
+output counts as a failed run whatever the exit status says.
+
 ### `loose-ends`
 Find work you finished and then lost track of. Work arcs sprawl across Claude
 sessions, git branches, stashes and MRs; each source looks fine alone and the loss
