@@ -276,6 +276,34 @@ print("blocks", len(blocks))
     [[ "$output" == *"blocks 0"* ]]
 }
 
+# --- the quote, verbatim -----------------------------------------------------------------
+
+@test "Slack's own escaping is undone before the quote is a quote" {
+    # Slack escapes exactly three characters in message text -- & < > -- and _slack_text
+    # never undid them, so `A -> B` came back as `A -&gt; B` in the terminal ledger and as
+    # `A -&amp;gt; B` on the page, where esc() escaped the ampersand a second time. Found on
+    # a real quote: "the sequence of MRs is UL-1637-&gt;UL-1790". Every Slack quote on the
+    # page and in the ledger goes through this, so the fix is shared and so is the bug.
+    #
+    # Order is the whole subtlety. The markup passes read real angle brackets (`<@U1>`,
+    # `<url|label>`), so the unescaping has to come after them -- and `&amp;` has to come
+    # last, or `&amp;gt;`, which Slack means as the literal text "&gt;", would end up as a
+    # bare `>`.
+    run wa '
+for raw, want in (
+        ("the sequence is UL-1637-&gt;UL-1790", "the sequence is UL-1637->UL-1790"),
+        ("if a &lt; b &amp;&amp; c", "if a < b && c"),
+        ("A &amp;gt; B", "A &gt; B"),
+        ("ask <@U0559U5P64F> about <https://x.test/y|the doc>",
+         "ask @U0559U5P64F about the doc"),
+        ("<https://x.test/plain>", "https://x.test/plain")):
+    got = wa._slack_text(raw)
+    print(("ok  " if got == want else "BAD "), repr(got))
+'
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"BAD"* ]]
+}
+
 # --- what counts as having seen everything ---------------------------------------------
 
 @test "a thread read whole that holds nothing quotable is not an outage" {

@@ -163,6 +163,31 @@ section{margin-bottom:3rem}
 blockquote{margin:.1rem 0 .1rem .2rem;padding:.35rem .6rem;background:var(--quote);
            border-left:2px solid var(--hairline);border-radius:0 2px 2px 0;
            font-size:.8rem;color:var(--ink-soft);text-wrap:pretty}
+/* What Slack decided about this workstream. Deliberately quieter than the demands above it:
+   a decision is a fact to be recalled, not something being asked of you, so nothing here
+   takes a severity colour. The DECIDED mark is check-shaped and ink-faint rather than
+   green -- green would read as "this went well", and a decision has no opinion about that.
+   The OPEN mark borrows the demands' warm, because a question left standing in a thread is
+   that register even though it is not a demand. */
+.slk{margin:.55rem 0 0;border-top:1px solid var(--hairline);padding-top:.5rem}
+.slk-h{font-family:var(--mono);font-size:.63rem;text-transform:uppercase;
+       letter-spacing:.09em;color:var(--ink-faint);margin-bottom:.4rem}
+.slk-t{display:flex;flex-direction:column;gap:.22rem;margin-bottom:.5rem}
+.slk-t .hd{display:flex;gap:.5rem;align-items:baseline;font-size:.72rem;
+           font-family:var(--mono);color:var(--ink-faint)}
+.slk-t .hd .ch{color:var(--ink-soft)}
+.slk-t .hd .dis{margin-left:auto}
+.slk-i{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:.32rem}
+.slk-i li{display:grid;grid-template-columns:1em 1fr;gap:.05rem .45rem;font-size:.83rem}
+.slk-i .mk{font-size:.74rem;line-height:1.6;text-align:center}
+.slk-i .dec .mk{color:var(--ink-faint)}
+.slk-i .opn .mk{color:var(--warm)}
+.slk-i .what{color:var(--ink);text-wrap:pretty}
+.slk-i blockquote{grid-column:2;margin-left:0}
+.slk-i a{color:inherit;text-decoration:underline;
+         text-decoration-color:var(--hairline);text-underline-offset:2px}
+.slk-i a:hover{text-decoration-color:currentColor}
+.slk-note{font-size:.72rem;color:var(--ink-faint);margin:.15rem 0 0;text-wrap:pretty}
 .tickets{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;
          gap:.12rem;font-size:.78rem}
 .tickets li{display:flex;gap:.5rem;min-width:0}
@@ -1402,6 +1427,25 @@ def render(data, lede, focus_days, limit, cost=None):
             buckets.append((key, title, got))
     gap = data.get("gap") or {}
 
+    # The Slack lens's boundary, composed once and printed on every card that carries a
+    # block. It is one constant sentence plus whatever this particular run could not see, and
+    # both halves belong next to the reader rather than in a page-level note they scrolled
+    # past: "somebody decided this" is the strongest claim on the page, and the terms it was
+    # gathered under have to travel with it.
+    slk = data.get("slack_threads") or {}
+    slack_note = ("Threads you took part in, read with your own token, on your own page. "
+                  "Only threads readable in full appear here — this token holds no DM "
+                  f"history, so {slk['denied']} thread(s) in the window were never opened."
+                  if slk.get("denied") else
+                  "Threads you took part in, read with your own token, on your own page.")
+    if not slk.get("complete", True):
+        # The ledger's three-state note, applied to the same problem. A lens that
+        # half-answered and says nothing looks complete, and a decision missing from a
+        # complete-looking section reads as a decision nobody made.
+        slack_note += (" Slack answered only part of this run"
+                       + (f" ({slk['why']})" if slk.get("why") else "")
+                       + ", so a thread may be missing from it.")
+
     # The three lists whose rows the morning brief can point at, resolved here rather than
     # where each section renders. The brief is the first thing on the page and the rows are
     # the last, so it has to know what will exist before any of it is emitted -- and a
@@ -1741,6 +1785,49 @@ def render(data, lede, focus_days, limit, cost=None):
                                 + ("" if n == 1 else "s"))
                 a(f'<span class="stack">{" &middot; ".join(bits)}</span>')
             a("</div>")
+        # What Slack decided about this work. Last of the prose on the card because it is the
+        # only part of it a model wrote: everything above is derived, and a reader who has
+        # learned to trust the top of the card should meet the inferred part knowing which
+        # part it is. Absent entirely when nothing joined, which is most cards.
+        slack = arc.get("slack") or []
+        if slack:
+            a('<div class="slk" data-disgroup><div class="slk-h">From Slack</div>')
+            for s in slack:
+                ch = f"#{s['channel']}" if s.get("channel") else "a conversation"
+                a(f'<div class="slk-t" data-fp="{esc(s.get("fp",""))}" '
+                  f'data-dismissed="{1 if s.get("dismissed") else 0}">')
+                a('<div class="hd">'
+                  + link(s.get("url", ""), esc(ch), "ch")
+                  + f'<span>{esc(s.get("asked",""))}</span>'
+                  # How the thread was attached to this workstream, always, because the join
+                  # is the one step of this that could be wrong in a way the reader cannot
+                  # see from the words. "matched on UL-1744" is checkable in a second.
+                  + f'<span>matched on {esc(s.get("how","").split(" ")[-1])}</span>'
+                  + f'<span>{s.get("messages", 0)} messages</span>'
+                  + '<button class="dis" type="button" aria-label="acknowledge this '
+                    'thread — it returns if anyone adds to it" title="acknowledge — '
+                    'returns if anyone adds to the thread">&#x2715;</button>'
+                  + "</div>")
+                a('<ul class="slk-i">')
+                # One message can settle one thing and leave another standing, and both are
+                # worth saying -- but its quote is worth printing once. The second item on
+                # the same message keeps its link, moved onto the sentence, and drops the
+                # blockquote: principle 5 is "the source one click away", not "the source
+                # transcribed twice".
+                quoted = set()
+                for cls, mark, items in (("dec", "&#x2713;", s.get("decided") or []),
+                                         ("opn", "?", s.get("open") or [])):
+                    for it in items:
+                        q, u = esc(it.get("quote", "")), it.get("url", "")
+                        what = esc(it.get("what", ""))
+                        a(f'<li class="{cls}"><span class="mk">{mark}</span>'
+                          + (f'<span class="what">{link(u, what)}</span>' if q in quoted
+                             else f'<span class="what">{what}</span><blockquote>'
+                                  + link(u, "&ldquo;" + q + "&rdquo;") + "</blockquote>")
+                          + "</li>")
+                        quoted.add(q)
+                a("</ul></div>")
+            a(f'<p class="slk-note">{slack_note}</p></div>')
         # Detachable only where the clustering decided membership: an arc keyed on a
         # ticket or a prefix got its members from their own names, and the only way to
         # detach a branch from its own name is to rename it.

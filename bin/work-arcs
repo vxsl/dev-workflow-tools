@@ -945,10 +945,24 @@ def _slack_window():
 
 
 def _slack_text(body):
-    """Slack markup fit to quote: links keep their label, mentions keep a readable @."""
+    """Slack markup fit to quote: links keep their label, mentions keep a readable @.
+
+    The three entities go last, and they were missing entirely. Slack escapes exactly `&`,
+    `<` and `>` in message text, so `A -> B` arrives as `A -&gt; B` -- and every Slack quote
+    in the ledger showed it that way, while on the page esc() escaped the ampersand a second
+    time and made it `A -&amp;gt; B`. Found on a real one: "the sequence of MRs is
+    UL-1637-&gt;UL-1790".
+
+    Order carries the whole subtlety. The three regexes above read *unescaped* angle
+    brackets, because that is what Slack's own markup is written in (`<@U1>`,
+    `<url|label>`) -- so unescaping before them would turn a quoted `&lt;@U1&gt;` into a
+    mention. And `&amp;` comes last of the three, or `&amp;gt;`, which Slack means as the
+    literal text "&gt;", would arrive as a bare `>`.
+    """
     body = re.sub(r"<[^|>]+\|([^>]+)>", r"\1", body or "")
     body = re.sub(r"<@([A-Z0-9]+)>", r"@\1", body)
     body = re.sub(r"<([^>]+)>", r"\1", body)
+    body = body.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
     return _clean_note(body)
 
 
@@ -1658,6 +1672,11 @@ Leave out:
 - anything you have to infer more than one step to assert
 - an OPEN item that a later message in this same thread answers
 - a DECIDED item that no single message in the thread actually states
+- anything an automated post announces: a merge request opened, a build, a deploy, a
+  ticket created. "Kyle posted MR !10468" is not a decision, and the page it is going on
+  already lists that merge request two lines above this
+- somebody wondering aloud whether a thing is possible. That is an OPEN item at most, and
+  usually nothing
 
 Every item must name the ONE message number where the thing is said. If no single message
 says it, it is not an item.
@@ -1693,6 +1712,16 @@ def _synthesise_threads(items, ledger):
     cannot reuse yesterday's answers (item 1c) and a thread that grew is a new question.
     Nothing is cached from a failed or unparseable call: the next run asks again rather than
     remembering an accident as a verdict.
+
+    Extended thinking is left ON, and this is the obvious saving that must not be taken.
+    Measured on three of the live threads, the same input twice: with thinking, output is
+    1400-8900 tokens a call and the pass costs $0.13 a thread; with MAX_THINKING_TOKENS=0 it
+    is 130-185 tokens and about $0.08. A third cheaper, and on the 34-message UB-6802 thread
+    the cheap run reported "Sentry can't be used for repro data" as a DECISION, where the
+    thread says only "I wonder if there are alternatives, or if we can hand roll stuff". A
+    decision asserted where somebody merely wondered is exactly the failure this whole
+    section is built to avoid -- one wrong claim costs more trust than ten right ones earn --
+    and a third of $2 a day is not the price of buying it.
     """
     if not items:
         return []
@@ -1768,11 +1797,19 @@ def _synthesise_threads(items, ledger):
         by_ts = {m.get("ts"): m for m in t["msgs"]}
         sides = {}
         for side in ("decided", "open"):
-            rows = []
+            rows, used = [], set()
             for f in _drop_seen(v.get(side) or [], t["chan"], seen):
                 m = by_ts.get(f.get("ts"))
-                if not m:
+                # One message states one thing per side. Two DECIDED items projecting the
+                # same message are one decision the model split in half, and they render as
+                # the identical quote twice under two headings -- which reads as the page
+                # padding. Measured on the first live run: one block in eighteen, showing
+                # `#1 design team is working on this #2 future ticket #3 I can't reproduce?`
+                # three times over. Across sides is a different matter and stays: a message
+                # can settle one thing and leave another standing.
+                if not m or f.get("ts") in used:
                     continue
+                used.add(f.get("ts"))
                 rows.append({"what": f["what"],
                              "quote": _clip(_slack_text(m.get("text")), 220),
                              "url": _thread_link(t["base"], t["chan"],
