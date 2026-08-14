@@ -117,8 +117,31 @@ def lines(s):
     return [x for x in s.splitlines() if x.strip()]
 
 
+DAY = 86400
+# Local midnights, not UTC ones. An evening's work at UTC-7 runs past 00:00 UTC, so
+# bucketing on UTC splits one sitting across two days -- which inflates "active days" and
+# therefore deflates the per-day intensity that is the whole distinction between a burst
+# and a trickle. Measured on this corpus: UTC buckets turn 178 (branch, day) pairs into
+# 184, and every one of those six extra days is a late-night sitting counted twice --
+# which is exactly the hardest work, on exactly the arcs this is trying to see. One
+# offset for the whole run; DST moves it by an hour twice a year, which cannot move a day
+# boundary by a day.
+LOCAL_OFFSET = int(datetime.now().astimezone().utcoffset().total_seconds())
+
+
+def day_no(epoch):
+    """An epoch as a local day number. Only differences between these are ever used."""
+    return int((int(epoch) + LOCAL_OFFSET) // DAY)
+
+
+def day_str(day):
+    """A day number back as YYYY-MM-DD, for anything a person reads."""
+    return time.strftime("%Y-%m-%d", time.localtime(day * DAY - LOCAL_OFFSET + DAY // 2))
+
+
 def session_index(projects_dir):
-    """branch -> {"paths": set, "last": epoch}, from one rg pass over every project.
+    """branch -> {"paths": set, "last": epoch, "entries": int, "days": {...}}, from one
+    rg pass over every project.
 
     Sessions run from $HOME record gitBranch=HEAD and land in a project dir named
     after $HOME rather than the repo, so scanning every dir is the only way to see
@@ -130,8 +153,19 @@ def session_index(projects_dir):
     always precedes `gitBranch` on a line, so one pattern captures the pair; the 20k
     gap covers 99% of entries, and since only the maximum per branch matters, the
     remainder cannot change the answer.
+
+    `days` buckets the same entries by the day they happened on, which is what turns a
+    total into a shape: `entries` alone cannot tell 19 sessions over three days from 19
+    sessions over three weeks, and that difference is the whole of forgotten-work
+    detection. It costs nothing extra to collect -- the timestamp is already parsed for
+    recency, so this is a second use of a number this loop had in hand. Nor does it cost
+    memory: measured over the real corpus, 76,060 branch-tagged entries collapse to 178
+    (branch, day) pairs and 341 (branch, day, session) triples, because a branch is
+    worked on a handful of days and hammered on each of them.
     """
-    idx = defaultdict(lambda: {"paths": set(), "last": 0, "entries": 0})
+    idx = defaultdict(lambda: {"paths": set(), "last": 0, "entries": 0,
+                               "days": defaultdict(lambda: {"entries": 0,
+                                                            "paths": set()})})
     if not projects_dir.is_dir() or not shutil.which("rg"):
         return idx
     r = subprocess.run(
@@ -157,6 +191,9 @@ def session_index(projects_dir):
             continue
         if epoch > entry["last"]:
             entry["last"] = epoch
+        bucket = entry["days"][day_no(epoch)]
+        bucket["entries"] += 1
+        bucket["paths"].add(path)
     return idx
 
 
@@ -197,12 +234,30 @@ def collect_branches(repo, main_ref):
             "--format=%(refname:short)", "refs/heads",
         ))
         b["parents"] = [p for p in parents if p != name]
-        # What the branch's commits say they did. Carried here rather than fetched per
-        # arc because it is what tells a superseded copy from live work, and every
-        # consumer downstream -- the duplicate pass, the split prompt, the brief --
-        # wants the same list. 394 branches cost ~1.1s, once.
-        b["subjects"] = lines(git(repo, "log", "--format=%s", "-20",
-                                  f"{main_ref}..{name}"))
+        # What the branch's commits say they did, and when each was made. Carried here
+        # rather than fetched per arc because it is what tells a superseded copy from live
+        # work, and every consumer downstream -- the duplicate pass, the split prompt, the
+        # brief -- wants the same list. 394 branches cost ~1.1s, once.
+        #
+        # The date and the sha ride along on the same call, so the activity series costs no
+        # git invocation of its own. The depth goes to 200 while `subjects` stays capped at
+        # 20, because the two want opposite things: mark_duplicates compares whole subject
+        # sets and only trusts its containment test under 20, whereas an activity series
+        # built from a truncated log lies in the worst direction -- it keeps the recent,
+        # dense days and drops the sparse early ones, which shrinks the arc's apparent
+        # rhythm and makes every silence look longer against it. Measured: 73 of 405
+        # branches carry more than 20 commits and the deepest carries 94, so 200 clears the
+        # corpus with room; measured again, the whole for-each-ref sweep costs 1.14s at -20
+        # and 1.28s at -200.
+        b["subjects"], b["commits"] = [], []
+        for line in lines(git(repo, "log", "--format=%ct%x09%h%x09%s", "-200",
+                              f"{main_ref}..{name}")):
+            when, _, rest = line.partition("\t")
+            sha, _, subject = rest.partition("\t")
+            b["subjects"].append(subject)
+            if when.isdigit():
+                b["commits"].append({"at": int(when), "sha": sha})
+        b["subjects"] = b["subjects"][:20]
     return branches
 
 
@@ -1072,6 +1127,13 @@ def apply_dismissals(ledger, arcs=None, gap=None, prune=False):
     for m in (gap or {}).get("status_mismatch") or []:
         if m.get("fp"):
             live[m["fp"]] = m
+    # Only a positive verdict is dismissable. The negative ones exist so a consumer can ask
+    # why an arc was *not* called forgotten, and there is nothing there to acknowledge --
+    # putting them in this universe would fill the store with rows nobody can ever click.
+    for arc in arcs or []:
+        f = (arc.get("activity") or {}).get("forgotten") or {}
+        if f.get("verdict") and f.get("fp"):
+            live[f["fp"]] = f
     if prune:
         expired = {k: v for k, v in store.items() if k not in live}
         for k, v in expired.items():
@@ -2002,6 +2064,10 @@ def build_arcs(branches, stashes, mrs, sessions, main_ref, cluster_assign=None,
             arcs[key]["mrs"].append(m)
 
     seen_session = defaultdict(set)
+    # branch -> arc, then day -> arc: the same rollup, one axis further. Kept beside the
+    # arcs rather than on them because it holds sets of transcript paths, and everything
+    # hung on an arc ends up in --json.
+    arc_days = defaultdict(lambda: defaultdict(lambda: {"entries": 0, "paths": set()}))
     for branch, info in sessions.items():
         key = branch_to_arc.get(branch)
         if not key or key not in arcs:
@@ -2009,6 +2075,10 @@ def build_arcs(branches, stashes, mrs, sessions, main_ref, cluster_assign=None,
         # Once per branch. Adding it per session multiplied a branch's mentions by
         # how many sessions mentioned it, which put a 109,272 on a five-branch arc.
         arcs[key]["engagement"] = arcs[key].get("engagement", 0) + info["entries"]
+        for day, seen in info.get("days", {}).items():
+            into = arc_days[key][day]
+            into["entries"] += seen["entries"]
+            into["paths"] |= seen["paths"]
         # sorted(), because `paths` is a set of strings and set iteration order varies
         # between processes. That randomness reached the brief: prompts are emitted in
         # session order, so 16 of 55 arcs produced different evidence text on two
@@ -2028,6 +2098,10 @@ def build_arcs(branches, stashes, mrs, sessions, main_ref, cluster_assign=None,
     for arc in arcs.values():
         arc["mrs_known"] = mrs_known
         finalize(arc, repo, main_ref)
+        # After finalize, because the series skips superseded copies and mark_duplicates is
+        # what says which those are. Before the verdict, which cannot run until `parked` and
+        # the second finalize have had their say -- see mark_forgotten.
+        arc["activity"] = activity_of(arc, arc_days.get(arc["id"]))
     ordered = sorted(arcs.values(), key=lambda a: (a["age_days"], -a["at_risk"]))
     return ordered, unattached
 
@@ -2262,6 +2336,310 @@ def own_activity(arc):
     ts = [b.get("committed", 0) for b in arc.get("branches", [])]
     ts += [s.get("last", 0) for s in arc.get("sessions", [])]
     return max(ts) if ts else 0
+
+
+# ── forgotten work ─────────────────────────────────────────────────────────────
+#
+# The plan's item 5, and the correction it makes to the loose-ends list that preceded it:
+# "here is what is old" was correctly called useless, because age is a fact about the
+# calendar and not about you. What is worth saying is where engagement fell off a cliff --
+# high investment, then an abrupt zero, on work that never settled. That is a statement
+# about the derivative of the activity, and `engagement` as it stood could not carry it:
+# it sums transcript entries with no time axis at all, so 941 entries reads identically
+# whether they arrived over three days or three months.
+#
+# What separates this from `--active N` and from the loose-ends list, in one line each:
+#
+#   old            last touched a long time ago.        Says nothing about investment.
+#   parked         you said you were setting it aside.  Declared, and it expires itself.
+#   settled        landed or abandoned.                 Finished, not forgotten.
+#   in review      somebody else's clock is running.    Silence there is the system working.
+#   FORGOTTEN      you were deep in it, and then you were not, and nothing closed it.
+#
+# Every threshold below has an env knob, because the right value is a property of one
+# person's corpus rather than of the idea. The defaults were measured against this one --
+# the numbers are in the commit that introduced them.
+FORGOTTEN_KNOBS = {
+    # The level. Either axis on its own qualifies, and there is deliberately no exchange
+    # rate between them: a transcript entry and a commit are not commensurable, and
+    # inventing a ratio to add them would be the same mistake `at_risk` used to make.
+    #
+    # 900 entries is the 87th percentile of per-branch session engagement on this corpus
+    # (median 176, p75 386, p90 1,318). The percentile is not the argument; what the
+    # percentile marks is. Below it a branch was something a session passed through -- read,
+    # grepped, mentioned -- and above it the branch was what the session was about. Losing
+    # the second costs a day of thinking that nothing else recorded.
+    "min_entries": ("WORK_ARCS_FORGOTTEN_ENTRIES", 900),
+    # 20 commits, taken from a gap the data draws itself: across arcs that have any commits
+    # at all the counts run 1,1,...,3,4,6,7,8,11,12,14,15 and then jump to 22,23,25,30,41.
+    # Fifteen-to-twenty-two is the widest break in the lower half, and it is the break
+    # between a branch somebody tried something on and a branch somebody built something on.
+    "min_commits": ("WORK_ARCS_FORGOTTEN_COMMITS", 20),
+    # The derivative, in two parts. An absolute floor, because a weekend is not a cliff:
+    # seven days is a whole working week in which nothing happened at all.
+    "cliff_days": ("WORK_ARCS_FORGOTTEN_CLIFF", 7),
+    # ...and a floor relative to the arc's own rhythm, which is the part that makes this a
+    # derivative rather than another age test. An arc worked every third day for a month
+    # and quiet for five days is running normally; one worked daily and quiet for twelve
+    # has stopped. Same five and twelve days, opposite readings, and only the ratio to its
+    # own typical gap can tell them apart. Measured, this is not decoration: at 4x it is
+    # the only test that rejects UB-6828 (73 commits, 260 entries, nine active days) --
+    # worked on a four-day rhythm and silent for seven, which is one missed beat.
+    "cliff_ratio": ("WORK_ARCS_FORGOTTEN_RATIO", 4.0),
+    # And a ceiling, because past some point this stops being forgotten work and becomes
+    # archaeology -- which is the loose-ends list this replaces, rebuilt by accident. Eight
+    # weeks, for a reason that is about evidence rather than about taste: the transcripts on
+    # this machine reach back 57 days, so no arc quieter than that can have session evidence
+    # at all, and every verdict beyond the line would rest on commits alone with no idea how
+    # much thinking went in. The corpus agrees where the reasoning lands -- eligible arcs run
+    # 42, 43, 44, 49, 51 and then a wall of 21 sitting at 58 days and older.
+    "cliff_max": ("WORK_ARCS_FORGOTTEN_MAX", 56),
+}
+
+# How far back the emitted series reaches. Not a limit on what is measured -- the totals
+# and the cliff are taken over everything -- only on what is printed, so a year-old arc
+# cannot put 300 pairs into a JSON document that a morning brief has to read.
+SERIES_DAYS = int(os.environ.get("WORK_ARCS_ACTIVITY_DAYS", "120"))
+
+# Stages where silence is not forgetting. `in-review` is the load-bearing one: an arc
+# whose only quiet is a reviewer's queue must never read as forgotten, or the feature
+# accuses you of dropping the ball on the one workflow that is working. `pre-landing` is
+# the other: those branches are drafts from before a sibling landed, which is residue
+# rather than an open loop. Settled and parked are handled separately, since they carry
+# their own sentences.
+FORGOTTEN_EXEMPT = {
+    "in-review": "out for review — the clock is a reviewer's, not yours",
+    "pre-landing": "drafts from before a sibling landed, not an open loop",
+}
+
+
+def _knob(name):
+    """One forgotten-work threshold, env first, measured default second."""
+    var, default = FORGOTTEN_KNOBS[name]
+    raw = os.environ.get(var, "").strip()
+    if not raw:
+        return default
+    try:
+        return type(default)(float(raw))
+    except ValueError:
+        return default
+
+
+def activity_of(arc, session_days):
+    """This arc's engagement as a shape over time, rather than as one number.
+
+    `engagement` answers "how much of you went into this" and answers it well, but it is a
+    total, and a total has no derivative. Bucketing the same entries by the day they landed
+    on is what turns it into a shape -- and the shape is the whole signal, because the two
+    situations that most need telling apart, a sprint that stopped and a slow burn that
+    never had a cliff to fall off, are indistinguishable by total.
+
+    Two sources, because either alone has a blind spot big enough to matter. Sessions reach
+    back only as far as the transcripts do -- measured, 57 days on this machine -- so an arc
+    last worked in April has no session evidence whatsoever, and its commits are the only
+    thing that can date it. Commits, conversely, are missing from the first day of anything:
+    reading, planning and being told why the last attempt failed produce hundreds of
+    transcript entries and no commit at all.
+
+    Both are counted the way the rest of this file counts things -- once. Commits are
+    deduplicated by sha and skipped on superseded copies, because a five-branch stack
+    otherwise reports five times the investment it holds; that is the same correction
+    `distinct_unpushed` makes for the same reason. Session entries are summed the way
+    `engagement` sums them, per branch, so the series and the total can never disagree even
+    where both overcount a transcript that named two branches of one arc.
+
+    The emitted series is [days_ago, units] pairs, newest first, and only for days that had
+    something on them: 90 zeroes are not data, they are the absence of it. `units` is
+    entries plus commits, which is an understatement of a commit and known to be one -- the
+    series exists to show *when*, and every threshold that decides anything is taken over
+    the two axes separately, never over this sum.
+    """
+    per_day = {}
+
+    def bucket(day):
+        return per_day.setdefault(day, {"entries": 0, "sessions": set(), "commits": 0})
+
+    for day, seen in (session_days or {}).items():
+        b = bucket(day)
+        b["entries"] += seen["entries"]
+        b["sessions"] |= seen["paths"]
+    shas = set()
+    for br in arc.get("branches", []):
+        if br.get("superseded_by"):
+            continue
+        for c in br.get("commits", []):
+            if c["sha"] in shas:
+                continue
+            shas.add(c["sha"])
+            bucket(day_no(c["at"]))["commits"] += 1
+
+    if not per_day:
+        # Not "no activity" -- no *evidence* of activity. An arc can be real and leave
+        # nothing here: a branch whose commits all predate the log window this reads, with
+        # no session that ever named it. Saying so is the honest form; a zero series would
+        # invite the verdict below to call it forgotten on the strength of knowing nothing.
+        return {"series": [], "invested": None, "first_active": None,
+                "last_active": None, "cliff_days": None, "typical_gap_days": None}
+
+    days = sorted(per_day)
+    today = day_no(time.time())
+    entries = sum(v["entries"] for v in per_day.values())
+    commits = sum(v["commits"] for v in per_day.values())
+    sessions = len(set().union(*(v["sessions"] for v in per_day.values())))
+    gaps = sorted(b - a for a, b in zip(days, days[1:]))
+    # A single active day is a rhythm of "daily" for this purpose: it says the work moved
+    # within one day, so a week of silence after it is already four of its own beats. The
+    # alternative -- no rhythm, so no ratio test -- would exempt precisely the arcs the
+    # plan names, the ones hammered for one sitting and dropped.
+    typical = gaps[len(gaps) // 2] if gaps else 1
+    series = [[today - d, per_day[d]["entries"] + per_day[d]["commits"]]
+              for d in sorted(days, reverse=True) if today - d <= SERIES_DAYS]
+    out = {
+        "series": series,
+        "invested": {"entries": entries, "sessions": sessions, "commits": commits,
+                     "days": len(days), "span_days": days[-1] - days[0] + 1,
+                     "per_active_day": round((entries + commits) / len(days), 1)},
+        "first_active": day_str(days[0]),
+        "last_active": day_str(days[-1]),
+        # Always <= arc["age_days"], and deliberately so where they differ. `age_days` is
+        # asked of the arc's lineage alone so a branch the clustering swept in cannot date
+        # it; this is asked of everything in the arc, so a stranger's commit today makes
+        # the cliff read 0 and the verdict stay silent. Under-claiming is the right
+        # direction for a sentence that accuses you of forgetting something.
+        "cliff_days": today - days[-1],
+        "typical_gap_days": typical,
+    }
+    older = sum(1 for d in days if today - d > SERIES_DAYS)
+    if older:
+        out["older_active_days"] = older
+    return out
+
+
+def _forgotten_why(arc, act):
+    """The evidence sentence, in the shape the plan asked for it.
+
+    "19 sessions across 3 days, then nothing for 12 days, never landed." One sentence
+    carrying the level, the derivative and the reason it is still open, which is the whole
+    verdict -- so a reader can disagree with it on the facts rather than having to trust it.
+    """
+    inv = act["invested"]
+    had = []
+    if inv["sessions"]:
+        had.append(f"{inv['sessions']} session" + ("" if inv["sessions"] == 1 else "s"))
+    if inv["commits"]:
+        had.append(f"{inv['commits']} commit" + ("" if inv["commits"] == 1 else "s"))
+    if not had:                       # entries with no session file and no commit
+        had.append(f"{inv['entries']} transcript entries")
+    d, k = inv["days"], act["cliff_days"]
+    sentence = (" and ".join(had)
+                + f" across {d} day" + ("" if d == 1 else "s")
+                + f", then nothing for {k} day" + ("" if k == 1 else "s"))
+    # "never landed" would flatly contradict the row above it on an arc that is part
+    # merged and part not, and that mixture is common enough to have its own line in
+    # finalize. Say which it is.
+    n = arc.get("landed_branches") or 0
+    if n:
+        return (sentence + f" — {n} branch{'' if n == 1 else 'es'} landed, "
+                "what is left never did.")
+    return sentence + ", never landed."
+
+
+def mark_forgotten(arc):
+    """Did engagement here fall off a cliff, and on what evidence.
+
+    Three tests, and every one of them is needed to keep this from collapsing back into the
+    loose-ends list it replaces:
+
+      level        enough went in that losing it costs something. Either axis alone --
+                   transcript entries or commits -- because they are not commensurable.
+      derivative   the silence is long in absolute terms AND long against this arc's own
+                   rhythm. The second half is what makes it a cliff rather than an age: a
+                   fortnight's quiet on something worked every third day is normal, and on
+                   something worked daily it is a stop.
+      unsettled    nothing closed it, nobody else is holding it, you did not park it.
+
+    Deliberately absent: a fourth test on intensity. It reads as though it should be here --
+    "hammered for three days" is half the plan's own example -- but it is already implied.
+    Light work fails the level test and heavy work passes it, whatever shape it arrived in;
+    an extra threshold on entries-per-day would only reject heavily-worked arcs for having
+    been worked patiently, which is not a fault. The rate is emitted as a fact for anything
+    downstream that wants it, and gates nothing.
+
+    Runs after apply_parked and after the second finalize, because two of its three tests
+    read `stage` and `parked` -- and recomputed rather than accumulated, so a verdict from
+    an earlier pass can never outlive the facts that produced it.
+    """
+    act = arc.get("activity")
+    if not act:
+        return
+    act.pop("forgotten", None)
+    if not act.get("invested"):
+        return
+
+    fp = _dfp("forgotten", arc.get("id"), arc.get("label"), act.get("last_active"))
+
+    def verdict(ok, why, because=()):
+        act["forgotten"] = {"verdict": ok, "why": why, "because": list(because),
+                            "fp": fp}
+
+    inv, k = act["invested"], act["cliff_days"]
+    if arc.get("settled"):
+        return verdict(False, {"landed": "landed", "abandoned": "abandoned"}
+                       [arc["settled"]] + " — finished, not forgotten")
+    if arc.get("parked"):
+        return verdict(False, "parked on purpose — the one thing this cannot derive")
+    if arc.get("stage") in FORGOTTEN_EXEMPT:
+        return verdict(False, FORGOTTEN_EXEMPT[arc["stage"]])
+
+    invested = (inv["entries"] >= _knob("min_entries")
+                or inv["commits"] >= _knob("min_commits"))
+    if not invested:
+        return verdict(False, f"only {inv['entries']} entries and {inv['commits']} "
+                       f"commits went in — too little to have been lost")
+    if k < _knob("cliff_days"):
+        return verdict(False, f"still live — last touched {k} day"
+                       + ("" if k == 1 else "s") + " ago")
+    if k > _knob("cliff_max"):
+        return verdict(False, f"silent {k} days — past recovering from memory, which is "
+                       "a different problem from forgetting it")
+    gap = act["typical_gap_days"] or 1
+    if k < _knob("cliff_ratio") * gap:
+        return verdict(False, f"quiet {k} days against a {gap}-day rhythm — a pause, "
+                       "not a cliff")
+
+    verdict(True, _forgotten_why(arc, act), [
+        f"{inv['entries']} transcript entries and {inv['commits']} commits over "
+        f"{inv['days']} active day" + ("" if inv["days"] == 1 else "s"),
+        f"silent {k} days, {k // gap}× its own {gap}-day rhythm",
+        f"{arc.get('stage') or 'unsettled'} — not landed, not parked, "
+        "nobody else's clock is running",
+    ])
+
+
+def fell_off_a_cliff(arcs, include_dismissed=True):
+    """The forgotten arcs, freshest cliff first.
+
+    Freshest first rather than biggest first, and that is a judgement about what the list is
+    for: you resume one of these, and the one you can still resume is the one you fell off
+    most recently. Ranking by size would put a two-month-old 240-commit arc above last
+    week's, which is the order in which they are impressive rather than the order in which
+    they are recoverable.
+
+    It is also the only ranking available honestly. Size would mean ranking entries against
+    commits, and there is no exchange rate between them -- the same reason the page never
+    sorts a stalled review against a swathe of unpublished work. They break ties here and
+    nothing more. Total tiebreak down to the label, because arc-brief fingerprints evidence
+    text and any order that reaches output has to be the same order twice.
+    """
+    out = [a for a in arcs
+           if ((a.get("activity") or {}).get("forgotten") or {}).get("verdict")
+           and (include_dismissed
+                or not a["activity"]["forgotten"].get("dismissed"))]
+    out.sort(key=lambda a: (a["activity"]["cliff_days"],
+                            -a["activity"]["invested"]["entries"],
+                            -a["activity"]["invested"]["commits"],
+                            str(a.get("label") or ""), str(a.get("id") or "")))
+    return out
 
 
 def _day_epoch(text):
@@ -3460,6 +3838,13 @@ def main():
         print(f"⚠ ignoring authoritative={s['branch']} for {s['label']}: {s['why']}",
               file=sys.stderr)
 
+    # Both of its exclusions -- parked, and whose clock is running -- are only settled by
+    # now: apply_parked has just run, and `stage` came from the finalize pass after
+    # reconcile. Before apply_dismissals, which needs the verdicts to know what is
+    # acknowledgeable.
+    for arc in arcs:
+        mark_forgotten(arc)
+
     # Last of the finalize-order corrections, because everything before this point --
     # the second finalize pass, a hand-set authoritative branch -- recomputes demands
     # from scratch, and a mark applied any earlier would be recomputed away. Pruning
@@ -3497,6 +3882,12 @@ def main():
               f"last build ({since['not_compared']['arcs']} regrouped or new, so not "
               "compared)", file=sys.stderr)
 
+    # Taken before the window filters, for the same reason the run-over-run diff is: an arc
+    # that fell off a cliff five weeks ago is by construction outside a two-week window, so
+    # computing this over the filtered list would make the section structurally unable to
+    # hold the arcs it exists for.
+    fell = fell_off_a_cliff(arcs, include_dismissed=False)
+
     if args.active is not None:
         arcs = [a for a in arcs if a["age_days"] <= args.active]
 
@@ -3509,6 +3900,13 @@ def main():
         arcs = arcs[:args.focus_limit]
 
     if args.json:
+        # Working material, not output. Every commit's date and sha is read once, by
+        # activity_of, and has been by now; left in it would put ~8,000 two-field objects
+        # into a document whose whole point is to be read by the next tool along. The
+        # shape it produced -- a handful of [day, count] pairs per arc -- is what survives.
+        for arc in arcs:
+            for b in arc.get("branches", []):
+                b.pop("commits", None)
         json.dump({
             "generated": generated,
             "repo": args.repo.name,
@@ -3600,6 +3998,10 @@ def main():
               f"{','.join(bits):<28}{risk}")
         for d in a["demands"][:2]:
             print(f"        └ {d['what']}")
+    if fell:
+        print("\n── fell off a cliff ─────────────────────────────────────")
+        for a in fell:
+            print(f"  {a['label']:<28} {a['activity']['forgotten']['why']}")
     print(f"\n✓ {len(arcs)} arcs from {len(branches)} branches, "
           f"{len(mrs)} MRs; {len(unattached)} stashes attached to no arc",
           file=sys.stderr)
