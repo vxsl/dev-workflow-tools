@@ -65,7 +65,10 @@ import headless_claude  # noqa: E402
 STATE = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "work-arcs"
 SAMPLES = STATE / "usage.jsonl"
 
-PROJECTS = Path.home() / ".claude" / "projects"
+# Same env var work-arcs reads, so the two agree on where the corpus is and a test can
+# point both at a fixture.
+PROJECTS = Path(os.environ.get("WORK_ARCS_PROJECTS",
+                               Path.home() / ".claude" / "projects"))
 # Derived from the library that creates them rather than written out here, so the two
 # cannot drift. headless_claude names the directory after its session dir, and says in
 # its own docstring that consumers reading ~/.claude/projects should skip it -- this is
@@ -105,6 +108,11 @@ CACHE_READ = 0.1
 # whole-number rounding of the utilisation figure, so no share is reported. Three points
 # is the smallest total at which the rounding error is a minority of the signal.
 MIN_POINTS = 3.0
+
+# How far `resets_at` may move between two readings and still be the same window. The
+# endpoint recomputes the boundary per response, so it wobbles by fractions of a second;
+# a genuine reset moves it by the window's whole length (five hours, or seven days).
+RESET_TOLERANCE = 3600
 
 SAMPLE_MIN_GAP = 60      # never more than one snapshot per minute
 HTTP_TIMEOUT = 8
@@ -358,7 +366,7 @@ def windowed(events):
     return spend
 
 
-def sampled_runs(samples, pipeline_events, rate):
+def sampled_runs(samples, pipeline_events, rates):
     """The cost of each individual run, bounded by its own two snapshots.
 
     This is the number that answers "what does refreshing the page cost me", and it is
@@ -378,49 +386,67 @@ def sampled_runs(samples, pipeline_events, rate):
         if a.get("marker") != "start" or b.get("marker") != "end":
             continue
         cost = spend(a["ts"], b["ts"])
-        run = {
+        wr = rates["seven_day"]["cost_per_point"]
+        fr = rates["five_hour"]["cost_per_point"]
+        runs.append({
             "from": datetime.fromtimestamp(
                 a["ts"], timezone.utc).astimezone().isoformat(),
             "seconds": b["ts"] - a["ts"],
             "list_cost": cost,
-            "quota_points": (cost / rate) if rate else None,
-        }
-        runs.append(run)
+            "week_points": (cost / wr) if wr else None,
+            "session_points": (cost / fr) if fr else None,
+        })
     return runs
 
 
-def observe_rate(samples, events):
-    """List-cost per point of weekly quota, from consecutive pairs of samples.
+def reset_epoch(win):
+    try:
+        return datetime.fromisoformat(
+            (win.get("resets_at") or "").replace("Z", "+00:00")).timestamp()
+    except (ValueError, AttributeError):
+        return None
+
+
+def observe_rate(samples, events, key):
+    """List-cost per point of the named quota window, from consecutive sample pairs.
 
     Every adjacent pair of snapshots is one observation: the quota moved by so many
-    points while so much total spend happened in between. *Total* spend, both surfaces
-    -- the quota moved because of everything that ran, so a rate derived from the
-    pipeline's share alone would be wrong by however much interactive work overlapped.
-    The pipeline's own share then falls out of dividing its spend by this rate.
+    points while so much total spend happened in between. *Total* spend, both surfaces --
+    the quota moved because of everything that ran, so a rate derived from the pipeline's
+    share alone would be wrong by however much of his own work overlapped it. The
+    pipeline's own share then falls out of dividing its spend by this rate.
 
-    A pair is discarded when it crossed a weekly reset, which is detectable exactly
-    rather than by inference: `resets_at` changes. A decrease in utilisation without a
-    changed reset time would be the endpoint contradicting itself, and is dropped too.
+    A pair that crossed a reset has to be thrown away, and identifying those is the one
+    fiddly part. `resets_at` is not a stable identifier for the window: the endpoint
+    recomputes it per response, so it jitters in the sub-second digits every time
+    (10:59:59.527968, then 11:00:00.031740, then 10:59:59.521218 -- three readings of the
+    same weekly window). Comparing it exactly rejects every pair and the rate never
+    becomes measurable, which is a silent failure -- the section would have gone on
+    politely saying "not yet" forever. A real reset moves the boundary by the whole
+    window length, days or hours, so an hour of tolerance separates the two cases with
+    room to spare. Utilisation going backwards is the same event seen from the other
+    side, and is dropped too.
     """
     spend = windowed(events)
     pairs = 0
     points = 0.0
     cost = 0.0
     for a, b in zip(samples, samples[1:]):
-        sa, sb = a["seven_day"], b["seven_day"]
-        if not sa or not sb:
+        sa, sb = a.get(key), b.get(key)
+        if not sa or not sb or b["ts"] <= a["ts"]:
             continue
-        if sa.get("resets_at") != sb.get("resets_at"):
+        ra, rb = reset_epoch(sa), reset_epoch(sb)
+        if ra is None or rb is None or abs(rb - ra) > RESET_TOLERANCE:
             continue
         d = sb["utilization"] - sa["utilization"]
-        if d < 0 or b["ts"] <= a["ts"]:
+        if d < 0:
             continue
         pairs += 1
         points += d
         cost += spend(a["ts"], b["ts"])
     if points < MIN_POINTS or cost <= 0:
-        return None, pairs, points
-    return cost / points, pairs, points
+        return {"cost_per_point": None, "pairs": pairs, "points": points}
+    return {"cost_per_point": cost / points, "pairs": pairs, "points": points}
 
 
 # --- assembly ---------------------------------------------------------------------
@@ -453,8 +479,15 @@ def build():
                 samples[0]["ts"] if samples else now.timestamp())
     surfaces, events, pipeline_events = scan(since, spans)
 
-    rate, pairs, points = observe_rate(samples, events)
-    runs = sampled_runs(samples, pipeline_events, rate)
+    # Both windows, because they converge at very different speeds. The weekly figure is
+    # the one asked for, and it is also the one that barely moves -- a whole run can leave
+    # it unchanged. The five-hour window shifted two points during a single 62-second run,
+    # so its rate becomes observable in a couple of runs rather than a couple of days, and
+    # it carries the same fact at a resolution you can actually watch.
+    rates = {k: observe_rate(samples, events, k)
+             for k in ("seven_day", "five_hour")}
+    rate = rates["seven_day"]["cost_per_point"]
+    runs = sampled_runs(samples, pipeline_events, rates)
 
     windows = {}
     for name, lo, hi in spans:
@@ -479,9 +512,10 @@ def build():
         why = ("no quota samples yet — bin/arcs takes one before and after each run, "
                "so this fills in from here")
     else:
-        why = (f"the weekly quota has moved {points:.0f} of the "
+        sd = rates["seven_day"]
+        why = (f"the weekly quota has moved {sd['points']:.0f} of the "
                f"{MIN_POINTS:.0f} points needed to observe a rate, across "
-               f"{pairs} sampled interval{'s' if pairs != 1 else ''}")
+               f"{sd['pairs']} sampled interval{'s' if sd['pairs'] != 1 else ''}")
 
     return {
         "generated": now.isoformat(),
@@ -501,9 +535,7 @@ def build():
             "seven_day": (latest or {}).get("seven_day"),
             "sampled_at": datetime.fromtimestamp(
                 latest["ts"], timezone.utc).astimezone().isoformat() if latest else None,
-            "rate_cost_per_point": rate,
-            "rate_pairs": pairs,
-            "rate_points": points,
+            "rates": rates,
             "pipeline_share_pct": share,
             "unmeasured": why,
         },
@@ -549,11 +581,15 @@ def text(d):
     r = d["runs"]
     out.append("")
     if r["last"]:
+        last = r["last"]
+        pts = []
+        if last["week_points"] is not None:
+            pts.append(f"{last['week_points']:.2f} pts of the week")
+        if last["session_points"] is not None:
+            pts.append(f"{last['session_points']:.2f} pts of the 5h window")
         out.append(f"Per run, over {r['measured']} bracketed run(s)")
-        out.append(f"  last     ${r['last']['list_cost']:.2f} "
-                   f"in {r['last']['seconds']}s"
-                   + (f" ≈ {r['last']['quota_points']:.2f} points of the weekly quota"
-                      if r["last"]["quota_points"] is not None else ""))
+        out.append(f"  last     ${last['list_cost']:.2f} in {last['seconds']}s"
+                   + (f"  ≈ {', '.join(pts)}" if pts else ""))
         out.append(f"  median   ${r['median_list_cost']:.2f}")
     else:
         out.append("Per run: not measured yet — a run is bracketed by its own two "
@@ -564,12 +600,19 @@ def text(d):
         out.append(f"Weekly quota at {q['sampled_at'][:16]}: "
                    f"{q['seven_day']['utilization']:.0f}% used")
     if q["pipeline_share_pct"] is not None:
+        sd = q["rates"]["seven_day"]
         out.append(f"  of which this pipeline accounts for "
                    f"{q['pipeline_share_pct']:.1f} points "
-                   f"(observed rate ${q['rate_cost_per_point']:.2f}/point over "
-                   f"{q['rate_pairs']} intervals)")
+                   f"(observed rate ${sd['cost_per_point']:.2f}/point over "
+                   f"{sd['pairs']} intervals)")
     else:
         out.append(f"  share of the weekly quota not yet measurable: {q['unmeasured']}")
+    for k, label in (("five_hour", "5-hour"), ("seven_day", "weekly")):
+        rt = q["rates"][k]
+        if rt["cost_per_point"]:
+            out.append(f"  observed {label} rate: "
+                       f"${rt['cost_per_point']:.2f} per point "
+                       f"({rt['points']:.0f} points over {rt['pairs']} intervals)")
     return "\n".join(out)
 
 

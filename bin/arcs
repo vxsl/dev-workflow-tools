@@ -44,13 +44,43 @@ mkdir -p "$(dirname "$OUT")"
 # Staged rather than piped, so a failure names the stage it happened in. A three-program
 # pipe reports the exit status of the last one, which meant a GitLab timeout in work-arcs
 # surfaced as arcs-page complaining that stdin was not JSON.
-graph="$(mktemp)"; trap 'rm -f "$graph" "$graph.brief"' EXIT
+COST="$STATE/cost.json"
+graph="$(mktemp)"; trap 'rm -f "$graph" "$graph.brief" "$COST.tmp"' EXIT
+
+# The quota position on either side of the run. This is the only place that knows a run is
+# happening, which is what makes the pair a measurement rather than an inference: every
+# model call sits between these two readings, so a run's cost and the quota it moved are
+# bracketed rather than guessed at from the gaps between calls. arcs-cost degrades
+# silently with no credentials and no network, so this cannot fail the rebuild.
+arcs-cost --sample start || true
+
 work-arcs --json >"$graph"
 if [ "$brief" = 1 ]; then
     arc-brief --from "$graph" >"$graph.brief"
     mv "$graph.brief" "$graph"
 fi
-arcs-page --focus "$FOCUS" --out "$OUT" ${page_args+"${page_args[@]}"} <"$graph"
+
+# After arc-brief, because that is where the model calls are; before the page, which is
+# what reads the result.
+arcs-cost --sample end || true
+
+# A sidecar rather than a key in the graph. arc-brief does pass unknown top-level keys
+# through -- it reparses and redumps the whole payload -- so threading it down the pipe
+# would work, but it would mean work-arcs growing a quota sampler in order to report a
+# cost that is not its own. What the run spent is a fact about the run.
+#
+# Written fresh each time and passed only when that succeeded: a cost section quietly
+# showing the previous run's numbers is the same failure as a wrong reminder.
+cost_arg=()
+if arcs-cost --json >"$COST.tmp" 2>/dev/null; then
+    mv "$COST.tmp" "$COST"
+    cost_arg=(--cost "$COST")
+else
+    rm -f "$COST.tmp"
+fi
+
+arcs-page --focus "$FOCUS" --out "$OUT" ${cost_arg+"${cost_arg[@]}"} \
+    ${page_args+"${page_args[@]}"} <"$graph"
 
 echo
 echo "  page:  $OUT"

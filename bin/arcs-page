@@ -401,6 +401,22 @@ td .dis{vertical-align:middle}
   font-variant-numeric:tabular-nums}
 .ladder-note{color:var(--ink-faint);font-size:.78rem;max-width:54em;margin:0 0 2rem;
   padding-left:.7rem;border-left:2px solid var(--hairline)}
+/* What the assistant costs. Information rather than an alarm, so there is deliberately no
+   severity colour in here and nothing ever goes hot: a figure that turns red teaches you
+   to dread reading it, and this one is only useful read calmly. */
+.cost{display:grid;grid-template-columns:repeat(auto-fit,minmax(10.5rem,1fr));
+  gap:.85rem;margin:0 0 1.1rem}
+.cost .fig{background:var(--surface);border:1px solid var(--hairline);border-radius:5px;
+  padding:.65rem .8rem}
+.cost .fig .n{font-family:var(--mono);font-size:1.1rem;color:var(--ink);display:block;
+  font-variant-numeric:tabular-nums}
+.cost .fig .l{font-size:.73rem;color:var(--ink-soft);display:block;margin-top:.2rem;
+  text-wrap:pretty}
+.cost .fig .s{font-family:var(--mono);font-size:.7rem;color:var(--ink-faint);
+  display:block;margin-top:.15rem}
+.costq{color:var(--ink-soft);font-size:.82rem;max-width:54em;margin:0 0 1.1rem;
+  padding-left:.7rem;border-left:2px solid var(--hairline)}
+
 h2:target{outline:2px solid var(--accent);outline-offset:.3rem;border-radius:2px}
 :focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 @media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
@@ -994,7 +1010,127 @@ DEMAND_SEV = {"conflict": 0, "threads": 1, "pipeline": 2, "approved": 3, "stacke
               "unpushed": 5, "unrequested": 6, "unreviewed": 7, "draft": 8}
 
 
-def render(data, lede, focus_days, limit):
+def toks(n):
+    for div, suf in ((1e9, "B"), (1e6, "M"), (1e3, "k")):
+        if n >= div:
+            return f"{n / div:.1f}{suf}"
+    return str(int(n))
+
+
+def money(x):
+    return f"${x:,.0f}" if x >= 10 else f"${x:.2f}"
+
+
+def render_cost(a, cost):
+    """What the pipeline that builds this page spent to build it.
+
+    Kept small and kept last on purpose. This is the one section describing the tool
+    rather than the work, and its whole value is that the figures are honest, so what it
+    says about their provenance matters as much as the numbers: which calls were counted
+    and which were not, what the money unit is when nothing is billed, and where a figure
+    is observed rather than derived. Where the pipeline cannot yet measure its share of
+    the quota it says exactly that, because a confidently wrong cost would discredit the
+    ledger sitting above it.
+    """
+    week, today = cost["windows"]["week"], cost["windows"]["today"]
+    wp, tp = week["pipeline"], today["pipeline"]
+    runs, q = cost["runs"], cost["quota"]
+
+    a("<section>")
+    a("<h2>What this assistant costs</h2>")
+    a('<p class="note">Every model call this pipeline makes — naming an arc, splitting '
+      "one, reading a commitment out of Slack, judging whether a DM wants a reply — runs "
+      "with its own working directory, so its transcript lands in a Claude Code project "
+      "of its own and can be counted apart from your sessions. <strong>These are the "
+      "pipeline&rsquo;s calls only</strong>; your own work in Claude is the comparison "
+      "figure beside them, never mixed in. Each response is counted once, by its message "
+      "id, because the transcript records every assistant turn twice. Tokens are weighted "
+      f"at {esc(cost['prices_as_of'])} before being compared, since this pipeline is "
+      "almost entirely cache traffic and an interactive session is not — read raw it "
+      "would look nearly free. <strong>Nothing here is billed</strong>: the subscription "
+      "reports a percentage and no dollars, so the money is a unit of account for "
+      "comparing one token mix with another.</p>")
+
+    def fig(n, label, sub=""):
+        a(f'<div class="fig"><span class="n">{esc(n)}</span>'
+          f'<span class="l">{esc(label)}</span>'
+          + (f'<span class="s">{esc(sub)}</span>' if sub else "")
+          + "</div>")
+
+    a('<div class="cost">')
+    wbasis = ("this week" if cost["week_basis"] == "quota-window" else "last 7 days")
+    fig(money(wp["list_cost"]), f"the pipeline, {wbasis}",
+        f"{wp['calls']:,} calls")
+    if week["share_pct"] is not None:
+        fig(f"{week['share_pct']:.0f}%", f"of your Claude spend, {wbasis}",
+            f"you: {money(week['interactive']['list_cost'])}")
+    fig(money(tp["list_cost"]), "the pipeline, today",
+        f"{tp['calls']:,} calls")
+    if today["share_pct"] is not None:
+        fig(f"{today['share_pct']:.0f}%", "of your Claude spend, today",
+            f"you: {money(today['interactive']['list_cost'])}")
+    if runs["last"]:
+        last = runs["last"]
+        pts = ""
+        if last["session_points"] is not None:
+            pts = f"≈ {last['session_points']:.1f}% of a 5h window"
+        elif last["week_points"] is not None:
+            pts = f"≈ {last['week_points']:.2f}% of the week"
+        fig(money(last["list_cost"]), "the last rebuild of this page",
+            pts or (f"median {money(runs['median_list_cost'])} of "
+                    f"{runs['measured']} run{'s' if runs['measured'] != 1 else ''}"))
+    a("</div>")
+
+    # The quota sentence, which is the thing actually asked for and the thing least
+    # possible to compute: the subscription publishes a whole-number percentage and no
+    # rate, so the rate has to be observed from snapshots taken around each run.
+    bits = []
+    if q["seven_day"]:
+        bits.append(f"Your weekly quota stood at "
+                    f"<strong>{q['seven_day']['utilization']:.0f}% used</strong> when "
+                    f"this ran.")
+    if q["pipeline_share_pct"] is not None:
+        sd = q["rates"]["seven_day"]
+        bits.append(f"Of that, this pipeline accounts for about "
+                    f"<strong>{q['pipeline_share_pct']:.1f} points</strong> — observed "
+                    f"rather than calculated, from how far the quota actually moved "
+                    f"across {sd['pairs']} sampled intervals either side of a run.")
+    elif q["unmeasured"]:
+        bits.append("Its share of that quota is <strong>not measurable yet</strong>: "
+                    + esc(q["unmeasured"]) + ". A percentage is all the subscription "
+                    "publishes, so the tokens-per-point rate has to be watched rather "
+                    "than worked out, and a guess here would be worth less than the "
+                    "gap.")
+    if runs["measured"] == 0:
+        bits.append("The cost of a single rebuild is not shown yet either — a run is "
+                    "bracketed by its own two snapshots rather than guessed at from "
+                    "the gaps between calls, which on this corpus would put it anywhere "
+                    "between $4 and $16 depending on the gap you picked.")
+    if bits:
+        a('<p class="costq">' + " ".join(bits) + "</p>")
+
+    by_model = sorted(wp["by_model"].items(), key=lambda kv: -kv[1]["list_cost"])
+    if by_model:
+        a('<div class="scroll"><table><thead><tr><th>Model</th><th>Calls</th>'
+          "<th>In</th><th>Out</th><th>Cache written</th><th>Cache read</th>"
+          "<th>Weighted</th></tr></thead><tbody>")
+        for name, v in by_model:
+            a(f'<tr><td class="k">{esc(name)}</td>'
+              f'<td class="d">{v["calls"]:,}</td>'
+              f'<td class="d">{esc(toks(v["input"]))}</td>'
+              f'<td class="d">{esc(toks(v["output"]))}</td>'
+              f'<td class="d">{esc(toks(v["cache_write"]))}</td>'
+              f'<td class="d">{esc(toks(v["cache_read"]))}</td>'
+              f'<td class="d">{esc(money(v["list_cost"]))}</td></tr>')
+        a("</tbody></table></div>")
+    if wp["unpriced"]:
+        a(f'<p class="note">{wp["unpriced"]:,} call(s) ran on a model with no listed '
+          "price. They are counted above and left out of the weighting rather than "
+          "priced at a guess.</p>")
+    a("</section>")
+
+
+def render(data, lede, focus_days, limit, cost=None):
     out = []
     a = out.append
     base = data.get("project_url") or ""
@@ -1558,6 +1694,13 @@ def render(data, lede, focus_days, limit):
                   f'<td class="d">{esc(init)}</td></tr>')
             a("</tbody></table></div></section>")
 
+    # --- what this assistant costs -------------------------------------------
+    # Absent unless `arcs` wrote a cost sidecar for this run. A stale figure here would
+    # be indistinguishable from a current one, and unlike a stale arc it would never
+    # correct itself on the next commit.
+    if cost:
+        render_cost(a, cost)
+
     a('<div id="parkbar"><span id="parkmsg"></span>'
       '<button type="button" id="parksave">Save for the command line</button>'
       '<span class="muted">Parking already applies here and survives reloads. Saving '
@@ -1593,12 +1736,25 @@ def main():
     p.add_argument("--limit", type=int, default=0,
                    help="cap the cards shown (0 = every active arc)")
     p.add_argument("--out", type=Path)
+    p.add_argument("--cost", type=Path, default=None,
+                   help="`arcs-cost --json` for this run; `arcs` writes it fresh each "
+                        "time and passes it. Without it the cost section is absent "
+                        "rather than stale — an old figure would read as a current one")
     args = p.parse_args()
     try:
         data = json.load(sys.stdin)
     except json.JSONDecodeError as e:
         sys.exit(f"arcs-page: stdin is not `work-arcs --json`: {e}")
-    page = render(data, args.lede, args.focus, args.limit)
+    cost = None
+    if args.cost:
+        # Loud, because a silently dropped section is how a measurement stops being
+        # taken without anyone noticing -- but not fatal, because the page is the point.
+        try:
+            cost = json.loads(args.cost.read_text())
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"arcs-page: no cost section — {args.cost} unreadable ({e})",
+                  file=sys.stderr)
+    page = render(data, args.lede, args.focus, args.limit, cost)
     if args.out:
         args.out.write_text(page)
         print(f"✓ {args.out} ({len(page)} bytes)", file=sys.stderr)
