@@ -13,7 +13,8 @@
 #
 #   arcs                 # rebuild with your usual window
 #   arcs --focus 30      # any arcs-page flag passes through
-#   arcs --no-brief      # skip the model pass: faster, and the cards lose their names
+#   arcs --no-brief      # skip both model passes: faster, the cards lose their names and
+#                        # the morning brief falls back to its deterministic prose
 #
 set -euo pipefail
 
@@ -56,7 +57,7 @@ SNAP="$STATE/snapshot.json"
 finished=0
 graph="$(mktemp)"
 cleanup() {
-    rm -f "$graph" "$graph.brief" "$COST.tmp"
+    rm -f "$graph" "$graph.brief" "$graph.morning" "$COST.tmp"
     if [ "$finished" = 0 ] && [ -f "$SNAP.prev" ]; then
         mv -f "$SNAP.prev" "$SNAP"
         echo "  the rebuild did not finish, so the run-over-run baseline was put back —" >&2
@@ -84,8 +85,17 @@ if [ "$brief" = 1 ]; then
     mv "$graph.brief" "$graph"
 fi
 
-# After arc-brief, because that is where the model calls are; before the page, which is
-# what reads the result.
+# After arc-brief and not before it: the brief's sentences name workstreams, and the good
+# name for a workstream is the one arc-brief derived. Its own model pass is optional and
+# cached; --no-brief turns it off along with the other one, because "no model calls this
+# run" has to mean one thing.
+morning_args=()
+[ "$brief" = 0 ] && morning_args+=(--no-model)
+arc-morning --from "$graph" ${morning_args+"${morning_args[@]}"} >"$graph.morning"
+mv "$graph.morning" "$graph"
+
+# After both model passes, because that is where the model calls are; before the page,
+# which is what reads the result.
 arcs-cost --sample end || true
 
 # A sidecar rather than a key in the graph. arc-brief does pass unknown top-level keys

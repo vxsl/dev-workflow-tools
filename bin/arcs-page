@@ -17,10 +17,12 @@ branch each branch was cut from; the previous version printed a flat list of the
 with the most commits, so the structure was computed on every run and discarded at the
 last step.
 
-  work-arcs --json | arc-brief | arcs-page --out page.html
+  work-arcs --json | arc-brief | arc-morning | arcs-page --out page.html
 
 Renders without arc-brief in the pipeline too -- the cards fall back to the cluster
-label and lose their descriptions, which is the honest degradation.
+label and lose their descriptions, which is the honest degradation. Without arc-morning
+the opening paragraph falls back to `derive_lede`, which is the same trade: one derived
+sentence instead of the composed several.
 """
 
 import argparse
@@ -32,6 +34,9 @@ import sys
 import urllib.parse
 from datetime import datetime
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+from timespan import fmt_interval  # noqa: E402
 
 CSS = """
 :root{
@@ -71,6 +76,19 @@ h1{font-family:var(--serif);font-weight:500;font-size:clamp(1.8rem,4vw,2.4rem);
 .lede{font-family:var(--serif);font-size:clamp(1.1rem,2.1vw,1.32rem);line-height:1.5;
       max-width:36em;margin:0 0 2.5rem;text-wrap:pretty}
 .lede em{color:var(--accent);font-style:normal;font-weight:600}
+
+/* The morning brief. The lede's register, a step larger and a line looser, because it is
+   the one block on the page meant to be read as prose rather than scanned -- everything
+   below it is the evidence it is a projection of.
+   Its links are underlines rather than coloured text: five accent-blue phrases in one
+   paragraph reads as a list of links with sentences around it, which is the shape this
+   block exists to stop being. The rule thickens on hover, so the page still says plainly
+   that every subject here is one click from what it is a claim about. */
+.brief{font-family:var(--serif);font-size:clamp(1.18rem,2.4vw,1.46rem);line-height:1.58;
+       max-width:40em;margin:.2rem 0 2.5rem;text-wrap:pretty;color:var(--ink)}
+.brief a{color:inherit;text-decoration:none;
+         box-shadow:inset 0 -1px 0 0 color-mix(in oklab,var(--accent) 45%,transparent)}
+.brief a:hover,.brief a:focus-visible{box-shadow:inset 0 -2px 0 0 var(--accent)}
 
 h2{font-family:var(--serif);font-weight:500;font-size:1.25rem;margin:0 0 .2rem;
    letter-spacing:-.01em}
@@ -746,8 +764,54 @@ INTERACT_JS = r"""
 """
 
 
+EVIDENCE_ID = {"ledger": "lg-", "forgotten": "fg-", "gap": "gp-"}
+
+# How many Jira-mismatch rows the table shows. The only truncation on the page, and it is
+# named rather than inlined because the morning brief has to know where the list stops in
+# order not to link into the part of it that was cut.
+MISMATCH_ROWS = 14
+
+
+def brief_block(data, here, fps):
+    """The morning brief, with every subject linked to the row it is a claim about.
+
+    arc-morning hands down a flat list of parts -- strings, and spans carrying wherever
+    their evidence is. Resolution order is deliberate: a row on this page beats a link off
+    it, because the whole claim of the brief is that the sections below are the evidence
+    layer you expand into rather than a second place to go looking. An external URL is the
+    fallback for the cases where nothing here holds the fact.
+
+    A span whose target is not on this page renders as plain text, which is the rule the
+    run-over-run strip and the cliff section already follow: an anchor to a row that was
+    never rendered is the same lie as a link to a 404.
+    """
+    parts = (data.get("brief") or {}).get("parts") or []
+    if not parts:
+        return ""
+    out = []
+    for p in parts:
+        if isinstance(p, str):
+            out.append(esc(p))
+            continue
+        t, of, fp = esc(p.get("t", "")), p.get("of"), p.get("fp")
+        if of and fp and fp in fps.get(of, ()):
+            out.append(f'<a href="#{EVIDENCE_ID[of]}{esc(fp)}">{t}</a>')
+        elif p.get("arc") in here:
+            out.append(f'<a href="#{anchor(p["arc"])}">{t}</a>')
+        elif p.get("url"):
+            out.append(link(p["url"], t))
+        else:
+            out.append(t)
+    return '<p class="brief">' + "".join(out) + "</p>"
+
+
 def derive_lede(data, focus_days):
     """Compose the opening sentence from the data itself.
+
+    Superseded by arc-morning's brief and kept as the degradation for a pipeline that did
+    not run it -- one derived sentence where there would have been several. Only ever one
+    of the two renders: two opening paragraphs each claiming to be the most consequential
+    fact is worse than either alone.
 
     A hand-written lede goes stale the moment anything moves, which turns a dashboard
     back into a report. This picks the single most consequential fact available and
@@ -1047,24 +1111,6 @@ def fmt_day(epoch):
         return "no date recorded"
 
 
-def fmt_interval(secs):
-    """A gap between two builds, in the coarsest unit that still says something.
-
-    Rounded up rather than truncated, because a 50-minute gap reported as "0 hours" reads
-    as a bug. Empty string when the gap is unknown, so the sentence can simply omit it
-    instead of printing a placeholder.
-    """
-    if not isinstance(secs, int) or secs < 0:
-        return ""
-    if secs < 5400:
-        n, unit = max(1, round(secs / 60)), "minute"
-    elif secs < 129600:
-        n, unit = max(1, round(secs / 3600)), "hour"
-    else:
-        n, unit = max(1, round(secs / 86400)), "day"
-    return f"{n} {unit}" + ("" if n == 1 else "s")
-
-
 SPARK_W, SPARK_H = 96, 18
 
 
@@ -1308,6 +1354,29 @@ def render(data, lede, focus_days, limit, cost=None):
             buckets.append((key, title, got))
     gap = data.get("gap") or {}
 
+    # The three lists whose rows the morning brief can point at, resolved here rather than
+    # where each section renders. The brief is the first thing on the page and the rows are
+    # the last, so it has to know what will exist before any of it is emitted -- and a
+    # second selection written here would be a second author for "which rows are on the
+    # page", which is how a link to a row that was truncated away gets written.
+    #
+    # The order comes down the wire, as it does in the section itself: work-arcs ranks the
+    # forgotten arcs and a ranking written twice will differ in one of them.
+    by_id = {x.get("id"): x for x in data.get("arcs", [])}
+    order = data.get("forgotten")
+    if order is None:
+        order = [x.get("id") for x in data.get("arcs", [])]
+    fell = [by_id[i] for i in order if i in by_id
+            and ((by_id[i].get("activity") or {}).get("forgotten") or {}).get("verdict")]
+    mism = (gap.get("status_mismatch") or [])[:MISMATCH_ROWS]
+    ledger = data.get("ledger")
+    evidence_fps = {
+        "ledger": {e.get("fp") for e in ((ledger or {}).get("they_owe") or [])
+                   + ((ledger or {}).get("you_owe") or []) if e.get("fp")},
+        "forgotten": {(x["activity"]["forgotten"]).get("fp") for x in fell},
+        "gap": {m.get("fp") for m in mism if m.get("fp")},
+    }
+
     try:
         stamp = datetime.fromisoformat(data.get("generated", "")).strftime(
             "%a %-d %b %Y, %-I:%M %p")
@@ -1340,9 +1409,16 @@ def render(data, lede, focus_days, limit, cost=None):
     elif sincer.get("why"):
         a(f'<span>no run-over-run diff — {esc(sincer["why"])}</span>')
     a("</div>")
-    lede = lede or derive_lede(data, focus_days)
+    # The brief when there is one, the derived lede when there is not, and never both --
+    # see brief_block and derive_lede. A hand-passed --lede still wins over either, because
+    # it is the one opening paragraph a person typed on purpose.
+    block = brief_block(data, {x.get("id") for x in arcs}, evidence_fps)
     if lede:
         a(f'<p class="lede">{lede}</p>')
+    elif block:
+        a(block)
+    else:
+        a(f'<p class="lede">{derive_lede(data, focus_days)}</p>')
 
     for s in data.get("stale_overrides") or []:
         a(f'<p class="note">Ignoring your hand-set authoritative branch '
@@ -1600,7 +1676,6 @@ def render(data, lede, focus_days, limit, cost=None):
     diffs = since.get("changes") or []
     if diffs:
         shown = {x.get("id") for x in arcs}
-        by_id = {x.get("id"): x for x in data.get("arcs", [])}
         bg = sum(1 for c in diffs if c.get("id") not in shown)
         ago = fmt_interval(since.get("interval_seconds"))
         a("<section>")
@@ -1654,7 +1729,6 @@ def render(data, lede, focus_days, limit, cost=None):
     # Both directions of "who is waiting on whom", which is what todo.md was for and
     # never kept up with. Absent entirely when GitLab was not asked -- an empty ledger
     # and an unconsulted one are different claims.
-    ledger = data.get("ledger")
     if ledger is not None:
         they = ledger.get("they_owe") or []
         you = ledger.get("you_owe") or []
@@ -1688,14 +1762,21 @@ def render(data, lede, focus_days, limit, cost=None):
 
         def row(e, inner):
             """One ledger row, carrying its own fingerprint so acknowledging it is a
-            claim about this fact and expires with it."""
+            claim about this fact and expires with it.
+
+            The fingerprint is also the row's id, so the morning brief can point a
+            sentence at the row it is a projection of. Same string in both places on
+            purpose: an anchor derived separately from the fingerprint would survive a
+            change to one and not the other.
+            """
             fp = e.get("fp", "")
             btn = ('<button class="dis" type="button" aria-label="acknowledge this '
                    'row — it returns on its own if anything changes" title="acknowledge '
                    '— returns on its own if anything changes">&#x2715;</button>'
                    if fp else "")
-            return (f'<li data-fp="{esc(fp)}" '
-                    f'data-dismissed="{1 if e.get("dismissed") else 0}">'
+            return (f'<li data-fp="{esc(fp)}"'
+                    + (f' id="lg-{esc(fp)}"' if fp else "")
+                    + f' data-dismissed="{1 if e.get("dismissed") else 0}">'
                     + clock(e) + f'<div class="what">{inner}</div>{btn}</li>')
 
         def visible(entries):
@@ -1841,13 +1922,8 @@ def render(data, lede, focus_days, limit, cost=None):
     # ranks these -- freshest cliff first, because the one you can still resume is the one
     # you fell off most recently -- and a ranking written twice is a ranking that will
     # differ in one of them. Falls back to the verdicts on the arcs themselves so an older
-    # graph still renders, in whatever order it arrived.
-    by_id = {x.get("id"): x for x in data.get("arcs", [])}
-    order = data.get("forgotten")
-    if order is None:
-        order = [x.get("id") for x in data.get("arcs", [])]
-    fell = [by_id[i] for i in order if i in by_id
-            and ((by_id[i].get("activity") or {}).get("forgotten") or {}).get("verdict")]
+    # graph still renders, in whatever order it arrived. Resolved at the top of render(),
+    # because the morning brief points at these rows and is emitted before them.
     if fell:
         here = {x.get("id") for x in arcs}
         # One axis for every row: the longest history in the section, so the pictures can
@@ -1877,8 +1953,9 @@ def render(data, lede, focus_days, limit, cost=None):
                      if x.get("id") in here else nm)
             tkt = x.get("ticket")
             i = next((y for y in x.get("issues", []) if y.get("key") == tkt), {})
-            a(f'<li data-fp="{esc(f.get("fp",""))}" '
-              f'data-dismissed="{1 if f.get("dismissed") else 0}">')
+            a(f'<li data-fp="{esc(f.get("fp",""))}"'
+              + (f' id="fg-{esc(f["fp"])}"' if f.get("fp") else "")
+              + f' data-dismissed="{1 if f.get("dismissed") else 0}">')
             # `UB-6918 UB-6918` on an arc the split pass never renamed: where the label is
             # the key, printing both says the key twice and the name not at all.
             key = (link(i.get("url", ""), esc(tkt), "key") + " "
@@ -1931,7 +2008,8 @@ def render(data, lede, focus_days, limit, cost=None):
 
     # --- where Jira disagrees with the code --------------------------------
     if gap:
-        mism = gap.get("status_mismatch") or []
+        # `mism` is the truncated list, resolved at the top of render(): the brief links
+        # into this table and must not point at a row the truncation removed.
         if mism:
             a("<section>")
             a("<h2>Jira says otherwise</h2>")
@@ -1940,10 +2018,11 @@ def render(data, lede, focus_days, limit, cost=None):
             a('<div class="scroll" data-disgroup><table><thead><tr>'
               "<th>Ticket</th><th>Claim</th><th>Reality</th><th>Summary</th><th></th>"
               "</tr></thead><tbody>")
-            for m in mism[:14]:
+            for m in mism:
                 i = m.get("issue", {})
-                a(f'<tr data-fp="{esc(m.get("fp",""))}" '
-                  f'data-dismissed="{1 if m.get("dismissed") else 0}"><td class="k">'
+                a(f'<tr data-fp="{esc(m.get("fp",""))}"'
+                  + (f' id="gp-{esc(m["fp"])}"' if m.get("fp") else "")
+                  + f' data-dismissed="{1 if m.get("dismissed") else 0}"><td class="k">'
                   + link(i.get("url", ""), esc(i.get("key", "")))
                   + f'</td><td class="d">{esc(i.get("status",""))}</td>'
                   f'<td class="n">{esc(m.get("why","").split(" but ")[-1])}</td>'
