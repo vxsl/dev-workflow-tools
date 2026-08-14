@@ -258,6 +258,27 @@ details.parked>summary b{color:var(--ink);font-weight:600}
 .ledger .who{display:block;font-size:.74rem;color:var(--ink-faint)}
 .ledger .covered{margin:0;font-size:.76rem;color:var(--ink-faint);
   border-top:1px solid var(--hairline);padding-top:.55rem}
+/* Acknowledging a row is the ledger's one control, and it is an acknowledgement, not a
+   deletion: the row stays countable behind a disclosure, and the store is keyed to the
+   row's fingerprint so any change to the fact underneath brings it back by itself. */
+.ledger li .dis{margin-left:auto;flex:none;font-family:var(--mono);font-size:.68rem;
+  line-height:1.3;border:1px solid var(--hairline);background:transparent;
+  color:var(--ink-faint);border-radius:2px;cursor:pointer;padding:.05rem .32rem}
+.ledger li .dis:hover{border-color:var(--parked);color:var(--ink-soft)}
+.ledger li[data-dismissed="1"]{display:none}
+.ledger .side[data-show="1"] li[data-dismissed="1"]{display:flex;opacity:.55}
+.ledger .showdis{align-self:flex-start;font-family:var(--mono);font-size:.68rem;
+  padding:.15rem .45rem;border-radius:2px;cursor:pointer;background:transparent;
+  border:1px solid var(--hairline);color:var(--ink-faint)}
+.ledger .showdis:hover{border-color:var(--parked);color:var(--ink-soft)}
+.ledger .disbar{display:none;gap:.7rem;align-items:center;flex-wrap:wrap;
+  grid-column:1/-1;font-size:.8rem;color:var(--ink-soft);
+  border:1px solid var(--parked);border-radius:4px;background:var(--surface);
+  padding:.6rem .8rem}
+.ledger .disbar.on{display:flex}
+.ledger .disbar button{font:inherit;padding:.25rem .6rem;border-radius:3px;
+  cursor:pointer;border:1px solid var(--accent);background:var(--accent);
+  color:var(--surface)}
 
 /* One line per workstream. Cards were inherited from the version of this page that showed
    six things, and at twenty-eight they are a wall -- the same reason a list of branches was
@@ -473,6 +494,82 @@ PARK_JS = r"""
     });
   });
   recount(); setBar();
+})();
+"""
+
+
+# Dismissal is the ledger's one control, and it follows parking's contract exactly: it
+# persists in the artifact frame's own localStorage (per-artifact origin, so it survives
+# republishing), it is keyed to the row's content fingerprint rather than to its name, so
+# any change to the fact underneath expires it, and saving to disk is offered rather than
+# required -- `work-arcs` reads dismissed.json so the CLI ledger and this page agree.
+# Rows the file already dismissed arrive pre-marked and are adopted into the local store,
+# which makes localStorage the single in-page authority after load.
+DISMISS_JS = r"""
+(function(){
+  var KEY='work-arcs:dismissed:v1', store={}, dirty=false;
+  function read(){ try{ return JSON.parse(localStorage.getItem(KEY)||'{}')||{}; }
+                   catch(e){ return {}; } }
+  function write(){ try{ localStorage.setItem(KEY,JSON.stringify(store)); return true; }
+                    catch(e){ return false; } }
+  store=read();
+  var rows=[].slice.call(document.querySelectorAll('.ledger li[data-fp]')),
+      bar=document.querySelector('.ledger .disbar'),
+      msg=document.querySelector('.ledger .dismsg'),
+      save=document.getElementById('dissave');
+  var present={};
+  rows.forEach(function(el){
+    present[el.dataset.fp]={ref:(el.querySelector('.ref')||{}).textContent||''};
+    if(el.dataset.dismissed==='1' && !(el.dataset.fp in store))
+      store[el.dataset.fp]=1;                     // adopt what the file already said
+  });
+  var pruned=false;
+  Object.keys(store).forEach(function(k){
+    if(!(k in present)){ delete store[k]; pruned=true; }  // the fact moved: expired
+  });
+  if(pruned) write();
+  function apply(){
+    rows.forEach(function(el){
+      el.dataset.dismissed=(el.dataset.fp in store)?'1':'0'; });
+    document.querySelectorAll('.ledger .side').forEach(function(side){
+      var all=side.querySelectorAll('li[data-fp]').length,
+          hid=side.querySelectorAll('li[data-dismissed="1"]').length,
+          c=side.querySelector('[data-count]'),
+          t=side.querySelector('.showdis');
+      if(c) c.textContent=all-hid;
+      if(t){ t.hidden=(hid===0);
+        t.textContent=hid+' acknowledged — '+(side.dataset.show==='1'?'hide':'show'); }
+    });
+    if(bar){ bar.classList.toggle('on', dirty);
+      if(msg) msg.textContent=Object.keys(store).length+' acknowledged in this browser'; }
+  }
+  document.addEventListener('click',function(ev){
+    var t=ev.target;
+    var dis=t.closest?t.closest('.ledger .dis'):null;
+    if(dis){ ev.preventDefault();
+      var el=dis.closest('li'), fp=el.dataset.fp;
+      if(fp in store) delete store[fp]; else store[fp]=1;
+      dirty=true; write(); apply(); return; }
+    var sh=t.closest?t.closest('.ledger .showdis'):null;
+    if(sh){ var side=sh.closest('.side');
+      side.dataset.show=(side.dataset.show==='1')?'0':'1'; apply(); }
+  });
+  if(save) save.addEventListener('click',function(){
+    var out={}, now=Math.floor(Date.now()/1000);
+    Object.keys(store).forEach(function(k){
+      out[k]={ref:(present[k]||{}).ref||'', at:now, note:''}; });
+    var dl=window.claude&&window.claude.downloads;
+    if(!dl){ if(msg) msg.textContent='Saving is not available in this view.'; return; }
+    dl.save({filename:'dismissed.json',data:JSON.stringify(out,null,1)})
+      .then(function(){
+        if(msg) msg.textContent='Saved. Move it to ~/.local/state/work-arcs/dismissed.json';
+        dirty=false; apply();
+      }).catch(function(e){
+        if(msg) msg.textContent=(e&&e.code==='declined')?'Not saved.'
+          :('Could not save: '+((e&&e.code)||'unknown'));
+      });
+  });
+  apply();
 })();
 """
 
@@ -1147,7 +1244,11 @@ def render(data, lede, focus_days, limit):
           "on its workstream: same fact, once by person, once by work. The one "
           "exception to &ldquo;derived&rdquo; is a commitment read out of your own "
           "Slack messages — those rows say so, and every Slack row quotes the message "
-          "it is a claim about, one click away."
+          "it is a claim about, one click away. <strong>&#x2715; acknowledges a "
+          "row</strong>: it leaves the list but stays counted, and it comes back on "
+          "its own the moment the fact under it changes — a new message, a "
+          "re-request, a touched ticket. Nothing here can be deleted, only "
+          "acknowledged."
           + ("" if ledger.get("slack") else
              " <strong>Slack was not consulted this run</strong> — these are GitLab "
              "and Jira only.") + "</p>")
@@ -1160,8 +1261,23 @@ def render(data, lede, focus_days, limit):
             hot = " hot" if d >= 14 else ""
             return f'<span class="clk{hot}">{d}d</span>'
 
+        def row(e, inner):
+            """One ledger row, carrying its own fingerprint so acknowledging it is a
+            claim about this fact and expires with it."""
+            fp = e.get("fp", "")
+            btn = ('<button class="dis" type="button" aria-label="acknowledge this '
+                   'row — it returns on its own if anything changes" title="acknowledge '
+                   '— returns on its own if anything changes">&#x2715;</button>'
+                   if fp else "")
+            return (f'<li data-fp="{esc(fp)}" '
+                    f'data-dismissed="{1 if e.get("dismissed") else 0}">'
+                    + clock(e) + f'<div class="what">{inner}</div>{btn}</li>')
+
+        def visible(entries):
+            return sum(1 for e in entries if not e.get("dismissed"))
+
         a('<div class="side">')
-        a(f'<h3>You owe them <span class="n">{len(you)}</span></h3>')
+        a(f'<h3>You owe them <span class="n" data-count>{visible(you)}</span></h3>')
         if you:
             a("<ul>")
             for e in you:
@@ -1180,14 +1296,13 @@ def render(data, lede, focus_days, limit):
                                         else "") + since
                                      + " (inferred from your message, quoted)",
                        }.get(e.get("kind"), who)
-                a("<li>" + clock(e) + '<div class="what">'
-                  + link(e.get("url", ""), esc(e.get("ref", "")), "ref")
-                  + f' {esc(e.get("title",""))}'
-                  + f'<span class="who">{sub}</span>'
-                  + (f"<blockquote>{esc(e['quote'])}</blockquote>"
-                     if e.get("quote") else "")
-                  + "</div></li>")
+                a(row(e, link(e.get("url", ""), esc(e.get("ref", "")), "ref")
+                      + f' {esc(e.get("title",""))}'
+                      + f'<span class="who">{sub}</span>'
+                      + (f"<blockquote>{esc(e['quote'])}</blockquote>"
+                         if e.get("quote") else "")))
             a("</ul>")
+            a('<button class="showdis" type="button" hidden></button>')
         else:
             a('<div class="quiet">Nobody is waiting on a review or a reply from '
               "you.</div>")
@@ -1198,7 +1313,7 @@ def render(data, lede, focus_days, limit):
         a("</div>")
 
         a('<div class="side">')
-        a(f'<h3>They owe you <span class="n">{len(they)}</span></h3>')
+        a(f'<h3>They owe you <span class="n" data-count>{visible(they)}</span></h3>')
         if they:
             a("<ul>")
             for e in they:
@@ -1216,20 +1331,27 @@ def render(data, lede, focus_days, limit):
                     sub = esc(f"with {who}"
                               + (f" · {e['status']}" if e.get("status") else "")
                               + f", untouched since {e.get('asked','?')}")
-                a("<li>" + clock(e) + '<div class="what">'
-                  + link(e.get("url", ""), esc(e.get("ref", "")), "ref")
-                  + f' {esc(e.get("title",""))}'
-                  + f'<span class="who">{sub}</span>'
-                  + (f"<blockquote>{esc(e['quote'])}</blockquote>"
-                     if e.get("quote") else "")
-                  + "</div></li>")
+                a(row(e, link(e.get("url", ""), esc(e.get("ref", "")), "ref")
+                      + f' {esc(e.get("title",""))}'
+                      + f'<span class="who">{sub}</span>'
+                      + (f"<blockquote>{esc(e['quote'])}</blockquote>"
+                         if e.get("quote") else "")))
             a("</ul>")
+            a('<button class="showdis" type="button" hidden></button>')
         else:
             a('<div class="quiet">Nobody owes you anything — no silent reviews, '
               "no stalled hand-offs.</div>")
         a("</div>")
 
-        a("</div></section>")
+        a('<div class="disbar"><span class="dismsg"></span>'
+          '<button type="button" id="dissave">Save for the command line</button>'
+          '<span>Acknowledging already applies here and survives reloads. Saving '
+          "writes <code>dismissed.json</code> for <code>work-arcs</code>, so its own "
+          "ledger agrees with this page.</span></div>")
+
+        a("</div>")
+        a(f"<script>{DISMISS_JS}</script>")
+        a("</section>")
 
     # --- the conditions, as peers ------------------------------------------
     # Still peers, still no hero figure and no severity hue: there is no honest exchange

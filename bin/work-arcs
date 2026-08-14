@@ -1015,6 +1015,84 @@ def ledger_slack():
     return they, you, True
 
 
+DISMISSED = (Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
+             / "work-arcs" / "dismissed.json")
+
+
+def _ledger_fp(e):
+    """A ledger row's identity: the fact it asserts, not the day it was rendered.
+
+    Built from everything that would change if the loop moved -- a re-requested review
+    restarts `asked`, a new DM message replaces the quote, a touched ticket moves its
+    date -- and nothing that changes on its own (`days` ticks daily). This is what
+    makes a dismissal safe to persist: acknowledge THIS fact, and the acknowledgement
+    dies with it.
+    """
+    h = hashlib.sha256("|".join([
+        e.get("kind", ""), e.get("ref", ""), e.get("url", ""),
+        e.get("asked", ""), e.get("quote", "")]).encode())
+    return h.hexdigest()[:16]
+
+
+def apply_dismissals(ledger):
+    """Acknowledged rows stay counted but stop shouting, until their fact moves.
+
+    The plan's principle 1 names this the one safe form of persisted human input: a
+    content-fingerprinted acknowledgement expires itself. An entry whose fingerprint no
+    longer matches any live row is deleted on sight -- either the loop closed (nothing
+    to show) or the fact changed (a new row, undismissed, takes its place).
+    """
+    try:
+        store = json.loads(DISMISSED.read_text()) or {}
+    except (OSError, ValueError):
+        store = {}
+    live = {e["fp"]: e for e in ledger["they_owe"] + ledger["you_owe"]}
+    expired = {k: v for k, v in store.items() if k not in live}
+    for k, v in expired.items():
+        del store[k]
+        print(f"  dismissal of {v.get('ref', k)} expired — the fact under it moved",
+              file=sys.stderr)
+    for k in store:
+        live[k]["dismissed"] = True
+    if expired:
+        try:
+            DISMISSED.write_text(json.dumps(store, indent=1, sort_keys=True))
+        except OSError:
+            pass
+
+
+def set_dismissed(ledger, spec, undo=False):
+    """`--dismiss REF[=note]` / `--undismiss REF`, stamped with the row it acknowledges."""
+    label, _, note = spec.partition("=")
+    label = label.strip()
+    rows = ledger["they_owe"] + ledger["you_owe"]
+    match = [e for e in rows if e.get("ref") == label or e["fp"].startswith(label)]
+    if not match:
+        sys.exit("work-arcs: no ledger row matches " + repr(label) + "\n  "
+                 + "\n  ".join(f"{e['ref']:<16} {e['fp']}  {e.get('kind','')}"
+                               for e in rows))
+    try:
+        store = json.loads(DISMISSED.read_text()) or {}
+    except (OSError, ValueError):
+        store = {}
+    for e in match:
+        if undo:
+            store.pop(e["fp"], None)
+        else:
+            store[e["fp"]] = {"ref": e["ref"], "at": int(time.time()),
+                              "note": note.strip()}
+    n = len(match)
+    if undo:
+        print(f"✓ {n} row{'' if n == 1 else 's'} back on the ledger", file=sys.stderr)
+    else:
+        print(f"✓ acknowledged {n} row{'' if n == 1 else 's'} ({label})",
+              file=sys.stderr)
+        print("  comes back on its own the moment the fact under it changes — "
+              f"{DISMISSED}", file=sys.stderr)
+    DISMISSED.parent.mkdir(parents=True, exist_ok=True)
+    DISMISSED.write_text(json.dumps(store, indent=1, sort_keys=True))
+
+
 def build_ledger(repo, mrs):
     """The waiting-on ledger, both directions, every row a counterparty and a clock.
 
@@ -1063,8 +1141,12 @@ def build_ledger(repo, mrs):
                         "quote": t.get("quote", ""), "url": m.get("url", "")})
     they.sort(key=lambda e: (-(e.get("days") or 0), e["ref"]))
     you.sort(key=lambda e: (-(e.get("days") or 0), e["ref"]))
-    return {"they_owe": they, "you_owe": you, "you_owe_covered": covered,
-            "slack": slack_seen}
+    for e in they + you:
+        e["fp"] = _ledger_fp(e)
+    ledger = {"they_owe": they, "you_owe": you, "you_owe_covered": covered,
+              "slack": slack_seen}
+    apply_dismissals(ledger)
+    return ledger
 
 
 def annotate_stacks(repo, mrs, main_ref):
@@ -2511,6 +2593,11 @@ def main():
                    help="set a workstream aside as backlog. Expires itself as soon as a "
                         "commit lands on it, so it can never quietly outlive its reason")
     p.add_argument("--unpark", metavar="ARC", help="put a parked workstream back in play")
+    p.add_argument("--dismiss", metavar="REF[=NOTE]",
+                   help="acknowledge a ledger row (by its !MR / ticket ref or "
+                        "fingerprint prefix). Expires itself the moment the fact "
+                        "under it changes, so it can never hide a new development")
+    p.add_argument("--undismiss", metavar="REF", help="bring a ledger row back")
     p.add_argument("--authoritative", metavar="ARC=BRANCH",
                    help="name the branch that IS an arc's work when the derivation gets it "
                         "wrong. Optional: it only corrects, nothing depends on it, and it "
@@ -2658,6 +2745,14 @@ def main():
 
     ledger = ledger_f.result() if ledger_f else None
 
+    if args.dismiss or args.undismiss:
+        if ledger is None:
+            sys.exit("work-arcs: the ledger was not built, so there is nothing to "
+                     "dismiss (GitLab unreachable, or --no-mr / --shallow-mr)")
+        set_dismissed(ledger, args.dismiss or args.undismiss,
+                      undo=bool(args.undismiss))
+        return
+
     gap = None
     if args.gap or args.json:
         issues, jira_error = collect_jira()
@@ -2747,6 +2842,13 @@ def main():
     if mr_error:
         print(f"⚠ {mr_error}", file=sys.stderr)
     if ledger and (ledger["they_owe"] or ledger["you_owe"]):
+        dismissed = sum(1 for e in ledger["they_owe"] + ledger["you_owe"]
+                        if e.get("dismissed"))
+        ledger = {**ledger,
+                  "they_owe": [e for e in ledger["they_owe"]
+                               if not e.get("dismissed")],
+                  "you_owe": [e for e in ledger["you_owe"]
+                              if not e.get("dismissed")]}
         print("── the ledger ───────────────────────────────────────────")
         for e in ledger["they_owe"]:
             who = ", ".join(e["who"]) if isinstance(e["who"], list) else e["who"]
@@ -2776,6 +2878,9 @@ def main():
         if ledger["you_owe_covered"]:
             print(f"  (+{ledger['you_owe_covered']} review requests already handled — "
                   "you spoke or someone approved)")
+        if dismissed:
+            print(f"  (+{dismissed} acknowledged — `work-arcs --undismiss REF` brings "
+                  "one back; any change brings it back on its own)")
         print()
     for a in arcs:
         c = a["counts"]
