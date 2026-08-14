@@ -90,7 +90,7 @@ fi
 # cached; --no-brief turns it off along with the other one, because "no model calls this
 # run" has to mean one thing.
 morning_args=()
-[ "$brief" = 0 ] && morning_args+=(--no-model)
+if [ "$brief" = 0 ]; then morning_args+=(--no-model); fi
 arc-morning --from "$graph" ${morning_args+"${morning_args[@]}"} >"$graph.morning"
 mv "$graph.morning" "$graph"
 

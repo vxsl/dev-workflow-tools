@@ -84,8 +84,10 @@ h1{font-family:var(--serif);font-weight:500;font-size:clamp(1.8rem,4vw,2.4rem);
    paragraph reads as a list of links with sentences around it, which is the shape this
    block exists to stop being. The rule thickens on hover, so the page still says plainly
    that every subject here is one click from what it is a claim about. */
+/* 34em rather than the lede's 36: a step up in size is also a step up in what one em
+   buys, and keeping the lede's measure at this size put ~80 characters on a line. */
 .brief{font-family:var(--serif);font-size:clamp(1.18rem,2.4vw,1.46rem);line-height:1.58;
-       max-width:40em;margin:.2rem 0 2.5rem;text-wrap:pretty;color:var(--ink)}
+       max-width:34em;margin:.2rem 0 2.5rem;text-wrap:pretty;color:var(--ink)}
 .brief a{color:inherit;text-decoration:none;
          box-shadow:inset 0 -1px 0 0 color-mix(in oklab,var(--accent) 45%,transparent)}
 .brief a:hover,.brief a:focus-visible{box-shadow:inset 0 -2px 0 0 var(--accent)}

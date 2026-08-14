@@ -581,6 +581,8 @@ Hard rules:
   and unbroken:
 {anchors}
 - Keep the same order of subjects, and keep it to {n} sentence(s).
+- Keep the punctuation you are given. The curly quotation marks and the em dashes are
+  the page's own, and straightening them is a change to how it is set.
 - Second person, plain declarative, no headings, no bullets, no preamble, no sign-off.
   Do not tell him what to do about any of it; state what is true.
 
