@@ -814,19 +814,31 @@ def _slack(method, **params):
 
 
 def _slack_sweep(query, pages=4):
-    """Every match for a search, newest first. Search is the one scope this token has,
-    so the whole Slack side is built from sweeps rather than per-conversation reads."""
+    """Every match for a search, newest first, and whether that "every" is true.
+
+    Search is the one scope this token has, so the whole Slack side is built from sweeps
+    rather than per-conversation reads.
+
+    The second return value is the load-bearing one and it was missing. A failed page used
+    to `break` and hand back whatever had arrived, which is indistinguishable from a
+    complete sweep that happened to be short -- so a token expiring between page 1 and
+    page 2 produced a ledger silently missing three quarters of its Slack rows, and a
+    dismissal-prune then deleted the acknowledgements on the rows that never arrived,
+    announcing "the fact under it moved" about a fact nobody had looked at. Absence of a
+    section over a wrong section: a caller that cannot say whether it saw everything must
+    not be trusted to say what is gone.
+    """
     out = []
     for page in range(1, pages + 1):
         d = _slack("search.messages", query=query, count=100, page=page,
                    sort="timestamp", sort_dir="desc")
         if not d:
-            break
+            return out, False
         matches = (d.get("messages") or {}).get("matches") or []
         out += matches
         if len(matches) < 100:
             break
-    return out
+    return out, True
 
 
 def _slack_text(body):
@@ -1244,21 +1256,53 @@ def ledger_slack():
 
     Bot noise is dropped structurally, not by name: automation mentions arrive as
     attachment-only messages with empty text, and an empty quote is no claim at all.
+
+    Returns (they_owe, you_owe, consulted, complete). The last two are not the same
+    question and the ledger needs both:
+
+      consulted  a token existed and Slack said who it belonged to. The page's caveat is
+                 read off this -- "Slack was not consulted this run, these are GitLab and
+                 Jira only" is a sentence about whether to expect Slack rows at all.
+      complete   the Slack universe in this ledger is the WHOLE Slack universe. The
+                 dismissal prune is read off this, because pruning means deleting an
+                 acknowledgement on the grounds that its row is gone, and a sweep that
+                 half-answered cannot support that claim about anything.
+
+    They come apart in both directions, which is the point. No token at all is
+    (False, True): there are no Slack rows and there never were, so nothing can be missing
+    and a prune is perfectly safe. A token that fails auth, or answers page 1 and not page
+    2, is (False, False) / (True, False): rows are missing and no one knows which.
     """
+    # Two different falsehoods, and conflating them cost Kyle his acknowledgements. See the
+    # return contract in the docstring: no token means the Slack universe is empty and
+    # correctly so, which is a complete answer; a token that fails to answer means the
+    # universe is unknown, which is not.
     if not os.environ.get("SLACK_USER_TOKEN"):
-        return [], [], False
+        return [], [], False, True
     who_am_i = _slack("auth.test") or {}
     me = who_am_i.get("user_id")
     if not me:
-        return [], [], False
+        print("  ledger: Slack has a token and would not say who it belongs to — no "
+              "Slack rows this run, and nothing pruned on their absence",
+              file=sys.stderr)
+        return [], [], False, False
     lookback = int(os.environ.get("WORK_ARCS_SLACK_LOOKBACK", "14"))
     settle = 86400 * int(os.environ.get("WORK_ARCS_SLACK_SETTLE_DAYS", "1"))
     after = datetime.fromtimestamp(time.time() - 86400 * (lookback + 1)).strftime(
         "%Y-%m-%d")
 
-    mine = _slack_sweep(f"from:<@{me}> after:{after}")
-    mentions = _slack_sweep(f"<@{me}> after:{after}", pages=1)
-    dms = _slack_sweep(f"is:dm after:{after}")
+    # All three sweeps, and whether each of them saw everything. auth.test succeeding proves
+    # a token existed a moment ago and nothing whatsoever about the three searches after it:
+    # a rate limit between page 1 and page 2 of the from:me sweep silently drops three
+    # quarters of the commitment candidates.
+    mine, ok_mine = _slack_sweep(f"from:<@{me}> after:{after}")
+    mentions, ok_mentions = _slack_sweep(f"<@{me}> after:{after}", pages=1)
+    dms, ok_dms = _slack_sweep(f"is:dm after:{after}")
+    complete = ok_mine and ok_mentions and ok_dms
+    if not complete:
+        print("  ledger: Slack answered some of its sweeps and not others — the Slack "
+              "rows this run are incomplete, so nothing is pruned on their absence",
+              file=sys.stderr)
 
     my_last_in_thread, my_last_in_chan = {}, {}
     for m in mine:
@@ -1321,7 +1365,7 @@ def ledger_slack():
     # And the one inferred entry: promises read out of your own words. Reuses the
     # from:me sweep already in hand, so commitments cost no extra Slack calls at all.
     you += ledger_commitments(mine)
-    return they, you, True
+    return they, you, True, complete
 
 
 DISMISSED = (Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
@@ -1359,6 +1403,16 @@ def apply_dismissals(ledger, arcs=None, gap=None, prune=False):
     acknowledged. Pruning only runs when every universe was actually computed this run:
     a --no-mr run sees no ledger rows, and deleting their acknowledgements for that
     would punish a cheap run for being cheap.
+
+    "Actually computed" has to mean completely, not attempted, and for two releases it
+    meant attempted. The gate read `ledger and gap is not None and args.json` -- and a
+    ledger dict is truthy whether or not its Slack half arrived. So a token that expired
+    between auth.test and the first search, or a rate limit between page 1 and page 2,
+    produced a ledger whose Slack rows were quietly absent, and this function then deleted
+    every acknowledgement on them while printing "the fact under it moved" about facts it
+    had not managed to read. The next good run brought the rows back undismissed, which is
+    the one thing a dismissal is supposed to be safe from. `ledger["slack"]` now reports
+    completeness rather than attempt, and the caller ANDs it into the gate.
 
     An acknowledged demand still decides the arc's stage and urgency -- a click must
     never change what is derived, only what shouts -- but it does leave `notify`: news
@@ -1466,7 +1520,7 @@ def build_ledger(repo, mrs):
         they = f_they.result() if f_they else []
         you, covered = f_you.result() if f_you else ([], 0)
         they += f_jira.result()
-        slack_they, slack_you, slack_seen = f_slack.result()
+        slack_they, slack_you, slack_seen, slack_whole = f_slack.result()
         they += slack_they
         you += slack_you
     # Questions on your own MRs that the reviewer is still waiting on. Already fetched
@@ -1490,7 +1544,11 @@ def build_ledger(repo, mrs):
             # Always present when the ledger is, empty or not, because a --json consumer
             # cannot tell a missing key from "nothing closed" and would have to guess.
             # close_commitments fills it; see there for why it cannot be filled here.
-            "you_owe_closed": [], "slack": slack_seen}
+            "you_owe_closed": [], "slack": slack_seen,
+            # Whether the Slack rows above are all of them. Separate from `slack` because
+            # "not consulted" and "consulted and half-answered" support opposite decisions
+            # about pruning an acknowledgement -- see ledger_slack's return contract.
+            "slack_complete": slack_whole}
 
 
 # `!10481` as it is written in prose, and the merge request URL that carries the same
@@ -4568,8 +4626,18 @@ def main():
     # the second finalize pass, a hand-set authoritative branch -- recomputes demands
     # from scratch, and a mark applied any earlier would be recomputed away. Pruning
     # only on the full pipeline run, where every dismissable universe exists.
+    #
+    # `slack_complete` and not just `ledger`: a truthy dict says the ledger was built, and
+    # the Slack rows are half of what it can hold. A partial Slack outage used to slip
+    # straight through this gate and take Kyle's acknowledgements with it -- see
+    # apply_dismissals. Note it is the *complete* flag and not `slack`: with no token
+    # configured there are no Slack rows to be missing, and blocking the prune there would
+    # mean a GitLab dismissal could never expire on a machine that has no Slack at all.
+    # Nothing else is conditional on this: the rows that DID arrive still get their
+    # `dismissed` mark, so an outage costs a prune, never a shout.
     apply_dismissals(ledger, arcs, gap,
-                     prune=bool(ledger and gap is not None and args.json))
+                     prune=bool(ledger and ledger.get("slack_complete")
+                                and gap is not None and args.json))
 
     # Before --active and --focus, and that is the whole point of the feature. The arcs
     # this diff exists to speak about are the ones the window hides: "of your 58

@@ -1905,9 +1905,17 @@ def render(data, lede, focus_days, limit, cost=None):
           "its own the moment the fact under it changes — a new message, a "
           "re-request, a touched ticket. Nothing here can be deleted, only "
           "acknowledged."
-          + ("" if ledger.get("slack") else
-             " <strong>Slack was not consulted this run</strong> — these are GitLab "
-             "and Jira only.") + "</p>")
+          # Three states, not two. "Consulted and half-answered" used to render as though
+          # nothing were wrong, and that is the worst of the three to be quiet about: the
+          # section looks complete and is not, so a missing row reads as a closed loop.
+          # Absence of a section over a wrong section -- and where the section still has to
+          # stand, it says what is missing from it.
+          + (" <strong>Slack was not consulted this run</strong> — these are GitLab "
+             "and Jira only." if not ledger.get("slack")
+             else "" if ledger.get("slack_complete", True)
+             else " <strong>Slack answered only part of this run</strong> — some Slack "
+             "rows are missing and there is no telling which, so nothing here was "
+             "expired on a Slack row's absence.") + "</p>")
         a('<div class="ledger">')
 
         def clock(e):
