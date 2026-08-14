@@ -1111,7 +1111,8 @@ def render_cost(a, cost):
 
     by_model = sorted(wp["by_model"].items(), key=lambda kv: -kv[1]["list_cost"])
     if by_model:
-        a('<div class="scroll"><table><thead><tr><th>Model</th><th>Calls</th>'
+        a('<div class="scroll"><table><thead><tr><th>Model</th>'
+          f"<th>Calls, {esc(wbasis)}</th>"
           "<th>In</th><th>Out</th><th>Cache written</th><th>Cache read</th>"
           "<th>Weighted</th></tr></thead><tbody>")
         for name, v in by_model:

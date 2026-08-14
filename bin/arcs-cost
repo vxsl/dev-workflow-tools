@@ -114,7 +114,7 @@ MIN_POINTS = 3.0
 # a genuine reset moves it by the window's whole length (five hours, or seven days).
 RESET_TOLERANCE = 3600
 
-SAMPLE_MIN_GAP = 60      # never more than one snapshot per minute
+SAMPLE_MIN_GAP = 60      # at most one bracketed pair a minute -- see take_sample
 HTTP_TIMEOUT = 8
 
 
@@ -159,16 +159,27 @@ def _window(d):
 def take_sample(marker):
     """Append one quota snapshot. Silent whatever happens -- see fetch_usage.
 
-    Rate-limited to one per minute so a fast `arcs --no-brief` (start and end within
-    seconds) does not write a pair whose two ends are the same reading, which would
-    contribute a zero-cost, zero-movement observation to the rate.
+    The throttle is on the *pair*, not on each snapshot, and that distinction was learned
+    the hard way. Rate-limiting both ends at one a minute looks right and quietly breaks
+    the measurement: a run whose briefs are all cached finishes in under a minute, so its
+    closing snapshot is the one suppressed, and it contributes no bracketed run at all.
+    Since a fully-cached run is what refreshing the page normally is, the per-run figure
+    would have been left describing only the slow uncached runs -- biased high, with
+    nothing on the page to say so.
+
+    So the opening bracket is throttled and the closing one is not, because an `end` is
+    not another poll of the same thing; it is the other half of one measurement. It also
+    cannot run away: an `end` only ever closes an open `start`, so a suppressed start
+    suppresses its end too and there is never an orphan. Worst case is two requests a
+    minute, against a hud that polls every five.
     """
-    try:
-        last = read_samples()[-1]["ts"] if SAMPLES.exists() else 0
-    except (OSError, ValueError, IndexError, KeyError):
-        last = 0
+    samples = read_samples()
+    last = samples[-1] if samples else None
     now = time.time()
-    if now - last < SAMPLE_MIN_GAP:
+    if marker == "start":
+        if last and now - last["ts"] < SAMPLE_MIN_GAP:
+            return
+    elif not last or last.get("marker") != "start":
         return
     raw = fetch_usage()
     if not raw:

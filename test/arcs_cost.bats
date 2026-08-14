@@ -161,6 +161,37 @@ PY
     [ "$(cost 'w["pipeline"]["calls"]')" = "0" ]
 }
 
+@test "a fast run still gets its closing snapshot, and an end never orphans" {
+    # The throttle is on the pair. Rate-limiting both ends drops the `end` of any run
+    # shorter than a minute -- which is what a fully-cached rebuild is -- so those runs
+    # would silently never be measured and the per-run figure would describe only the
+    # slow ones. Faked here by writing the start directly, since the real one needs
+    # credentials.
+    mkdir -p "$XDG_STATE_HOME/work-arcs"
+    python3 -c "
+import json, time
+w = {'utilization': 5.0, 'resets_at': '2026-08-19T11:00:00.1+00:00'}
+print(json.dumps({'ts': int(time.time()), 'marker': 'start',
+                  'seven_day': w, 'five_hour': w}))" \
+        > "$XDG_STATE_HOME/work-arcs/usage.jsonl"
+
+    # An end immediately after a start is the second half of one measurement, so it is
+    # written even though well under a minute has passed.
+    run python3 -c "
+import importlib.util as u
+from importlib.machinery import SourceFileLoader
+s = u.spec_from_loader('ac', SourceFileLoader('ac', '$REPO_ROOT/bin/arcs-cost'))
+m = u.module_from_spec(s); s.loader.exec_module(m)
+m.fetch_usage = lambda: {'five_hour': {'utilization': 9.0, 'resets_at': '2026-08-19T11:00:00.2+00:00'},
+                         'seven_day': {'utilization': 9.0, 'resets_at': '2026-08-19T11:00:00.3+00:00'}}
+m.take_sample('end')
+m.take_sample('end')   # nothing left to close
+m.take_sample('start') # throttled behind the fresh end
+print(sum(1 for _ in open(m.SAMPLES)))"
+    [ "$status" -eq 0 ]
+    [ "$output" = "2" ]
+}
+
 @test "sampling degrades silently with no credentials" {
     export HOME="$TEST_TMPDIR/nohome"
     mkdir -p "$HOME"
