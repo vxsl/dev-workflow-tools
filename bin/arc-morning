@@ -62,6 +62,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 import headless_claude  # noqa: E402
 from timespan import fmt_interval  # noqa: E402
+from statefile import load_store  # noqa: E402
 
 STATE = (Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
          / "work-arcs")
@@ -658,18 +659,15 @@ def cache_key(model, prompt):
 
 
 def cache_read(key):
-    try:
-        return (json.loads(CACHE.read_text()).get("entries") or {}).get(key)
-    except (OSError, ValueError):
-        return None
+    entries = load_store(CACHE, "the brief-rewrite cache").get("entries")
+    return entries.get(key) if isinstance(entries, dict) else None
 
 
 def cache_write(key, value):
-    try:
-        store = json.loads(CACHE.read_text())
-        entries = store.get("entries") or {}
-    except (OSError, ValueError):
-        store, entries = {"v": 1}, {}
+    store = load_store(CACHE, "the brief-rewrite cache") or {"v": 1}
+    entries = store.get("entries")
+    if not isinstance(entries, dict):
+        entries = {}
     entries[key] = value
     # A brief is a fact about one morning and is never asked for twice once the day's
     # numbers have moved, so the store is a receipt trail rather than a cache to grow.
@@ -784,7 +782,16 @@ def main():
     args = p.parse_args()
 
     raw = Path(args.src).read_text() if args.src else sys.stdin.read()
-    data = json.loads(raw)
+    try:
+        data = json.loads(raw)
+    except ValueError as e:
+        sys.exit(f"arc-morning: the graph on {args.src or 'stdin'} is not JSON ({e}). "
+                 "Nothing upstream of here wrote it as JSON, so there is no brief to "
+                 "compose and no payload to pass on.")
+    if not isinstance(data, dict):
+        sys.exit(f"arc-morning: the graph on {args.src or 'stdin'} parsed as "
+                 f"{type(data).__name__}, not the object arc-brief passes on — there is "
+                 "nothing here to compose a brief from")
     data["brief"] = build(data, "" if args.no_model else args.model, args.offline)
 
     b = data["brief"]

@@ -55,6 +55,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 import headless_claude  # noqa: E402
+from statefile import load_store  # noqa: E402
 
 # Built from JIRA_PROJECTS rather than a generic [A-Z]{2,4}, which matched things
 # like "UTF-8" and "IPV-4" as ticket keys. Falls back to the generic form only if
@@ -968,10 +969,7 @@ def _commitment_delivered(pairs, mine):
         return
 
     prompt_sha = hashlib.sha256(COMMIT_CLOSE_PROMPT.encode()).hexdigest()[:16]
-    try:
-        cache = json.loads(COMMIT_CLOSE_CACHE.read_text())
-    except (OSError, ValueError):
-        cache = {}
+    cache = load_store(COMMIT_CLOSE_CACHE, "the commitment close-out cache")
     if cache.get("prompt") != prompt_sha:
         cache = {"prompt": prompt_sha, "verdicts": {}}
     verdicts = cache.setdefault("verdicts", {})
@@ -1090,10 +1088,7 @@ def _dm_needs_reply(rows):
     if not rows:
         return rows
     prompt_sha = hashlib.sha256(DM_REPLY_PROMPT.encode()).hexdigest()[:16]
-    try:
-        cache = json.loads(DM_REPLY_CACHE.read_text())
-    except (OSError, ValueError):
-        cache = {}
+    cache = load_store(DM_REPLY_CACHE, "the DM-reply verdict cache")
     if cache.get("prompt") != prompt_sha:
         cache = {"prompt": prompt_sha, "verdicts": {}}
     verdicts = cache.setdefault("verdicts", {})
@@ -1156,10 +1151,7 @@ def ledger_commitments(mine):
     if not candidates:
         return rows
     prompt_sha = hashlib.sha256(COMMIT_PROMPT.encode()).hexdigest()[:16]
-    try:
-        cache = json.loads(COMMIT_CACHE.read_text())
-    except (OSError, ValueError):
-        cache = {}
+    cache = load_store(COMMIT_CACHE, "the commitment-detection cache")
     if cache.get("prompt") != prompt_sha:
         cache = {"prompt": prompt_sha, "verdicts": {}}
     verdicts = cache.setdefault("verdicts", {})
@@ -1418,10 +1410,7 @@ def apply_dismissals(ledger, arcs=None, gap=None, prune=False):
     never change what is derived, only what shouts -- but it does leave `notify`: news
     you have acknowledged is no longer news.
     """
-    try:
-        store = json.loads(DISMISSED.read_text()) or {}
-    except (OSError, ValueError):
-        store = {}
+    store = load_store(DISMISSED, "the dismissal store")
     live = {}
     for e in (ledger["they_owe"] + ledger["you_owe"]) if ledger else []:
         live[e["fp"]] = e
@@ -1468,10 +1457,7 @@ def set_dismissed(ledger, spec, undo=False):
         sys.exit("work-arcs: no ledger row matches " + repr(label) + "\n  "
                  + "\n  ".join(f"{e['ref']:<16} {e['fp']}  {e.get('kind','')}"
                                for e in rows))
-    try:
-        store = json.loads(DISMISSED.read_text()) or {}
-    except (OSError, ValueError):
-        store = {}
+    store = load_store(DISMISSED, "the dismissal store")
     for e in match:
         if undo:
             store.pop(e["fp"], None)
@@ -2329,11 +2315,7 @@ OVERRIDES = (Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")
 def load_overrides():
     if not OVERRIDES.exists():
         return {}
-    try:
-        data = json.loads(OVERRIDES.read_text())
-    except (OSError, ValueError):
-        return {}
-    return data if isinstance(data, dict) else {}
+    return load_store(OVERRIDES, "the authoritative-branch store")
 
 
 def apply_overrides(arcs, store):
@@ -2391,12 +2373,7 @@ def apply_parked(arcs):
 
     Returns the entries whose fingerprint no longer matches, so the page can say so.
     """
-    store = {}
-    if PARKED.exists():
-        try:
-            store = json.loads(PARKED.read_text()) or {}
-        except (OSError, ValueError):
-            store = {}
+    store = load_store(PARKED, "the parked store")
     stale = []
     for arc in arcs:
         entry = store.get(arc.get("label")) or store.get(arc.get("id"))
@@ -2420,12 +2397,7 @@ def set_parked(arcs, spec, unpark=False):
     if not match:
         sys.exit(f"work-arcs: no workstream named {label!r}")
     arc = match[0]
-    store = {}
-    if PARKED.exists():
-        try:
-            store = json.loads(PARKED.read_text()) or {}
-        except (OSError, ValueError):
-            store = {}
+    store = load_store(PARKED, "the parked store")
     if unpark:
         store.pop(label, None)
         print(f"✓ {label} is back in the run of play", file=sys.stderr)
@@ -2524,12 +2496,10 @@ def load_clusters(repo, main, resolution):
         git(repo, "rev-parse", main).strip(),
         turn_sig, str(resolution), knobs, str(tool.stat().st_mtime_ns),
     ]).encode()).hexdigest()
-    try:
-        cached = json.loads(CLUSTER_CACHE.read_text())
-        if cached.get("key") == key:
-            return cached["assign"], cached["sessions"]
-    except (OSError, ValueError, KeyError):
-        pass
+    cached = load_store(CLUSTER_CACHE, "the clustering cache")
+    if cached.get("key") == key and isinstance(cached.get("assign"), dict) \
+            and isinstance(cached.get("sessions"), dict):
+        return cached["assign"], cached["sessions"]
     try:
         r = subprocess.run(
             [str(tool), "--repo", str(repo), "--main", main,
@@ -2576,10 +2546,7 @@ def apply_detached(cluster_assign):
     A detached branch is not hidden. It falls back to what its name declares -- its
     ticket, its prefix, or itself -- exactly as if the clustering had never spoken.
     """
-    try:
-        store = json.loads(DETACHED.read_text()) or {}
-    except (OSError, ValueError):
-        store = {}
+    store = load_store(DETACHED, "the detachment store")
     removed, stale = [], []
     for branch, entry in list(store.items()):
         cur = cluster_assign.get(branch)
@@ -2614,10 +2581,7 @@ def apply_detached(cluster_assign):
 def set_detached(cluster_assign, branches, spec, undo=False):
     """`--detach BRANCH` / `--undetach BRANCH`, stamped with what it corrects."""
     branch = spec.strip()
-    try:
-        store = json.loads(DETACHED.read_text()) or {}
-    except (OSError, ValueError):
-        store = {}
+    store = load_store(DETACHED, "the detachment store")
     if undo:
         if branch not in store:
             sys.exit(f"work-arcs: {branch!r} is not detached")

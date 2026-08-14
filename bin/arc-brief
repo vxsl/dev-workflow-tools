@@ -41,6 +41,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 import headless_claude  # noqa: E402
+from statefile import load_store  # noqa: E402
 
 STATE = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "work-arcs"
 CACHE = STATE / "briefs.json"
@@ -692,13 +693,7 @@ def ask(evidence, model, timeout, tries=2):
 
 
 def load_cache():
-    if not CACHE.exists():
-        return {}
-    try:
-        data = json.loads(CACHE.read_text())
-    except (OSError, ValueError):
-        return {}
-    return data if isinstance(data, dict) else {}
+    return load_store(CACHE, "the brief cache")
 
 
 def save_cache(cache):
@@ -721,12 +716,7 @@ def do_split(data, repo, main_ref, args):
     here rather than partitioning the finished arcs keeps every count computed in one
     place; work-arcs simply clusters into more groups than it otherwise would.
     """
-    cache = {}
-    if SPLIT_CACHE.exists() and not args.refresh:
-        try:
-            cache = json.loads(SPLIT_CACHE.read_text()) or {}
-        except (OSError, ValueError):
-            cache = {}
+    cache = {} if args.refresh else load_store(SPLIT_CACHE, "the split cache")
 
     candidates = [a for a in data.get("arcs", []) if len(a.get("branches", [])) > 1]
     work, mapping, hits = [], {}, 0
@@ -828,6 +818,9 @@ def main():
         data = json.loads(raw)
     except json.JSONDecodeError as e:
         sys.exit(f"arc-brief: input is not the JSON work-arcs emits ({e})")
+    if not isinstance(data, dict):
+        sys.exit(f"arc-brief: input parsed as {type(data).__name__}, not the object "
+                 "`work-arcs --json` emits — there are no arcs in it to brief")
 
     repo = args.repo or Path(data.get("repo_path") or data.get("repo", ""))
     main_ref = data.get("main", "origin/main")

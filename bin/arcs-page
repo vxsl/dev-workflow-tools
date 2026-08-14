@@ -2318,6 +2318,9 @@ def main():
         data = json.load(sys.stdin)
     except json.JSONDecodeError as e:
         sys.exit(f"arcs-page: stdin is not `work-arcs --json`: {e}")
+    if not isinstance(data, dict):
+        sys.exit(f"arcs-page: stdin parsed as {type(data).__name__}, not the object "
+                 "`work-arcs --json` emits — there is no graph here to render")
     cost = None
     if args.cost:
         # Loud, because a silently dropped section is how a measurement stops being

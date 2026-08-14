@@ -170,6 +170,88 @@ print("survived", survives())'
     [[ "$output" == *"survived False"* ]]
 }
 
+# ── corrupt state must cost a cache, never a run ──────────────────────────────
+
+# Every wrong shape a state file can hold. The truncations are what a process killed
+# during write_text leaves behind; `null` is what json.dumps(None) writes; the valid-JSON
+# ones are the interesting half, because `except (OSError, ValueError)` catches neither
+# and the old readers went straight on to `.items()` on a list.
+SHAPES=('[{"x": 1}]' '["a","b"]' '"hello"' '42' 'null' '{"a": {"b"' '')
+
+@test "every wrong shape in every state file costs a cache and not a traceback" {
+    # 22 tracebacks before this, across apply_dismissals, apply_parked, apply_detached,
+    # cached_clusters and arc-morning's cache_read/cache_write. The readers are driven with
+    # non-empty inputs on purpose: an empty arc list makes apply_parked's loop never run,
+    # which is how a fuzz over this can come back clean while the bug is live.
+    for shape in "${SHAPES[@]}"; do
+        for f in dismissed.json parked.json detached.json authoritative.json \
+                 cluster-cache.json commitments.json morning.json briefs.json; do
+            printf '%s' "$shape" >"$XDG_STATE_HOME/work-arcs/$f"
+        done
+        run wa '
+arc = {"id": "A", "label": "A", "fingerprint": "fp", "branches": [], "demands": [],
+       "activity": {}, "settled": None, "notify": []}
+row = {"kind": "commitment", "ref": "#c", "fp": "fp-r", "days": 1, "quote": "q",
+       "promised": "p", "asked": "2026-08-01"}
+wa.apply_dismissals({"they_owe": [], "you_owe": [row]}, [arc], {}, prune=True)
+wa.apply_parked([dict(arc)])
+wa.apply_detached({"b": "A", "c": "A"})
+wa.load_overrides()
+wa.load_snapshot("proj")
+wa.load_store(wa.CLUSTER_CACHE, "the clustering cache").get("key")
+print("survived")'
+        [[ "$output" != *Traceback* ]] || {
+            echo "shape ${shape@Q} raised:"; echo "$output"; return 1; }
+        [[ "$output" == *survived* ]]
+    done
+}
+
+@test "a discarded state file names itself rather than emptying quietly" {
+    # A cache that silently empties looks exactly like a cache that is working and cold,
+    # and the difference is a run's worth of model calls. The wrong-shape case is the one
+    # that used to say nothing at all, because it never reached a message.
+    printf '%s' '[{"x": 1}]' >"$XDG_STATE_HOME/work-arcs/dismissed.json"
+    run wa 'wa.apply_dismissals({"they_owe": [], "you_owe": []}, [], {}, prune=False)'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"dismissed.json"* ]]
+    [[ "$output" == *"holds list where an object belongs"* ]]
+    [[ "$output" == *"the dismissal store starts empty this run"* ]]
+}
+
+@test "a corrupt dismissal store never prunes on its own emptiness" {
+    # The nastiest compound: the store is unreadable, so `live` and `store` are both empty,
+    # so a prune has nothing to delete -- but it must also not WRITE the empty store back
+    # over a file that might still be recoverable by hand.
+    printf '%s' '{"fp-r": {"ref": "#c"' >"$XDG_STATE_HOME/work-arcs/dismissed.json"
+    run wa '
+before = wa.DISMISSED.read_text()
+wa.apply_dismissals({"they_owe": [], "you_owe": []}, [], {}, prune=True)
+print("untouched", wa.DISMISSED.read_text() == before)'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"untouched True"* ]]
+}
+
+# ── a stage must not traceback on what the stage before it handed over ────────
+
+@test "each pipeline stage rejects a non-JSON payload with a sentence" {
+    for prog in arc-brief arc-morning arcs-page; do
+        run bash -c "printf 'not json {' | '$REPO_ROOT/bin/$prog' --out /dev/null 2>&1"
+        [[ "$output" != *Traceback* ]] || { echo "$prog: $output"; return 1; }
+        [[ "$output" == *"$prog:"* ]]
+    done
+}
+
+@test "each pipeline stage rejects a payload of the wrong shape with a sentence" {
+    # `[1,2,3]` parses, so the JSONDecodeError guard let it through to an AttributeError
+    # several frames deeper -- in arcs-page's case after work-arcs and both model passes
+    # had already been paid for.
+    for prog in arc-brief arc-morning arcs-page; do
+        run bash -c "printf '[1,2,3]' | '$REPO_ROOT/bin/$prog' --out /dev/null 2>&1"
+        [[ "$output" != *Traceback* ]] || { echo "$prog: $output"; return 1; }
+        [[ "$output" == *"list"* ]]
+    done
+}
+
 @test "a row that did arrive is still marked acknowledged during an outage" {
     # An outage costs a prune, never a shout. The rows Slack managed to return keep their
     # dismissed mark, so a partial answer does not make the acknowledged half loud again.
