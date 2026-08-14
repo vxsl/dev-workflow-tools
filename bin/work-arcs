@@ -3936,8 +3936,10 @@ def main():
             # list would be re-implementing fell_off_a_cliff's tiebreaks, and a ranking
             # written three times is a ranking that will differ in two of them. Ids only,
             # and dismissed rows included: acknowledgement is a display question, and a
-            # morning brief that skipped them would silently drop work he asked to see less
-            # of rather than none of.
+            # complete ranking is the only one a consumer can choose from -- one filtered
+            # here could never be un-filtered. arcs-page shows them behind a disclosure;
+            # arc-morning drops them, because a ✕ that still opens the morning brief is a
+            # ✕ that does nothing.
             "forgotten": forgotten_ids,
             "arcs": arcs,
             "ledger": ledger,
