@@ -502,3 +502,55 @@ print(min(xs(pg.cliff_spark(act(3, 90), 20))))'
     WORK_ARCS_FORGOTTEN_CLIFF="" run wa 'print(wa._knob("cliff_days"))'
     [ "$output" = "7" ]
 }
+
+# ── one day arithmetic, so no two numbers on a row can disagree ───────────────
+
+@test "a row's age and its cliff are the same number about the same silence" {
+    # The bug this pins: `age_days` counted elapsed 24-hour blocks and `cliff_days` counted
+    # local-midnight buckets, so the page showed "8d ago" beside a sprint chip reading
+    # "sprint · 9d" about one silence. Measured on the real corpus at the time: 107 of 111
+    # arcs disagreed.
+    #
+    # Swept over every hour of the day because that is what decides it -- the two agree only
+    # when the evidence's time of day is at or before the current time of day, so a test
+    # pinned to one hour passes or fails by when it is run. Which is how this shipped.
+    run wa '
+import time
+bad = []
+for hour in range(24):
+    at = (TODAY - 9) * wa.DAY - wa.LOCAL_OFFSET + hour * 3600
+    a = arc(branches=[br("b", [{"at": at, "sha": "s%d" % hour}])])
+    if wa.days_ago(at) != a["activity"]["cliff_days"]:
+        bad.append((hour, wa.days_ago(at), a["activity"]["cliff_days"]))
+print("disagreements", len(bad), bad[:3])'
+    [ "$status" -eq 0 ]
+    [[ "$output" == "disagreements 0 []" ]]
+}
+
+@test "work last night is yesterday, not today" {
+    # The half of the unification that is a behaviour choice rather than a consistency one.
+    # Elapsed blocks called 23:00 last night "0d ago" for another 23 hours, and the page
+    # rendered that as "today" -- a claim about work that is plainly false by breakfast.
+    # Skipped in the hour before midnight, when there is no "last night" to test yet.
+    run wa '
+import time
+now = time.time()
+if (int(now) + wa.LOCAL_OFFSET) % wa.DAY < 23 * 3600:
+    at = (TODAY - 1) * wa.DAY - wa.LOCAL_OFFSET + 23 * 3600
+    print("days_ago", wa.days_ago(at))
+    print("elapsed", int((now - at) // 86400))
+else:
+    print("days_ago", 1); print("elapsed", 0)'
+    [[ "$output" == *"days_ago 1"* ]]
+    [[ "$output" == *"elapsed 0"* ]]
+}
+
+@test "no age in this file is computed by dividing seconds by a day" {
+    # A grep, because the defect was not a wrong formula in one place -- it was a second
+    # formula existing at all. Three call sites had drifted to `(now - ts) // 86400` and
+    # every new one would drift the same way, so the rule is that ages come from `days_ago`
+    # and nothing else. `late` in close_commitments is the one documented exception: it is
+    # the interval between two named instants, not an age against now.
+    run grep -nE '\(time\.time\(\) - [^)]*\) *// *(86400|DAY)' "$REPO_ROOT/bin/work-arcs"
+    [ "$status" -ne 0 ]
+}

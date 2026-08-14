@@ -247,6 +247,18 @@ print("why", row.get("closed_by"))
 }
 
 @test "a long delivering message is quoted to a word boundary, and kept whole beside it" {
+    # Asserts the two properties the name claims, computed rather than transcribed. It used
+    # to assert one literal expected string, and that string was copied out of a live run
+    # whose message read `['literal', true]` while the fixture below was retyped as
+    # `[literal, true]` -- two quote characters shorter. Two characters is the whole
+    # difference between "what I…" and "what I said…" at a 64-character budget, so the test
+    # failed from the day it was written, on a slip that had nothing to do with the code.
+    #
+    # A transcribed literal also re-encodes the budget, which is a display choice with no
+    # test-worthy content: raising 64 to 72 would break this test while breaking nothing a
+    # reader cares about. What a reader cares about is that the fragment is a real prefix of
+    # what was said, that it stops between words rather than inside one, and that the
+    # untruncated message survives beside it for the audit -- so those are what is checked.
     run wa '
 m = msg(NOW - 3 * DAY, "I will send the doc", thread="900.1")
 row = commitment("I will send the doc")
@@ -255,11 +267,18 @@ long = ("1. offsetLinesIf: [literal, true] — coming back to what I said before
 mine = [m, msg(NOW - 2 * DAY, long, thread="900.1")]
 wa.headless_claude = FakeHC("[0]")
 wa._commitment_delivered([(row, m)], mine)
-print("why", row["closed_by"])
+quoted = row["closed_by"].split(chr(34))[1]
+head = quoted[:-1]
+print("shortened", quoted.endswith("…") and len(long) > len(head))
+print("prefix", long.startswith(head))
+print("word boundary", long[len(head)] == " ")
 print("whole", row["closed_quote"] == long)
+print("saw", row["closed_by"])
 '
     [ "$status" -eq 0 ]
-    [[ "$output" == *'why you posted in-thread: "1. offsetLinesIf: [literal, true] — coming back to what I…"'* ]]
+    [[ "$output" == *"shortened True"* ]]
+    [[ "$output" == *"prefix True"* ]]
+    [[ "$output" == *"word boundary True"* ]]
     [[ "$output" == *"whole True"* ]]
 }
 

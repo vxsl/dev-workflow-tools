@@ -152,6 +152,32 @@ def day_str(day):
     return time.strftime("%Y-%m-%d", time.localtime(day * DAY - LOCAL_OFFSET + DAY // 2))
 
 
+def days_ago(epoch):
+    """How many local days back something is. The ONE age arithmetic in this file.
+
+    There used to be two, and they disagreed on 107 of 111 arcs. `age_days` counted
+    elapsed 24-hour blocks -- `(now - ts) // 86400` -- while `activity_of` bucketed the
+    same instants by local midnight, so a row showed "8d ago" beside a sprint chip
+    reading "sprint · 9d" about the same silence. Measured: at 05:22 local, every commit
+    made after 06:00 on its day produced that mismatch, which is nearly every commit
+    anyone makes. Two numbers on one row that cannot both be right is worse than either
+    being wrong, because it tells the reader the page does not know.
+
+    Midnight bucketing is the one that survives, for two reasons beyond consistency.
+    First it is what a person means: work at 23:00 last night is "yesterday", and elapsed
+    blocks call it "today" for another 23 hours. Second, it restores the invariant
+    `activity_of` already documents -- cliff_days is measured over everything in the arc
+    and age_days over its lineage alone, so cliff is asked of a superset and must come out
+    <= age. Under mixed arithmetic it came out *greater* on 90-odd rows, and that
+    over-claim was pointed straight at the sprint strip, which accuses you of neglect.
+
+    Deliberately not applied to `late` in close_commitments: that is the interval between
+    two named instants ("!10481 merged 2d after you promised"), not the age of a thing
+    against now, and bucketing it would report a promise kept two hours later as a day.
+    """
+    return day_no(time.time()) - day_no(epoch)
+
+
 def session_index(projects_dir):
     """branch -> {"paths": set, "last": epoch, "entries": int, "days": {...}}, from one
     rg pass over every project.
@@ -224,7 +250,7 @@ def collect_branches(repo, main_ref):
             "name": name,
             "sha": sha[:9],
             "committed": int(ts),
-            "age_days": int((time.time() - int(ts)) // 86400),
+            "age_days": days_ago(ts),
         }
 
     worktrees = set()
@@ -402,7 +428,7 @@ def collect_stashes(repo):
             "ref": ref,
             "sha": sha[:9],
             "base": base,
-            "age_days": int((time.time() - int(ts)) // 86400),
+            "age_days": days_ago(ts),
             "files": files[:8],
             "file_count": len(files),
             "src_count": sum(1 for f in files if f.endswith(SRC_SUFFIXES)),
@@ -605,10 +631,16 @@ def _asked_at(notes, who=None):
 
 
 def _days_since(day):
+    # Through `days_ago` like every other age, even though `_day_epoch` returns a local
+    # midnight and the old `(now - epoch) // 86400` therefore already agreed with it to the
+    # day. Agreeing by arithmetic accident is how the age_days/cliff_days split survived
+    # two releases: the formulas were equivalent on the inputs anyone tested, until one
+    # input arrived mid-afternoon instead of at midnight. One formula, no accidents.
+    #
     # Clamped: GitLab stamps in UTC, so tonight's activity carries tomorrow's date and
     # an unclamped clock read "-1d", which is a strange thing to owe anybody.
     epoch = _day_epoch(day)
-    return max(0, int((time.time() - epoch) // 86400)) if epoch else None
+    return max(0, days_ago(epoch)) if epoch else None
 
 
 def ledger_they_owe(repo, mrs, me):
@@ -2735,8 +2767,7 @@ def build_arcs(branches, stashes, mrs, sessions, main_ref, cluster_assign=None,
             seen_session[key].add(p)
             arcs[key]["sessions"].append({
                 "id": Path(p).stem,
-                "age_days": int((time.time() - info["last"]) // 86400)
-                if info["last"] else 999,
+                "age_days": days_ago(info["last"]) if info["last"] else 999,
                 "last": info["last"],
                 "via": branch,
             })
@@ -3152,6 +3183,13 @@ def activity_of(arc, session_days):
         # it; this is asked of everything in the arc, so a stranger's commit today makes
         # the cliff read 0 and the verdict stay silent. Under-claiming is the right
         # direction for a sentence that accuses you of forgetting something.
+        #
+        # That "always" is an invariant and was a false claim for two releases: `age_days`
+        # counted elapsed 24-hour blocks while this counts local-midnight buckets, so the
+        # subset came out *larger* on 90-odd of 111 arcs and the page showed "8d ago" beside
+        # "sprint · 9d". Both sides now go through `days_ago`, which is what makes the
+        # sentence above true rather than aspirational. Keep it that way: any new age must
+        # come from `days_ago`, never from a fresh division by 86400.
         "cliff_days": today - days[-1],
         "typical_gap_days": typical,
     }
