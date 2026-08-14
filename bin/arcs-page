@@ -295,8 +295,11 @@ details.parked>summary b{color:var(--ink);font-weight:600}
    been kept, which is a derivation and not an acknowledgement -- so it leaves no ✕ and no
    store behind. The evidence is still printed, because a reminder that vanishes silently
    is indistinguishable from a reminder the tool dropped. */
-.ledger .cev{list-style:disc;margin:.4rem 0 0;padding-left:1.1rem;gap:.2rem}
-.ledger .cev li{display:list-item;font-size:.74rem;color:var(--ink-faint)}
+/* display:block, not the flex column `.ledger ul` sets: a flex item is not reliably given
+   a list marker, and this list wants its bullets. */
+.ledger .cev{display:block;list-style:disc;margin:.4rem 0 0;padding-left:1.1rem}
+.ledger .cev li{display:list-item;font-size:.74rem;color:var(--ink-faint);
+  margin-top:.2rem}
 .ledger .fade{opacity:.85}
 /* Acknowledging is the page's one universal control, and it is an acknowledgement, not
    a deletion: the row stays countable behind a disclosure, and the store is keyed to
