@@ -50,7 +50,16 @@ TURNS = STATE / "turns.jsonl"
 # Naming an arc from mixed evidence is a judgement, not an extraction, and a bad name
 # here reproduces exactly the failure this tool exists to fix. `claude -p` resolves the
 # alias, so there is no model id to keep in sync.
-DEFAULT_MODEL = os.environ.get("ARC_BRIEF_MODEL", "opus")
+#
+# Two defaults, because the two passes carry different risk. A blinded 15-arc A/B on
+# identical evidence (2026-08-14) found brief names and summaries indistinguishable
+# between opus and sonnet — sonnet even read landed-vs-residue status better twice —
+# and briefs are ~90% of the pipeline's call volume, so they take the 5x cheaper
+# model. The split pass keeps opus: a wrong split is exactly as damaging as a wrong
+# merge (item 1c), splits are rare, and cheap configurations have been measured
+# fabricating judgements (the thread lens's MAX_THINKING_TOKENS note).
+DEFAULT_MODEL = os.environ.get("ARC_BRIEF_MODEL", "sonnet")
+DEFAULT_SPLIT_MODEL = os.environ.get("ARC_SPLIT_MODEL", "opus")
 
 PROMPT = """\
 You are naming a unit of software work so an engineer can recognise it at a glance.
@@ -796,8 +805,9 @@ def main():
                    help="work-arcs --json output (default: stdin)")
     p.add_argument("--repo", type=Path, default=None,
                    help="the work repo (default: the repo named in the input)")
-    p.add_argument("--model", default=DEFAULT_MODEL,
-                   help=f"claude -p model alias (default: {DEFAULT_MODEL})")
+    p.add_argument("--model", default=None,
+                   help=f"claude -p model alias (default: {DEFAULT_MODEL} for briefs, "
+                        f"{DEFAULT_SPLIT_MODEL} for --split)")
     p.add_argument("--refresh", action="store_true",
                    help="recompute every brief, ignoring cached ones")
     p.add_argument("--limit", type=int, default=0,
@@ -812,6 +822,8 @@ def main():
                    help="emit a branch->arc map splitting arcs that hold several "
                         "bodies of work; for work-arcs to consume, not the page")
     args = p.parse_args()
+    if args.model is None:
+        args.model = DEFAULT_SPLIT_MODEL if args.split else DEFAULT_MODEL
 
     raw = args.src.read_text() if args.src else sys.stdin.read()
     try:
