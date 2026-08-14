@@ -466,6 +466,42 @@ td .dis{vertical-align:middle}
 .conditions .l{font-size:.78rem;color:var(--ink-soft);line-height:1.35;text-wrap:pretty}
 .conditions .sub{font-family:var(--mono);font-size:.68rem;color:var(--ink-faint)}
 
+/* The sprint strip: a lens, and sized like one. Time is still the spine of this page --
+   that decision is recorded three comments down, and it holds -- so what the sprint gets
+   is one bordered strip near the top and a chip on the rows it claims, not a grouping.
+   Deliberately quieter than .conditions: no tiles, no display figures, nothing that could
+   be mistaken for the page's primary reading. It is a paragraph with a border.
+
+   The clauses that name things (tickets with nothing behind them, arcs gone quiet) put the
+   things themselves on the line rather than a count pointing at a section elsewhere. Both
+   lists are bounded by the sprint, so they cannot run away, and a count you have to go
+   somewhere else to cash in is a count you stop believing. */
+.sprint{border:1px solid var(--hairline);border-left:3px solid var(--accent);
+  background:var(--surface);border-radius:4px;padding:.6rem .85rem;margin:0 0 2.5rem;
+  display:flex;flex-direction:column;gap:.28rem}
+.sprint .hd{display:flex;flex-wrap:wrap;align-items:baseline;gap:.25rem .6rem}
+.sprint .tag{font-family:var(--mono);font-size:.68rem;text-transform:uppercase;
+  letter-spacing:.09em;color:var(--accent)}
+.sprint .when{font-family:var(--mono);font-size:.7rem;color:var(--ink-faint)}
+.sprint .ln{font-size:.85rem;color:var(--ink-soft);line-height:1.5;text-wrap:pretty}
+.sprint .ln b{color:var(--ink);font-weight:600}
+.sprint a{color:var(--accent)}
+.sprint .k{font-family:var(--mono);font-size:.78rem}
+.sprint .d{font-family:var(--mono);font-size:.7rem;color:var(--ink-faint)}
+/* Warm, not hot. A sprint arc gone quiet for a working week is worth a look and is not an
+   emergency -- half the sprint is still in front of you when this first fires. */
+.sprint .ln.idle b{color:var(--warm)}
+
+/* On the row, inside .nm rather than as a sixth grid column. The summary grid is
+   6.5rem/1fr/auto/auto/auto and collapses to two columns under 640px; a new column would
+   have had to be defined twice and would have squeezed the name on the narrow one. Riding
+   inside the name cell, it wraps with the name and needs no breakpoint of its own. */
+.sprintchip{font-family:var(--mono);font-size:.6rem;text-transform:uppercase;
+  letter-spacing:.06em;padding:0 .3rem;border-radius:2px;border:1px solid currentColor;
+  color:var(--accent);opacity:.75;white-space:nowrap;vertical-align:.08em}
+.ws>summary:hover .sprintchip{opacity:1}
+.sprintchip.idle{color:var(--warm);opacity:1}
+
 .rung{display:flex;flex-wrap:wrap;align-items:baseline;gap:.2rem .6rem;margin:0 0 .2rem}
 .rung h2{margin:0}
 .rung .n{font-family:var(--mono);font-size:.75rem;color:var(--ink-faint);
@@ -1432,10 +1468,113 @@ def render(data, lede, focus_days, limit, cost=None):
     else:
         a(f'<p class="lede">{derive_lede(data, focus_days)}</p>')
 
+    # --- the declared lens, one strip wide ---------------------------------
+    # The only thing on this page that comes from a plan rather than from evidence. Every
+    # other section answers "what has happened"; this answers "what was this fortnight
+    # supposed to be", which is the question the page could not answer at all before.
+    #
+    # A lens and not the spine, and the placement is the argument: near the top so it is
+    # read, above the sections and outside them so nothing is grouped by it. Time stays the
+    # grouping -- see the comment on BUCKETS -- because that is how the work is actually
+    # recalled, and a page re-spined around sprint membership would have had no home for
+    # the two thirds of these arcs that no sprint claims.
+    #
+    # Absent entirely when work-arcs sent no sprint: no Jira, no Sprint field on the
+    # instance, or no open sprint. Absent, never wrong -- a strip guessing at a sprint is
+    # worse than a page that does not mention sprints. Present even when nothing joined,
+    # though, because "17 tickets and not one of them has work behind it" is the loudest
+    # thing this could ever say and it must not be silence.
+    sprint = data.get("sprint") or None
+    if sprint:
+        shown = {x.get("id") for x in arcs}
+        a('<div class="sprint" id="sprint">')
+        a('<div class="hd"><span class="tag">This sprint</span>')
+        left = sprint.get("days_left")
+        when = [esc(sprint.get("name") or "")]
+        if isinstance(left, int):
+            # Past its end and not yet closed is a real state -- a sprint runs until
+            # somebody clicks the button -- so it is said rather than shown as "-2 days".
+            when.append("ends today" if left == 0 else
+                        f"{left} day{'' if left == 1 else 's'} left" if left > 0 else
+                        f"ended {esc(sprint.get('ends',''))}, still open")
+        # Both board names, where two boards run the same fortnight. On the line it is one
+        # sprint; the tooltip is where the fact that it is two lives.
+        boards = sprint.get("boards") or []
+        title = f' title="{esc(" · ".join(boards))}"' if len(boards) > 1 else ""
+        a(f'<span class="when"{title}>{" &middot; ".join(when)}</span></div>')
+
+        play, mem = len(sprint.get("in_play") or []), len(sprint.get("arcs") or [])
+        done, open_ = sprint.get("done") or 0, sprint.get("tickets") or 0
+        bits = [f'<a href="#play"><b>{play}</b> workstream'
+                f'{"" if play == 1 else "s"} in play</a>']
+        if mem > play:
+            bits.append(f"<b>{mem - play}</b> landed or set aside")
+        bits.append(f"<b>{open_}</b> ticket{'' if open_ == 1 else 's'} still open"
+                    + (f", <b>{done}</b> done" if done else ""))
+        a(f'<div class="ln">{" &middot; ".join(bits)}</div>')
+
+        empty = sprint.get("tickets_without_work") or []
+        if empty:
+            a(f'<div class="ln"><b>{len(empty)}</b> sprint ticket'
+              f'{"" if len(empty) == 1 else "s"} with no work behind '
+              + ("it" if len(empty) == 1 else "them") + " &mdash; "
+              + " ".join(link(i.get("url", ""), esc(i.get("key", "")), "k")
+                         + f' <span class="d">{esc(i.get("status",""))}</span>'
+                         for i in empty)
+              + "</div>")
+
+        idle = sprint.get("untouched") or []
+        if idle:
+            n, days = len(idle), sprint.get("idle_days") or 0
+            # Named, and linked to their own rows where those rows exist. An arc quiet for
+            # a working week is by construction the likeliest to have fallen out of the
+            # focus window, and an anchor to a row that was never rendered is the same lie
+            # as a link to a 404 -- so the ones with no row read as plain text, exactly as
+            # the run-over-run strip handles the same case.
+            named = []
+            for u in idle:
+                arc = by_id.get(u.get("id")) or {}
+                nm = esc((arc.get("brief") or {}).get("name")
+                         or u.get("label") or u.get("id") or "?")
+                if u.get("id") in shown:
+                    nm = f'<a href="#{anchor(u.get("id"))}">{nm}</a>'
+                named.append(f'{nm} <span class="d">{esc(u.get("days"))}d</span>')
+            a(f'<div class="ln idle"><b>{n}</b> untouched for {days}+ days &mdash; '
+              + " &middot; ".join(named) + "</div>")
+        a("</div>")
+
     for s in data.get("stale_overrides") or []:
         a(f'<p class="note">Ignoring your hand-set authoritative branch '
           f'<code>{esc(s.get("branch",""))}</code> for {esc(s.get("label",""))}: '
           f'{esc(s.get("why",""))}. Re-set it if it is still right.</p>')
+
+    # Which sprint arcs have gone quiet, by id, so a row can wear the fact without
+    # re-deriving the threshold. work-arcs owns that judgement -- it is the one that knows
+    # cliff_days, `stage` and `parked` -- and a page that recomputed "untouched" would
+    # eventually disagree with the strip three inches above it.
+    idle_ids = {u.get("id"): u.get("days")
+                for u in ((data.get("sprint") or {}).get("untouched") or [])}
+
+    def sprint_chip(arc):
+        """The lens, on the row. Absent on every row no sprint claims.
+
+        Inside the name cell rather than as its own column: see the CSS note. Quiet by
+        default because two thirds of the rows in the window wear one and a chip that
+        loud would become the page's spine by sheer repetition -- which is the one thing
+        the sprint was not to become. It speaks up only where the strip is already
+        accusing it, and then it carries the number, so the claim and its evidence are
+        the same object rather than two that can drift.
+        """
+        s = arc.get("sprint")
+        if not s:
+            return ""
+        days = idle_ids.get(arc.get("id"))
+        if days is not None:
+            return (f'<span class="sprintchip idle" title="in {esc(s.get("name",""))} '
+                    f'and untouched for {esc(days)} days">sprint &middot; '
+                    f'{esc(days)}d</span>')
+        return (f'<span class="sprintchip" title="in the current sprint, '
+                f'{esc(s.get("name",""))}">sprint</span>')
 
     def plural(n, word):
         return f"{n} {word}" + ("" if n == 1 else "s")
@@ -1549,6 +1688,7 @@ def render(data, lede, focus_days, limit, cost=None):
         auth = arc.get("authoritative")
         a(f'<span class="nm">{nm}'
           + (f' <span class="onbr">{esc(auth)}</span>' if auth and not tkt else "")
+          + sprint_chip(arc)
           + "</span>")
         a(f'<span class="st">{esc(arc.get("state",""))}</span>')
         a(f'<span class="ag">{esc(when)}</span>')
