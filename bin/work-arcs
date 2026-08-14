@@ -1826,6 +1826,258 @@ def collect_jira():
     return issues, None
 
 
+# How long a sprint arc may sit still before the page says so. Five days is a working
+# week: inside a two-week sprint it is half the sprint gone with nothing to show, which
+# is the point at which the fact is worth a line and not before.
+SPRINT_IDLE_DAYS = int(os.environ.get("WORK_ARCS_SPRINT_IDLE_DAYS", "5"))
+
+# What a Sprint field *is*, as opposed to what it is called or where it happens to live.
+# Jira Cloud assigns Sprint a per-instance customfield id -- customfield_10018 on this
+# instance, customfield_10020 on a stock site -- so a hardcoded id is a bug that reports
+# "no sprint" forever on anybody else's Jira and looks exactly like an empty backlog. The
+# name is no better an identity: an admin can rename a field, and some instances carry
+# more than one thing called Sprint. The greenhopper schema tag is what survives both.
+SPRINT_SCHEMA = "com.pyxis.greenhopper.jira:gh-sprint"
+
+
+def _jira_get(path, params=None):
+    """One authenticated GET against the Jira REST API, or None.
+
+    New code only -- collect_jira and collect_initiatives each predate this and each
+    build the request by hand. Left alone deliberately: they work, and rewriting two
+    proven callers to save a dozen lines is how a working Jira integration acquires a
+    bug on a morning when nobody is reading the page.
+    """
+    domain = os.environ.get("JIRA_DOMAIN")
+    email = os.environ.get("JIRA_EMAIL")
+    token = os.environ.get("JIRA_API_TOKEN")
+    if not (domain and email and token):
+        return None
+    url = f"https://{domain}/rest/api/3/{path}"
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
+    req = urllib.request.Request(url, headers={"Accept": "application/json"})
+    auth = base64.b64encode(f"{email}:{token}".encode()).decode()
+    req.add_header("Authorization", f"Basic {auth}")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.load(r)
+    except (urllib.error.URLError, json.JSONDecodeError, TimeoutError, ValueError):
+        return None
+
+
+def _sprint_field():
+    """The id of this instance's Sprint field, discovered rather than assumed.
+
+    Measured against urbanlogiq.atlassian.net on 2026-08-14: `GET /rest/api/3/field`
+    returns 143 fields in 48KB and 0.29s, and exactly one of them carries the
+    greenhopper schema -- `customfield_10018`, named "Sprint". One call, no disk cache:
+    a third of a second is not worth buying with a staleness bug, and this sits beside a
+    pipeline that already spends minutes.
+    """
+    for f in _jira_get("field") or []:
+        if ((f.get("schema") or {}).get("custom") or "") == SPRINT_SCHEMA:
+            return f.get("id")
+    return None
+
+
+def _sprint_end(iso):
+    """Jira's sprint endDate as the sprint's last *day*.
+
+    The field is the instant the sprint closes, not the last day of it: this sprint is
+    named "Aug 10 - Aug 21, 2026" and stamps `2026-08-22T07:00:00.000Z`, which is
+    midnight on the 22nd in this timezone -- an exclusive boundary. Printing that date
+    would put the page a day out of step with the name Jira itself gives the sprint, on
+    every sprint, forever. So a boundary landing exactly on local midnight is walked
+    back a day and anything else is taken as it stands, which is the only reading that
+    covers a sprint configured to end at 5pm on the Friday.
+    """
+    try:
+        dt = datetime.fromisoformat((iso or "").replace("Z", "+00:00")).astimezone()
+    except ValueError:
+        return None
+    if (dt.hour, dt.minute, dt.second) == (0, 0, 0):
+        dt = datetime.fromtimestamp(dt.timestamp() - DAY)
+    return dt.strftime("%Y-%m-%d")
+
+
+def collect_sprint():
+    """The tickets the current sprint says are mine, as the declared plan for the fortnight.
+
+    The page already answers "what have I been doing" from the derived evidence and
+    "what is assigned to me" from Jira. Neither answers "what am I supposed to be doing
+    *this sprint*", because an assignee list is a backlog: 21 of these tickets are open
+    against me and the sprint claims 21 of them for the next ten working days.
+
+    ON THE JQL, WHICH IS NOT THE ONE THE PLAN GUESSED. `sprint in openSprints() AND
+    project in (SBX, UL)` was the assumed shape; measured, it returns the entire team's
+    board -- 100 issues (the page cap, so more) across twelve assignees, of which
+    fourteen are mine. That is somebody else's sprint, and rendering it on a page about
+    one person's work is both wrong and a small privacy leak. Two further facts kill the
+    project axis outright: SBX has *no sprints at all* (`project = SBX AND sprint is not
+    EMPTY` returns nothing, and nothing in SBX is assigned to me -- it is the initiative
+    project, as collect_initiatives already says), and my own sprint work spans UL *and*
+    UB, so a project list built for this would have had to differ from JIRA_PROJECTS
+    anyway. `assignee = currentUser()` is narrower, needs no list to maintain, and is
+    the axis the whole page is already about.
+
+    ON PLURALITY. There is not one active sprint. Measured: "Aug 10 - Aug 21, 2026 (UL)"
+    and "Aug 10 - Aug 21, 2026 (UB)" run concurrently on two boards over the same dates,
+    holding 19 and 2 of my tickets. So the boards are kept and the displayed name is the
+    one they agree on once the board suffix comes off -- and where they do not agree,
+    every name is printed rather than one being picked, because "which sprint am I in"
+    answered with a coin toss is worse than answered with two names.
+
+    ON THE FIELD BEING A HISTORY. The Sprint field holds every sprint an issue has ever
+    been in, closed ones included -- these 21 issues carry ten distinct sprints between
+    them, back to May. Only `state == "active"` entries are the current sprint. Reading
+    the array's last element instead, which is the obvious shortcut, would have been
+    right here and wrong the first time a ticket was pulled forward.
+
+    Done tickets are kept rather than filtered, unlike collect_jira's list: the sprint's
+    own arithmetic needs them (four of mine are Done), and a ticket that is finished and
+    has no branch left on this laptop is a success, not a gap.
+
+    Returns None -- never a half-built dict -- when there is no Jira, no Sprint field or
+    no open sprint. The strip that renders this is absent in exactly those cases.
+    """
+    field = _sprint_field()
+    if not field:
+        return None
+    raw = _jira_get("search/jql", {
+        "jql": "sprint in openSprints() AND assignee = currentUser()",
+        "fields": f"key,summary,status,updated,{field}",
+        "maxResults": 100,
+    })
+    if not raw or "issues" not in raw:
+        return None
+
+    domain = os.environ.get("JIRA_DOMAIN")
+    issues, sprints = [], {}
+    for i in raw["issues"]:
+        f = i.get("fields") or {}
+        active = [s for s in (f.get(field) or []) if s.get("state") == "active"]
+        if not active:
+            # openSprints() matched on *some* sprint of this issue's history. Without an
+            # active entry there is nothing to claim it for this fortnight.
+            continue
+        for s in active:
+            sprints.setdefault(s.get("name") or "?", s)
+        status = (f.get("status") or {}).get("name", "")
+        cat = ((f.get("status") or {}).get("statusCategory") or {}).get("key", "")
+        issues.append({
+            "key": i.get("key", ""),
+            "summary": " ".join((f.get("summary") or "").split()),
+            "status": status,
+            # The category, not the name: "Done" is one of a dozen strings a workflow can
+            # call its terminal column, and this instance already uses "Releasing" and
+            # "MR" for states that are emphatically not finished.
+            "done": cat == "done",
+            "handed_off": status.strip().lower() in HANDED_OFF,
+            "updated": (f.get("updated") or "")[:10],
+            "url": f"https://{domain}/browse/{i.get('key','')}",
+            "sprint": sorted(s.get("name") or "?" for s in active),
+        })
+    if not issues:
+        return None
+
+    names = sorted(sprints)
+    # The board suffix off the end -- "Aug 10 - Aug 21, 2026 (UL)" -> "Aug 10 - Aug 21,
+    # 2026". Two boards running the same fortnight is one sprint as far as a person is
+    # concerned, and printing both names would say there are two of everything.
+    bare = {re.sub(r"\s*\([A-Z]{2,5}\)\s*$", "", n) for n in names}
+    ends = sorted(filter(None, (_sprint_end(s.get("endDate")) for s in sprints.values())))
+    out = {
+        "name": bare.pop() if len(bare) == 1 else " + ".join(names),
+        "boards": names,
+        # The soonest close, where two boards disagree: the deadline that binds is the
+        # first one to arrive.
+        "ends": ends[0] if ends else None,
+        "tickets": sum(1 for i in issues if not i["done"]),
+        "done": sum(1 for i in issues if i["done"]),
+        "issues": issues,
+        "idle_days": SPRINT_IDLE_DAYS,
+    }
+    out["days_left"] = _days_until(out["ends"])
+    return out
+
+
+def _days_until(day):
+    epoch = _day_epoch(day)
+    return int(-(-(epoch - time.time()) // 86400)) if epoch else None
+
+
+def join_sprint(sprint, arcs):
+    """Hang the declared sprint on the derived arcs, and say where they fail to meet.
+
+    Three answers the page could not give before, and they are three different actions:
+    a sprint ticket with an arc is work in flight, a sprint ticket with no arc anywhere
+    is work that has not started (or started somewhere this machine cannot see), and a
+    sprint arc that has not moved in a working week is the sprint quietly not happening.
+
+    The join is `tickets_to_arcs`'s, which is reconcile's -- one author for the rule that
+    a ticket key lives in an arc's branch names and not only in its label. Written twice
+    it would have drifted the first time an arc was renamed.
+
+    Pure, and called after apply_parked and mark_forgotten rather than inside reconcile,
+    because `stage` and `parked` are what decide whether silence is neglect: an arc that
+    landed is silent because it is finished, and one that is parked is silent on purpose.
+    Both are excluded from `untouched` for that reason. `in-review` is not: a sprint
+    ticket sitting unread for a working week is exactly the sprint risk this exists to
+    surface, even though the next move belongs to somebody else.
+    """
+    by_key = tickets_to_arcs(arcs)
+    seen, members = set(), []
+    for i in sprint["issues"]:
+        arc = by_key.get(i["key"])
+        if arc is None:
+            continue
+        # One arc can carry several sprint tickets; it is one workstream either way.
+        if arc["id"] not in seen:
+            seen.add(arc["id"])
+            members.append(arc)
+        # On the arc as well as in the roll-up, so a row can wear a chip without the
+        # renderer having to carry the sprint's membership list around with it.
+        arc["sprint"] = {"name": sprint["name"], "ends": sprint["ends"]}
+
+    def idle(a):
+        # cliff_days first: it is measured over everything in the arc, so a colleague's
+        # commit today makes it read 0 and keeps this quiet. age_days is the fallback for
+        # an arc with no dated evidence at all, and over-claims by construction -- which
+        # is the wrong direction for an accusation, so it is only reached when there is
+        # nothing better.
+        act = a.get("activity") or {}
+        d = act.get("cliff_days")
+        return a.get("age_days", 0) if d is None else d
+
+    def in_play(a):
+        return (a.get("stage") not in ("landed", "abandoned", "parked")
+                and not a.get("parked"))
+
+    # Total tiebreak on id, like every other ordering here: two arcs idle the same number
+    # of days must not swap places between runs.
+    untouched = sorted((a for a in members
+                        if in_play(a) and idle(a) >= SPRINT_IDLE_DAYS),
+                       key=lambda a: (-idle(a), a["id"]))
+
+    members.sort(key=lambda a: (-a.get("engagement", 0), a["id"]))
+    sprint["arcs"] = [a["id"] for a in members]
+    # The subset that still wants something, kept separately rather than left for a
+    # renderer to re-derive. Both numbers are true and they answer different questions:
+    # "19 workstreams carry this sprint's tickets" is the sprint's size, and "7 of them
+    # are still in play" is the answer to what the page is actually asked every morning.
+    sprint["in_play"] = [a["id"] for a in members if in_play(a)]
+    sprint["untouched"] = [{"id": a["id"], "label": a.get("label"), "days": idle(a),
+                            "ticket": a.get("ticket"), "stage": a.get("stage")}
+                           for a in untouched]
+    # Not derived from gap's list of the same name: that one is scoped to collect_jira's
+    # window and drops Done tickets before this can see them, and a sprint ticket that is
+    # finished with nothing left on disk is the sprint working, not a hole in it.
+    sprint["tickets_without_work"] = [i for i in sprint["issues"]
+                                      if not i["done"] and i["key"] not in by_key]
+    return sprint
+
+
 def collect_initiatives(issues):
     """Map each issue to the initiative(s) it rolls up to.
 
@@ -1879,17 +2131,22 @@ def collect_initiatives(issues):
     return issue_to_init, initiatives
 
 
-def reconcile(arcs, issues):
-    """Where the derived picture and the declared one disagree.
+def tickets_to_arcs(arcs):
+    """ticket key -> the arc that owns it.
 
-    Three gaps, and they want different actions: work with no ticket needs one
-    filing, a ticket with no work needs closing or starting, and a ticket claiming
-    to be handed off while its commits sit on this laptop needs a push.
+    An arc's ticket keys live in its member branches, not in its label: clustering
+    names an arc after its evidence, so UL-1692's arc may be called something else
+    entirely. Keying off the label alone silently emptied this map and made every
+    issue look like work that never started.
+
+    Extracted so reconcile and join_sprint share one author for the rule. Both ask the
+    same question of the same arcs, and the two answers drifting apart -- an arc that
+    holds a ticket for the gap report but not for the sprint strip -- would be a bug
+    nobody could see from either end.
+
+    First branch wins, deliberately: where two arcs both name a ticket the older
+    mapping stands rather than flipping between runs.
     """
-    # An arc's ticket keys live in its member branches, not in its label: clustering
-    # names an arc after its evidence, so UL-1692's arc may be called something else
-    # entirely. Keying off the label alone silently emptied this map and made every
-    # issue look like work that never started.
     by_key = {}
     for a in arcs:
         for b in a["branches"]:
@@ -1899,6 +2156,17 @@ def reconcile(arcs, issues):
         m = TICKET_RE.search((a.get("label") or "").upper())
         if m:
             by_key.setdefault(m.group(0), a)
+    return by_key
+
+
+def reconcile(arcs, issues):
+    """Where the derived picture and the declared one disagree.
+
+    Three gaps, and they want different actions: work with no ticket needs one
+    filing, a ticket with no work needs closing or starting, and a ticket claiming
+    to be handed off while its commits sit on this laptop needs a push.
+    """
+    by_key = tickets_to_arcs(arcs)
     issue_keys = {i["key"] for i in issues}
 
     # An arc that owns a ticket owns its summary too. Without this the arc knows only
@@ -4178,9 +4446,19 @@ def main():
         return
 
     gap = None
+    sprint = None
     if args.gap or args.json:
         issues, jira_error = collect_jira()
         gap = reconcile(arcs, issues) if not jira_error else None
+        # Fetched here, beside the other Jira call, and joined much further down. The
+        # split is not tidiness: the join's whole judgement is whether an arc's silence
+        # is neglect, and `stage` and `parked` -- the two things that answer that -- are
+        # not settled until finalize, apply_parked and mark_forgotten have all run.
+        # --json only: `--gap` prints and returns before apply_parked, so the join could
+        # not be made honestly there, and a network call whose result is thrown away is
+        # a network call not worth making.
+        if gap is not None and args.json:
+            sprint = collect_sprint()
         if gap is not None:
             # Which branch is authoritative can depend on which ticket the arc owns, and
             # reconcile is where tickets arrive. Recomputing beats guessing earlier from
@@ -4279,6 +4557,13 @@ def main():
     fell = fell_off_a_cliff(arcs, include_dismissed=False)
     forgotten_ids = [a["id"] for a in fell_off_a_cliff(arcs)]
 
+    # Here for the same reason as the two lines above it: before the window filters. A
+    # sprint arc nobody has touched for a working week is by construction the one most
+    # likely to have fallen out of a recency window, so joining after the filter would
+    # make the strip structurally unable to hold the arcs it exists for.
+    if sprint is not None:
+        join_sprint(sprint, arcs)
+
     if args.active is not None:
         arcs = [a for a in arcs if a["age_days"] <= args.active]
 
@@ -4328,6 +4613,15 @@ def main():
             "forgotten": forgotten_ids,
             "arcs": arcs,
             "ledger": ledger,
+            # Top-level and beside `gap`, not inside it: the gap report is about
+            # disagreement between the derived and declared pictures, and a sprint is
+            # not a disagreement -- it is a second declared picture, with its own
+            # membership. Absent (null) whenever Jira, the Sprint field or an open
+            # sprint is missing, so the strip that reads it can be absent rather than
+            # wrong. Deliberately outside the snapshot: a ticket moving between sprints
+            # is not a workstream moving, and reporting it as one would put a line in
+            # the run-over-run diff every time somebody groomed the board.
+            "sprint": sprint,
             "unattached_stashes": unattached,
             "stale_overrides": stale_overrides,
             "stale_parks": stale_parks,
