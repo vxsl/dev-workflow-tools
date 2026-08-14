@@ -214,6 +214,61 @@ print(v(a)["verdict"], v(a)["why"])'
     [[ "${lines[1]}" == "True 20 commits across 2 days"* ]]
 }
 
+@test "a superseded copy's dates still date the arc, though its volume does not count" {
+    # Filed by the hardening pass and fixed here. Skipping the branch for the volume threw
+    # away its DATES with it, and the newest work in an arc often sits on exactly the copy
+    # that is skipped -- a squash or a cherry-pick made after the original. Measured live:
+    # UB-6668 reported cliff_days 119 against age_days 87, and 2 of 155 arcs claimed a
+    # silence older than the arc itself.
+    #
+    # Dates and volume are different kinds of fact. A date says when work happened, and a
+    # copy was made on the day it was made; volume is the thing that would be counted twice.
+    run wa '
+a = arc(branches=[br("tip", cmts({40: 12, 39: 14})),
+                  br("tip-presquash", cmts({10: 26}, tag="x"), superseded_by="tip")])
+act = a["activity"]
+print(act["invested"]["commits"], act["invested"]["days"], act["cliff_days"])
+print(act["last_active"] == wa.day_str(TODAY - 10))'
+    # 26 commits either way -- the squash holds the same work -- over three active days,
+    # and the arc last moved 10 days ago rather than 39.
+    [ "${lines[0]}" = "26 3 10" ]
+    [ "${lines[1]}" = "True" ]
+}
+
+@test "the cliff is measured over everything, so it cannot exceed the arc's own age" {
+    # The invariant activity_of's docstring already claims: age_days is asked of the
+    # lineage -- the authoritative branch plus the copies superseded by it -- and the cliff
+    # of everything in the arc, so the cliff is asked of a superset and must come out <=
+    # age. This is the second time that "always" turned out to be aspirational; the first
+    # was the mixed day arithmetic that days_ago closed.
+    run wa '
+tip = br("tip", cmts({40: 12}), authoritative=True)
+bak = br("tip-bak", cmts({10: 26}, tag="x"), superseded_by="tip")
+a = arc(branches=[tip, bak])
+# What finalize would compute: the newest touch over the lineage, which is both of these.
+age = min(TODAY - wa.day_no(c["at"]) for b in (tip, bak) for c in b["commits"])
+print(a["activity"]["cliff_days"] <= age, a["activity"]["cliff_days"], age)'
+    [ "$output" = "True 10 10" ]
+}
+
+@test "a copy made mid-arc joins the rhythm, and the rhythm is what the ratio tests" {
+    # The consequence of keeping the dates, in the direction that matters: an interior day
+    # narrows the arc's typical gap and lengthens nothing, so a verdict can only move
+    # toward the pause reading. Here the squash 12 days ago is real activity, and 12 days
+    # against the 7-day rhythm those three days describe is not a cliff. Before the fix the
+    # same arc read 19 days quiet on a 1-day rhythm and was accused.
+    run wa '
+a = arc(branches=[br("tip", cmts({20: 12, 19: 14})),
+                  br("tip-sq", cmts({12: 5}, tag="x"), superseded_by="tip")])
+act = a["activity"]
+print(act["cliff_days"], act["typical_gap_days"], act["invested"]["commits"])
+print(v(a)["verdict"])
+print(v(a)["why"])'
+    [ "${lines[0]}" = "12 7 26" ]
+    [ "${lines[1]}" = "False" ]
+    [[ "${lines[2]}" == *"a pause, not a cliff"* ]]
+}
+
 @test "an arc part of which landed does not claim it never landed" {
     # "never landed" beside a row already reading "7 already merged" is a flat
     # contradiction, and that mixture is common enough to have its own line in finalize.

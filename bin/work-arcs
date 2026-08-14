@@ -3463,9 +3463,10 @@ def build_arcs(branches, stashes, mrs, sessions, main_ref, cluster_assign=None,
     for arc in arcs.values():
         arc["mrs_known"] = mrs_known
         finalize(arc, repo, main_ref)
-        # After finalize, because the series skips superseded copies and mark_duplicates is
-        # what says which those are. Before the verdict, which cannot run until `parked` and
-        # the second finalize have had their say -- see mark_forgotten.
+        # After finalize, because the series counts only a live copy's commits and
+        # mark_duplicates is what says which copies those are. Before the verdict, which
+        # cannot run until `parked` and the second finalize have had their say -- see
+        # mark_forgotten.
         arc["activity"] = activity_of(arc, arc_days.get(arc["id"]))
     ordered = sorted(arcs.values(), key=lambda a: (a["age_days"], -a["at_risk"]))
     return ordered, unattached
@@ -3807,11 +3808,24 @@ def activity_of(arc, session_days):
     transcript entries and no commit at all.
 
     Both are counted the way the rest of this file counts things -- once. Commits are
-    deduplicated by sha and skipped on superseded copies, because a five-branch stack
-    otherwise reports five times the investment it holds; that is the same correction
-    `distinct_unpushed` makes for the same reason. Session entries are summed the way
-    `engagement` sums them, per branch, so the series and the total can never disagree even
-    where both overcount a transcript that named two branches of one arc.
+    deduplicated by sha and a superseded copy's are not counted at all, because a
+    five-branch stack otherwise reports five times the investment it holds; that is the same
+    correction `distinct_unpushed` makes for the same reason. Session entries are summed the
+    way `engagement` sums them, per branch, so the series and the total can never disagree
+    even where both overcount a transcript that named two branches of one arc.
+
+    But a superseded copy's DATES are kept, and the distinction is the whole of a filed bug.
+    Skipping the branch outright threw its dates away with its volume, and the newest work
+    in an arc frequently sits on exactly the copy that is skipped -- a squash or a
+    cherry-pick is made after the original it replaces, and `%ct` is a committer date.
+    Measured before the fix: UB-6668 reported a cliff of 119 days against an age of 87, and
+    2 of 155 arcs claimed a silence older than the arc itself, pointed straight at the sprint
+    strip and the forgotten verdict. The two are different kinds of fact: a date says when
+    work happened and a copy was made on the day it was made; volume is the thing that would
+    be counted twice. So `days`, the gaps and the cliff see every branch, and `commits` sees
+    only the live ones -- which does mean `per_active_day` reads lower on an arc that was
+    squashed on a day of its own, correctly, since that day had a person on it and no new
+    commits of its own.
 
     The emitted series is [days_ago, units] pairs, newest first, and only for days that had
     something on them: 90 zeroes are not data, they are the absence of it. `units` is
@@ -3829,14 +3843,19 @@ def activity_of(arc, session_days):
         b["entries"] += seen["entries"]
         b["sessions"] |= seen["paths"]
     shas = set()
-    for br in arc.get("branches", []):
-        if br.get("superseded_by"):
-            continue
+    # Live branches first, so a sha on both a live branch and a superseded one is claimed by
+    # the live one and keeps its volume. Sorted rather than merely partitioned, because the
+    # branch list's own order decides which copy claims a shared sha and two runs must agree.
+    for br in sorted(arc.get("branches", []),
+                     key=lambda b: (bool(b.get("superseded_by")), b.get("name") or "")):
+        counts = not br.get("superseded_by")
         for c in br.get("commits", []):
             if c["sha"] in shas:
                 continue
             shas.add(c["sha"])
-            bucket(day_no(c["at"]))["commits"] += 1
+            day = bucket(day_no(c["at"]))
+            if counts:
+                day["commits"] += 1
 
     if not per_day:
         # Not "no activity" -- no *evidence* of activity. An arc can be real and leave
@@ -3872,12 +3891,15 @@ def activity_of(arc, session_days):
         # the cliff read 0 and the verdict stay silent. Under-claiming is the right
         # direction for a sentence that accuses you of forgetting something.
         #
-        # That "always" is an invariant and was a false claim for two releases: `age_days`
-        # counted elapsed 24-hour blocks while this counts local-midnight buckets, so the
-        # subset came out *larger* on 90-odd of 111 arcs and the page showed "8d ago" beside
-        # "sprint · 9d". Both sides now go through `days_ago`, which is what makes the
-        # sentence above true rather than aspirational. Keep it that way: any new age must
-        # come from `days_ago`, never from a fresh division by 86400.
+        # That "always" is an invariant and has now been a false claim twice, both times
+        # because "everything in the arc" quietly was not. First `age_days` counted elapsed
+        # 24-hour blocks while this counts local-midnight buckets, so the subset came out
+        # *larger* on 90-odd of 111 arcs and the page showed "8d ago" beside "sprint · 9d";
+        # both sides now go through `days_ago`. Then the superseded skip above dropped the
+        # dates of branches `age_days` still reads through its lineage, which is the same
+        # over-claim from the other end -- 2 of 155 arcs, worst at 119 against 87. Keep both:
+        # any new age comes from `days_ago` and never from a fresh division by 86400, and
+        # anything excluded from the volume here still contributes its dates.
         "cliff_days": today - days[-1],
         "typical_gap_days": typical,
     }
