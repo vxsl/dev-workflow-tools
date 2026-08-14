@@ -258,27 +258,39 @@ details.parked>summary b{color:var(--ink);font-weight:600}
 .ledger .who{display:block;font-size:.74rem;color:var(--ink-faint)}
 .ledger .covered{margin:0;font-size:.76rem;color:var(--ink-faint);
   border-top:1px solid var(--hairline);padding-top:.55rem}
-/* Acknowledging a row is the ledger's one control, and it is an acknowledgement, not a
-   deletion: the row stays countable behind a disclosure, and the store is keyed to the
-   row's fingerprint so any change to the fact underneath brings it back by itself. */
-.ledger li .dis{margin-left:auto;flex:none;font-family:var(--mono);font-size:.68rem;
+/* Acknowledging is the page's one universal control, and it is an acknowledgement, not
+   a deletion: the row stays countable behind a disclosure, and the store is keyed to
+   the row's fingerprint so any change to the fact underneath brings it back itself. */
+.dis{flex:none;font-family:var(--mono);font-size:.68rem;
   line-height:1.3;border:1px solid var(--hairline);background:transparent;
   color:var(--ink-faint);border-radius:2px;cursor:pointer;padding:.05rem .32rem}
-.ledger li .dis:hover{border-color:var(--parked);color:var(--ink-soft)}
-.ledger li[data-dismissed="1"]{display:none}
+.dis:hover{border-color:var(--parked);color:var(--ink-soft)}
+.ledger li .dis,.needs .row .dis{margin-left:auto}
+[data-fp][data-dismissed="1"]{display:none}
 .ledger .side[data-show="1"] li[data-dismissed="1"]{display:flex;opacity:.55}
-.ledger .showdis{align-self:flex-start;font-family:var(--mono);font-size:.68rem;
+[data-disgroup][data-show="1"] [data-fp][data-dismissed="1"]{display:revert;opacity:.55}
+.showdis{align-self:flex-start;font-family:var(--mono);font-size:.68rem;
   padding:.15rem .45rem;border-radius:2px;cursor:pointer;background:transparent;
-  border:1px solid var(--hairline);color:var(--ink-faint)}
-.ledger .showdis:hover{border-color:var(--parked);color:var(--ink-soft)}
-.ledger .disbar{display:none;gap:.7rem;align-items:center;flex-wrap:wrap;
-  grid-column:1/-1;font-size:.8rem;color:var(--ink-soft);
-  border:1px solid var(--parked);border-radius:4px;background:var(--surface);
-  padding:.6rem .8rem}
-.ledger .disbar.on{display:flex}
-.ledger .disbar button{font:inherit;padding:.25rem .6rem;border-radius:3px;
-  cursor:pointer;border:1px solid var(--accent);background:var(--accent);
-  color:var(--surface)}
+  border:1px solid var(--hairline);color:var(--ink-faint);margin-top:.3rem}
+.showdis:hover{border-color:var(--parked);color:var(--ink-soft)}
+.news .item{position:relative;padding-right:2rem}
+.news .item .dis{position:absolute;top:0;right:0}
+td .dis{vertical-align:middle}
+/* The detach rail: ✕ per branch, an intent recorded now and applied on the next build.
+   The struck name says the intent took; the legend says when it takes effect. */
+.tree .det{font-family:var(--mono);font-size:11px;fill:var(--ink-faint);
+  cursor:pointer;user-select:none}
+.tree .det:hover{fill:var(--hot)}
+.tree .det.on{fill:var(--hot);font-weight:700}
+.tree text.detached{text-decoration:line-through;opacity:.45}
+#interactbar{position:sticky;bottom:0;margin-top:1rem;display:none;gap:.8rem;
+  align-items:center;flex-wrap:wrap;padding:.7rem .9rem;border:1px solid var(--parked);
+  border-radius:4px;background:var(--surface);font-size:.85rem;
+  box-shadow:0 -2px 12px rgba(0,0,0,.08)}
+#interactbar.on{display:flex}
+#interactbar button{font:inherit;padding:.3rem .7rem;border-radius:3px;cursor:pointer;
+  border:1px solid var(--accent);background:var(--accent);color:var(--surface)}
+#interactbar .muted{color:var(--ink-soft);font-size:.8rem}
 
 /* One line per workstream. Cards were inherited from the version of this page that showed
    six things, and at twenty-eight they are a wall -- the same reason a list of branches was
@@ -498,76 +510,163 @@ PARK_JS = r"""
 """
 
 
-# Dismissal is the ledger's one control, and it follows parking's contract exactly: it
-# persists in the artifact frame's own localStorage (per-artifact origin, so it survives
-# republishing), it is keyed to the row's content fingerprint rather than to its name, so
-# any change to the fact underneath expires it, and saving to disk is offered rather than
-# required -- `work-arcs` reads dismissed.json so the CLI ledger and this page agree.
-# Rows the file already dismissed arrive pre-marked and are adopted into the local store,
-# which makes localStorage the single in-page authority after load.
-DISMISS_JS = r"""
+# The page's two human inputs beyond parking, both held to the same contract: they
+# persist in the artifact frame's own localStorage (per-artifact origin, so they survive
+# republishing), they are keyed to content rather than to names, so any change to the
+# fact underneath expires them, and saving to disk is offered rather than required --
+# `work-arcs` reads dismissed.json and detached.json so the CLI and this page agree.
+# Rows the files already dismissed arrive pre-marked and are adopted into the local
+# store, which makes localStorage the single in-page authority after load.
+#
+# Acknowledgement is one store across every ✕ on the page -- a ledger row, a demand on
+# its card, the same demand in the news, a Jira-mismatch row -- so acknowledging a fact
+# anywhere acknowledges it everywhere it is rendered.
+INTERACT_JS = r"""
 (function(){
-  var KEY='work-arcs:dismissed:v1', store={}, dirty=false;
-  function read(){ try{ return JSON.parse(localStorage.getItem(KEY)||'{}')||{}; }
-                   catch(e){ return {}; } }
-  function write(){ try{ localStorage.setItem(KEY,JSON.stringify(store)); return true; }
-                    catch(e){ return false; } }
-  store=read();
-  var rows=[].slice.call(document.querySelectorAll('.ledger li[data-fp]')),
-      bar=document.querySelector('.ledger .disbar'),
-      msg=document.querySelector('.ledger .dismsg'),
-      save=document.getElementById('dissave');
-  var present={};
+  function read(key){ try{ return JSON.parse(localStorage.getItem(key)||'{}')||{}; }
+                      catch(e){ return {}; } }
+  function saveFile(filename, data, msg, done){
+    var dl=window.claude&&window.claude.downloads;
+    if(!dl){ msg.textContent='Saving is not available in this view.'; return; }
+    dl.save({filename:filename,data:data}).then(function(){
+      msg.textContent='Saved. Move it to ~/.local/state/work-arcs/'+filename;
+      done();
+    }).catch(function(e){
+      msg.textContent=(e&&e.code==='declined')?'Not saved.'
+        :('Could not save: '+((e&&e.code)||'unknown'));
+    });
+  }
+  var bar=document.getElementById('interactbar'),
+      msg=document.getElementById('intmsg'),
+      saveDis=document.getElementById('savedis'),
+      saveDet=document.getElementById('savedet');
+
+  // --- acknowledgements ----------------------------------------------------
+  var DKEY='work-arcs:dismissed:v1', dstore=read(DKEY), ddirty=false;
+  function dwrite(){ try{ localStorage.setItem(DKEY,JSON.stringify(dstore)); }catch(e){} }
+  var rows=[].slice.call(document.querySelectorAll('[data-fp]')), present={};
   rows.forEach(function(el){
-    present[el.dataset.fp]={ref:(el.querySelector('.ref')||{}).textContent||''};
-    if(el.dataset.dismissed==='1' && !(el.dataset.fp in store))
-      store[el.dataset.fp]=1;                     // adopt what the file already said
+    if(!el.dataset.fp) return;
+    if(!(el.dataset.fp in present))
+      present[el.dataset.fp]={ref:(el.querySelector('.ref')||{}).textContent||''};
+    if(el.dataset.dismissed==='1' && !(el.dataset.fp in dstore))
+      dstore[el.dataset.fp]=1;                    // adopt what the file already said
   });
   var pruned=false;
-  Object.keys(store).forEach(function(k){
-    if(!(k in present)){ delete store[k]; pruned=true; }  // the fact moved: expired
+  Object.keys(dstore).forEach(function(k){
+    if(!(k in present)){ delete dstore[k]; pruned=true; }  // the fact moved: expired
   });
-  if(pruned) write();
+  if(pruned) dwrite();
+
+  // --- detachments -----------------------------------------------------------
+  var TKEY='work-arcs:detached:v1', tstore=read(TKEY), tdirty=false;
+  function twrite(){ try{ localStorage.setItem(TKEY,JSON.stringify(tstore)); }catch(e){} }
+  var dets=[].slice.call(document.querySelectorAll('.tree .det'));
+  var detOf={};
+  dets.forEach(function(el){ detOf[el.dataset.branch]=el; });
+  function peersOf(el){
+    var out=[];
+    el.ownerSVGElement.querySelectorAll('.det').forEach(function(d){
+      if(d.dataset.branch!==el.dataset.branch) out.push(d.dataset.branch); });
+    return out;
+  }
+  // Tested against the co-members rather than the label: the split pass rewords labels
+  // between runs, and a recorded intent must not expire over a rewording. An entry
+  // whose branch no longer shows grouped with mostly the same work has either been
+  // applied by a build or overtaken by the clustering -- not this page's to keep.
+  Object.keys(tstore).forEach(function(b){
+    var el=detOf[b], e=tstore[b]||{};
+    var keep=false;
+    if(el){
+      if(el.dataset.arc===(e.from||'')) keep=true;
+      else if((e['with']||[]).length){
+        var cur={}; peersOf(el).forEach(function(p){ cur[p]=1; });
+        var hit=0; e['with'].forEach(function(p){ if(cur[p]) hit++; });
+        keep=hit/e['with'].length>=0.5;
+      }
+    }
+    if(!keep){ delete tstore[b]; twrite(); }
+  });
+
+  function setBar(){
+    if(!bar) return;
+    bar.classList.toggle('on', ddirty||tdirty);
+    if(saveDis) saveDis.hidden=!ddirty;
+    if(saveDet) saveDet.hidden=!tdirty;
+    if(msg&&(ddirty||tdirty))
+      msg.textContent=Object.keys(dstore).length+' acknowledged, '
+        +Object.keys(tstore).length+' detached in this browser';
+  }
+
   function apply(){
     rows.forEach(function(el){
-      el.dataset.dismissed=(el.dataset.fp in store)?'1':'0'; });
+      el.dataset.dismissed=(el.dataset.fp in dstore)?'1':'0'; });
+    // The ledger's sides carry their own counts and toggles.
     document.querySelectorAll('.ledger .side').forEach(function(side){
       var all=side.querySelectorAll('li[data-fp]').length,
           hid=side.querySelectorAll('li[data-dismissed="1"]').length,
-          c=side.querySelector('[data-count]'),
-          t=side.querySelector('.showdis');
+          c=side.querySelector('[data-count]'), t=side.querySelector('.showdis');
       if(c) c.textContent=all-hid;
       if(t){ t.hidden=(hid===0);
         t.textContent=hid+' acknowledged — '+(side.dataset.show==='1'?'hide':'show'); }
     });
-    if(bar){ bar.classList.toggle('on', dirty);
-      if(msg) msg.textContent=Object.keys(store).length+' acknowledged in this browser'; }
+    // Everywhere else gets an auto-appended disclosure so nothing is concealed.
+    document.querySelectorAll('[data-disgroup]').forEach(function(g){
+      var hid=g.querySelectorAll('[data-fp][data-dismissed="1"]').length, t=g.__tog;
+      if(!t){ t=document.createElement('button'); t.type='button';
+        t.className='showdis'; g.__tog=t; g.insertAdjacentElement('afterend',t);
+        t.addEventListener('click',function(){
+          g.dataset.show=(g.dataset.show==='1')?'0':'1'; apply(); }); }
+      t.hidden=(hid===0);
+      t.textContent=hid+' acknowledged — '+(g.dataset.show==='1'?'hide':'show');
+    });
+    // A news block whose every item is acknowledged has nothing left to say.
+    document.querySelectorAll('.news').forEach(function(n){
+      var items=n.querySelectorAll('.item[data-fp]');
+      n.style.display=(items.length&&n.querySelectorAll(
+        '.item[data-dismissed="1"]').length===items.length
+        &&n.closest('[data-disgroup]').dataset.show!=='1')?'none':''; });
+    dets.forEach(function(el){
+      var on=el.dataset.branch in tstore;
+      el.classList.toggle('on', on);
+      var svg=el.ownerSVGElement;
+      if(svg) svg.querySelectorAll('text.n').forEach(function(n){
+        if(n.dataset.branch===el.dataset.branch) n.classList.toggle('detached', on);
+      });
+    });
+    setBar();
   }
+
   document.addEventListener('click',function(ev){
     var t=ev.target;
-    var dis=t.closest?t.closest('.ledger .dis'):null;
+    var dis=t.closest?t.closest('.dis'):null;
     if(dis){ ev.preventDefault();
-      var el=dis.closest('li'), fp=el.dataset.fp;
-      if(fp in store) delete store[fp]; else store[fp]=1;
-      dirty=true; write(); apply(); return; }
+      var el=dis.closest('[data-fp]'), fp=el&&el.dataset.fp;
+      if(!fp) return;
+      if(fp in dstore) delete dstore[fp]; else dstore[fp]=1;
+      ddirty=true; dwrite(); apply(); return; }
+    var det=t.closest?t.closest('.tree .det'):null;
+    if(det){ ev.preventDefault();
+      var b=det.dataset.branch;
+      if(b in tstore) delete tstore[b];
+      else tstore[b]={from:det.dataset.arc,'with':peersOf(det).sort().slice(0,12),
+                      at:Math.floor(Date.now()/1000)};
+      tdirty=true; twrite(); apply(); return; }
     var sh=t.closest?t.closest('.ledger .showdis'):null;
-    if(sh){ var side=sh.closest('.side');
-      side.dataset.show=(side.dataset.show==='1')?'0':'1'; apply(); }
+    if(sh&&!sh.hidden){ var side=sh.closest('.side');
+      if(side){ side.dataset.show=(side.dataset.show==='1')?'0':'1'; apply(); } }
   });
-  if(save) save.addEventListener('click',function(){
+
+  if(saveDis) saveDis.addEventListener('click',function(){
     var out={}, now=Math.floor(Date.now()/1000);
-    Object.keys(store).forEach(function(k){
+    Object.keys(dstore).forEach(function(k){
       out[k]={ref:(present[k]||{}).ref||'', at:now, note:''}; });
-    var dl=window.claude&&window.claude.downloads;
-    if(!dl){ if(msg) msg.textContent='Saving is not available in this view.'; return; }
-    dl.save({filename:'dismissed.json',data:JSON.stringify(out,null,1)})
-      .then(function(){
-        if(msg) msg.textContent='Saved. Move it to ~/.local/state/work-arcs/dismissed.json';
-        dirty=false; apply();
-      }).catch(function(e){
-        if(msg) msg.textContent=(e&&e.code==='declined')?'Not saved.'
-          :('Could not save: '+((e&&e.code)||'unknown'));
-      });
+    saveFile('dismissed.json', JSON.stringify(out,null,1), msg,
+             function(){ ddirty=false; setBar(); });
+  });
+  if(saveDet) saveDet.addEventListener('click',function(){
+    saveFile('detached.json', JSON.stringify(tstore,null,1), msg,
+             function(){ tdirty=false; setBar(); });
   });
   apply();
 })();
@@ -710,7 +809,7 @@ def spawn_forest(branches):
     return rows, parent, kind
 
 
-def spawn_svg(arc, limit=12, base=""):
+def spawn_svg(arc, limit=12, base="", detachable=False):
     """Draw the arc's stacking tree, or nothing when there is no structure to show.
 
     Build the forest over every branch and prune afterwards, never the other way round.
@@ -765,8 +864,11 @@ def spawn_svg(arc, limit=12, base=""):
 
     widest = max((len(b["name"]) + tail_len(b) + 2) * 6.4 + x_of(d) for b, d in rows)
     height = PAD * 2 + len(rows) * ROW
-    svg = [f'<svg width="{int(widest) + 16}" height="{height}" '
-           f'viewBox="0 0 {int(widest) + 16} {height}" role="img" '
+    # Room on the right for the detach column, an aligned rail of ✕s rather than one
+    # trailing each name -- a control that jumps around per row cannot be aimed at.
+    w = int(widest) + (34 if detachable else 16)
+    svg = [f'<svg width="{w}" height="{height}" '
+           f'viewBox="0 0 {w} {height}" role="img" '
            f'aria-label="how this arc&rsquo;s branches relate: solid edges were cut from '
            f'the branch above, dashed edges are copies of it">']
 
@@ -800,12 +902,19 @@ def spawn_svg(arc, limit=12, base=""):
             tail = f'<tspan class="c" dx="7">+{b["unpushed"]}</tspan>'
         else:
             tail = ""
-        label = (f'<text class="n{cls}" x="{cx + 8}" y="{cy + 4}">'
+        label = (f'<text class="n{cls}" data-branch="{esc(b["name"])}" '
+                 f'x="{cx + 8}" y="{cy + 4}">'
                  f'{esc(b["name"])}{tail}</text>')
         if base and b.get("pushed"):
             label = (f'<a href="{esc(base)}/-/tree/{esc(urlq(b["name"]))}" '
                      f'target="_blank" rel="noopener">{label}</a>')
         svg.append(label)
+        if detachable:
+            svg.append(f'<text class="det" data-branch="{esc(b["name"])}" '
+                       f'data-arc="{esc(arc.get("label", ""))}" '
+                       f'x="{int(widest) + 8}" y="{cy + 4}">'
+                       '<title>not this work — pry this branch out of the arc '
+                       '(applies on the next build)</title>✕</text>')
 
     svg.append("</svg>")
     legend = []
@@ -814,6 +923,9 @@ def spawn_svg(arc, limit=12, base=""):
     hidden = len(branches) - len(rows)
     if hidden > 0:
         legend.append(f"{hidden} more branch{'es' if hidden != 1 else ''} in this arc")
+    if detachable:
+        legend.append("✕ = not this work; a detached branch stands on its own name "
+                      "from the next build")
     leg = f'<div class="legend">{" · ".join(esc(x) for x in legend)}</div>' if legend else ""
     return f'<div class="tree">{"".join(svg)}{leg}</div>'
 
@@ -995,71 +1107,6 @@ def render(data, lede, focus_days, limit):
             sub.append(f'<span class="arc-state">{esc(arc["state"])}</span>')
         return f'<div class="arc-sub">{"".join(sub)}</div>' if sub else ""
 
-    def card(arc):
-        c = arc.get("counts", {})
-        brief = arc.get("brief") or {}
-        a(f'<div class="arc is-{heat(arc)}">')
-
-        # The name the model derived, not the cluster label: `DE-3101` is what the
-        # deterministic namer picked for an arc that is really the impedance work, and
-        # a heading that misnames its own contents is worse than a terse one.
-        a(heading(arc, brief))
-        a(subhead(arc, brief))
-
-        if brief.get("summary"):
-            a(f'<p class="arc-sum">{esc(brief["summary"])}</p>')
-
-        # A demand that merely restates the rung is noise. In "Only on this laptop" the
-        # unpushed count was said three times on one card -- in the subhead, again as a
-        # demand row, and again in the footer -- which is how a card stops being read.
-        tautology = {"local-only": "unpushed", "not-proposed": "unreviewed",
-                     "no-reviewer": "unrequested"}.get(arc.get("stage"))
-        shown_d = [d for d in arc.get("demands", []) if d["kind"] != tautology]
-        if shown_d:
-            a('<ul class="needs">')
-            for d in shown_d[:4]:
-                sev = DEMAND_SEV.get(d["kind"], 6)
-                lbl = DEMAND_LABEL.get(d["kind"], d["kind"])
-                what = link(d.get("url", ""), esc(d["what"]))
-                a(f'<li><div class="row"><span class="chip sev-{sev}">{esc(lbl)}</span>'
-                  f'<span class="what">{what}</span></div>')
-                for q in (d.get("quotes") or ([d["quote"]] if d.get("quote") else []))[:4]:
-                    a(f"<blockquote>{esc(q)}</blockquote>")
-                a("</li>")
-            a("</ul>")
-        elif brief.get("blocker"):
-            # Only where nothing derived outranks it. A model's sentence about what is in
-            # the way is a guess next to "!10398 no longer merges", and it was measured
-            # getting this exact call wrong.
-            a(f'<p class="blocker">{esc(brief["blocker"])}</p>')
-
-        if arc.get("issues"):
-            a('<ul class="tickets">')
-            for i in arc["issues"][:4]:
-                a('<li>'
-                  + link(i.get("url", ""), esc(i.get("key", "")), "key")
-                  + f'<span class="t">{esc(i.get("summary",""))}</span></li>')
-            a("</ul>")
-
-        a(spawn_svg(arc, base=base))
-
-        a('<div class="metrics">')
-        live = arc.get("unpushed_live", arc.get("unpushed", 0))
-        if live and arc.get("stage") != "local-only":
-            a(f"<span><b>{live}</b> unpushed</span>")
-        dead = arc.get("unpushed_only_on_copies", 0)
-        if dead:
-            a(f"<span>{dead} only on a superseded copy</span>")
-        a(f"<span>{plural(c.get('branches',0),'branch').replace('branchs','branches')}</span>")
-        if arc.get("superseded"):
-            a(f"<span>{arc['superseded']} superseded</span>")
-        if c.get("sessions"):
-            a(f"<span>{plural(c['sessions'],'session')}</span>")
-        if c.get("stashes"):
-            a(f"<span>{plural(c['stashes'],'stash').replace('stashs','stashes')}</span>")
-        a(f"<span>{arc.get('age_days','?')}d idle</span>")
-        a("</div></div>")
-
     def rows(bucket, note_reviewers=False):
         """The compact form: one line per workstream, for rungs where a card would
         overstate. Never a truncation — every member of the rung is here."""
@@ -1094,12 +1141,6 @@ def render(data, lede, focus_days, limit):
                 a(f'<span class="sub">{" · ".join(bits)}</span>')
             a("</li>")
         a("</ul>")
-
-    def cards(bucket):
-        a('<div class="arcs">')
-        for arc in bucket:
-            card(arc)
-        a("</div>")
 
     def workstream_row(arc):
         """One line, with everything else behind a disclosure."""
@@ -1136,12 +1177,17 @@ def render(data, lede, focus_days, limit):
                      "no-reviewer": "unrequested"}.get(arc.get("stage"))
         shown_d = [d for d in arc.get("demands", []) if d["kind"] != tautology]
         if shown_d:
-            a('<ul class="needs">')
+            a('<ul class="needs" data-disgroup>')
             for d in shown_d[:4]:
                 sev = DEMAND_SEV.get(d["kind"], 6)
                 lbl = DEMAND_LABEL.get(d["kind"], d["kind"])
-                a(f'<li><div class="row"><span class="chip sev-{sev}">{esc(lbl)}</span>'
-                  f'<span class="what">{link(d.get("url",""), esc(d["what"]))}</span></div>')
+                a(f'<li data-fp="{esc(d.get("fp",""))}" '
+                  f'data-dismissed="{1 if d.get("dismissed") else 0}">'
+                  f'<div class="row"><span class="chip sev-{sev}">{esc(lbl)}</span>'
+                  f'<span class="what">{link(d.get("url",""), esc(d["what"]))}</span>'
+                  '<button class="dis" type="button" aria-label="acknowledge — returns '
+                  'on its own if anything changes" title="acknowledge — returns on its '
+                  'own if anything changes">&#x2715;</button></div>')
                 for q in (d.get("quotes") or ([d["quote"]] if d.get("quote") else []))[:3]:
                     a(f"<blockquote>{esc(q)}</blockquote>")
                 a("</li>")
@@ -1170,7 +1216,10 @@ def render(data, lede, focus_days, limit):
                                 + ("" if n == 1 else "s"))
                 a(f'<span class="stack">{" &middot; ".join(bits)}</span>')
             a("</div>")
-        a(spawn_svg(arc, base=base))
+        # Detachable only where the clustering decided membership: an arc keyed on a
+        # ticket or a prefix got its members from their own names, and the only way to
+        # detach a branch from its own name is to rename it.
+        a(spawn_svg(arc, base=base, detachable=arc.get("kind") == "cluster"))
         a('<div class="metrics">')
         lv = arc.get("unpushed_live", 0)
         if lv and arc.get("stage") != "local-only":
@@ -1196,11 +1245,12 @@ def render(data, lede, focus_days, limit):
     # touching the work removes it without anything being dismissed.
     news = [x for x in arcs if x.get("notify")]
     news.sort(key=lambda x: (x.get("urgency", 99), -x.get("engagement", 0)))
-    a("<section>")
+    a('<section data-disgroup>')
     a("<h2>Since you last touched them</h2>")
     a('<p class="note">Things that came back after your last commit or session on them. '
-      "Nothing here needs dismissing — work on it and it leaves on its own. Everything "
-      "else on this page is a standing state, not news.</p>")
+      "Working on one removes it, and so does acknowledging it — the ✕ expires by "
+      "itself if anything changes again. Everything else on this page is a standing "
+      "state, not news.</p>")
     if not news:
         a('<div class="quiet">Nothing has come back since you last worked on any of '
           "these. Every open merge request is either untouched or already answered.</div>")
@@ -1212,7 +1262,11 @@ def render(data, lede, focus_days, limit):
         a("<h3>" + (link(i.get("url", ""), esc(tkt), "tkt") + " &middot; " if tkt else "")
           + esc(brief.get("name") or arc.get("label", "?")) + "</h3>")
         for d in arc["notify"][:3]:
-            a('<div class="item">')
+            a(f'<div class="item" data-fp="{esc(d.get("fp",""))}" '
+              f'data-dismissed="{1 if d.get("dismissed") else 0}">')
+            a('<button class="dis" type="button" aria-label="acknowledge — returns on '
+              'its own if anything changes" title="acknowledge — returns on its own if '
+              'anything changes">&#x2715;</button>')
             a(f'<span class="when">'
               + (esc(fmt_day(d.get("at"))) + (" (from the merge request&rsquo;s own "
                  "last update, which is the closest timestamp there is)"
@@ -1343,15 +1397,7 @@ def render(data, lede, focus_days, limit):
               "no stalled hand-offs.</div>")
         a("</div>")
 
-        a('<div class="disbar"><span class="dismsg"></span>'
-          '<button type="button" id="dissave">Save for the command line</button>'
-          '<span>Acknowledging already applies here and survives reloads. Saving '
-          "writes <code>dismissed.json</code> for <code>work-arcs</code>, so its own "
-          "ledger agrees with this page.</span></div>")
-
-        a("</div>")
-        a(f"<script>{DISMISS_JS}</script>")
-        a("</section>")
+        a("</div></section>")
 
     # --- the conditions, as peers ------------------------------------------
     # Still peers, still no hero figure and no severity hue: there is no honest exchange
@@ -1427,6 +1473,10 @@ def render(data, lede, focus_days, limit):
         a(f'<p class="note">{esc(s.get("label",""))} is no longer parked: '
           f'{esc(s.get("why",""))}.</p>')
 
+    for s in data.get("stale_detached") or []:
+        a(f'<p class="note">{esc(s.get("branch",""))} is no longer detached: '
+          f'{esc(s.get("why",""))} — the derivation has been allowed to speak.</p>')
+
     if done:
         a("<section>")
         a(f'<div class="rung"><h2 id="settled">Landed or abandoned</h2>'
@@ -1447,16 +1497,21 @@ def render(data, lede, focus_days, limit):
             a("<h2>Jira says otherwise</h2>")
             a('<p class="note">Tickets whose status asserts the work left your hands, '
               "while the commits are still on this laptop.</p>")
-            a('<div class="scroll"><table><thead><tr>'
-              "<th>Ticket</th><th>Claim</th><th>Reality</th><th>Summary</th>"
+            a('<div class="scroll" data-disgroup><table><thead><tr>'
+              "<th>Ticket</th><th>Claim</th><th>Reality</th><th>Summary</th><th></th>"
               "</tr></thead><tbody>")
             for m in mism[:14]:
                 i = m.get("issue", {})
-                a('<tr><td class="k">'
+                a(f'<tr data-fp="{esc(m.get("fp",""))}" '
+                  f'data-dismissed="{1 if m.get("dismissed") else 0}"><td class="k">'
                   + link(i.get("url", ""), esc(i.get("key", "")))
                   + f'</td><td class="d">{esc(i.get("status",""))}</td>'
                   f'<td class="n">{esc(m.get("why","").split(" but ")[-1])}</td>'
-                  f'<td class="d">{esc(i.get("summary",""))}</td></tr>')
+                  f'<td class="d">{esc(i.get("summary",""))}</td>'
+                  '<td><button class="dis" type="button" aria-label="acknowledge — '
+                  'returns on its own if the status or the count moves" '
+                  'title="acknowledge — returns on its own if the status or the count '
+                  'moves">&#x2715;</button></td></tr>')
             a("</tbody></table></div></section>")
 
         unt = gap.get("unticketed_work") or []
@@ -1508,7 +1563,16 @@ def render(data, lede, focus_days, limit):
       '<span class="muted">Parking already applies here and survives reloads. Saving '
       'writes <code>parked.json</code> for <code>work-arcs</code>, so its own counts '
       'agree with this page.</span></div>')
+    a('<div id="interactbar"><span id="intmsg"></span>'
+      '<button type="button" id="savedis" hidden>Save acknowledgements</button>'
+      '<button type="button" id="savedet" hidden>Save detachments</button>'
+      '<span class="muted">Both apply here and survive reloads. Saving writes '
+      '<code>dismissed.json</code> / <code>detached.json</code> into '
+      '<code>~/.local/state/work-arcs/</code> — acknowledgements keep the CLI in '
+      'agreement, and a detachment only takes effect when <code>work-arcs</code> next '
+      'builds the page.</span></div>')
     a(f"<script>{PARK_JS}</script>")
+    a(f"<script>{INTERACT_JS}</script>")
 
     a("<footer>Derived, never declared — arcs come from the files your work "
       "touched, not from what branches were named, and which branch is the work comes "

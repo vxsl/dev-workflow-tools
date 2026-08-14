@@ -1019,46 +1019,73 @@ DISMISSED = (Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")
              / "work-arcs" / "dismissed.json")
 
 
-def _ledger_fp(e):
-    """A ledger row's identity: the fact it asserts, not the day it was rendered.
+def _dfp(*parts):
+    """A dismissable row's identity: the fact it asserts, not the day it was rendered.
 
-    Built from everything that would change if the loop moved -- a re-requested review
-    restarts `asked`, a new DM message replaces the quote, a touched ticket moves its
-    date -- and nothing that changes on its own (`days` ticks daily). This is what
-    makes a dismissal safe to persist: acknowledge THIS fact, and the acknowledgement
-    dies with it.
+    Built from everything that would change if the fact moved -- a re-requested review
+    restarts its date, a new message replaces the quote, an answered thread changes the
+    count in its own text -- and nothing that changes on its own (a `days` counter
+    ticks daily). This is what makes a dismissal safe to persist: it acknowledges THIS
+    fact, and dies with it.
     """
-    h = hashlib.sha256("|".join([
-        e.get("kind", ""), e.get("ref", ""), e.get("url", ""),
-        e.get("asked", ""), e.get("quote", "")]).encode())
+    h = hashlib.sha256("|".join(str(p or "") for p in parts).encode())
     return h.hexdigest()[:16]
 
 
-def apply_dismissals(ledger):
+def _ledger_fp(e):
+    return _dfp(e.get("kind"), e.get("ref"), e.get("url"),
+                e.get("asked"), e.get("quote"))
+
+
+def apply_dismissals(ledger, arcs=None, gap=None, prune=False):
     """Acknowledged rows stay counted but stop shouting, until their fact moves.
 
     The plan's principle 1 names this the one safe form of persisted human input: a
     content-fingerprinted acknowledgement expires itself. An entry whose fingerprint no
     longer matches any live row is deleted on sight -- either the loop closed (nothing
     to show) or the fact changed (a new row, undismissed, takes its place).
+
+    One store for every dismissable thing -- ledger rows, an arc's demands, a Jira
+    status-mismatch row -- so the page and the CLI cannot disagree about what has been
+    acknowledged. Pruning only runs when every universe was actually computed this run:
+    a --no-mr run sees no ledger rows, and deleting their acknowledgements for that
+    would punish a cheap run for being cheap.
+
+    An acknowledged demand still decides the arc's stage and urgency -- a click must
+    never change what is derived, only what shouts -- but it does leave `notify`: news
+    you have acknowledged is no longer news.
     """
     try:
         store = json.loads(DISMISSED.read_text()) or {}
     except (OSError, ValueError):
         store = {}
-    live = {e["fp"]: e for e in ledger["they_owe"] + ledger["you_owe"]}
-    expired = {k: v for k, v in store.items() if k not in live}
-    for k, v in expired.items():
-        del store[k]
-        print(f"  dismissal of {v.get('ref', k)} expired — the fact under it moved",
-              file=sys.stderr)
+    live = {}
+    for e in (ledger["they_owe"] + ledger["you_owe"]) if ledger else []:
+        live[e["fp"]] = e
+    for arc in arcs or []:
+        for d in arc.get("demands", []):
+            if d.get("fp"):
+                live[d["fp"]] = d
+    for m in (gap or {}).get("status_mismatch") or []:
+        if m.get("fp"):
+            live[m["fp"]] = m
+    if prune:
+        expired = {k: v for k, v in store.items() if k not in live}
+        for k, v in expired.items():
+            del store[k]
+            print(f"  dismissal of {v.get('ref', k)} expired — the fact under it "
+                  "moved", file=sys.stderr)
+        if expired:
+            try:
+                DISMISSED.write_text(json.dumps(store, indent=1, sort_keys=True))
+            except OSError:
+                pass
     for k in store:
-        live[k]["dismissed"] = True
-    if expired:
-        try:
-            DISMISSED.write_text(json.dumps(store, indent=1, sort_keys=True))
-        except OSError:
-            pass
+        if k in live:
+            live[k]["dismissed"] = True
+    for arc in arcs or []:
+        arc["notify"] = [d for d in arc.get("notify", [])
+                         if not d.get("dismissed")]
 
 
 def set_dismissed(ledger, spec, undo=False):
@@ -1143,10 +1170,8 @@ def build_ledger(repo, mrs):
     you.sort(key=lambda e: (-(e.get("days") or 0), e["ref"]))
     for e in they + you:
         e["fp"] = _ledger_fp(e)
-    ledger = {"they_owe": they, "you_owe": you, "you_owe_covered": covered,
-              "slack": slack_seen}
-    apply_dismissals(ledger)
-    return ledger
+    return {"they_owe": they, "you_owe": you, "you_owe_covered": covered,
+            "slack": slack_seen}
 
 
 def annotate_stacks(repo, mrs, main_ref):
@@ -1482,12 +1507,16 @@ def reconcile(arcs, issues):
         # credibility -- and this row exists to tell someone their ticket is lying.
         if i["handed_off"] and a["unpushed_live"] > 0:
             n = a["unpushed_live"]
-            mismatched.append({"issue": i, "arc": a,
+            mismatched.append({"issue": i, "arc": a, "ref": i["key"],
                                "why": f"status '{i['status']}' but {n} "
                                       f"commit{'' if n == 1 else 's'} never pushed"})
         elif not i["handed_off"] and a["age_days"] > 21:
-            mismatched.append({"issue": i, "arc": a,
+            mismatched.append({"issue": i, "arc": a, "ref": i["key"],
                                "why": f"status '{i['status']}' but untouched {a['age_days']}d"})
+    # The why-text carries the status and the count, so the fingerprint expires the
+    # moment either moves -- Jira gets corrected, or more commits pile up.
+    for m in mismatched:
+        m["fp"] = _dfp("gap", m["issue"]["key"], m["why"])
     return {"unticketed_work": unticketed, "tickets_without_work": no_work,
             "status_mismatch": mismatched}
 
@@ -1727,6 +1756,94 @@ def load_clusters(repo, main, resolution):
         except OSError:
             pass  # a cache that cannot be written is just a cache miss next time
     return assign, sessions
+
+
+DETACHED = (Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
+            / "work-arcs" / "detached.json")
+
+
+def apply_detached(cluster_assign):
+    """Branches a human pried out of the arc the file overlap put them in.
+
+    The residual clustering error has one shape -- two tickets editing the same module
+    look identical by files, and past the split pass no threshold fixes it -- so this is
+    the human backstop, held to the --authoritative contract: it records what assignment
+    it was correcting and applies only while the clustering still says that. The moment
+    the derivation moves the branch anywhere else, the detachment has been overtaken by
+    evidence it never saw, and it expires out loud instead of quietly outvoting it.
+
+    A detached branch is not hidden. It falls back to what its name declares -- its
+    ticket, its prefix, or itself -- exactly as if the clustering had never spoken.
+    """
+    try:
+        store = json.loads(DETACHED.read_text()) or {}
+    except (OSError, ValueError):
+        store = {}
+    removed, stale = [], []
+    for branch, entry in list(store.items()):
+        cur = cluster_assign.get(branch)
+        # The claim is "not the same work as THESE", so it is tested against the
+        # co-members, not the label -- the split pass rewords labels between runs
+        # ("selected state" became "selected-state" within an evening), and a
+        # detachment must not expire over a rewording. It applies while most of the
+        # recorded co-members are still what the branch is grouped with, and expires
+        # when the grouping genuinely changes.
+        recorded = set(entry.get("with") or [])
+        current = {n for n, lbl in cluster_assign.items()
+                   if lbl == cur and n != branch} if cur else set()
+        same_label = cur is not None and cur == entry.get("from")
+        overlap = (len(recorded & current) / len(recorded)) if recorded else 0
+        if cur is not None and (same_label or overlap >= 0.5):
+            del cluster_assign[branch]
+            removed.append(branch)
+        else:
+            stale.append({"branch": branch,
+                          "why": (f"the clustering now groups it with different work "
+                                  f"({cur!r})" if cur else "the clustering no longer "
+                                  "files it anywhere")})
+            del store[branch]
+    if stale:
+        try:
+            DETACHED.write_text(json.dumps(store, indent=1, sort_keys=True))
+        except OSError:
+            pass
+    return removed, stale
+
+
+def set_detached(cluster_assign, branches, spec, undo=False):
+    """`--detach BRANCH` / `--undetach BRANCH`, stamped with what it corrects."""
+    branch = spec.strip()
+    try:
+        store = json.loads(DETACHED.read_text()) or {}
+    except (OSError, ValueError):
+        store = {}
+    if undo:
+        if branch not in store:
+            sys.exit(f"work-arcs: {branch!r} is not detached")
+        was = store.pop(branch)
+        print(f"✓ {branch} may rejoin {was.get('from')!r} on the next build",
+              file=sys.stderr)
+    else:
+        if branch in store:
+            sys.exit(f"work-arcs: {branch!r} is already detached "
+                     f"(from {store[branch].get('from')!r})")
+        if branch not in branches:
+            sys.exit(f"work-arcs: no branch named {branch!r}")
+        label = cluster_assign.get(branch)
+        if not label:
+            sys.exit(f"work-arcs: {branch!r} is not grouped by file overlap — its arc "
+                     "comes from its own name (ticket or prefix), and the only way to "
+                     "detach a branch from its own name is to rename it")
+        # The co-members are the real referent -- see apply_detached. Capped, sorted,
+        # so the entry stays small and stable.
+        peers = sorted(n for n, lbl in cluster_assign.items()
+                       if lbl == label and n != branch)[:12]
+        store[branch] = {"from": label, "with": peers, "at": int(time.time())}
+        print(f"✓ {branch} detached from {label!r}", file=sys.stderr)
+        print("  it falls back to what its name declares; expires itself if the "
+              f"clustering ever reassigns it — {DETACHED}", file=sys.stderr)
+    DETACHED.parent.mkdir(parents=True, exist_ok=True)
+    DETACHED.write_text(json.dumps(store, indent=1, sort_keys=True))
 
 
 def split_assignment(arcs, args):
@@ -2308,6 +2425,12 @@ def demands(arc):
                                 f"commit{'' if n == 1 else 's'} and has no merge request"})
 
     out.sort(key=lambda d: DEMAND_RANK.get(d["kind"], 9))
+    # The arc's label disambiguates: "3 commits exist nowhere but this laptop" is the
+    # same sentence on many arcs, and without the label one ✕ would acknowledge all of
+    # them at once.
+    for d in out:
+        d["fp"] = _dfp("demand", arc.get("label"), d.get("kind"), d.get("what"),
+                       d.get("url"))
     return out
 
 
@@ -2593,6 +2716,12 @@ def main():
                    help="set a workstream aside as backlog. Expires itself as soon as a "
                         "commit lands on it, so it can never quietly outlive its reason")
     p.add_argument("--unpark", metavar="ARC", help="put a parked workstream back in play")
+    p.add_argument("--detach", metavar="BRANCH",
+                   help="pry a branch out of the arc the file overlap put it in; it "
+                        "falls back to what its name declares. Expires itself if the "
+                        "clustering ever reassigns the branch")
+    p.add_argument("--undetach", metavar="BRANCH",
+                   help="let a detached branch rejoin whatever the clustering says")
     p.add_argument("--dismiss", metavar="REF[=NOTE]",
                    help="acknowledge a ledger row (by its !MR / ticket ref or "
                         "fingerprint prefix). Expires itself the moment the fact "
@@ -2655,7 +2784,8 @@ def main():
     # underneath the squash index and the session scan instead of after them: measured,
     # that turns 9s of its own wall clock into none. The write-side commands skip it --
     # --park does not need to know who owes whom.
-    writing = args.park or args.unpark or args.authoritative or args.jira_ify
+    writing = (args.park or args.unpark or args.authoritative or args.jira_ify
+               or args.detach or args.undetach)
     ledger_f = None
     if mrs_known and not args.shallow_mr and not writing:
         ledger_f = futures.ThreadPoolExecutor(max_workers=1).submit(
@@ -2717,13 +2847,23 @@ def main():
     # same catalogs are structurally identical. The last discriminator is what the
     # changes say they are for, so arc-brief reads the commit subjects and returns a
     # refined assignment. Applied by re-clustering rather than by carving up finished
-    # arcs, so every count stays computed in one place.
-    if not args.no_split:
-        refined = split_assignment(arcs, args)
-        if refined:
-            cluster_assign = {**cluster_assign, **refined}
-            arcs, unattached = build_arcs(branches, stashes, mrs, sessions, args.main,
-                                          cluster_assign, args.repo, mrs_known, own_tokens)
+    # arcs, so every count stays computed in one place. Human detachments come last,
+    # after the split, because they correct the assignment the page actually showed --
+    # which is the post-split one.
+    refined = {} if args.no_split else split_assignment(arcs, args)
+    if refined:
+        cluster_assign = {**cluster_assign, **refined}
+    detached, stale_detached = apply_detached(cluster_assign)
+    for s in stale_detached:
+        print(f"⚠ {s['branch']} is no longer detached: {s['why']}", file=sys.stderr)
+    if refined or detached:
+        arcs, unattached = build_arcs(branches, stashes, mrs, sessions, args.main,
+                                      cluster_assign, args.repo, mrs_known, own_tokens)
+
+    if args.detach or args.undetach:
+        set_detached(cluster_assign, branches, args.detach or args.undetach,
+                     undo=bool(args.undetach))
+        return
 
     if args.park or args.unpark:
         set_parked(arcs, args.park or args.unpark, unpark=bool(args.unpark))
@@ -2804,6 +2944,13 @@ def main():
         print(f"⚠ ignoring authoritative={s['branch']} for {s['label']}: {s['why']}",
               file=sys.stderr)
 
+    # Last of the finalize-order corrections, because everything before this point --
+    # the second finalize pass, a hand-set authoritative branch -- recomputes demands
+    # from scratch, and a mark applied any earlier would be recomputed away. Pruning
+    # only on the full pipeline run, where every dismissable universe exists.
+    apply_dismissals(ledger, arcs, gap,
+                     prune=bool(ledger and gap is not None and args.json))
+
     if args.active is not None:
         arcs = [a for a in arcs if a["age_days"] <= args.active]
 
@@ -2834,6 +2981,7 @@ def main():
             "unattached_stashes": unattached,
             "stale_overrides": stale_overrides,
             "stale_parks": stale_parks,
+            "stale_detached": stale_detached,
             "gap": gap,
         }, sys.stdout, indent=1)
         print()
