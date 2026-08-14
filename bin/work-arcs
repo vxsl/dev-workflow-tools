@@ -50,6 +50,9 @@ from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+import headless_claude  # noqa: E402
+
 # Built from JIRA_PROJECTS rather than a generic [A-Z]{2,4}, which matched things
 # like "UTF-8" and "IPV-4" as ticket keys. Falls back to the generic form only if
 # .env declares nothing.
@@ -403,19 +406,12 @@ def unresolved_threads(repo, iid, me=""):
         if not notes or all(n.get("resolved") for n in notes):
             continue
         first = notes[0]
-        body = first.get("body") or ""
-        # An inline attachment is most of a note's characters and none of its meaning:
-        # one reviewer's question spent 90 of its first 180 characters on
-        # `![image](/uploads/bc04.../image.png){width=200...}`, which pushed the actual
-        # question out of the excerpt. The quote has to carry what was asked.
-        body = re.sub(r"!?\[[^\]]*\]\([^)]*\)(\{[^}]*\})?", " ", body)
-        body = re.sub(r"</?[a-z][^>]*>", " ", body)
-        body = " ".join(body.split())
+        body = _clean_note(first.get("body"))
         last = notes[-1]
         last_by = (last.get("author") or {}).get("username", "?")
         open_.append({
             "author": (first.get("author") or {}).get("username", "?"),
-            "quote": body[:180] + ("…" if len(body) > 180 else ""),
+            "quote": body,
             "notes": len(notes),
             "at": (first.get("created_at") or "")[:10],
             "last_by": last_by,
@@ -484,6 +480,17 @@ def branch_pipelines(repo):
 REVIEW_REQ_RE = re.compile(r"^requested review from", re.I)
 
 
+def _clean_note(body):
+    """A note's text fit to quote. An inline attachment is most of a note's characters
+    and none of its meaning: one reviewer's question spent 90 of its first 180 characters
+    on `![image](/uploads/bc04.../image.png){width=200...}`, which pushed the actual
+    question out of the excerpt. The quote has to carry what was asked."""
+    body = re.sub(r"!?\[[^\]]*\]\([^)]*\)(\{[^}]*\})?", " ", body or "")
+    body = re.sub(r"</?[a-z][^>]*>", " ", body)
+    body = " ".join(body.split())
+    return body[:180] + ("…" if len(body) > 180 else "")
+
+
 def _mr_notes(repo, iid):
     return glab(repo, f"projects/:id/merge_requests/{iid}/notes?per_page=100&sort=asc") or []
 
@@ -513,8 +520,10 @@ def _asked_at(notes, who=None):
 
 
 def _days_since(day):
+    # Clamped: GitLab stamps in UTC, so tonight's activity carries tomorrow's date and
+    # an unclamped clock read "-1d", which is a strange thing to owe anybody.
     epoch = _day_epoch(day)
-    return int((time.time() - epoch) // 86400) if epoch else None
+    return max(0, int((time.time() - epoch) // 86400)) if epoch else None
 
 
 def ledger_they_owe(repo, mrs, me):
@@ -561,15 +570,20 @@ def ledger_they_owe(repo, mrs, me):
 
 
 def ledger_you_owe(repo, me):
-    """Their merge requests waiting on your review, with how long you have had them.
+    """Their merge requests waiting on something of yours, and how long they have waited.
 
-    `reviewer_username=me` over the project's open MRs is the queue; what the list call
-    cannot say is whether you already dealt with each one. Dealt with means the same two
-    things in reverse: you approved it, or you said anything on it. Either and the row
-    vanishes -- which is the property that keeps this from rotting, no checkbox required.
+    Two ways to owe on someone else's MR, and the first version saw only one. A review
+    you never gave is the obvious one. The subtler one is a conversation you started and
+    walked away from: you comment, the author answers, and "I spoke" is exactly the
+    wrong test for done -- speaking is what created the debt. So having spoken routes
+    the MR into a thread check rather than out of the queue: an unresolved discussion
+    you took part in whose last human word is theirs is a reply you owe, quoted.
 
-    An MR somebody else already approved is dropped too, but counted: this project needs
-    one approval, so your review is no longer the thing between the author and a merge.
+    A review request where somebody else already approved is dropped but counted: this
+    project needs one approval, so yours is no longer what stands between the author and
+    a merge. Bounded to MRs that name you a reviewer -- a thread you opened on an MR you
+    were never a reviewer of is invisible here, and saying so beats sweeping every open
+    MR in the project for your name.
     """
     raw = glab(repo, "projects/:id/merge_requests?state=opened&per_page=100"
                      f"&reviewer_username={urllib.parse.quote(me, safe='')}")
@@ -580,16 +594,41 @@ def ledger_you_owe(repo, me):
 
     def one(m):
         iid = m.get("iid")
-        notes = _mr_notes(repo, iid)
+        # Discussions rather than flat notes: same single call, but it keeps the thread
+        # structure, which is what "whose turn is it in this conversation" needs.
+        discussions = glab(repo,
+                           f"projects/:id/merge_requests/{iid}/discussions?per_page=100")
+        notes = [n for d in discussions or [] for n in (d.get("notes") or [])]
         i_spoke = any((n.get("author") or {}).get("username") == me
                       for n in notes if not n.get("system"))
-        if i_spoke or _approved_by(repo, iid):
-            return None
-        asked = _asked_at(notes, who=me) or (m.get("created_at") or "")[:10]
-        return {"kind": "review-owed", "ref": f"!{iid}", "title": m.get("title", ""),
-                "who": (m.get("author") or {}).get("username", "?"),
-                "asked": asked, "days": _days_since(asked),
+        base = {"ref": f"!{iid}", "title": m.get("title", ""),
                 "url": m.get("web_url", "")}
+        if not i_spoke:
+            if _approved_by(repo, iid):
+                return None
+            asked = _asked_at(notes, who=me) or (m.get("created_at") or "")[:10]
+            return {**base, "kind": "review-owed",
+                    "who": (m.get("author") or {}).get("username", "?"),
+                    "asked": asked, "days": _days_since(asked)}
+        for d in discussions or []:
+            ns = [n for n in (d.get("notes") or []) if not n.get("system")]
+            if not ns or not any((n.get("author") or {}).get("username") == me
+                                 for n in ns):
+                continue
+            resolvable = [n for n in ns if n.get("resolvable")]
+            if resolvable and all(n.get("resolved") for n in resolvable):
+                continue
+            last = ns[-1]
+            who = (last.get("author") or {}).get("username", "?")
+            if who == me:
+                continue
+            at = (last.get("created_at") or "")[:10]
+            # One entry per MR, not per thread, same as the demands: whose turn it is
+            # is the fact; the quote is its evidence.
+            return {**base, "kind": "reply-owed", "who": who,
+                    "asked": at, "days": _days_since(at),
+                    "quote": _clean_note(last.get("body"))}
+        return None
 
     with futures.ThreadPoolExecutor(max_workers=16) as pool:
         for entry in pool.map(one, queue):
@@ -642,6 +681,340 @@ def ledger_jira_stalled(days_min=None):
     return out
 
 
+def _slack(method, **params):
+    """One Slack Web API call on the user token, or None. Same contract as glab()."""
+    token = os.environ.get("SLACK_USER_TOKEN")
+    if not token:
+        return None
+    url = f"https://slack.com/api/{method}?" + urllib.parse.urlencode(params)
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            d = json.load(r)
+    except (urllib.error.URLError, json.JSONDecodeError, TimeoutError, OSError):
+        return None
+    return d if d.get("ok") else None
+
+
+def _slack_sweep(query, pages=4):
+    """Every match for a search, newest first. Search is the one scope this token has,
+    so the whole Slack side is built from sweeps rather than per-conversation reads."""
+    out = []
+    for page in range(1, pages + 1):
+        d = _slack("search.messages", query=query, count=100, page=page,
+                   sort="timestamp", sort_dir="desc")
+        if not d:
+            break
+        matches = (d.get("messages") or {}).get("matches") or []
+        out += matches
+        if len(matches) < 100:
+            break
+    return out
+
+
+def _slack_text(body):
+    """Slack markup fit to quote: links keep their label, mentions keep a readable @."""
+    body = re.sub(r"<[^|>]+\|([^>]+)>", r"\1", body or "")
+    body = re.sub(r"<@([A-Z0-9]+)>", r"@\1", body)
+    body = re.sub(r"<([^>]+)>", r"\1", body)
+    return _clean_note(body)
+
+
+def _thread_of(match):
+    """The thread a search match sits in, recovered from its permalink -- the only
+    place a search result admits it. A message with no thread is its own root."""
+    m = re.search(r"[?&]thread_ts=([0-9.]+)", match.get("permalink") or "")
+    return m.group(1) if m else (match.get("ts") or "")
+
+
+COMMIT_CACHE = (Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
+                / "work-arcs" / "commitments.json")
+
+COMMIT_PROMPT = """\
+These are Kyle's own Slack messages from the last two weeks, numbered. Find the ones
+that are clear first-person commitments to do something another person is relying on --
+promises like "I'll take that", "I can pick this up", "leave it with me", "I'll send
+you the doc tomorrow".
+
+Count ONLY messages where all three hold:
+- first person future: Kyle himself will do the thing
+- concrete: a nameable action or deliverable, not a vague intention
+- someone else plausibly depends on it happening
+
+Exclude questions, opinions, past-tense reports, hypotheticals, jokes, "I'll look into
+it at some point" vagueness, and anything you are not sure about. A wrong claim that
+Kyle owes something costs more trust than ten right ones earn: prefer returning nothing
+over guessing.
+
+Reply with ONLY a JSON array, one object per commitment:
+[{"i": <message number>, "promised": "<3-8 word restatement of what he said he'd do>",
+  "to": "<who is relying on it, or empty>"}]
+
+Empty array if none qualify.
+
+Messages:
+{messages}
+"""
+
+
+DM_REPLY_CACHE = (Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
+                  / "work-arcs" / "dm-replies.json")
+
+DM_REPLY_PROMPT = """\
+Each numbered line is the LAST message in a Slack DM conversation with Kyle, written by
+the other person. Which of them still need a reply or an action from Kyle?
+
+Needing a reply means a question, a request, or something left explicitly hanging.
+Exclude closing pleasantries ("thanks", "all good", "sounds good"), FYIs that ask
+nothing, and automated messages. When you are not sure, exclude it: a wrong claim that
+Kyle owes a reply costs more than a missed one.
+
+Reply with ONLY a JSON array of the numbers that need something from Kyle, e.g. [0, 3].
+Empty array if none.
+
+Messages:
+{messages}
+"""
+
+
+def _dm_needs_reply(rows):
+    """Whether a DM's last word actually asks anything, judged once and cached.
+
+    "Whoever spoke last" is the right turn-taking rule and the wrong debt rule in DMs:
+    a conversation's last word is very often "thanks" or "all good", and rendering
+    those as things Kyle owes is exactly the wrong reminder the plan warns about. The
+    judge defaults to dropping -- a real ask that also arrived as an @-mention is still
+    caught by the mention sweep -- and a failed model call keeps the rows unfiltered,
+    which is the honest degradation.
+    """
+    if not rows:
+        return rows
+    prompt_sha = hashlib.sha256(DM_REPLY_PROMPT.encode()).hexdigest()[:16]
+    try:
+        cache = json.loads(DM_REPLY_CACHE.read_text())
+    except (OSError, ValueError):
+        cache = {}
+    if cache.get("prompt") != prompt_sha:
+        cache = {"prompt": prompt_sha, "verdicts": {}}
+    verdicts = cache.setdefault("verdicts", {})
+
+    def key(r):
+        return hashlib.sha256(
+            f"{r.get('url','')}\x00{r.get('quote','')}".encode()).hexdigest()[:16]
+
+    fresh = [r for r in rows if key(r) not in verdicts]
+    if fresh:
+        model = os.environ.get("WORK_ARCS_COMMIT_MODEL", "sonnet")
+        numbered = "\n".join(f"[{i}] (from {r.get('who','?')}) {r.get('quote','')}"
+                             for i, r in enumerate(fresh))
+        try:
+            r = headless_claude.run(
+                ["--model", model, "--dangerously-skip-permissions",
+                 DM_REPLY_PROMPT.replace("{messages}", numbered)], timeout=120)
+            hits = set(json.loads(re.search(r"\[.*?\]", r.stdout, re.S).group(0))) \
+                if r.returncode == 0 else None
+        except (OSError, subprocess.SubprocessError, ValueError,
+                AttributeError, TypeError):
+            hits = None
+        if hits is not None:
+            for i, row in enumerate(fresh):
+                verdicts[key(row)] = i in hits
+            try:
+                DM_REPLY_CACHE.parent.mkdir(parents=True, exist_ok=True)
+                DM_REPLY_CACHE.write_text(json.dumps(cache))
+            except OSError:
+                pass
+    return [r for r in rows if verdicts.get(key(r), True)]
+
+
+def ledger_commitments(mine):
+    """Things you said you'd do, read out of your own messages. The one inferred thing
+    in the ledger, and it wears that on its sleeve.
+
+    "You said you'd take responsibility for that 4 days ago" is not derivable -- no
+    API marks a sentence as a promise -- so this is a model call, held to the rules the
+    plan sets for exactly this feature: every row quotes the message it is a claim
+    about with a permalink to it, and the prompt prefers silence over a guess, because
+    a wrong "you owe" costs more trust than ten right ones earn.
+
+    Judged once per message, cached by content: the sliding window only ever pays for
+    messages the model has not seen, so this is one small call a day, not a sweep. The
+    cache keys on the prompt too -- rewording the question must not reuse old answers,
+    which is the exact way an evidence-keyed cache went stale once already (item 1c).
+    """
+    rows = []
+    candidates = [m for m in mine
+                  if len((m.get("text") or "").strip()) >= 12][:200]
+    if not candidates:
+        return rows
+    prompt_sha = hashlib.sha256(COMMIT_PROMPT.encode()).hexdigest()[:16]
+    try:
+        cache = json.loads(COMMIT_CACHE.read_text())
+    except (OSError, ValueError):
+        cache = {}
+    if cache.get("prompt") != prompt_sha:
+        cache = {"prompt": prompt_sha, "verdicts": {}}
+    verdicts = cache.setdefault("verdicts", {})
+
+    def key(m):
+        return hashlib.sha256(
+            f"{m.get('ts','')}\x00{m.get('text','')}".encode()).hexdigest()[:16]
+
+    fresh = [m for m in candidates if key(m) not in verdicts]
+    if fresh:
+        model = os.environ.get("WORK_ARCS_COMMIT_MODEL", "sonnet")
+        print(f"  ledger: reading {len(fresh)} new Slack messages of yours for "
+              f"commitments ({model})", file=sys.stderr)
+        numbered = "\n".join(
+            f"[{i}] (in {(m.get('channel') or {}).get('name') or 'a DM'}) "
+            + _slack_text(m.get("text"))
+            for i, m in enumerate(fresh))
+        try:
+            r = headless_claude.run(
+                ["--model", model, "--dangerously-skip-permissions",
+                 COMMIT_PROMPT.replace("{messages}", numbered)], timeout=240)
+            found = json.loads(re.search(r"\[.*\]", r.stdout, re.S).group(0)) \
+                if r.returncode == 0 else None
+        except (OSError, subprocess.SubprocessError, ValueError, AttributeError):
+            found = None
+        # Nothing is cached on a failed or unparseable call, so the next run asks again
+        # rather than remembering an accident as a verdict.
+        if isinstance(found, list):
+            hits = {}
+            for f in found:
+                try:
+                    hits[int(f["i"])] = {"promised": str(f.get("promised", ""))[:80],
+                                         "to": str(f.get("to", ""))[:40]}
+                except (KeyError, TypeError, ValueError):
+                    continue
+            for i, m in enumerate(fresh):
+                verdicts[key(m)] = hits.get(i, False)
+            try:
+                COMMIT_CACHE.parent.mkdir(parents=True, exist_ok=True)
+                COMMIT_CACHE.write_text(json.dumps(cache))
+            except OSError:
+                pass
+
+    settle = 86400 * int(os.environ.get("WORK_ARCS_SLACK_SETTLE_DAYS", "1"))
+    now = time.time()
+    for m in candidates:
+        v = verdicts.get(key(m))
+        if not isinstance(v, dict):
+            continue
+        ts = float(m.get("ts") or 0)
+        if now - ts < settle:
+            continue
+        day = datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
+        name = (m.get("channel") or {}).get("name", "")
+        # A DM's channel "name" is the other party's raw user id, which is not a name.
+        if re.fullmatch(r"[UDW][A-Z0-9]{8,}", name or ""):
+            name = ""
+        rows.append({"kind": "commitment", "ref": f"#{name}" if name else "DM",
+                     "title": "", "who": v.get("to", ""),
+                     "promised": v.get("promised", ""),
+                     "asked": day, "days": _days_since(day),
+                     "quote": _slack_text(m.get("text")),
+                     "url": m.get("permalink", "")})
+    return rows
+
+
+def ledger_slack():
+    """Slack's side of the ledger, from search alone -- the token has no history scope,
+    and it turns out none is needed for whose-turn-is-it.
+
+    Three sweeps: everything I said, everywhere I was mentioned, every DM. My own
+    messages become the answered-index -- a mention is answered if I spoke in its thread
+    after it, or anywhere in its channel after it (the channel-level catch-all errs
+    toward silence, because a wrong "you owe" costs more than a missed one). A DM is
+    judged like a review thread: whoever spoke last says whose turn it is.
+
+    One deliberate heuristic, the only one in the ledger: a DM where MY last word ends
+    in a question mark is somebody owing me an answer. Judging whether their trailing
+    word needs anything from me at all is left to the reader -- which is why every row
+    here quotes the message it is a claim about, verbatim.
+
+    Bot noise is dropped structurally, not by name: automation mentions arrive as
+    attachment-only messages with empty text, and an empty quote is no claim at all.
+    """
+    if not os.environ.get("SLACK_USER_TOKEN"):
+        return [], [], False
+    who_am_i = _slack("auth.test") or {}
+    me = who_am_i.get("user_id")
+    if not me:
+        return [], [], False
+    lookback = int(os.environ.get("WORK_ARCS_SLACK_LOOKBACK", "14"))
+    settle = 86400 * int(os.environ.get("WORK_ARCS_SLACK_SETTLE_DAYS", "1"))
+    after = datetime.fromtimestamp(time.time() - 86400 * (lookback + 1)).strftime(
+        "%Y-%m-%d")
+
+    mine = _slack_sweep(f"from:<@{me}> after:{after}")
+    mentions = _slack_sweep(f"<@{me}> after:{after}", pages=1)
+    dms = _slack_sweep(f"is:dm after:{after}")
+
+    my_last_in_thread, my_last_in_chan = {}, {}
+    for m in mine:
+        chan, ts = (m.get("channel") or {}).get("id", ""), float(m.get("ts") or 0)
+        key = (chan, _thread_of(m))
+        my_last_in_thread[key] = max(my_last_in_thread.get(key, 0), ts)
+        my_last_in_chan[chan] = max(my_last_in_chan.get(chan, 0), ts)
+
+    def day_of(ts):
+        return datetime.fromtimestamp(float(ts)).strftime("%Y-%m-%d")
+
+    now = time.time()
+    you = []
+    for m in mentions:
+        chan = (m.get("channel") or {}).get("id", "")
+        ts = float(m.get("ts") or 0)
+        text = (m.get("text") or "").strip()
+        if m.get("user") == me or not text or now - ts < settle:
+            continue
+        answered = max(my_last_in_thread.get((chan, _thread_of(m)), 0),
+                       my_last_in_chan.get(chan, 0))
+        if answered > ts:
+            continue
+        name = (m.get("channel") or {}).get("name", "")
+        if re.fullmatch(r"[UDW][A-Z0-9]{8,}", name or ""):
+            name = ""
+        you.append({"kind": "slack-mention", "ref": f"#{name}" if name else "DM",
+                    "title": "", "who": m.get("username", "?"),
+                    "asked": day_of(ts), "days": _days_since(day_of(ts)),
+                    "quote": _slack_text(text), "url": m.get("permalink", "")})
+
+    latest = {}
+    for m in dms:
+        chan = (m.get("channel") or {}).get("id", "")
+        if chan and float(m.get("ts") or 0) > float(
+                (latest.get(chan) or {}).get("ts") or 0):
+            latest[chan] = m
+    they, dm_candidates = [], []
+    for chan, m in latest.items():
+        ts, text = float(m.get("ts") or 0), (m.get("text") or "").strip()
+        if not text or now - ts < settle:
+            continue
+        who = m.get("username") or ""
+        # Slackbot's channel-hygiene nags are structurally indistinguishable from a
+        # person's last word; by name is the only way to drop them.
+        if who.lower() == "slackbot":
+            continue
+        counterpart = next((x.get("username", "?") for x in dms
+                            if (x.get("channel") or {}).get("id") == chan
+                            and x.get("user") != me), "?")
+        row = {"ref": "DM", "title": "", "asked": day_of(ts),
+               "days": _days_since(day_of(ts)),
+               "quote": _slack_text(text), "url": m.get("permalink", "")}
+        if m.get("user") != me:
+            dm_candidates.append({**row, "kind": "slack-dm", "who": who or "?"})
+        elif text.rstrip().endswith("?"):
+            they.append({**row, "kind": "slack-asked", "who": counterpart})
+    you += _dm_needs_reply(dm_candidates)
+
+    # And the one inferred entry: promises read out of your own words. Reuses the
+    # from:me sweep already in hand, so commitments cost no extra Slack calls at all.
+    you += ledger_commitments(mine)
+    return they, you, True
+
+
 def build_ledger(repo, mrs):
     """The waiting-on ledger, both directions, every row a counterparty and a clock.
 
@@ -652,22 +1025,46 @@ def build_ledger(repo, mrs):
     person moves: Neville replies, the row is gone, and nothing was checked off.
 
     GitLab and Jira only, deliberately -- facts, no model judgment, so no false-positive
-    risk on claims of the form "you owe X". Unanswered threads on your own MRs are
-    already demands on their arcs; the ledger does not restate them.
+    risk on claims of the form "you owe X". An unanswered thread on your own MR appears
+    both here and as a demand on its workstream, on purpose: the demand is the
+    by-workstream view and the ledger is the by-person one, and leaving threads out of
+    the ledger made "you owe them" read as nothing but a review queue -- which was
+    noticed within the hour. Deliberately absent: your own assigned-but-stalled tickets.
+    The mirror of "I filed this with you" is not "somebody filed this near me" -- a
+    backlog is not a personal debt, and rendering 30 idle tickets as debts to their
+    reporters would drown the three rows that are.
     """
     me = gitlab_me(repo)
     # The three sources share nothing, so they run at once -- measured serially they cost
     # 14s of wall clock, which is most of the whole tool's budget spent on one section.
-    with futures.ThreadPoolExecutor(max_workers=3) as pool:
+    with futures.ThreadPoolExecutor(max_workers=4) as pool:
         f_they = pool.submit(ledger_they_owe, repo, mrs, me) if me else None
         f_you = pool.submit(ledger_you_owe, repo, me) if me else None
         f_jira = pool.submit(ledger_jira_stalled)
+        f_slack = pool.submit(ledger_slack)
         they = f_they.result() if f_they else []
         you, covered = f_you.result() if f_you else ([], 0)
         they += f_jira.result()
+        slack_they, slack_you, slack_seen = f_slack.result()
+        they += slack_they
+        you += slack_you
+    # Questions on your own MRs that the reviewer is still waiting on. Already fetched
+    # and already judged by unresolved_threads -- whoever spoke last says whose turn it
+    # is -- so this costs nothing and cannot disagree with the card.
+    for m in mrs:
+        for t in m.get("threads") or []:
+            if t.get("answered"):
+                continue
+            at = t.get("last_at") or t.get("at") or ""
+            you.append({"kind": "thread-reply", "ref": f"!{m.get('iid')}",
+                        "title": m.get("title", ""),
+                        "who": t.get("last_by") or t.get("author") or "?",
+                        "asked": at, "days": _days_since(at),
+                        "quote": t.get("quote", ""), "url": m.get("url", "")})
     they.sort(key=lambda e: (-(e.get("days") or 0), e["ref"]))
     you.sort(key=lambda e: (-(e.get("days") or 0), e["ref"]))
-    return {"they_owe": they, "you_owe": you, "you_owe_covered": covered}
+    return {"they_owe": they, "you_owe": you, "you_owe_covered": covered,
+            "slack": slack_seen}
 
 
 def annotate_stacks(repo, mrs, main_ref):
@@ -2353,14 +2750,29 @@ def main():
         print("── the ledger ───────────────────────────────────────────")
         for e in ledger["they_owe"]:
             who = ", ".join(e["who"]) if isinstance(e["who"], list) else e["who"]
-            what = ("no response from " + who if e["kind"] == "review-silence"
-                    else f"with {who} ({e.get('status','')})")
+            what = {"review-silence": f"no response from {who}",
+                    "ticket-stalled": f"with {who} ({e.get('status','')})",
+                    "slack-asked": f"you asked {who}, no reply",
+                    }.get(e["kind"], who)
             print(f"  they owe you  {e['ref']:<9} {e.get('days','?'):>4}d  {what}")
-            print(f"                          └ {e['title'][:58]}")
+            if e.get("quote"):
+                print(f"                          “{e['quote'][:56]}”")
+            if e.get("title"):
+                print(f"                          └ {e['title'][:58]}")
         for e in ledger["you_owe"]:
-            print(f"  you owe them  {e['ref']:<9} {e.get('days','?'):>4}d  "
-                  f"{e['who']} asked for your review")
-            print(f"                          └ {e['title'][:58]}")
+            what = {"review-owed": f"{e['who']} asked for your review",
+                    "reply-owed": f"{e['who']} answered your comment — your turn",
+                    "thread-reply": f"{e['who']} awaits your reply on your own MR",
+                    "slack-mention": f"{e['who']} mentioned you, nothing from you since",
+                    "slack-dm": f"{e['who']} has the last word in your DM",
+                    "commitment": "you said you'd " + (e.get("promised") or "do this")
+                                  + (f" ({e['who']})" if e.get("who") else ""),
+                    }.get(e["kind"], e["who"])
+            print(f"  you owe them  {e['ref']:<9} {e.get('days','?'):>4}d  {what}")
+            if e.get("quote"):
+                print(f"                          “{e['quote'][:56]}”")
+            if e.get("title"):
+                print(f"                          └ {e['title'][:58]}")
         if ledger["you_owe_covered"]:
             print(f"  (+{ledger['you_owe_covered']} review requests already handled — "
                   "you spoke or someone approved)")

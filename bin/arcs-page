@@ -1140,11 +1140,17 @@ def render(data, lede, focus_days, limit):
         a("<section>")
         a("<h2>The ledger</h2>")
         a('<p class="note">Open loops with a person on the other end, longest open '
-          "first. Every row is derived — from a review request&rsquo;s own timestamp, "
-          "an approval, a comment, a ticket&rsquo;s assignee — so it closes itself the "
-          "moment the other person moves, and nothing is ever checked off. Questions "
-          "you owe answers to are demands on their own workstreams below; this is "
-          "everything else.</p>")
+          "first. Every row is derived — a review request&rsquo;s own timestamp, who "
+          "spoke last in a thread or a DM, an approval, a ticket&rsquo;s assignee — so "
+          "it closes itself the moment either of you moves, and nothing is ever "
+          "checked off. A question on your own merge request appears here <em>and</em> "
+          "on its workstream: same fact, once by person, once by work. The one "
+          "exception to &ldquo;derived&rdquo; is a commitment read out of your own "
+          "Slack messages — those rows say so, and every Slack row quotes the message "
+          "it is a claim about, one click away."
+          + ("" if ledger.get("slack") else
+             " <strong>Slack was not consulted this run</strong> — these are GitLab "
+             "and Jira only.") + "</p>")
         a('<div class="ledger">')
 
         def clock(e):
@@ -1159,15 +1165,32 @@ def render(data, lede, focus_days, limit):
         if you:
             a("<ul>")
             for e in you:
+                who = esc(e.get("who", "?"))
+                since = f' since {esc(e["asked"])}' if e.get("asked") else ""
+                sub = {"review-owed": f"{who} asked for your review{since}",
+                       "reply-owed": f"{who} answered your comment{since} — your turn",
+                       "thread-reply": f"{who} awaits your reply on your own merge "
+                                       f"request{since}",
+                       "slack-mention": f"{who} mentioned you{since} — nothing from "
+                                        "you in that thread or channel after it",
+                       "slack-dm": f"{who} has the last word in your DM{since}",
+                       "commitment": "you said you&rsquo;d "
+                                     + esc(e.get("promised") or "do this")
+                                     + (f" — {who} is relying on it" if e.get("who")
+                                        else "") + since
+                                     + " (inferred from your message, quoted)",
+                       }.get(e.get("kind"), who)
                 a("<li>" + clock(e) + '<div class="what">'
                   + link(e.get("url", ""), esc(e.get("ref", "")), "ref")
                   + f' {esc(e.get("title",""))}'
-                  f'<span class="who">{esc(e.get("who","?"))} asked for your review'
-                  + (f' on {esc(e["asked"])}' if e.get("asked") else "")
-                  + "</span></div></li>")
+                  + f'<span class="who">{sub}</span>'
+                  + (f"<blockquote>{esc(e['quote'])}</blockquote>"
+                     if e.get("quote") else "")
+                  + "</div></li>")
             a("</ul>")
         else:
-            a('<div class="quiet">Nobody is waiting on a review from you.</div>')
+            a('<div class="quiet">Nobody is waiting on a review or a reply from '
+              "you.</div>")
         if covered:
             a(f'<p class="covered">{covered} more review request'
               f'{"" if covered == 1 else "s"} already handled — you spoke, or someone '
@@ -1181,11 +1204,14 @@ def render(data, lede, focus_days, limit):
             for e in they:
                 who = e.get("who")
                 who = ", ".join(who) if isinstance(who, list) else (who or "?")
-                if e.get("kind") == "review-silence":
+                kind = e.get("kind")
+                if kind == "review-silence":
                     sub = esc(f"no response from {who} since {e.get('asked','?')}")
                     if e.get("asked_is_proxy"):
                         sub += (" (clock from the merge request&rsquo;s last update "
                                 "&mdash; no request note exists)")
+                elif kind == "slack-asked":
+                    sub = esc(f"you asked {who} on {e.get('asked','?')} — no reply")
                 else:
                     sub = esc(f"with {who}"
                               + (f" · {e['status']}" if e.get("status") else "")
@@ -1194,7 +1220,9 @@ def render(data, lede, focus_days, limit):
                   + link(e.get("url", ""), esc(e.get("ref", "")), "ref")
                   + f' {esc(e.get("title",""))}'
                   + f'<span class="who">{sub}</span>'
-                  "</div></li>")
+                  + (f"<blockquote>{esc(e['quote'])}</blockquote>"
+                     if e.get("quote") else "")
+                  + "</div></li>")
             a("</ul>")
         else:
             a('<div class="quiet">Nobody owes you anything — no silent reviews, '
