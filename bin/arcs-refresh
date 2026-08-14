@@ -1,0 +1,462 @@
+#!/usr/bin/env bash
+# arcs-refresh: run the arcs pipeline every morning, so the page is fresh before you are.
+#
+# "Passively, without keeping notes" was the point of the whole thing, and it was still a
+# command you had to remember to type. This is the part that types it. It is `arcs` plus
+# everything a program needs in order to be trusted to run while nobody is watching:
+#
+#   a quota guard   because extra_usage is ENABLED on this account -- crossing 100% does
+#                   not stop, it starts spending money. An automation is the one thing
+#                   that must never be what pushes you over, so it reads the utilisation
+#                   before it starts and stands down rather than find out afterwards.
+#   a lock          because a 07:10 cron and a 07:10 `arcs` typed by hand would otherwise
+#                   both move the run-over-run snapshot baseline, and the loser's interval
+#                   of changes disappears.
+#   a log           because a program nobody watches has to be able to say what it did.
+#   silence         on success. A daily "it worked" notification is training to ignore
+#                   notifications; you only hear from this when it did not run.
+#   an environment  built explicitly -- see below, this is where the real bug was.
+#
+# THE ENVIRONMENT IS THE WHOLE PROBLEM.
+#
+# cron runs jobs with PATH=/usr/bin:/bin and nothing else, and the pipeline was written by
+# and for a login shell. Timed from an emulated cron environment before this script
+# existed, the run "succeeded" in 40.5s and exited 0 -- and every arc on the page had lost
+# its name:
+#
+#     ! no brief for Zero-fill categorical chart domains in SQL — could not run claude
+#       (FileNotFoundError)
+#     arc-brief: 10 arc(s) have no description; they fall back to their cluster label
+#     brief: 4 sentences — unavailable — FileNotFoundError
+#
+# `claude` lives in ~/.local/bin and lib/headless_claude.py invokes it by bare name, so
+# with cron's PATH every model call in the pipeline raises FileNotFoundError. Each one is
+# caught -- correctly, a namer must not break the thing it names -- so the page is built,
+# published and worse, and nothing anywhere says so. That is the exact shape of failure an
+# unattended job exists to avoid, so this script does three things about it: it puts the
+# real PATH back, it refuses to start when a required program is missing, and it treats
+# "could not run claude" appearing in the output as a failed run even though the pipeline
+# exited 0.
+#
+# Two more environment facts, same root cause. `python3` is pyenv's 3.12.8 interactively
+# and /usr/bin/python3 (3.14) under cron -- a different interpreter with a different
+# site-packages, which is not what any of this was tested against. And bin/arcs sources
+# .env with a bare `source`, which sets shell variables without exporting them; it works
+# interactively only because shell/dev-workflow.zsh already did `set -a` around the same
+# file. From cron nothing has, so JIRA_REPO and the Slack tokens would be invisible to
+# every subprocess. Both are fixed here rather than there, because bin/arcs is correct for
+# the shell it was written for.
+#
+#   arcs-refresh                    run it now, the way cron will
+#   arcs-refresh --force            run even if the quota guard says no
+#   arcs-refresh --check-quota      just the guard's verdict, then exit
+#   arcs-refresh --install-cron     add-or-replace the 07:10 daily crontab line
+#   arcs-refresh --install-cron 06:30
+#   arcs-refresh --uninstall-cron   remove it, leave every other crontab line alone
+#   arcs-refresh --hook             print the arc-record Stop hook block for settings.json
+#
+# Tuning, all read from .env or the environment:
+#   WORK_ARCS_REFRESH_MAX_5H     stand down above this 5-hour utilisation  (default 80)
+#   WORK_ARCS_REFRESH_MAX_7D     stand down above this 7-day utilisation   (default 90)
+#   WORK_ARCS_REFRESH_ON_UNKNOWN skip|run when the quota cannot be read    (default skip)
+#   WORK_ARCS_REFRESH_CMD        the pipeline to run                       (default arcs)
+#   WORK_ARCS_REFRESH_LOG_LINES  ring-trim the log to this many lines      (default 2000)
+#
+# Exit codes are distinct so the log and a test can tell the outcomes apart: 0 refreshed,
+# 1 the pipeline failed, 3 stood down on quota, 4 another run holds the lock, 5 a required
+# program is missing. cron mails on output rather than on status and this script writes
+# its output to its own log, so a non-zero exit is quiet by construction.
+#
+# PUBLISHING IS NOT HERE, and cannot be: the page is a Claude Code artifact and only a
+# Claude Code session can write to that URL. That is a platform constraint rather than a
+# gap, and the human in the loop before anything goes outward is wanted anyway. What this
+# buys is that the expensive half is already done: by the time you type /arcs the page on
+# disk is minutes old, so the session's only job is the upload.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+REPO_DIR="$(dirname "$SCRIPT_DIR")"
+
+# --- the environment cron does not give you -------------------------------------------
+
+# Ordering matters and is not the obvious one. The repo's own bin goes first so `arcs` and
+# its stages resolve to this checkout. Then the dirs a login shell would have contributed
+# and cron does not -- pyenv's shims ahead of /usr/bin so python3 is the 3.12.8 everything
+# was written against, and ~/.local/bin so `claude` exists at all. The inherited PATH
+# follows rather than leads: under cron it is only /usr/bin:/bin, and putting it first
+# would let the wrong python3 win the very race this list exists to settle. The system
+# dirs are repeated at the end as a floor, for the case where PATH arrives empty.
+for d in "$HOME/.local/bin" "$HOME/.pyenv/shims" "$HOME/bin"; do
+    [ -d "$d" ] && PATH="$d:$PATH"
+done
+PATH="$SCRIPT_DIR:$PATH:/usr/local/bin:/usr/bin:/bin"
+export PATH
+
+# `set -a` and not a bare source: see the header. Subprocesses need these, not this shell.
+if [ -f "$REPO_DIR/.env" ]; then
+    set -a
+    # shellcheck disable=SC1091
+    source "$REPO_DIR/.env"
+    set +a
+fi
+
+# A desktop notification needs a session bus to deliver to and cron is not in one. All
+# three are derivable from the uid, and are only set when the bus socket is actually
+# there -- on a machine with nobody logged in, a notification that cannot be delivered
+# should fail quietly rather than hang.
+_uid="$(id -u)"
+if [ -S "/run/user/$_uid/bus" ]; then
+    export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$_uid}"
+    export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/$_uid/bus}"
+    export DISPLAY="${DISPLAY:-:0}"
+fi
+
+STATE="${XDG_STATE_HOME:-$HOME/.local/state}/work-arcs"
+LOG_FILE="$STATE/refresh.log"
+LOCK_FILE="$STATE/refresh.lock"
+STATE_FILE="$STATE/refresh.json"
+CREDS="$HOME/.claude/.credentials.json"
+USAGE_URL="${WORK_ARCS_USAGE_URL:-https://api.anthropic.com/api/oauth/usage}"
+NOTIFY="$HOME/bin/notification/claude-notify.sh"
+
+MAX_5H="${WORK_ARCS_REFRESH_MAX_5H:-80}"
+MAX_7D="${WORK_ARCS_REFRESH_MAX_7D:-90}"
+ON_UNKNOWN="${WORK_ARCS_REFRESH_ON_UNKNOWN:-skip}"
+PIPELINE="${WORK_ARCS_REFRESH_CMD:-arcs}"
+LOG_LINES="${WORK_ARCS_REFRESH_LOG_LINES:-2000}"
+HTTP_TIMEOUT=10
+
+CRON_MARKER="# work-arcs-refresh"
+CRON_DEFAULT_TIME="07:10"
+
+mkdir -p "$STATE"
+
+# --- saying what happened --------------------------------------------------------------
+
+log() {
+    printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S%z')" "$*" >>"$LOG_FILE"
+    # Echoed as well when a person is watching. Under cron stdout goes to /dev/null, so
+    # the log is the only reader and this costs nothing.
+    [ -t 1 ] && printf '%s\n' "$*" || true
+}
+
+# Only ever called when something went wrong. claude-notify.sh has no quiet mode of its
+# own -- CLAUDE_NOTIFY_QUIET is read by the Stop hook, not by the notifier -- so "silent
+# on success" has to mean "not called on success", which is what this file does.
+notify() {
+    [ -x "$NOTIFY" ] || return 0
+    "$NOTIFY" "work-arcs refresh" "$1" >/dev/null 2>&1 || true
+}
+
+trim_log() {
+    [ -f "$LOG_FILE" ] || return 0
+    local n
+    n="$(wc -l <"$LOG_FILE")"
+    [ "$n" -le "$LOG_LINES" ] && return 0
+    tail -n "$LOG_LINES" "$LOG_FILE" >"$LOG_FILE.trim" && mv "$LOG_FILE.trim" "$LOG_FILE"
+}
+
+# --- the quota guard --------------------------------------------------------------------
+
+# The same endpoint `/usage` and bin/arcs-cost read, with the same etiquette: a 401 is a
+# token caught mid-refresh rather than an error worth reporting, and any failure returns
+# nothing rather than a guess. The caller decides what "nothing" means -- see quota_verdict,
+# where it deliberately does not mean "go ahead".
+fetch_usage() {
+    local tok body code
+    tok="$(jq -r '.claudeAiOauth.accessToken // empty' "$CREDS" 2>/dev/null || true)"
+    [ -n "$tok" ] || return 1
+    body="$(mktemp)"
+    code="$(curl -sS -m "$HTTP_TIMEOUT" -o "$body" -w '%{http_code}' \
+        -H "Authorization: Bearer $tok" \
+        -H "anthropic-beta: oauth-2025-04-20" \
+        "$USAGE_URL" 2>/dev/null || echo 000)"
+    if [ "$code" = "200" ] && jq -e . "$body" >/dev/null 2>&1; then
+        cat "$body"; rm -f "$body"; return 0
+    fi
+    rm -f "$body"
+    return 1
+}
+
+# Prints "<verdict>|<reason>|<five_hour>|<seven_day>" where verdict is ok, over or unknown.
+#
+# `>` and not `>=`: the thresholds name the last utilisation that is still fine, so a
+# default of 80 permits a run at exactly 80% and refuses 81%. The comparison is jq's
+# because the endpoint reports floats and bash cannot compare them.
+quota_verdict() {
+    local raw
+    if ! raw="$(fetch_usage)"; then
+        printf 'unknown|the usage endpoint could not be read||\n'
+        return 0
+    fi
+    printf '%s\n' "$raw" | jq -r --argjson m5 "$MAX_5H" --argjson m7 "$MAX_7D" '
+        (.five_hour.utilization // null) as $f |
+        (.seven_day.utilization // null) as $s |
+        if $f == null or $s == null then
+            "unknown|the usage response carried no utilisation figures||"
+        elif $f > $m5 then
+            "over|5-hour quota at \($f)%, over the \($m5)% ceiling|\($f)|\($s)"
+        elif $s > $m7 then
+            "over|7-day quota at \($s)%, over the \($m7)% ceiling|\($f)|\($s)"
+        else
+            "ok||\($f)|\($s)"
+        end' 2>/dev/null || printf 'unknown|the usage response was not JSON||\n'
+}
+
+# --- preflight ---------------------------------------------------------------------------
+
+# Checked before the run rather than diagnosed after it, because the failure this catches
+# does not announce itself: a missing `claude` produces a complete page with no arc names
+# on it and an exit status of 0. Every name here is invoked by bare name somewhere in the
+# pipeline, so every one of them is a way for PATH to be silently wrong.
+PREFLIGHT_CMDS=(claude git glab jq python3 curl flock)
+
+preflight() {
+    local missing=() c
+    for c in "${PREFLIGHT_CMDS[@]}" "${PIPELINE%% *}"; do
+        command -v "$c" >/dev/null 2>&1 || missing+=("$c")
+    done
+    [ ${#missing[@]} -eq 0 ] && return 0
+    printf '%s\n' "${missing[*]}"
+    return 1
+}
+
+# --- the crontab line ----------------------------------------------------------------------
+
+# Installed as one self-identifying line rather than a file in /etc/cron.d, because this is
+# a user's job with a user's environment and it belongs in a user's crontab. The marker is a
+# trailing shell comment, not a cron comment line: cron hands the whole command to /bin/sh,
+# which ignores everything after the `#`, and keeping it on the command line means the
+# marker cannot become orphaned from the entry it names the way a comment above it can.
+#
+# Output goes to /dev/null and that is deliberate rather than careless. cron mails on
+# output, not on exit status; this script has a log of its own and a notifier for the cases
+# worth interrupting for, so anything cron captured would be a duplicate delivered by an
+# MTA that may not exist.
+cron_line() {
+    local time="$1" hh mm self
+    hh="${time%%:*}"; mm="${time##*:}"
+    self="$(readlink -f "${BASH_SOURCE[0]}")"
+    printf '%d %d * * * %s >/dev/null 2>&1  %s\n' \
+        "$((10#$mm))" "$((10#$hh))" "$self" "$CRON_MARKER"
+}
+
+# `crontab -l` exits 1 with "no crontab for kyle" when there is none, which is not an error
+# here; it is the empty case, and the difference between the two is a crontab that gets
+# wiped by an install.
+current_crontab() {
+    crontab -l 2>/dev/null || true
+}
+
+install_cron() {
+    local time="${1:-$CRON_DEFAULT_TIME}"
+    if ! printf '%s' "$time" | grep -Eq '^[0-9]{1,2}:[0-9]{2}$'; then
+        echo "arcs-refresh: --install-cron wants HH:MM, got '$time'" >&2
+        return 2
+    fi
+    local hh="${time%%:*}" mm="${time##*:}"
+    if [ "$((10#$hh))" -gt 23 ] || [ "$((10#$mm))" -gt 59 ]; then
+        echo "arcs-refresh: '$time' is not a time of day" >&2
+        return 2
+    fi
+    # Add-or-replace: every line that is not ours is copied through untouched, and exactly
+    # one of ours comes out the far end however many went in.
+    #
+    # Materialised before `crontab -` is started rather than piped into it, because the
+    # reader and the writer are the same crontab. A pipeline starts both ends at once, so
+    # anything that truncates its destination early would be truncating the file the left
+    # side is still reading. vixie's crontab buffers stdin first and would survive that;
+    # depending on it is a bet on an implementation detail with a wiped crontab as the
+    # stake.
+    local new
+    new="$(mktemp)"
+    { current_crontab | grep -vF "$CRON_MARKER" || true; cron_line "$time"; } >"$new"
+    crontab - <"$new"
+    rm -f "$new"
+    echo "installed:"
+    cron_line "$time"
+}
+
+uninstall_cron() {
+    local kept
+    kept="$(current_crontab | grep -vF "$CRON_MARKER" || true)"
+    printf '%s\n' "$kept" | grep -v '^$' | crontab - || true
+    echo "removed any $CRON_MARKER line; $(printf '%s\n' "$kept" | grep -c '[^[:space:]]' || true) other line(s) kept"
+}
+
+# The one piece of this workstream that is deliberately not installed for him. arc-record
+# turns the nightly transcript archaeology into a log written as it happens, but it is a
+# Stop hook, and ~/.claude/settings.json is his file to edit. So the block is printed
+# rather than applied, already merged with the notification hook that is in there now.
+print_hook() {
+    cat <<'HOOK'
+arc-record is a Stop hook and is NOT installed -- deliberately: settings.json is yours.
+To turn it on, ~/.claude/settings.json "hooks" becomes:
+
+  "Stop": [
+    {"hooks": [{"type": "command", "command": "~/bin/notification/claude-stop-hook.sh", "async": true}]},
+    {"hooks": [{"type": "command", "command": "~/bin/dev-workflow-tools/bin/arc-record", "async": true}]}
+  ]
+
+The first entry is what is already there. Until then work-arcs keeps reconstructing the
+same facts by rescanning transcripts, which works and costs a great deal more.
+HOOK
+}
+
+hook_installed() {
+    jq -e '[.. | strings] | any(test("arc-record"))' \
+        "$HOME/.claude/settings.json" >/dev/null 2>&1
+}
+
+# --- the run -------------------------------------------------------------------------------
+
+# Written after a successful build so the page can say how old it is without anyone timing
+# it. `published_at` is carried through rather than rewritten: this script cannot publish
+# -- only a Claude session can -- so whatever last stamped it knows something this does not.
+write_state() {
+    local dur="$1" bytes="$2" five="$3" seven="$4" page="$5" prev='{}'
+    [ -f "$STATE_FILE" ] && prev="$(cat "$STATE_FILE" 2>/dev/null || echo '{}')"
+    printf '%s' "$prev" | jq \
+        --argjson at "$(date +%s)" \
+        --arg iso "$(date -Is)" \
+        --arg page "$page" \
+        --argjson bytes "$bytes" \
+        --argjson dur "$dur" \
+        --arg five "$five" \
+        --arg seven "$seven" \
+        '{published_at: (.published_at // null)}
+         + {built_at: $at, built_at_iso: $iso, page: $page, bytes: $bytes,
+            duration_s: $dur,
+            five_hour: ($five | if . == "" then null else tonumber end),
+            seven_day: ($seven | if . == "" then null else tonumber end)}' \
+        >"$STATE_FILE.tmp" 2>/dev/null && mv "$STATE_FILE.tmp" "$STATE_FILE" || rm -f "$STATE_FILE.tmp"
+}
+
+do_run() {
+    local force="$1"
+
+    log "--- refresh starting (pid $$, ${PIPELINE})"
+
+    local missing
+    if ! missing="$(preflight)"; then
+        log "preflight failed: not on PATH: $missing"
+        log "    PATH=$PATH"
+        notify "cannot run: $missing not on PATH"
+        return 5
+    fi
+
+    local verdict reason five seven
+    IFS='|' read -r verdict reason five seven <<<"$(quota_verdict)" || true
+    case "$verdict" in
+        ok)
+            log "quota ok: 5h ${five}% (max ${MAX_5H}), 7d ${seven}% (max ${MAX_7D})" ;;
+        over)
+            if [ "$force" = 1 ]; then
+                log "quota over: $reason — running anyway (--force)"
+            else
+                log "stood down: $reason"
+                notify "skipped — $reason"
+                return 3
+            fi ;;
+        *)
+            if [ "$force" = 1 ] || [ "$ON_UNKNOWN" = run ]; then
+                log "quota unknown: $reason — running anyway"
+            else
+                log "stood down: $reason (WORK_ARCS_REFRESH_ON_UNKNOWN=run to run regardless)"
+                notify "skipped — $reason"
+                return 3
+            fi ;;
+    esac
+
+    local out started rc=0
+    out="$(mktemp)"
+    started="$(date +%s)"
+
+    # Stamped line by line as it arrives rather than in a block at the end, so the log
+    # says when each stage happened and a run that hangs is visible in the timestamps.
+    set +e
+    $PIPELINE 2>&1 | while IFS= read -r line; do
+        printf '%s  | %s\n' "$(date '+%Y-%m-%d %H:%M:%S%z')" "$line" >>"$LOG_FILE"
+        printf '%s\n' "$line" >>"$out"
+        [ -t 1 ] && printf '  %s\n' "$line"
+    done
+    rc="${PIPESTATUS[0]}"
+    set -e
+
+    local elapsed=$(( $(date +%s) - started ))
+
+    if [ "$rc" -ne 0 ]; then
+        log "FAILED after ${elapsed}s (exit $rc)"
+        notify "failed after ${elapsed}s — see $LOG_FILE"
+        rm -f "$out"
+        return 1
+    fi
+
+    # An exit status of 0 is not the same as a good page. Every model call in the pipeline
+    # is wrapped so that its failure degrades a name rather than breaking a build, which is
+    # right for a person watching the output and wrong for a job nobody reads: the page
+    # comes out complete, anonymous and published. This is the one string that says it
+    # happened, and finding it counts as a failed run.
+    if grep -q "could not run claude" "$out"; then
+        local n
+        n="$(grep -c "could not run claude" "$out" || true)"
+        log "FAILED: the page built, but $n model call(s) could not reach claude — the"
+        log "        arcs on it have no names. Treated as a failure; see $LOG_FILE"
+        notify "built a page with no arc names ($n model calls failed) — see $LOG_FILE"
+        rm -f "$out"
+        return 1
+    fi
+
+    local page bytes=0
+    page="${WORK_ARCS_PAGE:-$STATE/page.html}"
+    [ -f "$page" ] && bytes="$(stat -c %s "$page")"
+    write_state "$elapsed" "$bytes" "${five:-}" "${seven:-}" "$page"
+
+    log "refreshed in ${elapsed}s — $page ($bytes bytes)"
+    if [ -n "${WORK_ARCS_ARTIFACT_URL:-}" ]; then
+        log "publish: from a Claude Code session, \`publish $page to $WORK_ARCS_ARTIFACT_URL\`"
+        log "         or just /arcs — the build is already done, so it is upload-only"
+    else
+        log "publish: no WORK_ARCS_ARTIFACT_URL in .env, so a publish would make a new artifact"
+    fi
+    hook_installed || log "note: the arc-record Stop hook is not installed — \`arcs-refresh --hook\`"
+
+    rm -f "$out"
+    return 0
+}
+
+# --- arguments -------------------------------------------------------------------------------
+
+force=0
+case "${1:-}" in
+    -h|--help)     sed -n '2,74p' "$0" | sed 's/^# \?//'; exit 0 ;;
+    --hook)        print_hook; exit 0 ;;
+    --install-cron)   install_cron "${2:-}"; exit $? ;;
+    --uninstall-cron) uninstall_cron; exit $? ;;
+    --check-quota)
+        IFS='|' read -r v r f s <<<"$(quota_verdict)" || true
+        case "$v" in
+            ok)   echo "ok — 5h ${f}% (max ${MAX_5H}), 7d ${s}% (max ${MAX_7D})"; exit 0 ;;
+            over) echo "over — $r"; exit 3 ;;
+            *)    echo "unknown — $r"; exit 4 ;;
+        esac ;;
+    --force)       force=1 ;;
+    "")            ;;
+    *)             echo "arcs-refresh: unknown argument '$1' (try --help)" >&2; exit 2 ;;
+esac
+
+# Non-blocking, and a held lock is reported rather than waited on. Waiting would mean two
+# runs of a 40-second pipeline queued behind each other for no gain -- the second one would
+# rebuild a page the first had just rebuilt -- and the interesting case is not "later" but
+# "somebody is already doing this".
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+    log "skipped: another arcs-refresh holds $LOCK_FILE"
+    exit 4
+fi
+
+rc=0
+do_run "$force" || rc=$?
+trim_log
+exit "$rc"
