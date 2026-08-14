@@ -577,62 +577,6 @@ caught, and the pipeline exits 0 having built a page with no arc names on it. Pr
 refuses to start when a required program is missing, and `could not run claude` in the
 output counts as a failed run whatever the exit status says.
 
-### `loose-ends`
-Find work you finished and then lost track of. Work arcs sprawl across Claude
-sessions, git branches, stashes and MRs; each source looks fine alone and the loss
-happens in the joins. Read-only — it never pushes, writes to a repo, or posts
-anywhere.
-
-Listing every anomaly does not work at this scale (on one machine: 310 branches
-with unpushed commits, 98 stashes touching source). So it **ranks** instead, using
-the signal that a branch a Claude session actually worked on is work you invested
-in rather than an experiment. What it reports:
-
-| Class | What it means |
-|---|---|
-| `unpushed` | commits reachable from no remote, ranked by session and worktree evidence |
-| `stash` | stashes touching source, or stranded on a branch that's gone, merged, or was detached |
-| `dup-tip` | two branches at the same tip — redundant workstreams |
-| `mr-quiet` | open MRs with zero comments that haven't moved |
-| `session-no-branch` | substantive sessions with no branch recorded (sessions run from `$HOME`) |
-| `main-behind` | local `main` behind `origin/main` |
-
-```bash
-loose-ends                    # ranked report, capped per class
-loose-ends --days 14          # only work idle this long (default 7)
-loose-ends --all              # everything, no caps, ignore dismissals
-loose-ends --dismiss          # acknowledge what was shown; quiet until it changes
-loose-ends --all --dismiss    # acknowledge the withheld ones too
-loose-ends --forget           # clear all dismissals
-loose-ends --no-mr            # skip the GitLab call
-loose-ends --slack            # ask Slack whether anyone else knows about it
-```
-
-**`--slack`** asks one question per finding — *has anyone else mentioned this?* —
-and that single bit changes what a finding means. 18 commits sitting unpushed for
-three weeks that 28 Slack messages are discussing is a different problem from 14
-commits nobody has ever mentioned; the first has people waiting on it, the second
-is a private experiment. Matches annotate the line with a count and a permalink
-into the conversation, and rank it up.
-
-It runs on displayed findings only, one HTTP call each, capped by
-`LOOSE_ENDS_SLACK_BUDGET` (default 15) because `search.messages` is rate-limited,
-and it only spends a call on an identifier specific enough to mean one thing — a
-ticket key, or a branch name of 8+ characters. Searching `smp` would match half the
-workspace. Needs `SLACK_USER_TOKEN` with `search:read`; without it, it says so and
-still reports everything else.
-
-Silence comes from `--dismiss`, not from having nothing to say. Findings are
-fingerprinted by content — tip sha, commit count, stash sha — so a dismissed item
-stays quiet until the work behind it changes, and any new work changes it.
-`--dismiss` only ever acknowledges what was actually printed, never findings
-withheld behind a `... and N more` line.
-
-Env overrides: `LOOSE_ENDS_DAYS`, `LOOSE_ENDS_REPOS` (default `~/work/repos`),
-`LOOSE_ENDS_PROJECTS` (default `~/.claude/projects`), `LOOSE_ENDS_LIMIT`,
-`LOOSE_ENDS_SLACK`, `LOOSE_ENDS_SLACK_BUDGET`, `LOOSE_ENDS_SLACK_SLEEP`.
-Dismissals live in `${XDG_STATE_HOME:-~/.local/state}/loose-ends/dismissed`.
-
 ## Shell Integration
 
 The `shell/dev-workflow.zsh` provides:
