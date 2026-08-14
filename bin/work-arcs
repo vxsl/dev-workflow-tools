@@ -15,7 +15,9 @@ So this derives the graph instead of listing the artifacts:
   |                  can sit on several, so this is a DAG rather than a tree
   |- stash           with the files in it, because `stash@{38}` alone says nothing
   |- merge request   with whether anyone has commented
-  '- session         Claude sessions that touched any branch in the arc
+  |- session         Claude sessions that touched any branch in the arc
+  '- Slack thread    threads you posted in that name one of the above, and what they
+                     decided -- the one edge whose evidence exists nowhere else here
 
 Every edge here is derived, nothing is declared. The one thing that cannot be
 derived is a name for work that never got a ticket: `adaptive`, `adaptive-bak`,
@@ -28,11 +30,16 @@ rename.
   work-arcs --active 14            only arcs touched in the last 14 days
   work-arcs --json --snapshot      the graph, and leave a baseline for the next run
 
-Read-only by default. Runs git and glab; the two nuances are that an MR with no cached
-mergeability verdict gets a recompute requested (see collect_mrs), which changes no state
-anyone can see, only whether GitLab knows its own answer -- and that --snapshot writes the
-run-over-run baseline that `since_last_run` is diffed against. That write is opt-in for a
-reason: see write_snapshot.
+Read-only by default. Runs git, glab, Jira and Slack; the two nuances are that an MR with no
+cached mergeability verdict gets a recompute requested (see collect_mrs), which changes no
+state anyone can see, only whether GitLab knows its own answer -- and that --snapshot writes
+the run-over-run baseline that `since_last_run` is diffed against. That write is opt-in for
+a reason: see write_snapshot.
+
+The Slack side reads only conversations you yourself posted in, on your own user token, and
+only where that token can see a whole thread -- see slack_threads for what it therefore
+cannot read and why that is left alone rather than approximated. `--no-slack-threads` skips
+it entirely.
 """
 
 import argparse

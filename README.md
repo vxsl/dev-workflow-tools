@@ -501,8 +501,36 @@ a different action:
 count, session count, recent commit subjects — then drops into `create-jira-ticket`'s
 board picker, because UL vs UB is a judgment call. Add `--dry-run` to see it first.
 
+**The Slack lens: what was decided, on the card for the work it decided about.** The
+graph knows what the code says and what the tickets say, and both are records of
+decisions already taken. The taking happens in Slack — a week later the only trace of
+"we agreed to drop the `array_has` calls" is thirty messages deep in `#tech-backend`,
+recoverable nowhere else on the machine. So each workstream card carries a **From Slack**
+block: what its threads settled, what they left standing, every line quoting the one
+message it comes from with a permalink to it.
+
+Only threads **you posted in**, read with **your own token**, on **your own page** — the
+boundary is structural rather than a policy, and the block says so. A thread joins a
+workstream on an exact identifier it contains: a ticket key some arc owns, a branch name
+distinctive enough to survive being typed in a sentence, an MR iid. Measured over a
+fortnight: 219 threads, 78 of them in channels, **18 joined** — 14 on a ticket key, 3 on
+an MR reference, 1 on a branch name. Threads are read whole or not used at all; a
+synthesis over the fifth of a conversation that search happens to return is not partial
+but wrong, because the message that reverses the decision is exactly the one search
+missed. DM and group-DM history this token cannot read and does not ask for, so 151 of
+those 219 were never opened — the block reports that count rather than implying it saw
+everything.
+
+`✕` acknowledges a thread; the fingerprint carries the thread's last message, so anyone
+adding to it brings the block back. One cached model call per thread: the first run of
+the day costs about 13¢ a thread and every rerun costs nothing.
+`--no-slack-threads` skips the lens (the ledger's own Slack rows are unaffected).
+
 Env: `WORK_ARCS_REPO` (default `~/work/repos/ul`), `WORK_ARCS_MAIN` (`origin/main`),
-`WORK_ARCS_PROJECTS` (`~/.claude/projects`), plus the `JIRA_*` vars for `--gap`.
+`WORK_ARCS_PROJECTS` (`~/.claude/projects`), plus the `JIRA_*` vars for `--gap`. For the
+Slack lens: `WORK_ARCS_SLACK_LOOKBACK` (14 days), `WORK_ARCS_SLACK_THREADS_MAX` (150
+threads a run), `WORK_ARCS_SLACK_THREAD_JOBS` (6 concurrent) and
+`WORK_ARCS_SLACK_THREAD_MODEL` (falls back to `WORK_ARCS_COMMIT_MODEL`, then `sonnet`).
 
 ### `arcs-refresh`
 `arcs` rebuilds the work-arcs page; this runs it at 07:10 so the page is already fresh
