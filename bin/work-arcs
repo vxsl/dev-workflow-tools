@@ -59,10 +59,23 @@ import headless_claude  # noqa: E402
 # Built from JIRA_PROJECTS rather than a generic [A-Z]{2,4}, which matched things
 # like "UTF-8" and "IPV-4" as ticket keys. Falls back to the generic form only if
 # .env declares nothing.
+#
+# JIRA_EXTRA_PROJECTS widens this alternation and nothing else, which is the whole
+# reason it exists as a second variable. JIRA_PROJECTS means "boards I file tickets
+# on": jira-fzf and rr.sh interpolate it into `project IN (...)`, and
+# create-jira-ticket offers each entry in its board picker. SBX is the initiative
+# project -- measured, 45 non-Epic issues of which 40 are company Initiatives, and no
+# sprints at all -- so putting it there would flood the daily ticket picker with
+# initiatives and offer "file this bug against an initiative" as a menu item, to buy a
+# key that appears in zero branches and zero commit subjects in the repo. Recognising a
+# key when it turns up in prose is a strictly smaller claim than being able to file
+# against it, and this is where the smaller claim lives.
 def _ticket_re():
-    keys = [k.strip().upper() for k in
-            os.environ.get("JIRA_PROJECTS", os.environ.get("JIRA_PROJECT", "")).split(",")
-            if k.strip()]
+    keys = list(dict.fromkeys(
+        k.strip().upper() for k in
+        (os.environ.get("JIRA_PROJECTS", os.environ.get("JIRA_PROJECT", ""))
+         + "," + os.environ.get("JIRA_EXTRA_PROJECTS", "")).split(",")
+        if k.strip()))
     if keys:
         return re.compile(r"\b(" + "|".join(map(re.escape, keys)) + r")-(\d{2,5})\b")
     return re.compile(r"\b([A-Z]{2,4})-(\d{2,5})\b")
