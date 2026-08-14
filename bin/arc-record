@@ -128,8 +128,10 @@ def main():
 
     # A `claude -p` utility call fires the Stop hook like any session. Recording one
     # would make the tools that call Claude into work Claude did, and feed the arc
-    # namer's own prompts back to the clusterer that groups them.
-    if cwd and Path(cwd).resolve() == headless_claude.SESSION_DIR.resolve():
+    # namer's own prompts back to the clusterer that groups them. Matched by the
+    # directory's name rather than its resolved path, so a call made under a moved
+    # XDG_STATE_HOME is still recognised as the utility call it is.
+    if headless_claude.is_utility_cwd(cwd):
         return
 
     prompt, files, branch = tail_turn(transcript)

@@ -9,11 +9,19 @@ what you owe other people should be able to say what it costs you.
 
 Every such call goes through `lib/headless_claude.py`, which runs it with its cwd inside
 one dedicated directory so its transcript lands in a Claude Code project directory of its
-own. That directory is the exact, auditable record of what this pipeline consumed: one
-`message.usage` per API response, with the model that served it. It is also the reason
-this measurement can be honest about whose usage it is -- the pipeline's calls are in
-that directory and nowhere else, and your own interactive sessions are in the other 85
-directories and never in that one. The two are summed separately and never mixed.
+own. Those directories are the exact, auditable record of what this pipeline consumed:
+one `message.usage` per API response, with the model that served it. They are also the
+reason this measurement can be honest about whose usage it is -- the pipeline's calls are
+in them and nowhere else, and your own interactive sessions are in the other 85
+directories and never in one of them. The two are summed separately and never mixed.
+
+Plural, because the directory is identified by its name and not by one absolute path.
+The A/B that compared brief models gave each arm its own XDG_STATE_HOME, so 65 calls
+arc-brief made landed outside the one path this file used to check, and were counted as
+Kyle's own interactive usage -- the single thing the paragraph above promises cannot
+happen. Per-run cost is unaffected either way, because that figure is bounded by the
+snapshots `bin/arcs` records around a run and an experiment run by hand sits outside
+every one of them.
 
 Three things are worth knowing about how the number is arrived at.
 
@@ -70,10 +78,12 @@ SAMPLES = STATE / "usage.jsonl"
 PROJECTS = Path(os.environ.get("WORK_ARCS_PROJECTS",
                                Path.home() / ".claude" / "projects"))
 # Derived from the library that creates them rather than written out here, so the two
-# cannot drift. headless_claude names the directory after its session dir, and says in
-# its own docstring that consumers reading ~/.claude/projects should skip it -- this is
-# the consumer that instead reads *only* it.
+# cannot drift. headless_claude says in its own docstring that consumers reading
+# ~/.claude/projects should skip these -- this is the consumer that instead reads *only*
+# them. `PIPELINE_DIR` is the one this machine writes to now, reported below so the
+# figures name their source; `is_pipeline_dir` is what the sum is actually taken over.
 PIPELINE_DIR = headless_claude.PROJECT_DIR
+is_pipeline_dir = headless_claude.is_utility_project_dir
 
 CREDS = Path.home() / ".claude" / ".credentials.json"
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
@@ -291,7 +301,7 @@ def scan(since, spans):
     except OSError:
         dirs = []
     for d in dirs:
-        surf = "pipeline" if d.name == PIPELINE_DIR else "interactive"
+        surf = "pipeline" if is_pipeline_dir(d.name) else "interactive"
         acc = surfaces[surf]
         try:
             files = sorted(d.glob("*.jsonl"))

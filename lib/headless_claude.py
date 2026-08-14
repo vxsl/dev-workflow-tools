@@ -20,7 +20,16 @@ hook already honours.
     from headless_claude import run
     r = run(["--model", "haiku", prompt], timeout=30)
 
-Consumers that read ~/.claude/projects should skip `PROJECT_DIR`.
+Consumers that read ~/.claude/projects should skip anything `is_utility_project_dir`
+accepts -- not `PROJECT_DIR` alone. The directory's *name* is the convention; its root is
+whatever XDG_STATE_HOME says at the time, and a caller is free to move that. The A/B that
+compared brief models did exactly this, giving each arm its own state root so the two
+could not share a cache, and every consumer matching the one absolute path went blind:
+65 transcripts landed in ~/.claude/projects/*-ab-{opus,sonnet}-claude-headless, where
+orch listed them as sessions of Kyle's work and arc-backfill was one run away from
+feeding them back as prompts. A repository literally named `claude-headless` would be
+skipped too, which is the right trade for a rule that cannot be walked around by moving
+a directory.
 """
 
 import os
@@ -29,13 +38,35 @@ import subprocess
 import sys
 from pathlib import Path
 
+# The convention is this name, wherever it is rooted. Consumers match on it.
+SESSION_DIRNAME = "claude-headless"
+
 STATE = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
-SESSION_DIR = STATE / "claude-headless"
+SESSION_DIR = STATE / SESSION_DIRNAME
 
 # Claude Code names a project directory after its cwd with every non-alphanumeric
 # character replaced by a dash, so the name is derivable rather than something to
 # hardcode and keep in sync.
 PROJECT_DIR = re.sub(r"[^A-Za-z0-9]", "-", str(SESSION_DIR))
+
+# ...which makes every such directory, under any state root, end in this.
+PROJECT_DIR_SUFFIX = "-" + SESSION_DIRNAME
+
+
+def is_utility_project_dir(name) -> bool:
+    """Whether a ~/.claude/projects directory holds utility-call transcripts.
+
+    Takes the directory's name, not a path, because that is what a consumer walking
+    ~/.claude/projects has. `PROJECT_DIR` is the one this process would write to; this
+    accepts that and every other state root's, which is the difference that matters.
+    """
+    return str(name).endswith(PROJECT_DIR_SUFFIX)
+
+
+def is_utility_cwd(path) -> bool:
+    """Whether a session's cwd marks it a utility call. For Stop-hook-shaped consumers,
+    which are handed the working directory rather than the project directory."""
+    return bool(path) and Path(path).name == SESSION_DIRNAME
 
 _README = """\
 Transcripts of `claude -p` utility calls made by dev-workflow-tools -- intent

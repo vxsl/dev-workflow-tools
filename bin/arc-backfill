@@ -141,8 +141,10 @@ def main():
             # Slack intent classifier -- write transcripts like any other session. Read
             # back as prompts they close a loop: arc-brief describing 59 arcs seeds 59
             # prompts that the next run clusters and describes. They are marked by the
-            # directory they run in, so one check keeps them out for good.
-            if f.parent.name == headless_claude.PROJECT_DIR:
+            # directory they run in, so one check keeps them out for good -- by the
+            # directory's name and not its full path, because a caller that moves
+            # XDG_STATE_HOME moves the path and the loop closes again.
+            if headless_claude.is_utility_project_dir(f.parent.name):
                 continue
             files_seen += 1
             for rec in turns_in(f):

@@ -115,6 +115,19 @@ PY
     [ "$(cost 'round(w["share_pct"])')" = "25" ]
 }
 
+@test "a headless call under a moved state root is still the pipeline's, not his" {
+    # The A/B that chose the brief model gave each arm its own XDG_STATE_HOME so the two
+    # could not share a cache. headless_claude put those calls in a claude-headless
+    # directory as always, but under the arm's root -- a project directory the current
+    # env cannot name. Matched by path, 65 of arc-brief's own calls were charged to
+    # Kyle's interactive usage, which is the one thing this file promises never happens.
+    mkdir -p "$WORK_ARCS_PROJECTS/-tmp-scratch-ab-sonnet-claude-headless"
+    add_call "-tmp-scratch-ab-sonnet-claude-headless" ab m_ab claude-sonnet-5 0 1000 0 0 0
+
+    [ "$(cost 'w["pipeline"]["calls"]')" = "1" ]
+    [ "$(cost 'w["interactive"]["calls"]')" = "0" ]
+}
+
 @test "sub-second jitter in resets_at is the same window, so the rate is observable" {
     # The two boundaries differ only in their microseconds -- one reading said
     # ...59.527968 and the next ...00.031740 of the same weekly window.
