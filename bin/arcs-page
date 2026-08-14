@@ -291,6 +291,13 @@ details.parked>summary b{color:var(--ink);font-weight:600}
 .ledger .who{display:block;font-size:.74rem;color:var(--ink-faint)}
 .ledger .covered{margin:0;font-size:.76rem;color:var(--ink-faint);
   border-top:1px solid var(--hairline);padding-top:.55rem}
+/* A commitment closed on evidence: the row is gone because the promise was shown to have
+   been kept, which is a derivation and not an acknowledgement -- so it leaves no ✕ and no
+   store behind. The evidence is still printed, because a reminder that vanishes silently
+   is indistinguishable from a reminder the tool dropped. */
+.ledger .cev{list-style:disc;margin:.4rem 0 0;padding-left:1.1rem;gap:.2rem}
+.ledger .cev li{display:list-item;font-size:.74rem;color:var(--ink-faint)}
+.ledger .fade{opacity:.85}
 /* Acknowledging is the page's one universal control, and it is an acknowledgement, not
    a deletion: the row stays countable behind a disclosure, and the store is keyed to
    the row's fingerprint so any change to the fact underneath brings it back itself. */
@@ -1735,6 +1742,7 @@ def render(data, lede, focus_days, limit, cost=None):
         they = ledger.get("they_owe") or []
         you = ledger.get("you_owe") or []
         covered = ledger.get("you_owe_covered") or 0
+        closed = ledger.get("you_owe_closed") or []
         a("<section>")
         a("<h2>The ledger</h2>")
         a('<p class="note">Open loops with a person on the other end, longest open '
@@ -1745,7 +1753,11 @@ def render(data, lede, focus_days, limit, cost=None):
           "on its workstream: same fact, once by person, once by work. The one "
           "exception to &ldquo;derived&rdquo; is a commitment read out of your own "
           "Slack messages — those rows say so, and every Slack row quotes the message "
-          "it is a claim about, one click away. <strong>&#x2715; acknowledges a "
+          "it is a claim about, one click away. A commitment closes the same way "
+          "everything else here does, on evidence: you delivered it later in the same "
+          "thread, the merge request you named merged, the ticket you named reached "
+          "Done. Where nothing shows that, the row says so and gives the date it "
+          "expires under instead of pretending. <strong>&#x2715; acknowledges a "
           "row</strong>: it leaves the list but stays counted, and it comes back on "
           "its own the moment the fact under it changes — a new message, a "
           "re-request, a touched ticket. Nothing here can be deleted, only "
@@ -1804,6 +1816,14 @@ def render(data, lede, focus_days, limit, cost=None):
                                         else "") + since
                                      + " (inferred from your message, quoted)",
                        }.get(e.get("kind"), who)
+                # How this row will die, said out loud. Every other row on the ledger
+                # closes when the other person moves; a commitment whose fulfilment
+                # nothing can show has only the sliding window, and a row that vanishes
+                # one morning unexplained teaches the same distrust as a stale one.
+                if e.get("kind") == "commitment" and e.get("expires_in") is not None:
+                    sub += ('<span class="fade"> — nothing yet shows it landed, so it '
+                            f'expires with the {e.get("window_days", 14)}-day Slack '
+                            f'window in {esc(e["expires_in"])}d</span>')
                 a(row(e, link(e.get("url", ""), esc(e.get("ref", "")), "ref")
                       + f' {esc(e.get("title",""))}'
                       + f'<span class="who">{sub}</span>'
@@ -1818,6 +1838,23 @@ def render(data, lede, focus_days, limit, cost=None):
             a(f'<p class="covered">{covered} more review request'
               f'{"" if covered == 1 else "s"} already handled — you spoke, or someone '
               "approved before you got there.</p>")
+        # Closed on evidence, with the evidence. Not a dismissal and not a checkbox: the
+        # tool worked out that the promise was kept, so the row is gone rather than
+        # acknowledged. It is still shown, because a reminder that disappears silently is
+        # indistinguishable from a reminder the tool lost.
+        if closed:
+            a('<div class="covered">')
+            a(f'{len(closed)} commitment{"" if len(closed) == 1 else "s"} closed on '
+              "evidence rather than by the clock — the promise was kept, so the row is "
+              "gone, and here is what showed it:")
+            a('<ul class="cev">')
+            for e in closed:
+                a("<li>you said you&rsquo;d "
+                  + esc(e.get("promised") or "do this") + " &mdash; "
+                  + link(e.get("closed_url") or e.get("url", ""),
+                         esc(e.get("closed_by", "")))
+                  + "</li>")
+            a("</ul></div>")
         a("</div>")
 
         a('<div class="side">')

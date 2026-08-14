@@ -514,8 +514,17 @@ def branch_mr_states(repo, pages=8):
             # A branch can carry several MRs over its life -- reopened, retargeted,
             # superseded. Merged beats closed: if any attempt landed, the work landed.
             if prev is None or (prev["state"] == "closed" and state == "merged"):
+                settled = m.get("merged_at") or m.get("closed_at") or ""
                 out[branch] = {"iid": m.get("iid"), "state": state,
-                               "at": (m.get("merged_at") or m.get("closed_at") or "")[:10],
+                               "at": settled[:10],
+                               # The same instant undivided, because one consumer needs
+                               # to order it against another event rather than print it.
+                               # close_commitments asks whether the merge came after a
+                               # promise, and at day resolution a promise made in the
+                               # morning and kept that afternoon is unorderable -- which
+                               # would have to be resolved as "no evidence", losing the
+                               # cleanest fulfilment there is.
+                               "at_ts": settled,
                                "url": m.get("web_url", "")}
     return out
 
@@ -820,6 +829,177 @@ Messages:
 """
 
 
+COMMIT_CLOSE_CACHE = (Path(os.environ.get("XDG_STATE_HOME",
+                                          Path.home() / ".local/state"))
+                      / "work-arcs" / "commitment-closes.json")
+
+COMMIT_CLOSE_PROMPT = """\
+Each numbered block is a promise Kyle made in Slack, followed by ONE later message Kyle
+himself wrote in the same conversation. For each block, decide whether that later
+message shows the promise was KEPT.
+
+Kept looks like: "here you go", "done", "pushed", "merged", "have a look", the link or
+document he promised, a report of the result, handing the thing over.
+
+NOT kept: more discussion of the same problem, another promise or a new deadline, a
+question, an apology for the delay, "still working on it", or unrelated talk that merely
+happens to come later in the same thread. Being present in the conversation is not
+delivering.
+
+Reply with ONLY a JSON array of the block numbers whose later message plainly delivers
+the promise, e.g. [0, 2]. Leave out every block you are not sure about: a listed block
+DELETES a reminder, and a promise quietly forgotten is worse than a reminder that stays
+a day too long. Empty array if none.
+
+Blocks:
+{blocks}
+"""
+
+
+def _commitment_delivered(pairs, mine):
+    """Which promises Kyle can be shown to have kept in the same conversation.
+
+    The cheapest fulfilment signal there is, because it needs no new network call: the
+    `from:me` sweep is already in hand for the answered-index, covers the same lookback,
+    and therefore already contains whatever Kyle said after the promise. What it does not
+    contain is a judgment, and the judgment is the whole difficulty -- "I'll take a look
+    on Monday" followed by ten more messages in that thread proves he was in the room, not
+    that he looked.
+
+    So the candidate set is narrow and the judge is asked one question per pair:
+
+    * SAME THREAD ONLY in a channel. `_thread_of` is recovered from the permalink, which
+      is the only place a search match admits its thread. Later chatter anywhere else in
+      #tech-backend is not evidence about a promise made in one of its threads, and
+      treating it as evidence is exactly how this feature would start deleting real
+      reminders.
+    * THE WHOLE CHANNEL in a DM, because a DM's channel *is* the conversation. Slack gives
+      every top-level DM message its own thread id, so a same-thread rule would make a
+      promise made in a DM structurally unclosable -- and a DM has no ambient traffic for
+      a reply to be confused with.
+    * NEWER THAN THE PROMISE, and at most the last few, since a wrap-up is the last thing
+      said rather than the first.
+
+    The default is the opposite of `_dm_needs_reply`'s, and deliberately so. There, an
+    unjudged row is kept because a missed reminder is cheaper than a false one; here, an
+    unjudged pair closes nothing, because the two failures have swapped places. A stale
+    reminder shows its own quote and can be read and dismissed in a second. A promise
+    silently deleted on a guess is a tool that has quietly stopped telling you things --
+    the one failure from which no amount of correctness later recovers.
+
+    Verdicts cache per (promise, candidate) pair with the prompt in the key, so a re-run
+    is free and a reworded question cannot reuse yesterday's answers (item 1c).
+    """
+    if not pairs:
+        return
+    cands = {}
+    for i, (row, m) in enumerate(pairs):
+        chan = (m.get("channel") or {}).get("id", "")
+        if not chan:
+            continue
+        thread, ts = _thread_of(m), float(m.get("ts") or 0)
+        dm = chan.startswith("D")
+        later = [c for c in mine
+                 if (c.get("channel") or {}).get("id") == chan
+                 and float(c.get("ts") or 0) > ts
+                 and (dm or _thread_of(c) == thread)
+                 and (c.get("text") or "").strip()]
+        later.sort(key=lambda c: float(c.get("ts") or 0))
+        for c in later[-int(os.environ.get("WORK_ARCS_CLOSE_CANDIDATES", "4")):]:
+            cands[(i, c.get("ts") or "")] = c
+    if not cands:
+        return
+
+    prompt_sha = hashlib.sha256(COMMIT_CLOSE_PROMPT.encode()).hexdigest()[:16]
+    try:
+        cache = json.loads(COMMIT_CLOSE_CACHE.read_text())
+    except (OSError, ValueError):
+        cache = {}
+    if cache.get("prompt") != prompt_sha:
+        cache = {"prompt": prompt_sha, "verdicts": {}}
+    verdicts = cache.setdefault("verdicts", {})
+
+    def key(i, c):
+        row, m = pairs[i]
+        return hashlib.sha256(
+            f"{m.get('ts','')}\x00{m.get('text','')}\x00"
+            f"{c.get('ts','')}\x00{c.get('text','')}".encode()).hexdigest()[:16]
+
+    fresh = [(i, c) for (i, _), c in sorted(cands.items())
+             if key(i, c) not in verdicts]
+    if fresh:
+        model = os.environ.get("WORK_ARCS_COMMIT_MODEL", "sonnet")
+        print(f"  ledger: judging {len(fresh)} later message(s) of yours for whether a "
+              f"commitment was kept ({model})", file=sys.stderr)
+        blocks = []
+        for n, (i, c) in enumerate(fresh):
+            row, m = pairs[i]
+            where = row.get("ref") or "a DM"
+            blocks.append(
+                f"[{n}] PROMISE ({row.get('asked','?')} in {where}): "
+                + _slack_text(m.get("text"))
+                + f"\n    LATER, same conversation ({_day_str(c)}): "
+                + _slack_text(c.get("text")))
+        try:
+            r = headless_claude.run(
+                ["--model", model, "--dangerously-skip-permissions",
+                 COMMIT_CLOSE_PROMPT.replace("{blocks}", "\n".join(blocks))],
+                timeout=180)
+            hits = set(json.loads(re.search(r"\[.*?\]", r.stdout, re.S).group(0))) \
+                if r.returncode == 0 else None
+        except (OSError, subprocess.SubprocessError, ValueError,
+                AttributeError, TypeError):
+            hits = None
+        # Nothing cached on a failed or unparseable call: the next run asks again rather
+        # than remembering an accident as a verdict. And nothing closes on this run,
+        # which is the honest degradation -- the rows simply stand.
+        if hits is not None:
+            for n, (i, c) in enumerate(fresh):
+                verdicts[key(i, c)] = n in hits
+            try:
+                COMMIT_CLOSE_CACHE.parent.mkdir(parents=True, exist_ok=True)
+                COMMIT_CLOSE_CACHE.write_text(json.dumps(cache))
+            except OSError:
+                pass
+
+    # Newest delivering message wins the evidence slot: if he said "on it" and later
+    # "done", the later one is the one worth quoting back.
+    for (i, _), c in sorted(cands.items(), key=lambda kv: float(kv[0][1] or 0)):
+        if verdicts.get(key(i, c)):
+            row = pairs[i][0]
+            text = _slack_text(c.get("text"))
+            row["closed_how"] = "thread"
+            row["closed_by"] = f'you posted in-thread: "{_clip(text, 64)}"'
+            # The whole message as well as the sentence, because the two have different
+            # readers: the sentence is a line on a page and this is what an audit of "why
+            # did that reminder go away" actually wants. Neither is a truncation of the
+            # evidence itself -- only of the version that has a column to fit into.
+            row["closed_quote"] = text
+            row["closed_url"] = c.get("permalink", "")
+
+
+def _clip(text, n):
+    """Shorten to about n characters at a word boundary, with an ellipsis if it shortened.
+
+    Quotes inside a sentence, only. A fragment cut mid-word reads as a bug in the tool
+    rather than as a quotation, which matters here because the sentence it lands in is
+    the reason a reminder was deleted -- the one sentence that has to look trustworthy.
+    """
+    text = " ".join((text or "").split())
+    if len(text) <= n:
+        return text
+    head = text[:n].rsplit(" ", 1)[0]
+    return (head or text[:n]) + "…"
+
+
+def _day_str(m):
+    """The day a Slack match was posted, for a prompt to read."""
+    try:
+        return datetime.fromtimestamp(float(m.get("ts") or 0)).strftime("%Y-%m-%d")
+    except (ValueError, TypeError):
+        return "?"
+
+
 DM_REPLY_CACHE = (Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
                   / "work-arcs" / "dm-replies.json")
 
@@ -904,6 +1084,14 @@ def ledger_commitments(mine):
     messages the model has not seen, so this is one small call a day, not a sweep. The
     cache keys on the prompt too -- rewording the question must not reuse old answers,
     which is the exact way an evidence-keyed cache went stale once already (item 1c).
+
+    A row that survives its own fulfilment is a wrong reminder, so two fields go out
+    with each one for the closing pass to use. `asked_ts` is the promise's own instant,
+    because "did this merge come after the promise" cannot be answered at day
+    resolution. `expires_in` is how many days the row has left before the lookback
+    window slides past its message and takes it away -- the honest ending for a promise
+    nothing can be shown about, and something the page should say out loud rather than
+    let a row vanish unexplained.
     """
     rows = []
     candidates = [m for m in mine
@@ -959,7 +1147,9 @@ def ledger_commitments(mine):
                 pass
 
     settle = 86400 * int(os.environ.get("WORK_ARCS_SLACK_SETTLE_DAYS", "1"))
+    lookback = int(os.environ.get("WORK_ARCS_SLACK_LOOKBACK", "14"))
     now = time.time()
+    pairs = []
     for m in candidates:
         v = verdicts.get(key(m))
         if not isinstance(v, dict):
@@ -972,12 +1162,23 @@ def ledger_commitments(mine):
         # A DM's channel "name" is the other party's raw user id, which is not a name.
         if re.fullmatch(r"[UDW][A-Z0-9]{8,}", name or ""):
             name = ""
-        rows.append({"kind": "commitment", "ref": f"#{name}" if name else "DM",
-                     "title": "", "who": v.get("to", ""),
-                     "promised": v.get("promised", ""),
-                     "asked": day, "days": _days_since(day),
-                     "quote": _slack_text(m.get("text")),
-                     "url": m.get("permalink", "")})
+        days = _days_since(day)
+        row = {"kind": "commitment", "ref": f"#{name}" if name else "DM",
+               "title": "", "who": v.get("to", ""),
+               "promised": v.get("promised", ""),
+               "asked": day, "days": days,
+               "asked_ts": ts,
+               "expires_in": max(0, lookback - (days or 0)),
+               "window_days": lookback,
+               "quote": _slack_text(m.get("text")),
+               "url": m.get("permalink", "")}
+        rows.append(row)
+        pairs.append((row, m))
+    # The rows and the messages they came from, together, because the closing judge needs
+    # the message: only the raw match carries the channel id and the thread its permalink
+    # encodes. Marked here, removed later -- see close_commitments for why the removal is
+    # one place and not three.
+    _commitment_delivered(pairs, mine)
     return rows
 
 
@@ -1241,7 +1442,166 @@ def build_ledger(repo, mrs):
     for e in they + you:
         e["fp"] = _ledger_fp(e)
     return {"they_owe": they, "you_owe": you, "you_owe_covered": covered,
-            "slack": slack_seen}
+            # Always present when the ledger is, empty or not, because a --json consumer
+            # cannot tell a missing key from "nothing closed" and would have to guess.
+            # close_commitments fills it; see there for why it cannot be filled here.
+            "you_owe_closed": [], "slack": slack_seen}
+
+
+# `!10481` as it is written in prose, and the merge request URL that carries the same
+# number. The lookbehind keeps `foo!10481` and `wow!!10481` out while letting `(!10481)`
+# and `see !10481` in, and three digits is the floor because `!5` is punctuation here.
+MR_MENTION_RE = re.compile(r"(?<![\w!])!(\d{3,6})\b|/merge_requests/(\d{3,6})\b")
+
+
+def jira_status_moves(keys):
+    """For a handful of ticket keys: their status now, its category, and when it moved.
+
+    Its own call rather than a join onto `collect_jira`'s list, for the two things that
+    list cannot carry. It asks for `statusCategory != Done`, so a ticket that reached
+    Done -- the only status move that can close a promise -- is absent from it by
+    construction, and an absence is not evidence: a key missing from that list is equally
+    a ticket reassigned to somebody else. And it carries `updated`, which moves when
+    anyone edits a label; `statuscategorychangedate` is the only field that dates the
+    move itself, which is what "moved status AFTER the commitment" needs.
+
+    One GET per key rather than one `key in (...)` JQL, because a single key that does
+    not exist makes the whole JQL a 400 and would take the other keys' answers down with
+    it. Bounded, and only called with keys a commitment actually names, so on a normal
+    day this is nothing or one call.
+    """
+    domain = os.environ.get("JIRA_DOMAIN")
+    email = os.environ.get("JIRA_EMAIL")
+    token = os.environ.get("JIRA_API_TOKEN")
+    keys = list(keys)[:int(os.environ.get("WORK_ARCS_CLOSE_KEYS", "8"))]
+    if not (domain and email and token and keys):
+        return {}
+    auth = base64.b64encode(f"{email}:{token}".encode()).decode()
+
+    def one(key):
+        url = (f"https://{domain}/rest/api/3/issue/{urllib.parse.quote(key)}"
+               "?fields=status,statuscategorychangedate,resolutiondate")
+        req = urllib.request.Request(url, headers={"Accept": "application/json"})
+        req.add_header("Authorization", f"Basic {auth}")
+        try:
+            with urllib.request.urlopen(req, timeout=20) as r:
+                d = json.load(r)
+        except (urllib.error.URLError, json.JSONDecodeError, TimeoutError, OSError):
+            return None
+        f = d.get("fields") or {}
+        status = (f.get("status") or {})
+        moved = f.get("statuscategorychangedate") or f.get("resolutiondate") or ""
+        return {"key": key, "status": status.get("name", ""),
+                "category": ((status.get("statusCategory") or {}).get("name") or ""),
+                "moved": moved,
+                "url": f"https://{domain}/browse/{key}"}
+
+    with futures.ThreadPoolExecutor(max_workers=4) as pool:
+        return {d["key"]: d for d in pool.map(one, keys) if d}
+
+
+def close_commitments(ledger, fates):
+    """Take off the ledger the promises that can be shown to have been kept.
+
+    The gap this closes: nothing noticed the promised thing being *done*, so a commitment
+    row aged out through the 14-day Slack window instead of through its own fulfilment.
+    A row that outlives the promise it is about is a wrong reminder, and those cost more
+    trust than ten right ones earn -- the reader learns that the list contains stale
+    things, and from then on reads none of it carefully.
+
+    Three signals, cheapest first, and the order is also strongest-first by accident of
+    what is cheap:
+
+    1. You said so yourself, in the same conversation. Free -- `_commitment_delivered`
+       has already run inside the ledger build off the `from:me` sweep -- and it arrives
+       here as `closed_by` already set.
+    2. The merge request you named merged after you promised. No call at all: the fates
+       of every MR you have ever opened are already in hand for the branch list, so this
+       is a join. Merged only, never closed: a closed MR is work abandoned, which is the
+       opposite of a promise kept.
+    3. The ticket you named reached Done after you promised. One small Jira call, and
+       only for keys a surviving row actually names.
+
+    Done, and not merely "moved". Jira's three status categories make the line clean: To
+    Do -> In Progress is the promise being *worked*, not kept, and a reminder that dies
+    when you start the thing would delete itself at the exact moment it became true. So
+    only the category reaching Done counts, and only strictly after the promise -- a
+    ticket already Done when the promise was made is evidence about something else, and
+    with `asked_ts` and `statuscategorychangedate` both carrying real instants, a promise
+    kept the same afternoon is still orderable.
+
+    REMOVED, not dismissed. A dismissal is a human saying "I know"; this is the tool
+    saying "it happened", and the two must not share a store -- an acknowledgement
+    expires when its fact changes, whereas a derivation has no fact left to expire. The
+    row leaves `you_owe` and lands in `you_owe_closed` with the evidence that removed it,
+    so --json, the page and any later audit can all ask why a reminder is gone. Nothing
+    about the surviving rows changes, fingerprints included.
+    """
+    if not ledger:
+        return
+    rows = ledger.get("you_owe") or []
+    commits = [e for e in rows if e.get("kind") == "commitment"]
+    ledger.setdefault("you_owe_closed", [])
+    if not commits:
+        return
+
+    # Merged MRs by iid, out of the branch-keyed fates already collected. Only ever the
+    # ones you opened yourself, which is the safe half anyway: for somebody else's MR
+    # there is no fate here and the row correctly stands.
+    merged = {}
+    for f in (fates or {}).values():
+        if f.get("iid") and f.get("state") == "merged":
+            merged[int(f["iid"])] = f
+
+    def refs(e):
+        text = f"{e.get('quote','')} {e.get('promised','')}"
+        iids = {int(a or b) for a, b in MR_MENTION_RE.findall(text)}
+        keys = {m.group(0) for m in TICKET_RE.finditer(text.upper())}
+        return iids, keys
+
+    open_rows = [e for e in commits if not e.get("closed_by")]
+    for e in open_rows:
+        iids, _ = refs(e)
+        at = float(e.get("asked_ts") or _day_epoch(e.get("asked", "")))
+        for iid in sorted(iids):
+            f = merged.get(iid)
+            if not f or _iso_epoch(f.get("at_ts") or f.get("at")) <= at:
+                continue
+            late = max(0, int((_iso_epoch(f.get("at_ts") or f.get("at")) - at) // 86400))
+            e["closed_how"] = "mr"
+            e["closed_by"] = (f"!{iid} merged "
+                              + ("the same day" if late == 0 else f"{late}d after"))
+            e["closed_url"] = f.get("url", "")
+            break
+
+    still = [e for e in open_rows if not e.get("closed_by")]
+    wanted = sorted({k for e in still for k in refs(e)[1]})
+    moves = jira_status_moves(wanted) if wanted else {}
+    for e in still:
+        at = float(e.get("asked_ts") or _day_epoch(e.get("asked", "")))
+        for key in sorted(refs(e)[1]):
+            d = moves.get(key)
+            if not d or (d.get("category") or "").strip().lower() != "done":
+                continue
+            when = _iso_epoch(d.get("moved"))
+            if when <= at:
+                continue
+            late = max(0, int((when - at) // 86400))
+            e["closed_how"] = "ticket"
+            e["closed_by"] = (f"{key} moved to {d.get('status') or 'Done'} "
+                              + ("the same day" if late == 0 else f"{late}d after"))
+            e["closed_url"] = d.get("url", "")
+            break
+
+    closed = [e for e in commits if e.get("closed_by")]
+    if not closed:
+        return
+    ledger["you_owe"] = [e for e in rows
+                        if not (e.get("kind") == "commitment" and e.get("closed_by"))]
+    ledger["you_owe_closed"] = closed
+    for e in closed:
+        print(f"  commitment closed on evidence: “{(e.get('promised') or '')[:40]}” — "
+              f"{e['closed_by']}", file=sys.stderr)
 
 
 def annotate_stacks(repo, mrs, main_ref):
@@ -2655,6 +3015,24 @@ def _day_epoch(text):
         return 0
 
 
+def _iso_epoch(text):
+    """A full API timestamp as an epoch, or 0. The precise sibling of `_day_epoch`.
+
+    GitLab stamps `2026-08-12T19:41:07.000Z` and Jira `2026-08-12T19:41:07.000-0700`;
+    fromisoformat handles both once the trailing Z is spelled the way it means. Falls
+    back to the day, then to 0 -- and 0 is load-bearing rather than a sentinel nobody
+    checks: close_commitments only ever compares "did this happen after that", so an
+    unparseable date orders before everything and closes nothing.
+    """
+    if not text:
+        return 0
+    try:
+        return int(datetime.fromisoformat(
+            str(text).strip().replace("Z", "+00:00")).timestamp())
+    except (ValueError, TypeError):
+        return _day_epoch(text)
+
+
 def demands(arc):
     """What this arc needs from *you*, worst first. Empty means it is someone else's turn.
 
@@ -3689,10 +4067,14 @@ def main():
     if mrs_known and not args.shallow_mr and not writing:
         ledger_f = futures.ThreadPoolExecutor(max_workers=1).submit(
             build_ledger, args.repo, mrs)
-    if mrs_known:
-        for name, fate in branch_mr_states(args.repo).items():
-            if name in branches:
-                branches[name]["mr_fate"] = fate
+    # Kept rather than consumed into the branches: close_commitments asks whether an MR
+    # a promise named has merged since, and this sweep is the only place that knows the
+    # fate of a merge request that is no longer open. Refetching it for the ledger would
+    # be a second 500-MR pass for facts already on the desk.
+    fates = branch_mr_states(args.repo) if mrs_known else {}
+    for name, fate in fates.items():
+        if name in branches:
+            branches[name]["mr_fate"] = fate
     # Squash first, because it is both the stronger test and the cheaper one, and because
     # every merge request in this project squashes -- which is what made finished work keep
     # surfacing as live. See landed_as_squash for the controls it was validated against.
@@ -3783,6 +4165,9 @@ def main():
         sys.exit(jira_ify(args.repo, arc, args.dry_run))
 
     ledger = ledger_f.result() if ledger_f else None
+    # Immediately, and before anything can act on the ledger: a commitment shown to have
+    # been kept must not be dismissable, diffable or renderable, because it is not a row.
+    close_commitments(ledger, fates)
 
     if args.dismiss or args.undismiss:
         if ledger is None:
@@ -3988,9 +4373,18 @@ def main():
                 print(f"                          “{e['quote'][:56]}”")
             if e.get("title"):
                 print(f"                          └ {e['title'][:58]}")
+            # A commitment nothing can be shown about says how it will die, because the
+            # alternative is a row that disappears one morning for no visible reason.
+            if e["kind"] == "commitment" and e.get("expires_in") is not None:
+                print(f"                          nothing shows it landed; expires with "
+                      f"the {e.get('window_days', 14)}-day Slack window in "
+                      f"{e['expires_in']}d")
         if ledger["you_owe_covered"]:
             print(f"  (+{ledger['you_owe_covered']} review requests already handled — "
                   "you spoke or someone approved)")
+        for e in ledger.get("you_owe_closed") or []:
+            print(f"  ✓ closed on evidence: you said you'd "
+                  f"{e.get('promised') or 'do this'} — {e['closed_by']}")
         if dismissed:
             print(f"  (+{dismissed} acknowledged — `work-arcs --undismiss REF` brings "
                   "one back; any change brings it back on its own)")
