@@ -332,6 +332,24 @@ print(says(d, "changed"))'
     [[ "$output" == *"SMP selected state changed under you"* ]]
 }
 
+@test "a Slack thread on an arc is an input to this sentence like any other" {
+    # The lens is a fifth universe in the diff and needs nothing here: work-arcs ranked it
+    # against the conflicts and the ticket moves, and this stage lifts the sentence it was
+    # handed. A stage that composed its own phrasing for one kind of change would be a
+    # second author of a ranking that already has one.
+    run am '
+w = "a thread in #impl-trimet decided: Logan owns the migration"
+d = payload(arcs=[arc("a1", "trimet-legend", brief={"name": "TriMet legend"})],
+            since_last_run={"previous_generated": "2026-08-13T21:00:00-0700",
+                            "interval_seconds": 37800, "compared": 40, "changed": 1,
+                            "changes": [{"id": "a1", "label": "trimet-legend",
+                                         "kinds": ["slack"], "what": [w],
+                                         "evidence": [{"kind": "slack", "what": w,
+                                                       "url": "https://x/archives/C1/p1"}]}]})
+print(says(d, "changed"))'
+    [ "$output" = "Overnight, TriMet legend changed under you: a thread in #impl-trimet decided: Logan owns the migration." ]
+}
+
 @test "a quiet hour is not news, a quiet night is" {
     # Silence is only information when the gap was long enough for noise to have been
     # likely. Otherwise this is the stamp line said twice, in larger type. A ledger row

@@ -4542,6 +4542,13 @@ SNAPSHOT = (Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
 # Bumped whenever a field below changes meaning. A snapshot at any other version is
 # discarded with a note rather than read: half-understood state is worse than none,
 # because it produces confident sentences about changes that never happened.
+#
+# Deliberately NOT bumped when a whole new universe is *added* -- the Slack lens arrived
+# after v1 and this still reads v1. `known` is what makes that safe and is the reason it
+# exists: a v1 snapshot carries no `known["slack"]`, so the gate reads false and the lens
+# is silent for exactly one run while every other comparison goes on working. Bumping
+# would have thrown a morning's whole diff away to protect against a field that already
+# protects itself.
 SNAPSHOT_V = 1
 
 # Merge-status values that mean "GitLab has not worked it out yet". They must never be
@@ -4554,18 +4561,27 @@ MERGE_UNKNOWN = frozenset(("", "unchecked", "checking", "preparing", "unknown"))
 # Worst first. Within an arc these order its sentences; across arcs the best sentence
 # orders the arc. Every value is distinct except merged/closed, which are the same event
 # from the page's point of view.
+#
+# `slack` sits just under `ledger` and over `merged`, which is a judgement worth stating.
+# It is the same family as the two above it -- a person said something about this work --
+# and it differs in not being addressed to Kyle, so it ranks below a debt with his name on
+# it and above the news that something landed. Its two sides, a decision and a question left
+# standing, deliberately share one rank for the same reason merged and closed do: from the
+# page's point of view they are one event, the lens saying something about this arc it was
+# not saying at the last build, and the sentence itself says which.
 CHANGE_RANK = {
-    "conflict": 0,        # the branch stopped merging
-    "pipeline": 1,        # it went red
-    "threads": 2,         # a reviewer asked you something and is waiting
-    "ledger": 3,          # a new open loop with a person on the other end
-    "merged": 4,          # it landed
-    "closed": 4,          # it was closed without landing
-    "ticket": 5,          # its ticket moved in Jira
-    "stage": 6,           # the rung it sits on moved
-    "mergeable": 7,       # it became mergeable
-    "unconflict": 8,      # it merges again
-    "pipeline-green": 9,  # it went green again
+    "conflict": 0,         # the branch stopped merging
+    "pipeline": 1,         # it went red
+    "threads": 2,          # a reviewer asked you something and is waiting
+    "ledger": 3,           # a new open loop with a person on the other end
+    "slack": 4,            # a conversation about it settled or opened something
+    "merged": 5,           # it landed
+    "closed": 5,           # it was closed without landing
+    "ticket": 6,           # its ticket moved in Jira
+    "stage": 7,            # the rung it sits on moved
+    "mergeable": 8,        # it became mergeable
+    "unconflict": 9,       # it merges again
+    "pipeline-green": 10,  # it went green again
 }
 
 MR_REF_RE = re.compile(r"^!(\d+)$")
@@ -4607,6 +4623,57 @@ def _ledger_rows(ledger):
     return ((ledger or {}).get("they_owe") or []) + ((ledger or {}).get("you_owe") or [])
 
 
+# What the lens says about one arc, keyed on the message it quotes rather than on its words.
+SLACK_SAYS = {"decided": "decided", "open": "left open"}
+
+
+def slack_marks(arc):
+    """The arc's Slack lens items, each keyed on the message it quotes and never its words.
+
+    Three properties this key has to hold at once, and they pull against each other:
+
+    * A model re-wording an item is not a change. The synthesis re-runs whenever a prompt
+      changes or a cache is lost, and "the design team owns this" versus "design owns this"
+      is the same decision. So the wording is not in the key at all -- the *quoted message*
+      is, as (channel, ts) recovered from its permalink by `_perma_id`, which is the same
+      identity the ledger dedupe already recovers there. Search writes `?thread_ts=&cid=`
+      on its links and the ones built here do not, so string equality on the URL would
+      compare two spellings of one message.
+    * A revived thread IS a change. The block's own fingerprint carries the thread's last
+      message, so a reply moves it, and the fingerprint is the first component of every key
+      -- the same act that retires the ✕ on a block also makes its items new. That is the
+      point: a thread somebody added to is not the thread that was read, and whether the
+      re-synthesis happened to land on the same quotes is not what changed.
+    * The side is part of the identity. One message can be the question at the last build
+      and the answer at this one, and "that got settled" is a development.
+
+    An acknowledged block is excluded outright rather than filtered later, so it is absent
+    from the snapshot on both sides -- a ✕ before this build and a ✕ after it produce no
+    row, no sentence and no arc in the changed count. That is the own-activity gate applied
+    to the reader instead of the author: an aggregate claim ("16 workstreams moved under
+    you") must not be built out of a fact its reader has already told the page he has seen.
+    """
+    out = {}
+    for b in arc.get("slack") or []:
+        if b.get("dismissed"):
+            continue
+        chan = b.get("channel") or ""
+        where = f"#{chan}" if chan else ""
+        for side, verb in SLACK_SAYS.items():
+            for it in b.get(side) or []:
+                pid = _perma_id(it.get("url"))
+                if not pid:
+                    continue
+                out["\x1f".join((b.get("fp") or "", side, pid[0], pid[1]))] = {
+                    "what": (f"a thread in {where} " if where else "a Slack thread ")
+                            + f"{verb}: {it.get('what') or ''}",
+                    "ref": where,
+                    "url": it.get("url") or "",
+                    "quotes": [it.get("quote")],
+                }
+    return out
+
+
 def _mr_ref(ref):
     m = MR_REF_RE.match(str(ref or ""))
     return int(m.group(1)) if m else None
@@ -4626,6 +4693,11 @@ def snapshot_of(arcs, ledger, known, repo, generated):
     `!10438` is the single ref they share. Rows about other people's merge requests
     therefore attach to no arc at all, correctly: reviewing someone else's branch is not
     a development on any workstream of yours.
+
+    The Slack lens is the one universe here that needs no such join, because it arrives
+    already attached: a thread is matched to a workstream by the branch names, ticket keys
+    and MR iids in its own text. What it needs instead is an identity per item that survives
+    a re-wording, and that is `slack_marks`.
     """
     by_fp = {}
     for e in _ledger_rows(ledger):
@@ -4655,6 +4727,12 @@ def snapshot_of(arcs, ledger, known, repo, generated):
             "threads": sorted({d["rfp"] for d in arc.get("demands", [])
                                if d.get("kind") == "threads" and d.get("rfp")}),
             "ledger": led,
+            # The Slack lens, keyed on the messages it quotes -- see slack_marks for why the
+            # model's wording is nowhere in here. Unlike every other field on this row it
+            # joins to the arc directly rather than through a merge request: a thread is
+            # matched to a workstream by its branch names, ticket keys and MR iids, which is
+            # a join the lens has already made and this need not repeat.
+            "slack": sorted(slack_marks(arc)),
             "issues": {i["key"]: (i.get("status") or "")
                        for i in arc.get("issues", []) if i.get("key")},
         })
@@ -4824,11 +4902,15 @@ def diff_runs(prev, cur, arcs, ledger):
     cmp_mrs = bool(pk.get("mrs")) and bool(ck.get("mrs"))
     cmp_issues = bool(pk.get("issues")) and bool(ck.get("issues"))
     cmp_ledger = bool(pk.get("ledger")) and bool(ck.get("ledger"))
+    cmp_slack = bool(pk.get("slack")) and bool(ck.get("slack"))
 
     live = {a.get("id"): a for a in arcs}
     demand_by_rfp = {d["rfp"]: d for a in arcs for d in a.get("demands", [])
                      if d.get("rfp")}
     ledger_by_fp = {e["fp"]: e for e in _ledger_rows(ledger) if e.get("fp")}
+    slack_by_mark = {}
+    for a in arcs:
+        slack_by_mark.update(slack_marks(a))
 
     changes = []
     for i, j in pairs:
@@ -4905,6 +4987,18 @@ def diff_runs(prev, cur, arcs, ledger):
                 add("ledger", text, e.get("ref") or "", e.get("url") or "",
                     [e.get("quote")])
 
+        # The Slack lens. A new item, or an item on a thread somebody has replied to since
+        # the last build -- see slack_marks for what is and is not in that key. Read off the
+        # live arc rather than the snapshot, like the thread demands above it: the snapshot
+        # holds identities and the sentence needs the quote and the permalink, and principle
+        # 5 says a claim of this kind is only worth making with its source one click away.
+        if cmp_slack:
+            for mark in sorted(set(n.get("slack") or []) - set(o.get("slack") or [])):
+                it = slack_by_mark.get(mark)
+                if not it:
+                    continue
+                add("slack", it["what"], it["ref"], it["url"], it["quotes"])
+
         if cmp_issues:
             o_is, n_is = o.get("issues") or {}, n.get("issues") or {}
             for key in sorted(set(o_is) & set(n_is)):
@@ -4967,7 +5061,7 @@ def diff_runs(prev, cur, arcs, ledger):
         },
         "skipped_universes": sorted(
             k for k, ok in (("mrs", cmp_mrs), ("issues", cmp_issues),
-                            ("ledger", cmp_ledger)) if not ok),
+                            ("ledger", cmp_ledger), ("slack", cmp_slack)) if not ok),
         "changes": changes,
     }
 
@@ -5352,8 +5446,20 @@ def main():
     # baseline of only the recent ones would report the rest as appearing and vanishing
     # every time the window moved.
     generated = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    # `slack` is the one universe gated on having been consulted AND complete, where the
+    # other three are gated on presence. The two failures it has to tell apart both produce
+    # blocks that are simply absent: a run with no token or --no-slack-threads never looked,
+    # and a run where three conversations.replies calls timed out looked and came back
+    # short. Either way the NEXT run reads them all and every block reads as new -- a
+    # morning of "a thread on this arc decided X" about conversations that had been sitting
+    # there for a week. Note this is the opposite trade from apply_dismissals, which gates on
+    # completeness alone precisely so a machine configured for less does not freeze the
+    # store forever: there, refusing to act costs an expiry that never happens; here it
+    # costs one silent morning that heals itself on the next run.
     snap = snapshot_of(arcs, ledger, {"mrs": mrs_known, "ledger": ledger is not None,
-                                      "issues": gap is not None},
+                                      "issues": gap is not None,
+                                      "slack": bool(slack_lens.get("consulted")
+                                                    and slack_lens.get("complete"))},
                        args.repo.name, generated)
     prev, no_prev = load_snapshot(args.repo.name)
     if prev is None:

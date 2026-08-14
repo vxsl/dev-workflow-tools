@@ -526,6 +526,15 @@ adding to it brings the block back. One cached model call per thread: the first 
 the day costs about 13¢ a thread and every rerun costs nothing.
 `--no-slack-threads` skips the lens (the ledger's own Slack rows are unaffected).
 
+The lens also feeds **Since the last build**, so a decision reached overnight can open the
+morning brief. What counts as new there is the *message* an item quotes, never the sentence
+about it — the model may reword a decision and that is not news — while a reply to the
+thread does count, because it is the same event the `✕` expires against. An acknowledged
+thread contributes nothing: no line, and no arc in the "N workstreams moved under you"
+count. Threads are compared only between two runs that both read the lens whole, so the
+first run after an outage or a `--no-slack-threads` says nothing about Slack rather than
+reporting a week-old conversation as this morning's news.
+
 Env: `WORK_ARCS_REPO` (default `~/work/repos/ul`), `WORK_ARCS_MAIN` (`origin/main`),
 `WORK_ARCS_PROJECTS` (`~/.claude/projects`), plus the `JIRA_*` vars for `--gap`. For the
 Slack lens: `WORK_ARCS_SLACK_LOOKBACK` (14 days), `WORK_ARCS_SLACK_THREADS_MAX` (150

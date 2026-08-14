@@ -17,7 +17,12 @@
 #     demand's count, names and oldest date unchanged -- the fingerprint must not
 #   - a stage that moved after your own commit moved because of your own commit
 #   - a stage that moved while the membership shifted may have moved for that reason alone
-#   - an arc's own MRs, threads and issues are compared only where BOTH runs saw them
+#   - a Slack lens item is identified by the message it quotes, so the model re-wording a
+#     decision is not a development -- while a reply to the thread is, because that is the
+#     same fact the ✕ on the block expires against
+#   - an acknowledged thread contributes nothing to "N workstreams moved under you"
+#   - an arc's own MRs, threads, issues and Slack threads are compared only where BOTH runs
+#     saw them
 #   - a snapshot at another version is discarded, not misread
 #
 # The diff functions are called directly rather than through the CLI: everything they do is
@@ -53,7 +58,8 @@ def sarc(label, branches, **kw):
     """A snapshot row, at rest: nothing here has moved."""
     d = {"id": label, "label": label, "ticket": None, "branches": sorted(branches),
          "stage": "in-review", "state": "in review", "settled": None,
-         "own_activity": 1000, "mrs": {}, "threads": [], "ledger": [], "issues": {}}
+         "own_activity": 1000, "mrs": {}, "threads": [], "ledger": [], "issues": {},
+         "slack": []}
     d.update(kw)
     return d
 
@@ -63,9 +69,52 @@ def smr(state="opened", merge_state="not_approved", conflicts=False,
             "pipeline": pipeline, "url": url, "at": at}
 
 def snap(arcs, gen="2026-08-14T01:00:00-0700", **known):
-    k = {"mrs": True, "ledger": True, "issues": True}
+    k = {"mrs": True, "ledger": True, "issues": True, "slack": True}
     k.update(known)
     return {"v": 1, "generated": gen, "repo": "ul", "known": k, "arcs": arcs}
+
+def mts(n):
+    """A Slack message stamp. Ten digits and six, because _perma_id reads exactly that out
+    of a permalink and a made-up shorter stamp would make every item unidentifiable."""
+    return "1755000000.%06d" % n
+
+def block(chan="C1", ts=1, last=9, name="impl-trimet", decided=(), open_=(), **kw):
+    """One Slack lens block, in the shape slack_threads hands over.
+
+    decided and open_ are (message number, what) pairs. The permalink is built the way the
+    lens builds it, because the item's identity is recovered back out of that permalink.
+    """
+    def side(items):
+        return [{"what": w, "quote": "q:" + w,
+                 "url": wa._thread_link("https://x.slack.com", chan, mts(n), mts(ts))}
+                for n, w in items]
+    d = {"chan": chan, "channel": name, "ts": mts(ts), "last_ts": mts(last),
+         "fp": wa._dfp("slack-thread", chan, mts(ts), mts(last)),
+         "decided": side(decided), "open": side(open_)}
+    d.update(kw)
+    return d
+
+def slarc(label, branches, blocks=(), **kw):
+    """A live arc carrying Slack blocks. Its snapshot row comes from snapshot_of, so the
+    key under test is the one the real run would write."""
+    a = {"id": label, "label": label, "ticket": None, "stage": "in-review",
+         "state": "in review", "settled": None, "own_activity": 1000, "age_days": 1,
+         "urgency": 5, "engagement": 0, "issues": [], "demands": [], "mrs": [],
+         "branches": [{"name": b} for b in sorted(branches)], "slack": list(blocks)}
+    a.update(kw)
+    return a
+
+def srow(arcs, gen, **known):
+    k = {"mrs": True, "ledger": False, "issues": True, "slack": True}
+    k.update(known)
+    return wa.snapshot_of(list(arcs), None, k, "ul", gen)
+
+def slack_what(before, after, **known):
+    """The sentences the diff produces over two runs of the same live arcs."""
+    p = srow(before, "2026-08-14T01:00:00-0700", **known)
+    c = srow(after, "2026-08-14T05:00:00-0700", **known)
+    d = wa.diff_runs(p, c, list(after), None)
+    return [w for x in d["changes"] for w in x["what"]]
 
 def what(prev, cur, arcs=(), ledger=None):
     """Every sentence the diff produces, flattened."""
@@ -289,6 +338,110 @@ d = wa.diff_runs(sn(three, "2026-08-14T01:00:00-0700"),
 print(d["changed"])'
     [[ "${lines[0]}" == "1 ['!1: 1 thread awaiting your reply"* ]]
     [ "${lines[1]}" = "0" ]
+}
+
+# ── the Slack lens ────────────────────────────────────────────────────────────
+#
+# The lens puts a model's words on a card, which makes it the one universe here whose text
+# moves without its facts moving. So the identity is the message it quotes and never the
+# sentence about it -- see slack_marks. Four cases, and three of them assert silence.
+
+@test "a decision a thread reached since the last build is a change" {
+    run wa '
+was = [slarc("A", ["a"], [block(decided=[(4, "the legend ships in 25.3")])])]
+now = [slarc("A", ["a"], [block(decided=[(4, "the legend ships in 25.3"),
+                                         (7, "Logan owns the migration")])])]
+print(slack_what(was, now))'
+    [ "$output" = "['a thread in #impl-trimet decided: Logan owns the migration']" ]
+}
+
+@test "the same decision re-worded is not a change" {
+    # The synthesis re-runs whenever its prompt or its cache moves, and the model is under
+    # no obligation to choose the same words twice. Same quoted message, same permalink,
+    # same decision -- and a diff keyed on the sentence would call that news every time the
+    # prompt was touched, which is the run-over-run version of the bug that made the split
+    # pass reuse yesterday'"'"'s answers.
+    run wa '
+was = [slarc("A", ["a"], [block(decided=[(4, "the legend ships in 25.3")])])]
+now = [slarc("A", ["a"], [block(decided=[(4, "legend lands in release 25.3")])])]
+print(slack_what(was, now))'
+    [ "$output" = "[]" ]
+}
+
+@test "a thread somebody has replied to since the last build is a change again" {
+    # The block fingerprint carries the thread'"'"'s last message, so a reply moves it -- the
+    # same act that retires a ✕ on the block. Identical items either side: what changed is
+    # that this is no longer the thread that was read.
+    run wa '
+d = [(4, "the legend ships in 25.3")]
+was = [slarc("A", ["a"], [block(last=9, decided=d)])]
+now = [slarc("A", ["a"], [block(last=12, decided=d)])]
+print(slack_what(was, now))'
+    [ "$output" = "['a thread in #impl-trimet decided: the legend ships in 25.3']" ]
+}
+
+@test "an open question that got answered moves sides, and that is a development" {
+    run wa '
+was = [slarc("A", ["a"], [block(open_=[(4, "who owns the backfill")])])]
+now = [slarc("A", ["a"], [block(decided=[(4, "Logan owns the backfill")])])]
+print(slack_what(was, now))'
+    [ "$output" = "['a thread in #impl-trimet decided: Logan owns the backfill']" ]
+}
+
+@test "an acknowledged thread makes no claim about the interval" {
+    # ✕ means "I have read this thread", and the aggregate sentence the diff feeds -- "16
+    # workstreams moved under you" -- is exactly where that has to be honoured or the
+    # mechanism is decorative. Same shape as the own-activity gate on `stage`, applied to
+    # the reader rather than the author. The block is absent from the snapshot on both
+    # sides, so it contributes no row, no sentence and no arc to the count.
+    run wa '
+new_item = [(4, "the legend ships in 25.3"),
+            (7, "Logan owns the migration")]
+was = [slarc("A", ["a"], [block(decided=new_item[:1], dismissed=True)])]
+now = [slarc("A", ["a"], [block(decided=new_item, dismissed=True)])]
+p = srow(was, "2026-08-14T01:00:00-0700")
+c = srow(now, "2026-08-14T05:00:00-0700")
+d = wa.diff_runs(p, c, list(now), None)
+print(p["arcs"][0]["slack"], d["changed"], [w for x in d["changes"] for w in x["what"]])'
+    [ "$output" = "[] 0 []" ]
+}
+
+@test "a run that did not consult Slack compares no threads" {
+    # A run with no token, or with --no-slack-threads, and a run where three
+    # conversations.replies calls timed out are the same absence at this end: blocks are
+    # missing and the next run reads them all. Comparing across that boundary would report
+    # a week-old conversation as this morning'"'"'s news.
+    run wa '
+d = [(4, "the legend ships in 25.3")]
+was = [slarc("A", ["a"], [])]
+now = [slarc("A", ["a"], [block(decided=d)])]
+p = srow(was, "2026-08-14T01:00:00-0700", slack=False)
+c = srow(now, "2026-08-14T05:00:00-0700")
+r = wa.diff_runs(p, c, list(now), None)
+print(r["skipped_universes"], [w for x in r["changes"] for w in x["what"]])
+# ...and with both sides consulted, the same pair is the change it looks like.
+print(slack_what(was, now))'
+    [ "${lines[0]}" = "['ledger', 'slack'] []" ]
+    [ "${lines[1]}" = "['a thread in #impl-trimet decided: the legend ships in 25.3']" ]
+}
+
+@test "a Slack change carries the quote and the permalink it is a claim about" {
+    # Principle 5: nothing asserting a fact about a conversation without the message it
+    # read, one click away. The model returns a message number and never a link, so the
+    # quote and the URL are read out of the message list -- this asserts they survive the
+    # trip through the snapshot, which holds neither.
+    run wa '
+was = [slarc("A", ["a"], [block()])]
+now = [slarc("A", ["a"], [block(open_=[(4, "nobody has run the backfill")])])]
+p = srow(was, "2026-08-14T01:00:00-0700")
+c = srow(now, "2026-08-14T05:00:00-0700")
+e = wa.diff_runs(p, c, list(now), None)["changes"][0]["evidence"][0]
+print(e["kind"], e["ref"])
+print(e["quotes"])
+print(e["url"])'
+    [ "${lines[0]}" = "slack #impl-trimet" ]
+    [ "${lines[1]}" = "['q:nobody has run the backfill']" ]
+    [ "${lines[2]}" = "https://x.slack.com/archives/C1/p1755000000000004?thread_ts=1755000000.000001" ]
 }
 
 # ── the store itself ──────────────────────────────────────────────────────────
