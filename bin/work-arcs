@@ -254,7 +254,12 @@ def collect_branches(repo, main_ref):
                               f"{main_ref}..{name}")):
             when, _, rest = line.partition("\t")
             sha, _, subject = rest.partition("\t")
-            b["subjects"].append(subject)
+            # An empty subject stays dropped, which is what `lines()` did back when the
+            # format was %s alone and the whole line went blank. It matters: mark_duplicates
+            # tests subject-set containment, and a branch whose only subject were "" would
+            # be contained in every set and so declared a copy of whatever outranked it.
+            if subject.strip():
+                b["subjects"].append(subject)
             if when.isdigit():
                 b["commits"].append({"at": int(when), "sha": sha})
         b["subjects"] = b["subjects"][:20]
