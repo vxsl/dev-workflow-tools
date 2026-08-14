@@ -857,8 +857,17 @@ def ledger_jira_stalled(days_min=None):
     return out, True
 
 
-def _slack(method, **params):
-    """One Slack Web API call on the user token, or None. Same contract as glab()."""
+def _slack_raw(method, **params):
+    """One Slack Web API call, and its whole answer whether or not Slack liked the call.
+
+    Only for callers that have to tell Slack's refusals apart, which so far means one:
+    `missing_scope` on a conversation is a permanent wall -- this token will never read a
+    DM's history and no amount of retrying changes that -- while a timeout or a 429 is an
+    outage. The same absence means "there is nothing here to see" in the first case and
+    "nobody looked" in the second, and slack_threads decides whether an acknowledgement may
+    be pruned on exactly that difference, so it cannot be collapsed into the None that
+    `_slack` collapses it into.
+    """
     token = os.environ.get("SLACK_USER_TOKEN")
     if not token:
         return None
@@ -866,10 +875,27 @@ def _slack(method, **params):
     req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
     try:
         with urllib.request.urlopen(req, timeout=30) as r:
-            d = json.load(r)
+            return json.load(r)
     except (urllib.error.URLError, json.JSONDecodeError, TimeoutError, OSError):
         return None
-    return d if d.get("ok") else None
+
+
+def _slack(method, **params):
+    """One Slack Web API call on the user token, or None. Same contract as glab()."""
+    d = _slack_raw(method, **params)
+    return d if d and d.get("ok") else None
+
+
+# Sweeps already made this process, by query. Two features want the same `from:me` window --
+# the ledger reads it for commitments and answered mentions, slack_threads reads it for
+# which threads Kyle took part in -- and they run at different points in main for reasons of
+# their own. Asking search the identical question twice would double the Slack budget of the
+# run to buy nothing, and worse, the two answers could disagree: a page that arrives for one
+# caller and 429s for the other puts a thread in the ledger and not on the card, or the
+# reverse, with nothing visible from either end to say which sweep was the short one. One
+# sweep, one completeness verdict, shared. In-process only, and deliberately: this is not a
+# cache of Slack between runs, it is one run not asking twice.
+_SWEEPS = {}
 
 
 def _slack_sweep(query, pages=4):
@@ -887,17 +913,35 @@ def _slack_sweep(query, pages=4):
     section over a wrong section: a caller that cannot say whether it saw everything must
     not be trusted to say what is gone.
     """
+    if (query, pages) in _SWEEPS:
+        return _SWEEPS[(query, pages)]
     out = []
     for page in range(1, pages + 1):
         d = _slack("search.messages", query=query, count=100, page=page,
                    sort="timestamp", sort_dir="desc")
         if not d:
+            # Not memoised: a sweep that failed halfway is the one answer worth asking for
+            # again, and the two callers are minutes apart in a run.
             return out, False
         matches = (d.get("messages") or {}).get("matches") or []
         out += matches
         if len(matches) < 100:
             break
+    _SWEEPS[(query, pages)] = (out, True)
     return out, True
+
+
+def _slack_window():
+    """The lookback in days and the `after:` date every sweep shares.
+
+    One place, because the two features that sweep must agree to the day: a thread joined
+    from a window one day wider than the ledger's would carry a decision the ledger's own
+    rows cannot corroborate, and the mismatch would only ever show up as a card that
+    disagrees with itself.
+    """
+    lookback = int(os.environ.get("WORK_ARCS_SLACK_LOOKBACK", "14"))
+    after = datetime.fromtimestamp(time.time() - 86400 * (lookback + 1)).strftime("%Y-%m-%d")
+    return lookback, after
 
 
 def _slack_text(body):
@@ -1336,10 +1380,8 @@ def ledger_slack():
               "Slack rows this run, and nothing pruned on their absence",
               file=sys.stderr)
         return [], [], False, False
-    lookback = int(os.environ.get("WORK_ARCS_SLACK_LOOKBACK", "14"))
+    lookback, after = _slack_window()
     settle = 86400 * int(os.environ.get("WORK_ARCS_SLACK_SETTLE_DAYS", "1"))
-    after = datetime.fromtimestamp(time.time() - 86400 * (lookback + 1)).strftime(
-        "%Y-%m-%d")
 
     # All three sweeps, and whether each of them saw everything. auth.test succeeding proves
     # a token existed a moment ago and nothing whatsoever about the three searches after it:
@@ -1418,6 +1460,505 @@ def ledger_slack():
     return they, you, True, complete
 
 
+# ── what Slack decided, joined to the work it decided about ────────────────────────────
+#
+# The last lens, and the only one whose evidence exists nowhere else on this machine. The
+# page can already read what the code says (branches, MRs, commits) and what the tickets
+# say (Jira status, sprints) -- and both of those are records of decisions already taken.
+# The taking happens in Slack, and a week later the only trace of "we agreed to drop the
+# array_has calls" is thirty messages deep in #tech-backend.
+#
+# The privacy line the plan draws (Kean sync, 01:04:30) is satisfied by construction rather
+# than by policy: only threads Kyle himself posted in, fetched with his own token, rendered
+# on a page only he can open. There is no version of this that reads a room he was not in.
+#
+# WHAT THE TOKEN CAN ACTUALLY SEE, measured 2026-08-14 rather than assumed:
+#
+#   scopes            identify, channels:history, groups:history, channels:read,
+#                     groups:read, search:read, users:read
+#   channel threads   conversations.replies works. 68 of the 78 channel threads Kyle posted
+#                     in over the window returned whole (has_more was false on every one)
+#   DMs               missing_scope, needed im:history
+#   group DMs         missing_scope, needed mpim:history -- the 10 of 78 that failed
+#
+# So the coverage question has a clean answer, and it decides the design. In a channel we
+# hold every message; in a DM we hold only what search happened to return, which measured
+# a median of about a fifth of the thread (1 of 86, 3 of 22, 15 of 34). A synthesis over a
+# fifth of a conversation is not a partial synthesis, it is a wrong one -- the message that
+# reverses the decision is exactly the one search did not return. So this synthesises only
+# threads it holds whole, says how many it therefore left alone, and never hedges an item.
+# The two scopes it lacks are the two most private places in Slack, which is a coincidence
+# worth keeping.
+#
+# The join is measured too. Reading only what the sweeps already hold (free, no new call)
+# joins 8 threads; reading each thread whole joins 18 of the same 68. More than half the
+# joins are ticket keys somebody OTHER than Kyle typed, in a thread he replied to without
+# repeating the key -- which is the normal shape of a conversation. So the fetch happens
+# before the join, not after it, and costs 78 calls in 18s sequentially, a few seconds
+# eight-wide.
+
+SLACK_THREAD_CACHE = (Path(os.environ.get("XDG_STATE_HOME",
+                                          Path.home() / ".local/state"))
+                      / "work-arcs" / "slack-threads.json")
+
+# A branch name is only usable as a join key if it could not plausibly be typed as prose.
+# Measured on this repo: of 405 branches, 291 clear both bars, and the 114 that do not are
+# almost all bare ticket keys (`UB-6802`) which the stronger ticket join already owns. What
+# the bars keep out is `main`, `fix`, `wip` -- names that would attach "this is the main
+# problem" to a workstream.
+BRANCH_JOIN_MIN = 8
+# Branch-shaped runs of text, to look up rather than to trust. Long enough to exclude
+# ordinary words, and a lookup against real branch names does the actual deciding.
+BRANCHY_RE = re.compile(r"[A-Za-z0-9][\w./-]{6,90}")
+
+
+def _thread_join_index(arcs):
+    """Every identifier that can attach a Slack thread to a workstream, and the arc it
+    belongs to.
+
+    Three kinds of key, and the order they are tried in is the order of how much a match
+    proves. A ticket key is a name for the work itself. A branch name is a name for one
+    piece of it, exact but only if the name is distinctive enough to survive being typed in
+    a sentence. An MR iid is exact and narrow -- it identifies a proposal rather than the
+    work, so it comes last.
+
+    First arc wins each key, matching tickets_to_arcs: where two arcs both name a key the
+    older mapping stands rather than flipping between runs.
+    """
+    tickets = tickets_to_arcs(arcs)
+    branches, mrs = {}, {}
+    for a in arcs:
+        for b in a.get("branches", []):
+            n = b["name"]
+            if len(n) >= BRANCH_JOIN_MIN and re.search(r"[-_/.]", n):
+                branches.setdefault(n.lower(), a)
+        for m in a.get("mrs") or []:
+            if m.get("iid") is not None:
+                mrs.setdefault(str(m["iid"]), a)
+    return {"tickets": tickets, "branches": branches, "mrs": mrs}
+
+
+def _join_thread(text, index):
+    """The arc a thread is about, how it was decided, and the identifier that decided it.
+
+    Returns (arc, "ticket UL-1744", "UL-1744") or (None, "", "").
+
+    A thread that names several arcs goes to the one it names most, because a passing
+    cross-reference is one mention and the subject is usually more. A dead tie goes to
+    whichever was mentioned first, and then -- because two arcs can be mentioned in the
+    same sentence -- to the lower arc id, so the answer does not depend on the order arcs
+    happen to arrive in. An unstable join would re-fingerprint a card's Slack block on
+    alternate runs and quietly un-acknowledge it.
+    """
+    hits = {}   # arc id -> [count, first position, arc, how, token]
+
+    def note(arc, how, token, at):
+        h = hits.get(arc["id"])
+        if h:
+            h[0] += 1
+            h[1] = min(h[1], at)
+        else:
+            hits[arc["id"]] = [1, at, arc, how, token]
+
+    upper = text.upper()
+    for m in TICKET_RE.finditer(upper):
+        arc = index["tickets"].get(m.group(0))
+        if arc:
+            note(arc, "ticket", m.group(0), m.start())
+    if not hits:
+        for m in BRANCHY_RE.finditer(text):
+            tok = m.group(0).lower().strip("./-")
+            # `origin/UB-6802-fix` is how a branch is quoted half the time it is quoted at
+            # all, and the remote prefix is not part of its name.
+            for cand in (tok, tok.split("/", 1)[1] if tok.startswith("origin/") else tok):
+                arc = index["branches"].get(cand)
+                if arc:
+                    note(arc, "branch", cand, m.start())
+                    break
+    if not hits:
+        for m in MR_MENTION_RE.finditer(text):
+            iid = m.group(1) or m.group(2)
+            arc = index["mrs"].get(iid)
+            if arc:
+                note(arc, "mr", "!" + iid, m.start())
+    if not hits:
+        return None, "", ""
+    n, at, arc, how, token = max(hits.values(), key=lambda h: (h[0], -h[1], h[2]["id"]))
+    return arc, f"{how} {token}", token
+
+
+def _thread_link(base, chan, ts, thread_ts=""):
+    """A permalink for a message conversations.replies returned, which carries none.
+
+    Slack's archive URL is derivable from the three ids, and derivable beats another API
+    call: every item this feature renders has to link the message it quotes, and asking
+    chat.getPermalink per message would be one call per rendered line.
+    """
+    link = f"{base}/archives/{chan}/p{ts.replace('.', '')}"
+    if thread_ts and thread_ts != ts:
+        link += f"?thread_ts={thread_ts}"
+    return link
+
+
+def _perma_id(url):
+    """(channel, ts) out of a Slack archive permalink, or None.
+
+    The identity of a message, for comparing two URLs that name it. Search writes
+    `?thread_ts=…&cid=…` on the end and our own constructed links do not, so string
+    equality would let the same message through twice -- once as a ledger row, once as a
+    decision -- which is the same fact in two registers reading as two facts.
+    """
+    m = re.search(r"/archives/([A-Z0-9]+)/p(\d{10})(\d{6})", url or "")
+    return (m.group(1), f"{m.group(2)}.{m.group(3)}") if m else None
+
+
+def _ledger_permalinks(ledger):
+    """Every Slack message the ledger already shows, as (channel, ts).
+
+    Both directions and both fields: a commitment quotes the promise, and a commitment
+    closed on evidence also quotes the message that closed it. Neither should come back as
+    a decision -- "you said you'd rerun the job" and "he will rerun the job" are one fact,
+    and the ledger's version has a clock on it.
+    """
+    seen = set()
+    for e in ((ledger or {}).get("they_owe") or []) + \
+             ((ledger or {}).get("you_owe") or []) + \
+             ((ledger or {}).get("you_owe_closed") or []):
+        for field in ("url", "closed_url"):
+            pid = _perma_id(e.get(field))
+            if pid:
+                seen.add(pid)
+    return seen
+
+
+def _drop_seen(items, chan, seen):
+    """Items whose message the ledger has not already spoken for."""
+    return [i for i in items if (chan, i.get("ts")) not in seen]
+
+
+SLACK_THREAD_PROMPT = """\
+Below is one Slack thread from a channel at Kyle's work, in order, one numbered line per
+message. It has already been matched to a piece of work he is doing: {arc}.
+
+Answer two questions about this thread and nothing else.
+
+DECIDED — what was settled here that somebody picking the work up would need to know: a
+choice made, an approach ruled out, a cause identified, a number agreed, an owner named.
+
+OPEN — what this thread raised and left standing: a question nobody answered, a blocker
+still in the way, something explicitly put off.
+
+At most two of each, and fewer is usually right. One good item beats two thin ones, and
+nothing at all beats a guess — this is read months later to remember what happened, and an
+invented decision is worse than a missing one. If you are unsure, leave it out.
+
+Leave out:
+- the thread's subject restated ("the team discussed the metric catalog")
+- greetings, thanks, scheduling, who is out, anything social
+- anything you have to infer more than one step to assert
+- an OPEN item that a later message in this same thread answers
+- a DECIDED item that no single message in the thread actually states
+
+Every item must name the ONE message number where the thing is said. If no single message
+says it, it is not an item.
+
+Reply with ONLY JSON, no prose:
+{"decided": [{"what": "<one short sentence>", "i": <message number>}],
+ "open": [{"what": "<one short sentence>", "i": <message number>}]}
+
+Both lists may be empty, and often should be.
+
+Thread:
+{thread}
+"""
+
+
+def _synthesise_threads(items, ledger):
+    """What each joined thread decided and left open, judged once per thread and cached.
+
+    One model call per thread rather than one per arc, and that is a decision against the
+    obvious batching. Batching an arc's three threads into one call saves two calls and
+    costs the cache: the key would then cover all three, so one new message in one thread
+    would invalidate the verdicts on the other two and re-pay for them. Over a sliding
+    14-day window that is not an edge case, it is most days. Per-thread keys are what make
+    a re-run free, and the calls run concurrently anyway, so the wall clock is one call
+    either way.
+
+    The permalink is not the model's to give. It returns a message NUMBER, and the quote
+    and the link are then read out of the message list here -- so principle 5 ("no claim
+    without its source one click away") is held by construction rather than trusted. An
+    item naming a message that does not exist is dropped rather than rendered bare.
+
+    The cache keys on the prompt and on every message in the thread, so a reworded question
+    cannot reuse yesterday's answers (item 1c) and a thread that grew is a new question.
+    Nothing is cached from a failed or unparseable call: the next run asks again rather than
+    remembering an accident as a verdict.
+    """
+    if not items:
+        return []
+    prompt_sha = hashlib.sha256(SLACK_THREAD_PROMPT.encode()).hexdigest()[:16]
+    cache = load_store(SLACK_THREAD_CACHE, "the Slack thread synthesis cache")
+    if cache.get("prompt") != prompt_sha:
+        cache = {"prompt": prompt_sha, "verdicts": {}}
+    verdicts = cache.setdefault("verdicts", {})
+
+    def numbered(t):
+        return "\n".join(
+            f"[{i}] {_slack_text(m.get('text'))}" for i, m in enumerate(t["msgs"]))
+
+    def key(t):
+        body = "\x00".join(f"{m.get('ts','')}\x1f{m.get('text','')}" for m in t["msgs"])
+        return hashlib.sha256(f"{t['arc']}\x00{body}".encode()).hexdigest()[:16]
+
+    fresh = [t for t in items if key(t) not in verdicts]
+    if fresh:
+        model = os.environ.get("WORK_ARCS_SLACK_THREAD_MODEL",
+                               os.environ.get("WORK_ARCS_COMMIT_MODEL", "sonnet"))
+        print(f"  slack: reading {len(fresh)} thread(s) for what they decided ({model})",
+              file=sys.stderr)
+
+        def ask(t):
+            prompt = (SLACK_THREAD_PROMPT
+                      .replace("{arc}", t["arc"])
+                      .replace("{thread}", numbered(t)))
+            try:
+                r = headless_claude.run(
+                    ["--model", model, "--dangerously-skip-permissions", prompt],
+                    timeout=180)
+                if r.returncode != 0:
+                    return None
+                return json.loads(re.search(r"\{.*\}", r.stdout, re.S).group(0))
+            except (OSError, subprocess.SubprocessError, ValueError,
+                    AttributeError, TypeError):
+                return None
+
+        jobs = max(1, int(os.environ.get("WORK_ARCS_SLACK_THREAD_JOBS", "6")))
+        with futures.ThreadPoolExecutor(max_workers=jobs) as pool:
+            answers = list(pool.map(ask, fresh))
+        wrote = False
+        for t, ans in zip(fresh, answers):
+            if not isinstance(ans, dict):
+                continue
+            keep = {}
+            for side in ("decided", "open"):
+                out = []
+                for f in (ans.get(side) or [])[:6]:
+                    try:
+                        i, what = int(f["i"]), str(f.get("what", "")).strip()
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    if what and 0 <= i < len(t["msgs"]):
+                        out.append({"what": what[:160], "ts": t["msgs"][i].get("ts", "")})
+                keep[side] = out[:2]
+            verdicts[key(t)] = keep
+            wrote = True
+        if wrote:
+            try:
+                SLACK_THREAD_CACHE.parent.mkdir(parents=True, exist_ok=True)
+                SLACK_THREAD_CACHE.write_text(json.dumps(cache))
+            except OSError:
+                pass
+
+    seen = _ledger_permalinks(ledger)
+    blocks = []
+    for t in items:
+        v = verdicts.get(key(t))
+        if not isinstance(v, dict):
+            continue
+        by_ts = {m.get("ts"): m for m in t["msgs"]}
+        sides = {}
+        for side in ("decided", "open"):
+            rows = []
+            for f in _drop_seen(v.get(side) or [], t["chan"], seen):
+                m = by_ts.get(f.get("ts"))
+                if not m:
+                    continue
+                rows.append({"what": f["what"],
+                             "quote": _clip(_slack_text(m.get("text")), 220),
+                             "url": _thread_link(t["base"], t["chan"],
+                                                 m.get("ts", ""), t["ts"])})
+            sides[side] = rows[:2]
+        if not (sides["decided"] or sides["open"]):
+            continue
+        last = t["msgs"][-1].get("ts", "")
+        blocks.append({
+            "arc": t["arc"], "arc_id": t.get("arc_id", t["arc"]),
+            "chan": t["chan"], "channel": t["name"],
+            "ts": t["ts"], "last_ts": last, "how": t["how"],
+            "messages": len(t["msgs"]),
+            "asked": datetime.fromtimestamp(float(last or 0)).strftime("%Y-%m-%d"),
+            "url": _thread_link(t["base"], t["chan"], t["ts"]),
+            "decided": sides["decided"], "open": sides["open"],
+            # The thread and its last word, so a reply revives an acknowledged block: a ✕
+            # means "I have read this thread", and a thread somebody has added to since is
+            # not the thread that was read.
+            "fp": _dfp("slack-thread", t["chan"], t["ts"], last)})
+    return blocks
+
+
+def _thread_messages(chan, ts):
+    """A thread's messages, and whether they are all of them.
+
+    Returns (messages, "whole" | "partial" | "denied" | "unknown"). The last two are the
+    ones that matter downstream and they are not the same absence: "denied" is this token
+    lacking im:history or mpim:history, which is permanent and structural -- that thread
+    will never be a row, so nothing is missing from a run that skipped it. "unknown" is a
+    timeout or a rate limit, where a row that should exist is absent and no one can say
+    which, and an acknowledgement must not be pruned on that.
+    """
+    d = _slack_raw("conversations.replies", channel=chan, ts=ts, limit=200)
+    if d is None:
+        return [], "unknown"
+    if not d.get("ok"):
+        return [], "denied" if d.get("error") == "missing_scope" else "unknown"
+    msgs = [m for m in (d.get("messages") or []) if (m.get("text") or "").strip()]
+    msgs.sort(key=lambda m: float(m.get("ts") or 0))
+    # Paged threads are excluded rather than paged. Measured, nothing in the window reaches
+    # 200 messages; a thread that did would be a channel-wide argument rather than a
+    # decision about one workstream, and half of one is the half that gets it wrong.
+    return msgs, ("partial" if d.get("has_more") else "whole")
+
+
+def slack_threads(arcs, ledger):
+    """Attach to each workstream what the Slack threads about it decided and left open.
+
+    Fills `arc["slack"]` and returns a report of what this cost and what it could not see.
+    The report is the load-bearing part: these blocks are ✕-acknowledgeable, so a run that
+    silently saw fewer threads than the last one would let apply_dismissals delete the
+    acknowledgements on the ones that never arrived -- the exact failure the hardening pass
+    closed for the ledger's own sweeps. `complete` here means every thread Kyle posted in
+    was either read whole or refused for a reason that will refuse it forever.
+    """
+    report = {"consulted": False, "complete": True, "threads": 0, "readable": 0,
+              "denied": 0, "unreadable": 0, "over_cap": 0, "joined": 0, "blocks": 0,
+              "why": ""}
+    if not os.environ.get("SLACK_USER_TOKEN"):
+        report["why"] = "no Slack token"
+        return report
+    who = _slack("auth.test") or {}
+    me = who.get("user_id")
+    if not me:
+        report.update(complete=False, why="Slack would not say who the token belongs to")
+        print("  slack: no thread lens this run — Slack would not say who the token "
+              "belongs to, and nothing is pruned on its absence", file=sys.stderr)
+        return report
+    report["consulted"] = True
+    _, after = _slack_window()
+    mine, ok_mine = _slack_sweep(f"from:<@{me}> after:{after}")
+    if not ok_mine:
+        report.update(complete=False, why="the from:me sweep did not finish")
+
+    # Threads Kyle himself posted in, newest first -- the whole population this feature is
+    # allowed to look at.
+    order, base = [], ""
+    threads = {}
+    for m in sorted(mine, key=lambda m: -float(m.get("ts") or 0)):
+        chan = (m.get("channel") or {}).get("id", "")
+        if not chan:
+            continue
+        if not base:
+            b = re.match(r"(https://[^/]+)/archives/", m.get("permalink") or "")
+            base = b.group(1) if b else ""
+        key = (chan, _thread_of(m))
+        if key not in threads:
+            name = (m.get("channel") or {}).get("name", "")
+            if re.fullmatch(r"[UDW][A-Z0-9]{8,}", name or ""):
+                name = ""
+            threads[key] = {"chan": chan, "name": name, "ts": key[1]}
+            order.append(key)
+    report["threads"] = len(order)
+    # The workspace address, which no message carries and every constructed link needs. Read
+    # off any permalink search returned, so it costs nothing and cannot be misconfigured; the
+    # loop above assigns `base` on whichever match has one, and it is stamped on the threads
+    # afterwards because the first few may have been seen before it was known.
+    if not base:
+        report.update(complete=False,
+                      why="no Slack permalink to read the workspace address from")
+        return report
+    for t in threads.values():
+        t["base"] = base
+
+    # DMs are refused before they are asked. This token holds channels:history and
+    # groups:history and neither im:history nor mpim:history, so conversations.replies on a
+    # `D…` channel is a certain missing_scope -- and measured, 141 of the 219 threads in the
+    # window are DMs. Asking anyway would treble the Slack calls of this feature to be told
+    # no 141 times. Group DMs cannot be recognised from their id (they are `C…` like any
+    # channel), so those are found the only way available, by being refused.
+    denied_upfront = [k for k in order if k[0].startswith("D")]
+    report["denied"] += len(denied_upfront)
+    order = [k for k in order if not k[0].startswith("D")]
+
+    # A ceiling on the fetch, said out loud when it bites. 78 channel threads is what the
+    # window holds today; a run that hits this has an incomplete Slack lens, and must say so
+    # rather than look like a quiet fortnight.
+    cap = int(os.environ.get("WORK_ARCS_SLACK_THREADS_MAX", "150"))
+    if len(order) > cap:
+        report["over_cap"] = len(order) - cap
+        report["complete"] = False
+        report["why"] = f"{len(order) - cap} thread(s) over the {cap}-thread ceiling"
+        print(f"  slack: {len(order)} channel threads in the window, reading the {cap} "
+              f"newest (WORK_ARCS_SLACK_THREADS_MAX) — the thread lens is incomplete "
+              "this run", file=sys.stderr)
+        order = order[:cap]
+
+    jobs = max(1, int(os.environ.get("WORK_ARCS_SLACK_THREAD_JOBS", "6")))
+    with futures.ThreadPoolExecutor(max_workers=jobs) as pool:
+        fetched = list(pool.map(lambda k: _thread_messages(k[0], k[1]), order))
+
+    index = _thread_join_index(arcs)
+    by_arc = defaultdict(list)
+    for key, (msgs, how) in zip(order, fetched):
+        if how == "denied":
+            report["denied"] += 1
+            continue
+        if how != "whole":
+            report["unreadable"] += 1
+            report["complete"] = False
+            continue
+        report["readable"] += 1
+        # Read whole, and holding nothing anyone could quote: a thread of attachment-only
+        # messages, an alert with no caption. Counted with the outages -- as it was, for one
+        # commit -- it made `complete` false, and that freezes the dismissal prune for every
+        # universe on the page. Not for a run: forever, because such a thread is in the
+        # window every day and comes back the same way every day. Measured, exactly one in
+        # the live window, and one was enough.
+        if not msgs:
+            continue
+        t = threads[key]
+        arc, why, _ = _join_thread(
+            " ".join(_slack_text(m.get("text")) for m in msgs), index)
+        if not arc:
+            continue
+        report["joined"] += 1
+        # The label is what the prompt is told the thread is about, because "UB-6802" or
+        # "release notes cherry-pick" is what a reader would call the work; the id is what
+        # the block is handed back on, because two arcs can carry the same label and only
+        # the id is an identity.
+        by_arc[arc["id"]].append({**t, "msgs": msgs, "arc": arc["label"],
+                                  "arc_id": arc["id"], "how": why})
+    if report["unreadable"]:
+        report["why"] = (report["why"]
+                         or f"{report['unreadable']} thread(s) Slack would not return")
+        print(f"  slack: {report['unreadable']} thread(s) could not be read this run — "
+              "the thread lens is incomplete, and nothing is pruned on its absence",
+              file=sys.stderr)
+
+    # One flat pass so every thread is judged in one pool, then handed back to its arc.
+    flat = [t for key in sorted(by_arc) for t in by_arc[key]]
+    blocks = _synthesise_threads(flat, ledger)
+    on = defaultdict(list)
+    for b in blocks:
+        on[b["arc_id"]].append(b)
+    for arc in arcs:
+        got = on.get(arc["id"]) or []
+        # Newest thread first, and a total tiebreak: two threads that end in the same second
+        # must not swap places between runs, or their blocks re-fingerprint for nothing.
+        got.sort(key=lambda b: (-float(b["last_ts"] or 0), b["chan"], b["ts"]))
+        arc["slack"] = got
+    report["blocks"] = len(blocks)
+    return report
+
+
 DISMISSED = (Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
              / "work-arcs" / "dismissed.json")
 
@@ -1448,9 +1989,10 @@ def apply_dismissals(ledger, arcs=None, gap=None, prune=False):
     longer matches any live row is deleted on sight -- either the loop closed (nothing
     to show) or the fact changed (a new row, undismissed, takes its place).
 
-    One store for every dismissable thing -- ledger rows, an arc's demands, a Jira
-    status-mismatch row -- so the page and the CLI cannot disagree about what has been
-    acknowledged. Pruning only runs when every universe was actually computed this run:
+    One store for every dismissable thing -- ledger rows, an arc's demands, an arc's Slack
+    thread blocks, a Jira status-mismatch row -- so the page and the CLI cannot disagree
+    about what has been acknowledged. Pruning only runs when every universe was actually
+    computed this run:
     a --no-mr run sees no ledger rows, and deleting their acknowledgements for that
     would punish a cheap run for being cheap.
 
@@ -1476,6 +2018,12 @@ def apply_dismissals(ledger, arcs=None, gap=None, prune=False):
         for d in arc.get("demands", []):
             if d.get("fp"):
                 live[d["fp"]] = d
+        # And the Slack blocks, one acknowledgement per thread rather than per item: a ✕
+        # there means "I have read this thread", and reading it is one act. Its fingerprint
+        # carries the thread's last message, so a reply revives the whole block.
+        for s in arc.get("slack") or []:
+            if s.get("fp"):
+                live[s["fp"]] = s
     for m in (gap or {}).get("status_mismatch") or []:
         if m.get("fp"):
             live[m["fp"]] = m
@@ -4418,6 +4966,10 @@ def main():
                    help="arc-cluster granularity passed through (see arc-cluster for why "
                         "2.0 rather than the 3.0 that predated session segments)")
     p.add_argument("--no-mr", action="store_true", help="skip the GitLab call")
+    p.add_argument("--no-slack-threads", action="store_true",
+                   help="skip the Slack thread lens: one conversations.replies per channel "
+                        "thread you posted in, plus a cached model pass per thread that "
+                        "joined a workstream. The ledger's own Slack rows are unaffected")
     p.add_argument("--shallow-mr", action="store_true",
                    help="skip the per-MR calls for unresolved review threads and pipeline "
                         "status; the list call alone still gives conflicts and approvals")
@@ -4682,6 +5234,21 @@ def main():
     for arc in arcs:
         mark_forgotten(arc)
 
+    # The Slack lens, after every other derivation, because the join reads a settled arc: a
+    # thread attaches through the arc's branch names, ticket keys and MR iids, and the second
+    # finalize pass, the split and the hand-set authoritative branch have all had their say
+    # by here. It is also the only pass that puts a model's words on a card, so it goes last
+    # for the plainer reason too -- everything above it is derived, and if it fails the page
+    # loses one section and nothing else.
+    # complete=False when the flag skipped it, and that is the opposite of what "no Slack
+    # token" reports. A token that does not exist means there are no blocks and never were,
+    # so nothing is missing; a flag means the blocks exist and this run chose not to look,
+    # and pruning their acknowledgements would punish a cheap run for being cheap. Same
+    # distinction --no-mr already makes for the ledger.
+    slack_lens = {"consulted": False, "complete": False, "why": "--no-slack-threads"}
+    if not args.no_slack_threads:
+        slack_lens = slack_threads(arcs, ledger)
+
     # Last of the finalize-order corrections, because everything before this point --
     # the second finalize pass, a hand-set authoritative branch -- recomputes demands
     # from scratch, and a mark applied any earlier would be recomputed away. Pruning
@@ -4700,8 +5267,15 @@ def main():
     #
     # Nothing else is conditional on this: the rows that DID arrive still get their
     # `dismissed` mark, so an outage costs a prune, never a shout.
+    # `slack_lens["complete"]` joins the gate for the same reason `ledger["complete"]` did:
+    # the thread blocks are a fifth dismissable universe, and a run where three
+    # conversations.replies calls timed out has blocks quietly missing. Note it is again
+    # completeness and not presence -- no token, or --no-slack-threads, means there are no
+    # blocks and there never were, so nothing can be missing and a stale acknowledgement on
+    # some OTHER universe must still be able to expire.
     apply_dismissals(ledger, arcs, gap,
                      prune=bool(ledger and ledger.get("complete")
+                                and slack_lens.get("complete")
                                 and gap is not None and args.json))
 
     # Before --active and --focus, and that is the whole point of the feature. The arcs
@@ -4797,6 +5371,13 @@ def main():
             "forgotten": forgotten_ids,
             "arcs": arcs,
             "ledger": ledger,
+            # What the Slack thread lens saw and what it could not, top-level because it is
+            # a fact about the run rather than about any one workstream -- and because the
+            # page's boundary note is read off it. `denied` is the two scopes this token
+            # will never hold (DMs and group DMs), which is why the count is large and
+            # stable rather than alarming; `unreadable` is an outage, and the only one of
+            # the two that makes `complete` false.
+            "slack_threads": slack_lens,
             # Top-level and beside `gap`, not inside it: the gap report is about
             # disagreement between the derived and declared pictures, and a sprint is
             # not a disagreement -- it is a second declared picture, with its own
@@ -4887,6 +5468,12 @@ def main():
               f"{','.join(bits):<28}{risk}")
         for d in a["demands"][:2]:
             print(f"        └ {d['what']}")
+        for s in a.get("slack") or []:
+            if s.get("dismissed"):
+                continue
+            for what in [f"decided: {x['what']}" for x in s["decided"]] \
+                    + [f"still open: {x['what']}" for x in s["open"]]:
+                print(f"        ⌁ #{s['channel'] or '?'} {what}")
     if fell:
         print("\n── fell off a cliff ─────────────────────────────────────")
         for a in fell:
