@@ -234,6 +234,17 @@ details.parked>summary b{color:var(--ink);font-weight:600}
   color:var(--ink-faint);white-space:nowrap;font-variant-numeric:tabular-nums}
 .parked-list .sub{grid-column:1/-1;font-family:var(--mono);font-size:.7rem;
   color:var(--ink-faint)}
+/* Work that fell off a cliff. Same compact row as the lists above, one column wider for
+   the sparkline and the ✕ — and the why-sentence is set as prose rather than as the faint
+   mono `.sub`, because on these rows it is not metadata about the row, it IS the row. */
+.parked-list.cliff li{grid-template-columns:minmax(0,1fr) auto auto auto}
+.parked-list.cliff[data-show="1"] li[data-dismissed="1"]{display:grid;opacity:.55}
+.cliff .why{grid-column:1/-1;font-size:.79rem;color:var(--ink-soft);text-wrap:pretty}
+.cliff .spark{align-self:center}
+.cliff .spark rect{fill:var(--ink-soft)}
+.cliff .spark .base{stroke:var(--hairline);stroke-width:1}
+.cliff .spark .now{stroke:var(--parked);stroke-width:1.2}
+.cliff .dis{align-self:center}
 
 .count{font-family:var(--mono);font-variant-numeric:tabular-nums}
 
@@ -659,6 +670,11 @@ INTERACT_JS = r"""
     // Everywhere else gets an auto-appended disclosure so nothing is concealed.
     document.querySelectorAll('[data-disgroup]').forEach(function(g){
       var hid=g.querySelectorAll('[data-fp][data-dismissed="1"]').length, t=g.__tog;
+      // A group whose heading carries its own count keeps the two honest: a section
+      // reading 6 above a list showing 2 is the sort of small lie that costs a page its
+      // credit for everything else on it.
+      var cf=g.dataset.countfor&&document.querySelector(g.dataset.countfor);
+      if(cf) cf.textContent=g.querySelectorAll('[data-fp]').length-hid;
       if(!t){ t=document.createElement('button'); t.type='button';
         t.className='showdis'; g.__tog=t; g.insertAdjacentElement('afterend',t);
         t.addEventListener('click',function(){
@@ -1047,6 +1063,63 @@ def fmt_interval(secs):
     else:
         n, unit = max(1, round(secs / 86400)), "day"
     return f"{n} {unit}" + ("" if n == 1 else "s")
+
+
+SPARK_W, SPARK_H = 96, 18
+
+
+def cliff_spark(act, span):
+    """One tick per active day, on a real time axis shared by the whole section, ending
+    at today.
+
+    The one thing on this page that draws a shape rather than states a fact, and it is here
+    because the shape *is* the claim: a dense band on the left and nothing at all on the
+    right is what "fell off a cliff" looks like, and it lands before a word has been read.
+
+    Three decisions make it legible with no legend, which was the condition for drawing it
+    at all.
+
+    The axis is time and not index, so the silence occupies its true width and the work its
+    true density. Pack the active days evenly instead and 18 days of work followed by 43 of
+    nothing renders identically to 18 days of steady work -- the exact confusion this
+    section exists to undo.
+
+    That axis is the *section's*, not the row's, so the rows are comparable to each other.
+    Scaled per row they are not, and the failure is specific: an 8-day cliff after two days
+    of work and a 43-day cliff after eighteen draw the same picture, sitting immediately
+    beside the column that says 8d and 43d. A chart that has to be corrected by the number
+    next to it is worse than no chart.
+
+    And the ticks are all one height. A height axis was drawn first and it lied: `units` is
+    transcript entries plus commits, and on UB-6908 a single 514-entry session flattened
+    sixteen genuine commit days to the minimum stroke, so the picture said "one spike then
+    nothing" about seventeen days of work. There is no honest scale for a sum of two
+    incommensurable things, and the log axis that would make it readable needs a sentence to
+    explain it, which is a legend. What the picture is for is *when*; how much is in the
+    sentence beside it, in words that can name both units.
+
+    aria-hidden, deliberately: every fact in it is in that sentence already, and announcing
+    it twice is worse for a screen reader than not drawing it at all.
+    """
+    series = act.get("series") or []
+    if not series or span <= 0:
+        return ""
+    w, h, pad = SPARK_W, SPARK_H, 1.5
+    bar = max(1.6, min(4.0, w / (span + 1)))
+    out = [f'<svg class="spark" width="{w}" height="{h}" viewBox="0 0 {w} {h}" '
+           'aria-hidden="true" focusable="false">']
+    for ago, _ in series:
+        # Clamped, not dropped: the domain is the section's longest history, so nothing can
+        # fall outside it -- but a day older than the axis would be drawn off the left edge
+        # rather than not at all, which is the one way this could silently lose evidence.
+        x = max(0.0, (span - min(ago, span)) / span * (w - bar))
+        out.append(f'<rect x="{x:.1f}" y="{pad}" width="{bar:.1f}" '
+                   f'height="{h - pad * 2:.1f}" rx="0.6"/>')
+    out.append(f'<line class="base" x1="0" y1="{h - pad:.1f}" x2="{w}" '
+               f'y2="{h - pad:.1f}"/>')
+    out.append(f'<line class="now" x1="{w - 0.6}" y1="0" x2="{w - 0.6}" y2="{h}"/>')
+    out.append("</svg>")
+    return "".join(out)
 
 
 def heat(arc):
@@ -1752,6 +1825,69 @@ def render(data, lede, focus_days, limit, cost=None):
             workstream_row(arc)
         a("</div>")
     a("</section>")
+
+    # --- work that fell off a cliff -----------------------------------------
+    # Not a filter over the page and not a rung: a lens. Every arc here also renders
+    # wherever it already rendered, because de-emphasis is not hiding and this section is
+    # making a claim about arcs rather than replacing their rows. Most of them have no row
+    # at all -- an arc that went quiet five weeks ago is by construction outside the focus
+    # window, which is precisely why nobody was going to notice it.
+    #
+    # Absent when empty, like the run-over-run strip and for the same reason: a section
+    # that says "0 forgotten" every morning trains you to stop reading it, and then the
+    # morning it says 1 you will not see that either.
+    fell = [x for x in data.get("arcs", [])
+            if ((x.get("activity") or {}).get("forgotten") or {}).get("verdict")]
+    fell.sort(key=lambda x: (x["activity"]["cliff_days"],
+                             -x["activity"]["invested"]["entries"],
+                             -x["activity"]["invested"]["commits"],
+                             str(x.get("label") or ""), str(x.get("id") or "")))
+    if fell:
+        here = {x.get("id") for x in arcs}
+        # One axis for every row: the longest history in the section, so the pictures can
+        # be read against each other rather than only against themselves.
+        cliff_span = max((d for x in fell for d, _ in x["activity"]["series"]), default=0)
+        a("<section>")
+        a('<div class="rung"><h2 id="cliff">Fell off a cliff</h2>'
+          f'<span class="n" data-count="cliff">{len(fell)}</span></div>')
+        a('<p class="note">Not the old work — <em>the dropped</em> work. Each of these '
+          "took real investment and then stopped dead, and nothing closed it: no merge, "
+          "no abandonment, no park, and nobody else holding it. The distinction is the "
+          "derivative rather than the level, so an arc worked lightly but steadily is "
+          "absent while one hammered for three days and dropped cold is here, and the "
+          "silence is measured against each arc&rsquo;s own rhythm rather than against "
+          "the calendar. Nothing is hidden from anywhere else by appearing here. "
+          "<strong>&#x2715; acknowledges a row</strong> — it is keyed to the day the arc "
+          "went quiet, so a single commit on it brings the row back by itself.</p>")
+        a('<ul class="parked-list cliff" data-disgroup data-countfor="[data-count=cliff]">')
+        for x in fell:
+            act, f = x["activity"], x["activity"]["forgotten"]
+            brief = x.get("brief") or {}
+            nm = esc(brief.get("name") or x.get("label", "?"))
+            # Linked only where the row exists. An anchor to a workstream the focus window
+            # never rendered is the same lie as a link to a 404 -- the run-over-run strip
+            # settled this already, and most rows here are outside the window.
+            named = (f'<a href="#{anchor(x.get("id"))}">{nm}</a>'
+                     if x.get("id") in here else nm)
+            tkt = x.get("ticket")
+            i = next((y for y in x.get("issues", []) if y.get("key") == tkt), {})
+            a(f'<li data-fp="{esc(f.get("fp",""))}" '
+              f'data-dismissed="{1 if f.get("dismissed") else 0}">')
+            # `UB-6918 UB-6918` on an arc the split pass never renamed: where the label is
+            # the key, printing both says the key twice and the name not at all.
+            key = (link(i.get("url", ""), esc(tkt), "key") + " "
+                   if tkt and nm != esc(tkt) else "")
+            a(f'<span class="nm">{key}{named}</span>')
+            a(cliff_spark(act, cliff_span))
+            a(f'<span class="ag" title="last active {esc(act.get("last_active") or "?")}">'
+              f'{act.get("cliff_days","?")}d</span>')
+            a('<button class="dis" type="button" aria-label="acknowledge — returns on its '
+              'own as soon as anything lands on this workstream" title="acknowledge — '
+              'returns on its own as soon as anything lands on this workstream">'
+              "&#x2715;</button>")
+            a(f'<span class="why">{esc(f.get("why",""))}</span>')
+            a("</li>")
+        a("</ul></section>")
 
     # Always emitted, even empty: parking happens in the page, so the client needs somewhere
     # to move a row to without inventing structure.

@@ -348,6 +348,129 @@ print(v(a)["verdict"])'
     [ "$output" = "False" ]
 }
 
+# ── the page ──────────────────────────────────────────────────────────────────
+
+# Runs a python snippet with arcs-page imported as `pg`.
+pg() {
+    python3 - "$REPO_ROOT/bin/arcs-page" <<PY
+import importlib.machinery, importlib.util, sys, re
+loader = importlib.machinery.SourceFileLoader("pg", sys.argv[1])
+spec = importlib.util.spec_from_loader("pg", loader)
+pg = importlib.util.module_from_spec(spec)
+sys.argv = ["pg"]
+loader.exec_module(pg)
+
+def act(*ago):
+    return {"series": [[d, 10] for d in sorted(ago, reverse=True)]}
+
+def xs(svg):
+    return [float(x) for x in re.findall(r'<rect x="([-0-9.]+)"', svg)]
+
+def hs(svg):
+    return {h for h in re.findall(r'height="([0-9.]+)" rx=', svg)}
+
+$1
+PY
+}
+
+# Renders a whole page from a minimal work-arcs document.
+page() {
+    python3 - "$REPO_ROOT/bin/arcs-page" "$1" <<'PY' > "$TEST_TMPDIR/page.html"
+import json, subprocess, sys
+doc = json.loads(sys.argv[2])
+r = subprocess.run([sys.executable, sys.argv[1], "--focus", "14"],
+                   input=json.dumps(doc), capture_output=True, text=True)
+sys.stderr.write(r.stderr)
+sys.stdout.write(r.stdout)
+PY
+    cat "$TEST_TMPDIR/page.html"
+}
+
+@test "the sparkline axis is the section's, so two rows can be read against each other" {
+    # Scaled per row, an 8-day cliff after two days' work and a 43-day cliff after
+    # eighteen draw the same picture -- immediately beside the column that says 8d and
+    # 43d. A chart the number next to it has to correct is worse than no chart.
+    run pg '
+span = 61
+near = xs(pg.cliff_spark(act(8, 9), span))
+far  = xs(pg.cliff_spark(act(43, 61), span))
+print(max(near) > max(far), round(max(near)), round(max(far)))'
+    [ "$output" = "True 82 28" ]
+}
+
+@test "every tick is the same height, because the units are not commensurable" {
+    # A height axis over entries-plus-commits flattened sixteen commit days of UB-6908 to
+    # the minimum stroke behind one 514-entry session, and said "one spike then nothing"
+    # about seventeen days of work.
+    run pg '
+svg = pg.cliff_spark({"series": [[3, 514], [4, 11], [9, 1]]}, 20)
+print(sorted(hs(svg)))'
+    [ "$output" = "['15.0']" ]
+}
+
+@test "nothing is drawn where there is nothing to draw" {
+    run pg '
+print(repr(pg.cliff_spark({"series": []}, 20)), repr(pg.cliff_spark(act(4), 0)))'
+    [ "$output" = "'' ''" ]
+}
+
+@test "a day older than the axis is clamped onto it, never drawn off the edge" {
+    # The domain is the section's longest history so this cannot arise -- but off-canvas
+    # is the one failure mode that would lose evidence silently rather than loudly.
+    run pg '
+print(min(xs(pg.cliff_spark(act(3, 90), 20))))'
+    [ "$output" = "0.0" ]
+}
+
+@test "the page has no cliff section when nothing fell off one" {
+    # Silence, not an empty state. A section reading "0 forgotten" every morning trains
+    # you to stop reading it, and then the morning it says 1 you will not see that either.
+    run page '{"generated": "2026-08-14T09:00:00-0700", "repo": "r", "arc_count": 1,
+      "arcs": [{"id": "A", "label": "A", "stage": "local-only", "state": "x",
+                "age_days": 1, "branches": [], "mrs": [], "stashes": [], "sessions": [],
+                "counts": {}, "demands": [], "issues": [],
+                "activity": {"series": [[1, 5]], "invested": {"entries": 5},
+                             "cliff_days": 1,
+                             "forgotten": {"verdict": false, "why": "still live"}}}]}'
+    [[ "$output" != *"Fell off a cliff"* ]]
+}
+
+@test "a forgotten row carries its sentence and an acknowledge control" {
+    run page '{"generated": "2026-08-14T09:00:00-0700", "repo": "r", "arc_count": 1,
+      "arcs": [{"id": "A", "label": "A", "stage": "local-only", "state": "x",
+                "age_days": 12, "branches": [], "mrs": [], "stashes": [], "sessions": [],
+                "counts": {}, "demands": [], "issues": [],
+                "activity": {"series": [[12, 5], [14, 9]],
+                             "invested": {"entries": 900, "commits": 0},
+                             "cliff_days": 12, "last_active": "2026-08-02",
+                             "forgotten": {"verdict": true, "fp": "deadbeefdeadbeef",
+                                           "why": "19 sessions across 3 days, then nothing for 12 days, never landed."}}}]}'
+    [[ "$output" == *"Fell off a cliff"* ]]
+    [[ "$output" == *"19 sessions across 3 days, then nothing for 12 days, never landed."* ]]
+    [[ "$output" == *'data-fp="deadbeefdeadbeef"'* ]]
+    [[ "$output" == *'class="dis"'* ]]
+    # In the focus window, so its name links to the row it also renders as.
+    [[ "$output" == *'<a href="#ws-a-'* ]]
+}
+
+@test "a forgotten arc outside the focus window is named but not linked" {
+    # Most of them are outside it -- an arc that went quiet five weeks ago is by
+    # construction hidden by a two-week window, which is why nobody was going to notice
+    # it. An anchor to a row that was never rendered is the same lie as a link to a 404.
+    run page '{"generated": "2026-08-14T09:00:00-0700", "repo": "r", "arc_count": 1,
+      "arcs": [{"id": "Zed", "label": "Zed", "stage": "local-only", "state": "x",
+                "age_days": 43, "branches": [], "mrs": [], "stashes": [], "sessions": [],
+                "counts": {}, "demands": [], "issues": [],
+                "activity": {"series": [[43, 5], [61, 9]],
+                             "invested": {"entries": 0, "commits": 426},
+                             "cliff_days": 43, "last_active": "2026-07-02",
+                             "forgotten": {"verdict": true, "fp": "f0f0f0f0f0f0f0f0",
+                                           "why": "426 commits across 18 days, then nothing for 43 days, never landed."}}}]}'
+    [[ "$output" == *"Fell off a cliff"* ]]
+    [[ "$output" == *"426 commits across 18 days"* ]]
+    [[ "$output" != *'href="#ws-zed-'* ]]
+}
+
 @test "a junk knob falls back to the measured default rather than to zero" {
     # An empty or unparseable env var must not silently turn the level test off, which
     # would make every quiet arc on the page read as forgotten.
