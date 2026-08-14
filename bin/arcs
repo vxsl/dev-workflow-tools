@@ -45,7 +45,28 @@ mkdir -p "$(dirname "$OUT")"
 # pipe reports the exit status of the last one, which meant a GitLab timeout in work-arcs
 # surfaced as arcs-page complaining that stdin was not JSON.
 COST="$STATE/cost.json"
-graph="$(mktemp)"; trap 'rm -f "$graph" "$graph.brief" "$COST.tmp"' EXIT
+SNAP="$STATE/snapshot.json"
+
+# The run-over-run baseline has to mean "the state the page last showed you". work-arcs
+# writes it as soon as it has computed the graph, which is before arc-brief and arcs-page
+# have had their chance to fail -- and a rebuild that died after moving the baseline would
+# silently swallow an interval's worth of changes. That is the exact failure the --snapshot
+# flag exists to prevent, arriving by a different door. So the old baseline is kept to one
+# side and put back unless we reach the end.
+finished=0
+graph="$(mktemp)"
+cleanup() {
+    rm -f "$graph" "$graph.brief" "$COST.tmp"
+    if [ "$finished" = 0 ] && [ -f "$SNAP.prev" ]; then
+        mv -f "$SNAP.prev" "$SNAP"
+        echo "  the rebuild did not finish, so the run-over-run baseline was put back —" >&2
+        echo "  the next page still diffs against the last one you actually saw" >&2
+    else
+        rm -f "$SNAP.prev"
+    fi
+}
+trap cleanup EXIT
+[ -f "$SNAP" ] && cp -p "$SNAP" "$SNAP.prev"
 
 # The quota position on either side of the run. This is the only place that knows a run is
 # happening, which is what makes the pair a measurement rather than an inference: every
@@ -54,7 +75,10 @@ graph="$(mktemp)"; trap 'rm -f "$graph" "$graph.brief" "$COST.tmp"' EXIT
 # silently with no credentials and no network, so this cannot fail the rebuild.
 arcs-cost --sample start || true
 
-work-arcs --json >"$graph"
+# --snapshot: this is the run whose state the next one is entitled to diff against. Every
+# other caller -- a test, an experiment, a one-off --json -- reads the baseline and leaves
+# it alone.
+work-arcs --json --snapshot >"$graph"
 if [ "$brief" = 1 ]; then
     arc-brief --from "$graph" >"$graph.brief"
     mv "$graph.brief" "$graph"
@@ -82,6 +106,7 @@ fi
 arcs-page --focus "$FOCUS" --out "$OUT" ${cost_arg+"${cost_arg[@]}"} \
     ${page_args+"${page_args[@]}"} <"$graph"
 
+finished=1
 echo
 echo "  page:  $OUT"
 if [ -n "$URL" ]; then

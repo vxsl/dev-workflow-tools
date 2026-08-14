@@ -24,8 +24,10 @@ label and lose their descriptions, which is the honest degradation.
 """
 
 import argparse
+import hashlib
 import html
 import json
+import re
 import sys
 import urllib.parse
 from datetime import datetime
@@ -376,6 +378,34 @@ td .dis{vertical-align:middle}
 .quiet{color:var(--ink-soft);font-size:.85rem;padding:.7rem .9rem;
   border:1px dashed var(--hairline);border-radius:4px}
 
+/* What moved on its own between the last build of this page and this one. A strip rather
+   than cards, because the whole claim being made is that there are only ever a handful --
+   and it is absent entirely when there are none, which is the load-bearing behaviour and
+   not a saving of space. Deliberately quieter than .news above it: that section is about
+   work whose clock is yours, this one is about work that moved while you were elsewhere,
+   and most of its rows are background arcs you were right not to be watching. */
+.lb{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;
+  border:1px solid var(--hairline);border-radius:4px;overflow:hidden}
+.lb li{display:grid;grid-template-columns:3.4rem minmax(9rem,15rem) 1fr;gap:.15rem .8rem;
+  align-items:baseline;padding:.5rem .8rem;font-size:.85rem;
+  border-top:1px solid var(--hairline)}
+.lb li:first-child{border-top:0}
+.lb li[data-bg="1"]{background:var(--surface-2)}
+.lb .ag{font-family:var(--mono);font-size:.7rem;color:var(--ink-faint);text-align:right}
+.lb li[data-bg="1"] .ag{color:var(--warm)}
+.lb .nm{font-weight:500}
+.lb .cls{display:flex;flex-direction:column;gap:.3rem;min-width:0}
+.lb .cl::before{content:"";display:inline-block;width:.45rem;height:.45rem;
+  border-radius:50%;margin-right:.45rem;vertical-align:.06rem;background:var(--ink-faint)}
+.lb .cl[data-k="conflict"]::before,.lb .cl[data-k="pipeline"]::before{
+  background:var(--hot)}
+.lb .cl[data-k="threads"]::before,.lb .cl[data-k="ledger"]::before{background:var(--warm)}
+.lb .cl[data-k="merged"]::before,.lb .cl[data-k="mergeable"]::before,
+.lb .cl[data-k="unconflict"]::before,
+.lb .cl[data-k="pipeline-green"]::before{background:var(--calm)}
+@media(max-width:640px){.lb li{grid-template-columns:3.4rem 1fr}
+  .lb .cls{grid-column:1/-1}}
+
 /* The conditions, as peers. There is no defensible exchange rate between "a reviewer asked a
    question six days ago" and "79 commits exist nowhere but this laptop" -- ranking them
    against each other invents one, and the swathe of unpublished work is a primary problem
@@ -673,6 +703,17 @@ INTERACT_JS = r"""
       if(side){ side.dataset.show=(side.dataset.show==='1')?'0':'1'; apply(); } }
   });
 
+  // A row linked from the run-over-run strip is a collapsed <details>, so jumping to it
+  // lands you on a summary line that says nothing you did not just read. Open it.
+  function openTarget(){
+    var el=location.hash&&document.querySelector(location.hash);
+    if(!el) return;
+    var d=el.tagName==='DETAILS'?el:el.closest('details');
+    if(d){ d.open=true; d.scrollIntoView({block:'center'}); }
+  }
+  window.addEventListener('hashchange', openTarget);
+  openTarget();
+
   if(saveDis) saveDis.addEventListener('click',function(){
     var out={}, now=Math.floor(Date.now()/1000);
     Object.keys(dstore).forEach(function(k){
@@ -954,6 +995,19 @@ def urlq(x):
     return urllib.parse.quote(str(x), safe="")
 
 
+def anchor(arc_id):
+    """A stable in-page id for a workstream row, so another section can link to it.
+
+    Slug plus a hash of the identity rather than the slug alone: arc labels are unique
+    within a run but their slugs are not -- `selected state` and `selected-state` are the
+    same slug, and the split pass has been observed emitting both names for the same arc
+    within one evening. Two rows sharing an id makes one of them unreachable.
+    """
+    slug = re.sub(r"[^a-z0-9]+", "-", str(arc_id).lower()).strip("-")[:40]
+    h = hashlib.sha1(str(arc_id).encode()).hexdigest()[:6]
+    return f"ws-{slug}-{h}" if slug else f"ws-{h}"
+
+
 def link(url, text, cls=""):
     """A hyperlink where there is somewhere to go, and plain text where there is not.
 
@@ -975,6 +1029,24 @@ def fmt_day(epoch):
         return datetime.fromtimestamp(epoch).strftime("%-d %b")
     except (ValueError, OSError, OverflowError):
         return "no date recorded"
+
+
+def fmt_interval(secs):
+    """A gap between two builds, in the coarsest unit that still says something.
+
+    Rounded up rather than truncated, because a 50-minute gap reported as "0 hours" reads
+    as a bug. Empty string when the gap is unknown, so the sentence can simply omit it
+    instead of printing a placeholder.
+    """
+    if not isinstance(secs, int) or secs < 0:
+        return ""
+    if secs < 5400:
+        n, unit = max(1, round(secs / 60)), "minute"
+    elif secs < 129600:
+        n, unit = max(1, round(secs / 3600)), "hour"
+    else:
+        n, unit = max(1, round(secs / 86400)), "day"
+    return f"{n} {unit}" + ("" if n == 1 else "s")
 
 
 def heat(arc):
@@ -1180,6 +1252,20 @@ def render(data, lede, focus_days, limit, cost=None):
     a(f"<span>{len(arcs)} workstreams touched &le; {focus_days}d"
       + (f", of {total}" if total and total != len(arcs) else "") + "</span>")
     a(f"<span>{len(live)} in play, {len(arcs) - len(live)} settled or parked</span>")
+    # The run-over-run diff renders as a section of its own further down, and is absent
+    # when nothing moved. Absent is right for the section and wrong for the mechanism: a
+    # comparison that has silently stopped comparing looks exactly like a quiet night. So
+    # the stamp -- which is already where facts about the build live -- says which it was,
+    # in the smallest type on the page.
+    sincer = data.get("since_last_run") or {}
+    if sincer.get("previous_generated"):
+        n, ago = sincer.get("changed") or 0, fmt_interval(sincer.get("interval_seconds"))
+        was = f" ({esc(ago)} ago)" if ago else ""
+        a("<span>" + (f"nothing changed since the last build{was}" if not n
+                      else f"{n} of {sincer.get('compared', 0)} workstreams changed "
+                           f"since the last build{was}") + "</span>")
+    elif sincer.get("why"):
+        a(f'<span>no run-over-run diff — {esc(sincer["why"])}</span>')
     a("</div>")
     lede = lede or derive_lede(data, focus_days)
     if lede:
@@ -1260,7 +1346,7 @@ def render(data, lede, focus_days, limit, cost=None):
                 ref = link(f.get("url", ""), "!" + str(f.get("iid", "?")))
             tkt = arc.get("ticket")
             i = next((x for x in arc.get("issues", []) if x.get("key") == tkt), {})
-            a("<li><span class=\"nm\">"
+            a(f'<li id="{anchor(arc.get("id"))}"><span class="nm">'
               + (link(i.get("url", ""), esc(tkt), "key") + " " if tkt else "")
               + f'{nm}</span>'
               f'<span class="mr">{ref or "&mdash;"}</span>'
@@ -1288,7 +1374,8 @@ def render(data, lede, focus_days, limit, cost=None):
         nm = esc(brief.get("name") or arc.get("label", "?"))
         age = arc.get("age_days", 0)
         when = "today" if age <= 0 else (f"{age}d ago")
-        a(f'<details class="ws" data-key="{esc(arc.get("label",""))}" '
+        a(f'<details class="ws" id="{anchor(arc.get("id"))}" '
+          f'data-key="{esc(arc.get("label",""))}" '
           f'data-fp="{esc(arc.get("fingerprint",""))}" '
           f'data-stage="{esc(arc.get("stage") or "")}" '
           f'data-parked="{1 if arc.get("parked") else 0}">')
@@ -1415,6 +1502,80 @@ def render(data, lede, focus_days, limit, cost=None):
             a("</div>")
         a("</div>")
     a("</section>")
+
+    # --- what moved between the last build and this one ---------------------
+    # A different clock from the section above it, and the two must not be merged. "Since
+    # you last touched them" is measured against your own last commit or session; this is
+    # measured against the previous build of this page. An arc can be in one and not the
+    # other: something that came back a week ago and you have not looked at is news by the
+    # first clock and old by the second, and something that broke overnight on work you
+    # touched this morning is the reverse.
+    #
+    # Silent when nothing moved -- no heading, no empty-state, nothing. That silence is the
+    # plan's rule for the background layer, not a rendering shortcut: the page earns the
+    # right to say "3 of your 58 background workstreams changed" only by saying nothing at
+    # all on the mornings when none did. The one concession is a chip in the stamp line at
+    # the top, because a mechanism that has quietly stopped working looks identical to a
+    # quiet night, and the stamp is already where facts about the build live.
+    #
+    # No ✕ on these lines, unlike every other list on the page. A dismissal is a
+    # content-fingerprinted acknowledgement, and it is worth persisting because the fact it
+    # acknowledges outlives it. A diff line describes one interval and is gone on the next
+    # build whether or not anyone looked, so there is nothing for an acknowledgement to
+    # expire against -- only rows in the store that could never be pruned.
+    since = data.get("since_last_run") or {}
+    diffs = since.get("changes") or []
+    if diffs:
+        shown = {x.get("id") for x in arcs}
+        by_id = {x.get("id"): x for x in data.get("arcs", [])}
+        bg = sum(1 for c in diffs if c.get("id") not in shown)
+        ago = fmt_interval(since.get("interval_seconds"))
+        a("<section>")
+        a("<h2>Since the last build</h2>")
+        note = ["What moved on its own in the "
+                + (f"{esc(ago)} " if ago else "") + "since this page was last built — "
+                "a different clock from the section above, which is measured against "
+                "<em>your</em> last commit. Nothing here needs acknowledging: each line "
+                "describes one interval and is gone by the next build."]
+        if bg:
+            # The sentence the whole feature exists for. These are arcs the focus window
+            # deliberately hides, and they are the ones most worth a line: nobody was
+            # watching them, which is exactly why something moving there is news.
+            outside = len(data.get("arcs", [])) - len(arcs)
+            note.append(f"<strong>{bg} of the {outside} workstreams outside the last "
+                        f"{focus_days} days moved</strong>, and "
+                        + ("has" if bg == 1 else "have")
+                        + " no row below — the age is marked on "
+                        + ("it" if bg == 1 else "each") + ".")
+        a(f'<p class="note">{" ".join(note)}</p>')
+        a('<ul class="lb">')
+        for c in diffs:
+            here = c.get("id") in shown
+            arc = by_id.get(c.get("id")) or {}
+            nm = esc((arc.get("brief") or {}).get("name") or c.get("label") or "?")
+            age = c.get("age_days")
+            a(f'<li data-bg="{0 if here else 1}">')
+            why = ("in the window below" if here
+                   else "outside the window below, so it has no row there")
+            a(f'<span class="ag" title="{why}">'
+              + (f"{esc(age)}d" if isinstance(age, int) else "&mdash;") + "</span>")
+            tkt = c.get("ticket")
+            i = next((x for x in arc.get("issues", []) if x.get("key") == tkt), {})
+            # The name links to its own row where there is one, and stays plain text where
+            # the window hides it -- an anchor to a row that was never rendered is the
+            # same lie as a link to a 404.
+            named = (f'<a href="#{anchor(c.get("id"))}">{nm}</a>' if here else nm)
+            a('<span class="nm">'
+              + (link(i.get("url", ""), esc(tkt), "tkt") + " &middot; " if tkt else "")
+              + named + "</span>")
+            a('<span class="cls">')
+            for e in c.get("evidence") or []:
+                a(f'<span class="cl" data-k="{esc(e.get("kind",""))}">'
+                  + link(e.get("url", ""), esc(e.get("what", ""))) + "</span>")
+                for q in (e.get("quotes") or [])[:2]:
+                    a(f"<blockquote>{esc(q)}</blockquote>")
+            a("</span></li>")
+        a("</ul></section>")
 
     # --- the waiting-on ledger ----------------------------------------------
     # Both directions of "who is waiting on whom", which is what todo.md was for and

@@ -26,10 +26,13 @@ rename.
   work-arcs --json                 the graph
   work-arcs                        a summary, most recently touched first
   work-arcs --active 14            only arcs touched in the last 14 days
+  work-arcs --json --snapshot      the graph, and leave a baseline for the next run
 
-Read-only. Runs git and glab, writes nothing -- the one nuance is that an MR with no
-cached mergeability verdict gets a recompute requested (see collect_mrs), which changes
-no state anyone can see, only whether GitLab knows its own answer.
+Read-only by default. Runs git and glab; the two nuances are that an MR with no cached
+mergeability verdict gets a recompute requested (see collect_mrs), which changes no state
+anyone can see, only whether GitLab knows its own answer -- and that --snapshot writes the
+run-over-run baseline that `since_last_run` is diffed against. That write is opt-in for a
+reason: see write_snapshot.
 """
 
 import argparse
@@ -2318,9 +2321,19 @@ def demands(arc):
                         f"{', '.join(who)} spoke last"
                         + (f", oldest {oldest}" if oldest else ""))
             newest = max((_day_epoch(t.get("last_at", "")) for t in group), default=0)
+            # `sig` exists only to sharpen the run-over-run fingerprint below, and is
+            # folded into it and dropped. `what` alone is too blunt for that job: only the
+            # first note of a thread is quoted, so a reviewer adding a third comment to an
+            # existing thread leaves the count, the names and the oldest date all
+            # unchanged. Who spoke last and how many notes deep it is are the fields that
+            # actually move, so they are what the fingerprint is taken over.
             out.append({"kind": kind, "what": what,
                         "quotes": [t["quote"] for t in group if t.get("quote")],
-                        "url": m.get("url", ""), "at": newest})
+                        "url": m.get("url", ""), "at": newest,
+                        "sig": sorted(
+                            "|".join((t.get("author", ""), t.get("at", ""),
+                                      t.get("last_by", ""), t.get("last_at", ""),
+                                      str(t.get("notes", 0)))) for t in group)})
         pipe = m.get("pipeline") or {}
         if pipe.get("status") in ("failed", "canceled"):
             out.append({"kind": "pipeline",
@@ -2428,9 +2441,18 @@ def demands(arc):
     # The arc's label disambiguates: "3 commits exist nowhere but this laptop" is the
     # same sentence on many arcs, and without the label one ✕ would acknowledge all of
     # them at once.
+    #
+    # `rfp` is the same fact fingerprinted for a different question -- did this move
+    # since the last build -- and it deliberately leaves the label OUT. Measured this
+    # week: the split pass reworded one arc "selected state" -> "selected-state" -> back
+    # within an evening, and a run-over-run comparison keyed on `fp` would have reported
+    # every demand on it as brand new both times. The label is presentation; the MR ref,
+    # the sentence and the thread signature are the fact.
     for d in out:
         d["fp"] = _dfp("demand", arc.get("label"), d.get("kind"), d.get("what"),
                        d.get("url"))
+        d["rfp"] = _dfp("run", d.get("kind"), d.get("what"), d.get("url"),
+                        *(d.pop("sig", None) or []))
     return out
 
 
@@ -2684,6 +2706,495 @@ def finalize(arc, repo=None, main_ref="origin/main"):
     arc["sessions"].sort(key=lambda s: (-s["last"], s["id"]))
 
 
+# ── what moved since the last build ────────────────────────────────────────────
+#
+# The plan's load-bearing rule for the background layer: it is silent unless something
+# changed under you. Not "here are 155 arcs" but "of your 58 background arcs, 3 changed
+# overnight: a pipeline failed, one got a review comment, one was reassigned to you."
+# That sentence is not derivable from one run, so each run leaves a snapshot behind and
+# the next one diffs against it.
+#
+# Two clocks must not be confused. `notify` already answers "what came back since *I*
+# last touched this", and its clock is your own last commit or session. This one answers
+# "what moved since the page was last built", and its clock is the previous run. The same
+# fact can be news to one and not the other, and the page renders them in separate
+# sections for exactly that reason.
+#
+# Nothing here is dismissable, deliberately. A dismissal is a content-fingerprinted
+# acknowledgement that has to outlive the thing it acknowledges long enough to be useful;
+# a diff line describes one interval and is gone on the next run whether or not anybody
+# looked at it. There is nothing for an acknowledgement to expire against, so adding the
+# machinery would only give the store rows that can never be pruned.
+SNAPSHOT = (Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
+            / "work-arcs" / "snapshot.json")
+# Bumped whenever a field below changes meaning. A snapshot at any other version is
+# discarded with a note rather than read: half-understood state is worse than none,
+# because it produces confident sentences about changes that never happened.
+SNAPSHOT_V = 1
+
+# Merge-status values that mean "GitLab has not worked it out yet". They must never be
+# one end of a reported transition. collect_mrs deliberately asks GitLab to recompute the
+# verdict for any MR reading `unchecked`, precisely so the NEXT run knows -- so
+# unchecked → conflict is the recheck landing, not the branch breaking, and reporting it
+# as "stopped merging" would make this feature lie on a schedule of its own making.
+MERGE_UNKNOWN = frozenset(("", "unchecked", "checking", "preparing", "unknown"))
+
+# Worst first. Within an arc these order its sentences; across arcs the best sentence
+# orders the arc. Every value is distinct except merged/closed, which are the same event
+# from the page's point of view.
+CHANGE_RANK = {
+    "conflict": 0,        # the branch stopped merging
+    "pipeline": 1,        # it went red
+    "threads": 2,         # a reviewer asked you something and is waiting
+    "ledger": 3,          # a new open loop with a person on the other end
+    "merged": 4,          # it landed
+    "closed": 4,          # it was closed without landing
+    "ticket": 5,          # its ticket moved in Jira
+    "stage": 6,           # the rung it sits on moved
+    "mergeable": 7,       # it became mergeable
+    "unconflict": 8,      # it merges again
+    "pipeline-green": 9,  # it went green again
+}
+
+MR_REF_RE = re.compile(r"^!(\d+)$")
+
+
+def arc_mr_state(arc):
+    """Every merge request this arc has, open or finished, keyed by iid as a string.
+
+    Open ones come from the list call; finished ones exist only as the fate stamped on a
+    branch, because collect_mrs asks for state=opened and a merged MR simply stops being
+    returned. Both have to be recorded or "!10398 merged" is indistinguishable from
+    "!10398 vanished", which is the one transition a morning brief most needs to state.
+
+    Open state is written second on purpose: it comes from the fresher call, so where the
+    two disagree about one iid the live one wins.
+    """
+    out = {}
+    for b in arc.get("branches", []):
+        f = b.get("mr_fate") or {}
+        if f.get("iid"):
+            out[str(f["iid"])] = {"state": f.get("state") or "", "merge_state": "",
+                                  "conflicts": False, "pipeline": "",
+                                  "url": f.get("url") or "", "at": f.get("at") or ""}
+    for m in arc.get("mrs", []):
+        if not m.get("iid"):
+            continue
+        out[str(m["iid"])] = {
+            "state": "opened",
+            "merge_state": m.get("merge_state") or "",
+            "conflicts": bool(m.get("conflicts")),
+            "pipeline": (m.get("pipeline") or {}).get("status") or "",
+            "url": m.get("url") or "",
+            "at": (m.get("updated") or "")[:10],
+        }
+    return out
+
+
+def _ledger_rows(ledger):
+    return ((ledger or {}).get("they_owe") or []) + ((ledger or {}).get("you_owe") or [])
+
+
+def _mr_ref(ref):
+    m = MR_REF_RE.match(str(ref or ""))
+    return int(m.group(1)) if m else None
+
+
+def snapshot_of(arcs, ledger, known, repo, generated):
+    """The smallest per-arc state the next run needs to say what moved, and no more.
+
+    Everything here is either an identity (the branch set), a fact that can move on its
+    own (a merge state, a pipeline, a ticket status, an MR's fate), or a fingerprint of
+    one (review threads, ledger rows). Notably absent: every counter that ticks by itself.
+    `days`, `age_days` and `engagement` change on every run without anything happening,
+    and storing them would guarantee a snapshot that always differs from the next one.
+
+    Ledger rows are attributed to an arc through its merge requests, which is the only
+    join that exists -- the ledger is a by-person view and an arc is a by-work one, and
+    `!10438` is the single ref they share. Rows about other people's merge requests
+    therefore attach to no arc at all, correctly: reviewing someone else's branch is not
+    a development on any workstream of yours.
+    """
+    by_fp = {}
+    for e in _ledger_rows(ledger):
+        iid = _mr_ref(e.get("ref"))
+        if iid is not None and e.get("fp"):
+            by_fp.setdefault(iid, []).append(e["fp"])
+    rows = []
+    for arc in arcs:
+        mrs = arc_mr_state(arc)
+        iids = {int(k) for k in mrs}
+        led = sorted({fp for iid in iids for fp in by_fp.get(iid, [])})
+        rows.append({
+            "id": arc.get("id"),
+            # Kept for the stderr notes and for reading the file by hand. Nothing compares
+            # on it -- see match_runs for why the label is not an identity.
+            "label": arc.get("label"),
+            "ticket": arc.get("ticket"),
+            "branches": sorted(b["name"] for b in arc.get("branches", [])),
+            "stage": arc.get("stage"),
+            "state": arc.get("state"),
+            "settled": arc.get("settled"),
+            "own_activity": arc.get("own_activity", 0),
+            "mrs": mrs,
+            # Only the bucket where the counterparty spoke last. The `unresolved` bucket
+            # -- threads you answered that nobody clicked Resolve on -- grows when *you*
+            # reply, so reporting it would turn your own reply into news.
+            "threads": sorted({d["rfp"] for d in arc.get("demands", [])
+                               if d.get("kind") == "threads" and d.get("rfp")}),
+            "ledger": led,
+            "issues": {i["key"]: (i.get("status") or "")
+                       for i in arc.get("issues", []) if i.get("key")},
+        })
+    rows.sort(key=lambda r: (r["label"] or "", r["id"] or ""))
+    return {"v": SNAPSHOT_V, "generated": generated, "repo": repo,
+            # Which universes this run actually consulted. A --no-mr run knows nothing
+            # about merge requests, and the difference between "no MRs" and "nobody
+            # looked" is the difference between a fact and a fabrication -- so the diff
+            # skips any comparison whose universe was missing on either side, the same
+            # discipline apply_dismissals uses before it prunes.
+            "known": known, "arcs": rows}
+
+
+def load_snapshot(repo):
+    """The previous run's snapshot, or None with the reason it is not being used."""
+    try:
+        snap = json.loads(SNAPSHOT.read_text())
+    except FileNotFoundError:
+        return None, "no previous snapshot to compare against"
+    except (OSError, ValueError) as e:
+        print(f"work-arcs: ignoring {SNAPSHOT} — it could not be read ({e})",
+              file=sys.stderr)
+        return None, "the previous snapshot could not be read"
+    if not isinstance(snap, dict) or snap.get("v") != SNAPSHOT_V:
+        got = snap.get("v") if isinstance(snap, dict) else "?"
+        print(f"work-arcs: discarding snapshot v{got} — this build writes v{SNAPSHOT_V}, "
+              "so nothing is compared this run", file=sys.stderr)
+        return None, f"the previous snapshot is v{got}, this build reads v{SNAPSHOT_V}"
+    if snap.get("repo") and repo and snap.get("repo") != repo:
+        print(f"work-arcs: discarding a snapshot of {snap['repo']!r} — this run is "
+              f"{repo!r}", file=sys.stderr)
+        return None, f"the previous snapshot was taken of a different repo ({snap['repo']})"
+    return snap, None
+
+
+def match_runs(prev_arcs, cur_arcs):
+    """Pair last run's arcs with this run's by branch membership, never by label.
+
+    The label cannot be the identity. Measured this week: the split pass reworded the same
+    arc "selected state" -> "selected-state" -> back within one evening, so a comparison
+    keyed on the name would have reported that arc as deleted and recreated twice, with
+    every fact on it fresh news both times. The branch set is what the arc actually is.
+
+    Same referent as apply_detached, and for the same reason: a detachment records the
+    co-members it was declared against rather than the label, and applies while most of
+    them are still what the branch is grouped with. Here the test is applied in both
+    directions and made strict -- a *majority* of each side's branches shared, more than
+    half rather than at least half -- which buys a property worth the extra character:
+    the pairing is unique and needs no tie-breaking at all. Two disjoint subsets cannot
+    each be more than half of the same set, so no old arc can qualify against two new
+    ones and no new arc against two old ones. A 50/50 split of a two-branch arc, the one
+    case a >= test would have had to guess at, falls out as unmatched instead.
+
+    Everything unmatched is classified but never compared. Last run's side (`was`):
+
+      split       its branches now spread across two or more new arcs
+      absorbed    all its branches went to one new arc, as a minority of it
+      disappeared none of its branches survive at all
+
+    and this run's side (`now`):
+
+      merged      it holds branches from two or more of last run's arcs
+      split_off   it holds the minority half of one arc that split
+      appeared    it holds no branch the last run had seen
+
+    A regrouped arc is silent on purpose. Its stage, its state and its demands are all
+    derived from its membership, so when the membership is what moved there is no honest
+    way to say whether anything changed *under* you -- and the plan's fifth principle
+    prices that trade explicitly: a wrong "changed under you" costs more trust than a
+    missed one.
+    """
+    prev_sets = [set(a.get("branches") or []) for a in prev_arcs]
+    cur_sets = [set(a.get("branches") or []) for a in cur_arcs]
+    where = defaultdict(list)
+    for i, s in enumerate(prev_sets):
+        for b in s:
+            where[b].append(i)
+    shared = defaultdict(int)
+    for j, s in enumerate(cur_sets):
+        for b in s:
+            for i in where.get(b, ()):
+                shared[(i, j)] += 1
+
+    pairs, took_prev, took_cur = [], set(), set()
+    for (i, j), n in shared.items():
+        if n * 2 > len(prev_sets[i]) and n * 2 > len(cur_sets[j]):
+            pairs.append((i, j))
+            took_prev.add(i)
+            took_cur.add(j)
+    # Uniqueness is a property of the test above, not of this ordering -- but the output
+    # is ordered anyway, on the identity rather than on dict insertion, so two runs over
+    # the same data produce byte-identical JSON.
+    pairs.sort(key=lambda p: ((prev_arcs[p[0]].get("label") or "",
+                               prev_arcs[p[0]].get("id") or ""),
+                              (cur_arcs[p[1]].get("label") or "",
+                               cur_arcs[p[1]].get("id") or "")))
+
+    was = []
+    for i, s in enumerate(prev_sets):
+        if i in took_prev:
+            continue
+        lands = {j for b in s for j in range(len(cur_sets)) if b in cur_sets[j]}
+        how = "disappeared" if not lands else ("split" if len(lands) > 1 else "absorbed")
+        was.append({"label": prev_arcs[i].get("label"), "how": how,
+                    "into": sorted(cur_arcs[j].get("label") or "" for j in lands)})
+    now = []
+    for j, s in enumerate(cur_sets):
+        if j in took_cur:
+            continue
+        came = {i for b in s for i in where.get(b, ())}
+        # One source that did not qualify as a match means this arc holds the smaller half
+        # of something that split -- not a merge, whatever the count of sources says.
+        how = "appeared" if not came else ("merged" if len(came) > 1 else "split_off")
+        now.append({"label": cur_arcs[j].get("label"), "how": how,
+                    "from": sorted(prev_arcs[i].get("label") or "" for i in came)})
+    was.sort(key=lambda r: (r["how"], r["label"] or ""))
+    now.sort(key=lambda r: (r["how"], r["label"] or ""))
+    return pairs, {"was": was, "now": now}
+
+
+LEDGER_SAYS = {
+    "review-owed": lambda w, r: f"{w} asked for your review of {r}",
+    "reply-owed": lambda w, r: f"{w} answered your comment on {r} — your turn",
+    "review-silence": lambda w, r: f"still no response from {w} on {r}",
+}
+
+
+def _who(e):
+    w = e.get("who")
+    return ", ".join(w) if isinstance(w, list) else (w or "someone")
+
+
+def diff_runs(prev, cur, arcs, ledger):
+    """What moved between the previous snapshot and this run, one entry per arc.
+
+    Grouped by arc rather than by fact, because that is the shape of the sentence the plan
+    asks for: "3 of your background arcs changed overnight" needs a count of arcs, and a
+    reader scanning the strip wants one line per workstream with its clauses attached, not
+    the same workstream named four times.
+
+    `what` is a plain list of sentences so the morning brief can lift them straight into
+    prose; `evidence` is the same list with the ref, the URL and any quotes attached, so
+    the page can link every clause to the thing it is a claim about. One is a projection
+    of the other -- `what == [e["what"] for e in evidence]` -- rather than two lists that
+    can drift apart.
+
+    Three suppression rules, all of them there because the alternative is a confident
+    wrong sentence:
+
+    * An artifact is compared only where both runs saw it. An MR whose iid the previous
+      snapshot never held arrived because a branch joined the arc, which is a regrouping
+      and not a development.
+    * A transition with an unknown at either end is not a transition. See MERGE_UNKNOWN:
+      this tool asks GitLab to recompute the verdicts it lacks, so a verdict arriving is
+      the most common apparent "change" there is, and it is not one.
+    * Aggregate claims -- the rung the arc sits on -- are made only when the membership
+      held still and only when you did nothing here yourself. `stage` is derived from
+      branches and commits, so a stage that moved after your own commit moved because of
+      your own commit. This is `notify`'s own_activity test, applied to the aggregate
+      rather than to each fact: the facts keep their own clock, so a conflict that
+      appeared on a branch you also committed to is still reported.
+    """
+    prev_arcs = prev.get("arcs") or []
+    cur_arcs = cur.get("arcs") or []
+    pairs, regroup = match_runs(prev_arcs, cur_arcs)
+    pk, ck = prev.get("known") or {}, cur.get("known") or {}
+    cmp_mrs = bool(pk.get("mrs")) and bool(ck.get("mrs"))
+    cmp_issues = bool(pk.get("issues")) and bool(ck.get("issues"))
+    cmp_ledger = bool(pk.get("ledger")) and bool(ck.get("ledger"))
+
+    live = {a.get("id"): a for a in arcs}
+    demand_by_rfp = {d["rfp"]: d for a in arcs for d in a.get("demands", [])
+                     if d.get("rfp")}
+    ledger_by_fp = {e["fp"]: e for e in _ledger_rows(ledger) if e.get("fp")}
+
+    changes = []
+    for i, j in pairs:
+        o, n = prev_arcs[i], cur_arcs[j]
+        arc = live.get(n.get("id")) or {}
+        stable = set(o.get("branches") or []) == set(n.get("branches") or [])
+        mine_moved = (n.get("own_activity") or 0) > (o.get("own_activity") or 0)
+        items = []
+
+        def add(kind, text, ref="", url="", quotes=()):
+            items.append({"kind": kind, "what": text, "ref": ref, "url": url,
+                          "quotes": [q for q in quotes if q]})
+
+        o_mrs, n_mrs = o.get("mrs") or {}, n.get("mrs") or {}
+        settled_mr = False
+        if cmp_mrs:
+            for iid in sorted(set(o_mrs) & set(n_mrs), key=int):
+                om, nm = o_mrs[iid], n_mrs[iid]
+                ref, url = f"!{iid}", nm.get("url") or om.get("url") or ""
+                if om.get("state") == "opened" and nm.get("state") in ("merged",
+                                                                      "closed"):
+                    settled_mr = True
+                    when = nm.get("at") or ""
+                    if nm["state"] == "merged":
+                        add("merged", f"{ref} merged" + (f" on {when}" if when else ""),
+                            ref, url)
+                    else:
+                        add("closed", f"{ref} was closed without merging"
+                            + (f" on {when}" if when else ""), ref, url)
+                    continue
+                if nm.get("state") != "opened":
+                    continue
+                o_ms, n_ms = om.get("merge_state") or "", nm.get("merge_state") or ""
+                known_both = (o_ms not in MERGE_UNKNOWN and n_ms not in MERGE_UNKNOWN)
+                target = next((m.get("target") for m in arc.get("mrs", [])
+                               if str(m.get("iid")) == iid), None) or "main"
+                if known_both and nm.get("conflicts") and not om.get("conflicts"):
+                    add("conflict", f"{ref} no longer merges into {target} — a conflict "
+                        "appeared since the last build", ref, url)
+                elif known_both and om.get("conflicts") and not nm.get("conflicts"):
+                    add("unconflict", f"{ref} merges into {target} again", ref, url)
+                elif known_both and n_ms == "mergeable" and o_ms != "mergeable":
+                    add("mergeable", f"{ref} became mergeable — approved, with nothing "
+                        "in the way", ref, url)
+                o_p, n_p = om.get("pipeline") or "", nm.get("pipeline") or ""
+                bad = ("failed", "canceled")
+                if o_p and n_p in bad and o_p not in bad:
+                    add("pipeline", f"{ref} pipeline turned {n_p} — it was {o_p} at the "
+                        "last build", ref, url)
+                elif o_p in bad and n_p == "success":
+                    add("pipeline-green", f"{ref} pipeline is green again after {o_p}",
+                        ref, url)
+
+        # A new thread demand. The fingerprint moves when a reviewer speaks, and only
+        # then -- see the `sig` it is taken over in demands().
+        for rfp in sorted(set(n.get("threads") or []) - set(o.get("threads") or [])):
+            d = demand_by_rfp.get(rfp)
+            if not d:
+                continue
+            add("threads", d.get("what") or "a review thread is waiting on you",
+                "", d.get("url") or "", d.get("quotes") or [])
+
+        if cmp_ledger:
+            for fp in sorted(set(n.get("ledger") or []) - set(o.get("ledger") or [])):
+                e = ledger_by_fp.get(fp)
+                # `thread-reply` is the same fact as the thread demand above, once by
+                # person and once by work. On this strip it would be the same sentence
+                # twice, so the by-work one speaks and the by-person one stays quiet.
+                if not e or e.get("kind") == "thread-reply":
+                    continue
+                say = LEDGER_SAYS.get(e.get("kind"))
+                text = (say(_who(e), e.get("ref") or "")
+                        if say else f"{e.get('ref','')}: {e.get('kind','')} ({_who(e)})")
+                add("ledger", text, e.get("ref") or "", e.get("url") or "",
+                    [e.get("quote")])
+
+        if cmp_issues:
+            o_is, n_is = o.get("issues") or {}, n.get("issues") or {}
+            for key in sorted(set(o_is) & set(n_is)):
+                was, now = o_is[key], n_is[key]
+                if was and now and was != now:
+                    i = next((x for x in arc.get("issues", [])
+                              if x.get("key") == key), {})
+                    add("ticket", f"{key} moved from {was} to {now}", key,
+                        i.get("url") or "")
+
+        # The rung. Last, and hedged three ways: only where the membership held still,
+        # only where you did nothing here yourself, and never as a second telling of a
+        # merge that has already been reported in its own words.
+        if (stable and not mine_moved and o.get("stage") and n.get("stage")
+                and o["stage"] != n["stage"]
+                and not (settled_mr and n["stage"] in ("landed", "abandoned"))):
+            was, now = o.get("state") or o["stage"], n.get("state") or n["stage"]
+            if was == now:
+                was, now = o["stage"], n["stage"]
+            add("stage", f"moved from {was} to {now}")
+
+        if not items:
+            continue
+        items.sort(key=lambda it: (CHANGE_RANK.get(it["kind"], 99), it["ref"],
+                                   it["what"]))
+        changes.append({
+            "id": n.get("id"), "label": n.get("label"), "ticket": n.get("ticket"),
+            "branches": n.get("branches") or [],
+            "stage": n.get("stage"), "state": n.get("state"),
+            "age_days": arc.get("age_days"), "urgency": arc.get("urgency", 99),
+            "engagement": arc.get("engagement", 0),
+            "membership": "stable" if stable else "shifted",
+            "kinds": sorted({it["kind"] for it in items},
+                            key=lambda k: CHANGE_RANK.get(k, 99)),
+            "what": [it["what"] for it in items],
+            "evidence": items,
+        })
+    # Worst first, and a total order: the rank alone ties constantly (six arcs can all
+    # have gone red), and a stable sort then hands the page whatever order the arcs
+    # happened to arrive in. Ordering feeds the brief, and the brief caches on the text
+    # it is given -- the same lesson arc-brief's evidence fingerprint taught.
+    changes.sort(key=lambda c: (CHANGE_RANK.get(c["kinds"][0], 99),
+                                -(c["engagement"] or 0), c["label"] or "", c["id"] or ""))
+    return {
+        "v": SNAPSHOT_V,
+        "previous_generated": prev.get("generated"),
+        "interval_seconds": _interval(prev.get("generated"), cur.get("generated")),
+        "compared": len(pairs),
+        "changed": len(changes),
+        # Counts first, because a consumer wants "3 of 152 moved, 4 were regrouped" and
+        # not a wall of names -- these are facts about the derivation rather than about the
+        # work. `detail` is kept for whoever is asking why a line they expected is missing.
+        "not_compared": {
+            "arcs": len(regroup["now"]),
+            "how": {k: sum(1 for r in regroup["was"] + regroup["now"]
+                           if r["how"] == k)
+                    for k in sorted({r["how"] for r in
+                                     regroup["was"] + regroup["now"]})},
+            "detail": regroup,
+        },
+        "skipped_universes": sorted(
+            k for k, ok in (("mrs", cmp_mrs), ("issues", cmp_issues),
+                            ("ledger", cmp_ledger)) if not ok),
+        "changes": changes,
+    }
+
+
+def _interval(a, b):
+    """Seconds between two `generated` stamps, or None if either cannot be read."""
+    try:
+        fmt = "%Y-%m-%dT%H:%M:%S%z"
+        return int((datetime.strptime(b, fmt) - datetime.strptime(a, fmt))
+                   .total_seconds())
+    except (ValueError, TypeError):
+        return None
+
+
+def write_snapshot(snap):
+    """Replace the baseline the next run diffs against. Only ever behind --snapshot.
+
+    An ad-hoc run must not move this. The baseline is "the state the page last showed
+    you", and any experiment, test or one-off `work-arcs --json` that overwrote it would
+    silently consume an interval's worth of changes -- the diff would come out empty and
+    look like a quiet night. So the read is unconditional and the write is opt-in, and
+    `arcs` is the only caller that passes the flag.
+
+    Renamed into place rather than written in place: a run interrupted halfway through the
+    dump would otherwise leave a truncated file, and the next run would report the whole
+    graph as new work.
+    """
+    try:
+        SNAPSHOT.parent.mkdir(parents=True, exist_ok=True)
+        tmp = SNAPSHOT.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(snap, indent=1, sort_keys=True))
+        os.replace(tmp, SNAPSHOT)
+        return True
+    except OSError as e:
+        print(f"work-arcs: could not write {SNAPSHOT} ({e}) — the next run will have "
+              "nothing to compare against", file=sys.stderr)
+        return False
+
+
 def main():
     p = argparse.ArgumentParser(description="Group a repo's loose work into arcs.")
     p.add_argument("--repo", type=Path, default=None,
@@ -2742,6 +3253,11 @@ def main():
     p.add_argument("--gap", action="store_true",
                    help="where Jira and reality disagree: work with no ticket, "
                         "tickets with no work, tickets claiming to be handed off")
+    p.add_argument("--snapshot", action="store_true",
+                   help="leave this run's state behind as the baseline the NEXT run "
+                        "diffs against. Off by default so an ad-hoc run cannot consume "
+                        "an interval's changes; `arcs` passes it. Reading the previous "
+                        "snapshot always happens, flag or no flag")
     p.add_argument("--jira-ify", metavar="ARC",
                    help="file a ticket for an arc, prefilled from what it already is")
     p.add_argument("--dry-run", action="store_true",
@@ -2951,6 +3467,36 @@ def main():
     apply_dismissals(ledger, arcs, gap,
                      prune=bool(ledger and gap is not None and args.json))
 
+    # Before --active and --focus, and that is the whole point of the feature. The arcs
+    # this diff exists to speak about are the ones the window hides: "of your 58
+    # background arcs, 3 changed overnight" is a sentence about arcs that are not on the
+    # page, and computing the diff over a filtered list would have made it structurally
+    # impossible to say. The snapshot is taken over every arc for the same reason -- a
+    # baseline of only the recent ones would report the rest as appearing and vanishing
+    # every time the window moved.
+    generated = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    snap = snapshot_of(arcs, ledger, {"mrs": mrs_known, "ledger": ledger is not None,
+                                      "issues": gap is not None},
+                       args.repo.name, generated)
+    prev, no_prev = load_snapshot(args.repo.name)
+    if prev is None:
+        since = {"v": SNAPSHOT_V, "previous_generated": None, "interval_seconds": None,
+                 "compared": 0, "changed": 0, "why": no_prev,
+                 "not_compared": {"arcs": 0, "how": {}, "detail": {}},
+                 "skipped_universes": [], "changes": []}
+    else:
+        since = diff_runs(prev, snap, arcs, ledger)
+    if args.snapshot:
+        write_snapshot(snap)
+    # Said out loud on every run, because a diff that quietly stops finding anything looks
+    # exactly like a quiet night.
+    if prev is None:
+        print(f"  nothing to compare against — {no_prev}", file=sys.stderr)
+    else:
+        print(f"  {since['changed']} of {since['compared']} workstreams moved since the "
+              f"last build ({since['not_compared']['arcs']} regrouped or new, so not "
+              "compared)", file=sys.stderr)
+
     if args.active is not None:
         arcs = [a for a in arcs if a["age_days"] <= args.active]
 
@@ -2964,7 +3510,7 @@ def main():
 
     if args.json:
         json.dump({
-            "generated": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "generated": generated,
             "repo": args.repo.name,
             # The path, separately from the name. `repo` is the label a page prints, and
             # arc-brief was resolving it as a working directory: `git -C ul log` fails from
@@ -2976,6 +3522,10 @@ def main():
             "project_url": project_url(args.repo, mrs),
             "mr_error": mr_error,
             "arc_count": len(arcs),
+            # Top-level rather than a field on each arc, because it is a fact about the
+            # interval and not about any one workstream -- and because the arcs list is
+            # about to be filtered by --active while this deliberately is not.
+            "since_last_run": since,
             "arcs": arcs,
             "ledger": ledger,
             "unattached_stashes": unattached,
