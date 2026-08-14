@@ -1,0 +1,591 @@
+#!/usr/bin/env -S python3 -u
+"""
+arcs-cost: what the arcs pipeline spends of your Claude subscription.
+
+The pipeline names arcs, splits them, reads commitments out of Slack and judges whether
+a DM wants a reply -- every one of those is a model call, and none of them was visible
+anywhere. A tool that quietly consumes a fifth of your weekly quota while telling you
+what you owe other people should be able to say what it costs you.
+
+Every such call goes through `lib/headless_claude.py`, which runs it with its cwd inside
+one dedicated directory so its transcript lands in a Claude Code project directory of its
+own. That directory is the exact, auditable record of what this pipeline consumed: one
+`message.usage` per API response, with the model that served it. It is also the reason
+this measurement can be honest about whose usage it is -- the pipeline's calls are in
+that directory and nowhere else, and your own interactive sessions are in the other 85
+directories and never in that one. The two are summed separately and never mixed.
+
+Three things are worth knowing about how the number is arrived at.
+
+**Assistant lines are written twice.** Claude Code appends the assistant line mid-stream
+and again on completion, with the same `message.id` and the same usage both times. 1928
+assistant lines in the corpus are 1455 API responses. Summing lines instead of
+deduplicating by `message.id` overstates the cost by a third, which is precisely the
+kind of wrong number this section cannot afford.
+
+**Tokens are not fungible, so they are weighted before being compared.** A cache-read
+token costs a tenth of an input token and an output token costs five times one; the
+pipeline's mix is overwhelmingly cache traffic while an interactive session's is not, so
+comparing raw token counts between them would flatter the pipeline by a wide margin. The
+common currency is list price (PRICES below), which makes the comparison meaningful and
+the arithmetic checkable. It is a *unit of account, not a bill* -- the subscription's
+dollar fields are null and nothing here is charged. The measured cache TTL matters too:
+this pipeline writes its cache at the 1-hour TTL (13.8M of 16.7M cache-creation tokens),
+which is a 2x write multiplier rather than 1.25x, so the split is read per call rather
+than assumed.
+
+**The share of the weekly quota is measured, never modelled.** The subscription reports
+only a whole-number percentage, so there is no published tokens-per-percent rate to apply
+-- it has to be observed. `bin/arcs` snapshots the OAuth utilisation before and after
+every run into `usage.jsonl`; each consecutive pair of samples that did not cross a reset
+gives one observation of "this much spend moved the number this far", and the rate is
+their accumulation. Until enough quota has actually moved to make that rate meaningful,
+this reports that it does not know yet rather than producing a plausible number. A wrong
+cost figure costs trust exactly like a wrong reminder does.
+
+    arcs-cost                    # human view
+    arcs-cost --json             # for arcs-page
+    arcs-cost --sample start     # snapshot quota position (bin/arcs calls this)
+"""
+
+import argparse
+import bisect
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+import headless_claude  # noqa: E402
+
+STATE = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "work-arcs"
+SAMPLES = STATE / "usage.jsonl"
+
+PROJECTS = Path.home() / ".claude" / "projects"
+# Derived from the library that creates them rather than written out here, so the two
+# cannot drift. headless_claude names the directory after its session dir, and says in
+# its own docstring that consumers reading ~/.claude/projects should skip it -- this is
+# the consumer that instead reads *only* it.
+PIPELINE_DIR = headless_claude.PROJECT_DIR
+
+CREDS = Path.home() / ".claude" / ".credentials.json"
+USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+
+# Anthropic list prices per million tokens, (input, output), as published 2026-06-24.
+# A declared external fact -- the one thing on this page that is not derived, because
+# there is nowhere on the machine to derive it from. It is used only as a weighting to
+# make a cache-heavy token mix comparable with an output-heavy one; the subscription
+# bills none of it. An unlisted model is counted and left out of the weighting rather
+# than priced at a guess, and `unpriced` below says how many.
+PRICES = {
+    "claude-fable-5": (10.0, 50.0),
+    "claude-mythos-5": (10.0, 50.0),
+    "claude-opus-5": (5.0, 25.0),
+    "claude-opus-4-8": (5.0, 25.0),
+    "claude-opus-4-7": (5.0, 25.0),
+    "claude-opus-4-6": (5.0, 25.0),
+    "claude-opus-4-5": (5.0, 25.0),
+    "claude-sonnet-5": (3.0, 15.0),
+    "claude-sonnet-4-6": (3.0, 15.0),
+    "claude-sonnet-4-5": (3.0, 15.0),
+    "claude-haiku-4-5-20251001": (1.0, 5.0),
+    "claude-haiku-4-5": (1.0, 5.0),
+}
+PRICES_AS_OF = "2026-06-24 list prices"
+
+CACHE_WRITE_1H = 2.0     # 1-hour TTL cache write
+CACHE_WRITE_5M = 1.25    # 5-minute TTL cache write
+CACHE_READ = 0.1
+
+# Below this much accumulated quota movement the observed rate is dominated by the
+# whole-number rounding of the utilisation figure, so no share is reported. Three points
+# is the smallest total at which the rounding error is a minority of the signal.
+MIN_POINTS = 3.0
+
+SAMPLE_MIN_GAP = 60      # never more than one snapshot per minute
+HTTP_TIMEOUT = 8
+
+
+# --- the quota position -----------------------------------------------------------
+
+def fetch_usage():
+    """The OAuth endpoint the `/usage` screen hits, or None if it cannot be reached.
+
+    Etiquette copied from ~/bin/hud-claude-usage: an expired token mid-refresh is a 401
+    and not an error worth reporting, because Claude Code rewrites the token on its next
+    run. Every failure here is silent by design -- the pipeline must not fail, or even
+    complain, because a measurement of it was unavailable.
+    """
+    try:
+        tok = json.loads(CREDS.read_text())["claudeAiOauth"]["accessToken"]
+    except (OSError, ValueError, KeyError):
+        return None
+    if not tok:
+        return None
+    req = urllib.request.Request(USAGE_URL, headers={
+        "Authorization": f"Bearer {tok}",
+        "anthropic-beta": "oauth-2025-04-20",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as r:
+            if r.status != 200:
+                return None
+            return json.loads(r.read().decode())
+    except (urllib.error.URLError, OSError, ValueError, TimeoutError):
+        return None
+
+
+def _window(d):
+    if not isinstance(d, dict):
+        return None
+    u = d.get("utilization")
+    if u is None:
+        return None
+    return {"utilization": float(u), "resets_at": d.get("resets_at")}
+
+
+def take_sample(marker):
+    """Append one quota snapshot. Silent whatever happens -- see fetch_usage.
+
+    Rate-limited to one per minute so a fast `arcs --no-brief` (start and end within
+    seconds) does not write a pair whose two ends are the same reading, which would
+    contribute a zero-cost, zero-movement observation to the rate.
+    """
+    try:
+        last = read_samples()[-1]["ts"] if SAMPLES.exists() else 0
+    except (OSError, ValueError, IndexError, KeyError):
+        last = 0
+    now = time.time()
+    if now - last < SAMPLE_MIN_GAP:
+        return
+    raw = fetch_usage()
+    if not raw:
+        return
+    rec = {"ts": int(now), "marker": marker,
+           "five_hour": _window(raw.get("five_hour")),
+           "seven_day": _window(raw.get("seven_day"))}
+    if not rec["seven_day"]:
+        return
+    try:
+        SAMPLES.parent.mkdir(parents=True, exist_ok=True)
+        with SAMPLES.open("a") as fh:
+            fh.write(json.dumps(rec, sort_keys=True) + "\n")
+    except OSError:
+        return
+
+
+def read_samples():
+    if not SAMPLES.exists():
+        return []
+    out = []
+    try:
+        for line in SAMPLES.read_text(errors="replace").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(r, dict) and r.get("ts") and r.get("seven_day"):
+                out.append(r)
+    except OSError:
+        return []
+    out.sort(key=lambda r: r["ts"])
+    return out
+
+
+# --- the transcripts --------------------------------------------------------------
+
+def price(model, usage):
+    """List-price weighting for one API response, and whether it could be priced.
+
+    The cache-creation split is read from `usage.cache_creation` rather than assumed,
+    because the two TTLs differ by a factor of 1.6 in write cost and this pipeline uses
+    the more expensive one. Older lines predate that field and carry only the total; they
+    are charged at the cheaper 5-minute rate, which understates rather than inflates.
+    """
+    pr = PRICES.get(model)
+    if not pr:
+        return 0.0, False
+    pin, pout = pr
+    cc = usage.get("cache_creation") or {}
+    h = cc.get("ephemeral_1h_input_tokens") or 0
+    s = cc.get("ephemeral_5m_input_tokens") or 0
+    if not (h or s):
+        s = usage.get("cache_creation_input_tokens") or 0
+    return (((usage.get("input_tokens") or 0) * pin
+             + h * pin * CACHE_WRITE_1H
+             + s * pin * CACHE_WRITE_5M
+             + (usage.get("cache_read_input_tokens") or 0) * pin * CACHE_READ
+             + (usage.get("output_tokens") or 0) * pout) / 1e6), True
+
+
+def blank():
+    return {"calls": 0, "sessions": 0, "input": 0, "output": 0,
+            "cache_write": 0, "cache_read": 0, "list_cost": 0.0,
+            "unpriced": 0, "by_model": {}}
+
+
+def add(acc, model, usage, cost, priced):
+    acc["calls"] += 1
+    acc["input"] += usage.get("input_tokens") or 0
+    acc["output"] += usage.get("output_tokens") or 0
+    acc["cache_write"] += usage.get("cache_creation_input_tokens") or 0
+    acc["cache_read"] += usage.get("cache_read_input_tokens") or 0
+    acc["list_cost"] += cost
+    if not priced:
+        acc["unpriced"] += 1
+    m = acc["by_model"].setdefault(
+        model, {"calls": 0, "input": 0, "output": 0, "cache_write": 0,
+                "cache_read": 0, "list_cost": 0.0})
+    m["calls"] += 1
+    m["input"] += usage.get("input_tokens") or 0
+    m["output"] += usage.get("output_tokens") or 0
+    m["cache_write"] += usage.get("cache_creation_input_tokens") or 0
+    m["cache_read"] += usage.get("cache_read_input_tokens") or 0
+    m["list_cost"] += cost
+
+
+def scan(since, spans):
+    """Sum usage per (surface, span), plus per-second cost for the rate observations.
+
+    `spans` is a list of (name, from_ts, to_ts). One pass over the corpus fills them
+    all; a message is attributed to every span containing its timestamp, which is what
+    lets "today" and "this week" overlap without reading anything twice.
+
+    Files last written before the earliest boundary cannot hold a line inside any span,
+    so their mtime excludes them without opening them. The corpus is 465MB and grows.
+    """
+    surfaces = {}
+    for surf in ("pipeline", "interactive"):
+        surfaces[surf] = {name: blank() for name, _, _ in spans}
+    events = []          # (ts, cost) for every response, both surfaces, since `since`
+    pipeline_events = []  # (ts, cost) for the pipeline's alone, for per-run costing
+    seen = set()
+    try:
+        dirs = [d for d in PROJECTS.iterdir() if d.is_dir()]
+    except OSError:
+        dirs = []
+    for d in dirs:
+        surf = "pipeline" if d.name == PIPELINE_DIR else "interactive"
+        acc = surfaces[surf]
+        try:
+            files = sorted(d.glob("*.jsonl"))
+        except OSError:
+            continue
+        for f in files:
+            try:
+                if f.stat().st_mtime < since:
+                    continue
+            except OSError:
+                continue
+            counted_here = set()
+            try:
+                fh = f.open(errors="replace")
+            except OSError:
+                continue
+            with fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except ValueError:
+                        continue
+                    if rec.get("type") != "assistant":
+                        continue
+                    msg = rec.get("message") or {}
+                    mid = msg.get("id")
+                    model = msg.get("model") or ""
+                    # Both halves of the streamed pair carry the same id and the same
+                    # usage; counting the line rather than the response inflates the
+                    # total by a third.
+                    if not mid or mid in seen:
+                        continue
+                    # `<synthetic>` lines are Claude Code's own local stubs, not API
+                    # responses -- they consume no quota and are not calls.
+                    if not model or model.startswith("<"):
+                        continue
+                    ts = rec.get("timestamp")
+                    if not ts:
+                        continue
+                    try:
+                        when = datetime.fromisoformat(
+                            ts.replace("Z", "+00:00")).timestamp()
+                    except ValueError:
+                        continue
+                    seen.add(mid)
+                    usage = msg.get("usage") or {}
+                    cost, priced = price(model, usage)
+                    if when >= since:
+                        events.append((when, cost))
+                        if surf == "pipeline":
+                            pipeline_events.append((when, cost))
+                    for name, lo, hi in spans:
+                        if lo <= when < hi:
+                            add(acc[name], model, usage, cost, priced)
+                            counted_here.add(name)
+            for name in counted_here:
+                acc[name]["sessions"] += 1
+    events.sort()
+    pipeline_events.sort()
+    return surfaces, events, pipeline_events
+
+
+# --- the rate, and the cost of one run --------------------------------------------
+
+def windowed(events):
+    """`spend(lo, hi)` over a time-sorted (ts, cost) list, by prefix sum.
+
+    Both the rate and the per-run figures ask for many overlapping sub-windows of the
+    same list; summing it per query is quadratic once a few weeks of samples exist.
+    """
+    times = [t for t, _ in events]
+    running = [0.0]
+    for _, c in events:
+        running.append(running[-1] + c)
+
+    def spend(lo, hi):
+        return (running[bisect.bisect_left(times, hi)]
+                - running[bisect.bisect_left(times, lo)])
+
+    return spend
+
+
+def sampled_runs(samples, pipeline_events, rate):
+    """The cost of each individual run, bounded by its own two snapshots.
+
+    This is the number that answers "what does refreshing the page cost me", and it is
+    the one figure here that could have been faked convincingly: clustering the
+    pipeline's calls by a time gap yields a plausible per-run cost, and on this corpus
+    the answer moves from $4.27 to $16.14 a run depending on whether you call a 5-minute
+    or a 30-minute silence a boundary. That is a knob disguised as a measurement.
+
+    `bin/arcs` brackets each run with a start and an end snapshot, so a run's extent is
+    recorded rather than inferred, and the calls inside it are exactly its own. Runs
+    without both ends -- an interrupted run, or the window straddling a reset -- are
+    left out rather than half-counted.
+    """
+    spend = windowed(pipeline_events)
+    runs = []
+    for a, b in zip(samples, samples[1:]):
+        if a.get("marker") != "start" or b.get("marker") != "end":
+            continue
+        cost = spend(a["ts"], b["ts"])
+        run = {
+            "from": datetime.fromtimestamp(
+                a["ts"], timezone.utc).astimezone().isoformat(),
+            "seconds": b["ts"] - a["ts"],
+            "list_cost": cost,
+            "quota_points": (cost / rate) if rate else None,
+        }
+        runs.append(run)
+    return runs
+
+
+def observe_rate(samples, events):
+    """List-cost per point of weekly quota, from consecutive pairs of samples.
+
+    Every adjacent pair of snapshots is one observation: the quota moved by so many
+    points while so much total spend happened in between. *Total* spend, both surfaces
+    -- the quota moved because of everything that ran, so a rate derived from the
+    pipeline's share alone would be wrong by however much interactive work overlapped.
+    The pipeline's own share then falls out of dividing its spend by this rate.
+
+    A pair is discarded when it crossed a weekly reset, which is detectable exactly
+    rather than by inference: `resets_at` changes. A decrease in utilisation without a
+    changed reset time would be the endpoint contradicting itself, and is dropped too.
+    """
+    spend = windowed(events)
+    pairs = 0
+    points = 0.0
+    cost = 0.0
+    for a, b in zip(samples, samples[1:]):
+        sa, sb = a["seven_day"], b["seven_day"]
+        if not sa or not sb:
+            continue
+        if sa.get("resets_at") != sb.get("resets_at"):
+            continue
+        d = sb["utilization"] - sa["utilization"]
+        if d < 0 or b["ts"] <= a["ts"]:
+            continue
+        pairs += 1
+        points += d
+        cost += spend(a["ts"], b["ts"])
+    if points < MIN_POINTS or cost <= 0:
+        return None, pairs, points
+    return cost / points, pairs, points
+
+
+# --- assembly ---------------------------------------------------------------------
+
+def build():
+    now = datetime.now().astimezone()
+    samples = read_samples()
+
+    # "This week" means the quota's own seven-day window whenever a sample tells us when
+    # it resets, so the share below is a share of the same period the percentage is. Only
+    # when no sample exists does it fall back to a trailing seven days, and it says which
+    # of the two it used -- the difference is a few hours and worth not glossing over.
+    week_basis = "trailing-7d"
+    week_start = now - timedelta(days=7)
+    for s in reversed(samples):
+        ra = (s.get("seven_day") or {}).get("resets_at")
+        if ra:
+            try:
+                reset = datetime.fromisoformat(ra.replace("Z", "+00:00"))
+                week_start = reset - timedelta(days=7)
+                week_basis = "quota-window"
+                break
+            except ValueError:
+                continue
+
+    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    spans = [("today", day_start.timestamp(), now.timestamp() + 1),
+             ("week", week_start.timestamp(), now.timestamp() + 1)]
+    since = min(min(lo for _, lo, _ in spans),
+                samples[0]["ts"] if samples else now.timestamp())
+    surfaces, events, pipeline_events = scan(since, spans)
+
+    rate, pairs, points = observe_rate(samples, events)
+    runs = sampled_runs(samples, pipeline_events, rate)
+
+    windows = {}
+    for name, lo, hi in spans:
+        p = surfaces["pipeline"][name]
+        i = surfaces["interactive"][name]
+        total = p["list_cost"] + i["list_cost"]
+        windows[name] = {
+            "from": datetime.fromtimestamp(lo, timezone.utc).astimezone().isoformat(),
+            "to": datetime.fromtimestamp(min(hi, now.timestamp()),
+                                         timezone.utc).astimezone().isoformat(),
+            "pipeline": p,
+            "interactive": i,
+            "share_pct": (100.0 * p["list_cost"] / total) if total > 0 else None,
+        }
+
+    latest = samples[-1] if samples else None
+    share = None
+    why = None
+    if rate:
+        share = windows["week"]["pipeline"]["list_cost"] / rate
+    elif not samples:
+        why = ("no quota samples yet — bin/arcs takes one before and after each run, "
+               "so this fills in from here")
+    else:
+        why = (f"the weekly quota has moved {points:.0f} of the "
+               f"{MIN_POINTS:.0f} points needed to observe a rate, across "
+               f"{pairs} sampled interval{'s' if pairs != 1 else ''}")
+
+    return {
+        "generated": now.isoformat(),
+        "pipeline_dir": str(PROJECTS / PIPELINE_DIR),
+        "prices_as_of": PRICES_AS_OF,
+        "week_basis": week_basis,
+        "windows": windows,
+        "samples": len(samples),
+        "runs": {
+            "measured": len(runs),
+            "last": runs[-1] if runs else None,
+            "median_list_cost": (
+                sorted(r["list_cost"] for r in runs)[len(runs) // 2] if runs else None),
+        },
+        "quota": {
+            "five_hour": (latest or {}).get("five_hour"),
+            "seven_day": (latest or {}).get("seven_day"),
+            "sampled_at": datetime.fromtimestamp(
+                latest["ts"], timezone.utc).astimezone().isoformat() if latest else None,
+            "rate_cost_per_point": rate,
+            "rate_pairs": pairs,
+            "rate_points": points,
+            "pipeline_share_pct": share,
+            "unmeasured": why,
+        },
+    }
+
+
+# --- the human view ---------------------------------------------------------------
+
+def toks(n):
+    for div, suf in ((1e9, "B"), (1e6, "M"), (1e3, "k")):
+        if n >= div:
+            return f"{n / div:.1f}{suf}"
+    return str(int(n))
+
+
+def text(d):
+    out = []
+    out.append("What the arcs pipeline costs")
+    out.append(f"  measured from {d['pipeline_dir']}")
+    out.append(f"  weighted at {d['prices_as_of']}; the subscription bills none of it")
+    for name, title in (("today", "Today"), ("week", "This week")):
+        w = d["windows"][name]
+        p, i = w["pipeline"], w["interactive"]
+        basis = (" (the quota's own window)" if name == "week"
+                 and d["week_basis"] == "quota-window" else
+                 " (trailing 7 days)" if name == "week" else "")
+        out.append("")
+        out.append(f"{title}{basis}")
+        out.append(f"  pipeline      {p['calls']:6d} calls  "
+                   f"in {toks(p['input']):>7}  out {toks(p['output']):>7}  "
+                   f"cache w {toks(p['cache_write']):>7} r {toks(p['cache_read']):>7}  "
+                   f"= ${p['list_cost']:.2f}")
+        out.append(f"  your sessions {i['calls']:6d} calls  "
+                   f"{'':>26}{'':>24}= ${i['list_cost']:.2f}")
+        if w["share_pct"] is not None:
+            out.append(f"  the pipeline is {w['share_pct']:.0f}% of your Claude spend "
+                       f"in this window")
+        if p["unpriced"]:
+            out.append(f"  {p['unpriced']} call(s) on a model with no listed price are "
+                       f"counted but not weighted")
+        for m, v in sorted(p["by_model"].items(), key=lambda kv: -kv[1]["list_cost"]):
+            out.append(f"     {m:<28} {v['calls']:5d} calls  ${v['list_cost']:.2f}")
+    r = d["runs"]
+    out.append("")
+    if r["last"]:
+        out.append(f"Per run, over {r['measured']} bracketed run(s)")
+        out.append(f"  last     ${r['last']['list_cost']:.2f} "
+                   f"in {r['last']['seconds']}s"
+                   + (f" ≈ {r['last']['quota_points']:.2f} points of the weekly quota"
+                      if r["last"]["quota_points"] is not None else ""))
+        out.append(f"  median   ${r['median_list_cost']:.2f}")
+    else:
+        out.append("Per run: not measured yet — a run is bracketed by its own two "
+                   "snapshots, never guessed from gaps between calls")
+    q = d["quota"]
+    out.append("")
+    if q["seven_day"]:
+        out.append(f"Weekly quota at {q['sampled_at'][:16]}: "
+                   f"{q['seven_day']['utilization']:.0f}% used")
+    if q["pipeline_share_pct"] is not None:
+        out.append(f"  of which this pipeline accounts for "
+                   f"{q['pipeline_share_pct']:.1f} points "
+                   f"(observed rate ${q['rate_cost_per_point']:.2f}/point over "
+                   f"{q['rate_pairs']} intervals)")
+    else:
+        out.append(f"  share of the weekly quota not yet measurable: {q['unmeasured']}")
+    return "\n".join(out)
+
+
+def main():
+    p = argparse.ArgumentParser(
+        description="What the arcs pipeline spends of your Claude subscription.")
+    p.add_argument("--json", action="store_true", help="machine-readable, for arcs-page")
+    p.add_argument("--sample", choices=("start", "end"), default=None,
+                   help="snapshot the quota position and exit (bin/arcs calls this)")
+    args = p.parse_args()
+    if args.sample:
+        take_sample(args.sample)
+        return
+    d = build()
+    print(json.dumps(d, indent=1) if args.json else text(d))
+
+
+if __name__ == "__main__":
+    main()
