@@ -1836,12 +1836,18 @@ def render(data, lede, focus_days, limit, cost=None):
     # Absent when empty, like the run-over-run strip and for the same reason: a section
     # that says "0 forgotten" every morning trains you to stop reading it, and then the
     # morning it says 1 you will not see that either.
-    fell = [x for x in data.get("arcs", [])
-            if ((x.get("activity") or {}).get("forgotten") or {}).get("verdict")]
-    fell.sort(key=lambda x: (x["activity"]["cliff_days"],
-                             -x["activity"]["invested"]["entries"],
-                             -x["activity"]["invested"]["commits"],
-                             str(x.get("label") or ""), str(x.get("id") or "")))
+    #
+    # The order comes down the wire rather than being re-derived here. work-arcs already
+    # ranks these -- freshest cliff first, because the one you can still resume is the one
+    # you fell off most recently -- and a ranking written twice is a ranking that will
+    # differ in one of them. Falls back to the verdicts on the arcs themselves so an older
+    # graph still renders, in whatever order it arrived.
+    by_id = {x.get("id"): x for x in data.get("arcs", [])}
+    order = data.get("forgotten")
+    if order is None:
+        order = [x.get("id") for x in data.get("arcs", [])]
+    fell = [by_id[i] for i in order if i in by_id
+            and ((by_id[i].get("activity") or {}).get("forgotten") or {}).get("verdict")]
     if fell:
         here = {x.get("id") for x in arcs}
         # One axis for every row: the longest history in the section, so the pictures can

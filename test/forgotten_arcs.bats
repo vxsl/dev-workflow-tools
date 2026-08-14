@@ -422,6 +422,28 @@ print(min(xs(pg.cliff_spark(act(3, 90), 20))))'
     [ "$output" = "0.0" ]
 }
 
+@test "the page takes the ranking off the wire rather than re-deriving it" {
+    # One author for the order. Re-deriving it here would mean re-implementing
+    # fell_off_a_cliff's tiebreaks in a second file, and a ranking written twice is a
+    # ranking that will differ in one of them.
+    run page '{"generated": "2026-08-14T09:00:00-0700", "repo": "r", "arc_count": 2,
+      "forgotten": ["Zed", "Ay"],
+      "arcs": [{"id": "Ay", "label": "Ay", "stage": "local-only", "state": "x",
+                "age_days": 12, "branches": [], "mrs": [], "stashes": [], "sessions": [],
+                "counts": {}, "demands": [], "issues": [],
+                "activity": {"series": [[12, 5], [14, 9]], "cliff_days": 12,
+                             "invested": {"entries": 900, "commits": 0},
+                             "forgotten": {"verdict": true, "fp": "a1", "why": "AY-SAYS"}}},
+               {"id": "Zed", "label": "Zed", "stage": "local-only", "state": "x",
+                "age_days": 43, "branches": [], "mrs": [], "stashes": [], "sessions": [],
+                "counts": {}, "demands": [], "issues": [],
+                "activity": {"series": [[43, 5], [61, 9]], "cliff_days": 43,
+                             "invested": {"entries": 0, "commits": 426},
+                             "forgotten": {"verdict": true, "fp": "z1", "why": "ZED-SAYS"}}}]}'
+    # Zed first, though Ay's cliff is shorter and Ay sorts first by every other key.
+    [[ "$output" == *"ZED-SAYS"*"AY-SAYS"* ]]
+}
+
 @test "the page has no cliff section when nothing fell off one" {
     # Silence, not an empty state. A section reading "0 forgotten" every morning trains
     # you to stop reading it, and then the morning it says 1 you will not see that either.

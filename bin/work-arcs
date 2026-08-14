@@ -3892,6 +3892,7 @@ def main():
     # computing this over the filtered list would make the section structurally unable to
     # hold the arcs it exists for.
     fell = fell_off_a_cliff(arcs, include_dismissed=False)
+    forgotten_ids = [a["id"] for a in fell_off_a_cliff(arcs)]
 
     if args.active is not None:
         arcs = [a for a in arcs if a["age_days"] <= args.active]
@@ -3929,6 +3930,15 @@ def main():
             # interval and not about any one workstream -- and because the arcs list is
             # about to be filtered by --active while this deliberately is not.
             "since_last_run": since,
+            # The forgotten arcs in their canonical order, as ids, so the ranking has one
+            # author. The verdict itself lives on the arc where it belongs -- this is the
+            # order, not the data. Every consumer that instead re-derived it from the arcs
+            # list would be re-implementing fell_off_a_cliff's tiebreaks, and a ranking
+            # written three times is a ranking that will differ in two of them. Ids only,
+            # and dismissed rows included: acknowledgement is a display question, and a
+            # morning brief that skipped them would silently drop work he asked to see less
+            # of rather than none of.
+            "forgotten": forgotten_ids,
             "arcs": arcs,
             "ledger": ledger,
             "unattached_stashes": unattached,
