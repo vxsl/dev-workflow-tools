@@ -604,11 +604,25 @@ def _clean_note(body):
 
 
 def _mr_notes(repo, iid):
-    return glab(repo, f"projects/:id/merge_requests/{iid}/notes?per_page=100&sort=asc") or []
+    """The notes on one MR, or None where GitLab would not say.
+
+    The `or []` this used to end with fabricated ledger rows. ledger_they_owe reads an
+    empty note list as "nobody has said a word", which IS the review-silence claim, so one
+    failed glab call invented a row accusing five reviewers of ignoring a merge request
+    they had already discussed. None is the honest answer and the caller drops the MR.
+    """
+    return glab(repo, f"projects/:id/merge_requests/{iid}/notes?per_page=100&sort=asc")
 
 
 def _approved_by(repo, iid):
-    a = glab(repo, f"projects/:id/merge_requests/{iid}/approvals") or {}
+    """Who has approved, or None where GitLab would not say. See _mr_notes for why None.
+
+    Same fabrication by a second door: an unreadable approvals call read as "nobody has
+    approved", which is half of what puts a review-owed row on the ledger.
+    """
+    a = glab(repo, f"projects/:id/merge_requests/{iid}/approvals")
+    if a is None or not isinstance(a, dict):
+        return None
     return [(x.get("user") or {}).get("username", "") for x in a.get("approved_by") or []]
 
 
@@ -658,16 +672,22 @@ def ledger_they_owe(repo, mrs, me):
     over from there. Only total silence lands in the ledger.
     """
     asked_for = [m for m in mrs if m.get("reviewers") and not m.get("draft")]
+    UNKNOWN = object()          # this MR could not be read, as distinct from "attended"
 
     def one(m):
         # Notes first, approvals only when the notes leave it open: a note already
         # proves the MR is attended, and each skipped call is real wall clock here.
         notes = _mr_notes(repo, m["iid"])
+        if notes is None:
+            return UNKNOWN
         spoke = {(n.get("author") or {}).get("username", "")
                  for n in notes if not n.get("system")} - {me, ""}
         if spoke:
             return None
-        if set(_approved_by(repo, m["iid"])) - {me, ""}:
+        approvers = _approved_by(repo, m["iid"])
+        if approvers is None:
+            return UNKNOWN
+        if set(approvers) - {me, ""}:
             return None
         asked = _asked_at(notes)
         entry = {"kind": "review-silence", "ref": f"!{m['iid']}",
@@ -684,7 +704,13 @@ def ledger_they_owe(repo, mrs, me):
         return entry
 
     with futures.ThreadPoolExecutor(max_workers=16) as pool:
-        return [e for e in pool.map(one, asked_for) if e]
+        seen = list(pool.map(one, asked_for))
+    missed = sum(1 for e in seen if e is UNKNOWN)
+    if missed:
+        print(f"  ledger: GitLab would not answer for {missed} merge request(s) — they "
+              "are left off rather than guessed at, so nothing is pruned on their "
+              "absence", file=sys.stderr)
+    return [e for e in seen if e and e is not UNKNOWN], not missed
 
 
 def ledger_you_owe(repo, me):
@@ -705,10 +731,17 @@ def ledger_you_owe(repo, me):
     """
     raw = glab(repo, "projects/:id/merge_requests?state=opened&per_page=100"
                      f"&reviewer_username={urllib.parse.quote(me, safe='')}")
-    queue = [m for m in raw or []
+    if raw is None or not isinstance(raw, list):
+        # No queue means no rows on this side at all, and reporting that as an empty
+        # queue would let a prune delete every acknowledgement on it.
+        print("  ledger: GitLab would not list the merge requests awaiting you — that "
+              "side of the ledger is absent this run, not empty", file=sys.stderr)
+        return [], 0, False
+    queue = [m for m in raw
              if not (m.get("draft") or m.get("work_in_progress"))
              and (m.get("author") or {}).get("username") != me]
     out, covered = [], 0
+    UNKNOWN = object()          # this MR could not be read, as distinct from "attended"
 
     def one(m):
         iid = m.get("iid")
@@ -716,19 +749,24 @@ def ledger_you_owe(repo, me):
         # structure, which is what "whose turn is it in this conversation" needs.
         discussions = glab(repo,
                            f"projects/:id/merge_requests/{iid}/discussions?per_page=100")
-        notes = [n for d in discussions or [] for n in (d.get("notes") or [])]
+        if discussions is None or not isinstance(discussions, list):
+            return UNKNOWN
+        notes = [n for d in discussions for n in (d.get("notes") or [])]
         i_spoke = any((n.get("author") or {}).get("username") == me
                       for n in notes if not n.get("system"))
         base = {"ref": f"!{iid}", "title": m.get("title", ""),
                 "url": m.get("web_url", "")}
         if not i_spoke:
-            if _approved_by(repo, iid):
+            approvers = _approved_by(repo, iid)
+            if approvers is None:
+                return UNKNOWN
+            if approvers:
                 return None
             asked = _asked_at(notes, who=me) or (m.get("created_at") or "")[:10]
             return {**base, "kind": "review-owed",
                     "who": (m.get("author") or {}).get("username", "?"),
                     "asked": asked, "days": _days_since(asked)}
-        for d in discussions or []:
+        for d in discussions:
             ns = [n for n in (d.get("notes") or []) if not n.get("system")]
             if not ns or not any((n.get("author") or {}).get("username") == me
                                  for n in ns):
@@ -748,13 +786,23 @@ def ledger_you_owe(repo, me):
                     "quote": _clean_note(last.get("body"))}
         return None
 
+    missed = 0
     with futures.ThreadPoolExecutor(max_workers=16) as pool:
         for entry in pool.map(one, queue):
-            if entry:
+            if entry is UNKNOWN:
+                missed += 1
+            elif entry:
                 out.append(entry)
             else:
+                # "Covered" is a claim -- somebody approved, or you already spoke -- so an
+                # MR that could not be read must not land here either. It would inflate the
+                # "+N review requests already handled" count with requests nobody handled.
                 covered += 1
-    return out, covered
+    if missed:
+        print(f"  ledger: GitLab would not discuss {missed} merge request(s) awaiting "
+              "you — left off rather than guessed at, and nothing is pruned on their "
+              "absence", file=sys.stderr)
+    return out, covered, not missed
 
 
 def ledger_jira_stalled(days_min=None):
@@ -770,7 +818,9 @@ def ledger_jira_stalled(days_min=None):
     email = os.environ.get("JIRA_EMAIL")
     token = os.environ.get("JIRA_API_TOKEN")
     if not (domain and email and token):
-        return []
+        # Not configured is a complete answer: there are no Jira rows and there never
+        # were, so nothing can be missing. Contrast the failures below.
+        return [], True
     jql = ("reporter = currentUser() AND assignee != currentUser() AND "
            "assignee is not EMPTY AND statusCategory != Done ORDER BY updated ASC")
     url = (f"https://{domain}/rest/api/3/search/jql?jql=" + urllib.parse.quote(jql)
@@ -781,8 +831,16 @@ def ledger_jira_stalled(days_min=None):
     try:
         with urllib.request.urlopen(req, timeout=30) as r:
             raw = json.load(r)
-    except (urllib.error.URLError, json.JSONDecodeError, TimeoutError):
-        return []
+    except (urllib.error.URLError, json.JSONDecodeError, TimeoutError, OSError):
+        print("  ledger: Jira would not answer for the tickets you filed — that side of "
+              "the ledger is absent this run, not empty", file=sys.stderr)
+        return [], False
+    if not isinstance(raw, dict):
+        # Same shape trap as the state files: a valid JSON list here used to reach
+        # raw.get() and raise AttributeError. See lib/statefile.py.
+        print("  ledger: Jira answered with something other than a search result — "
+              "that side of the ledger is absent this run", file=sys.stderr)
+        return [], False
     out = []
     for i in raw.get("issues", []):
         f = i.get("fields", {})
@@ -796,7 +854,7 @@ def ledger_jira_stalled(days_min=None):
                     "status": (f.get("status") or {}).get("name", ""),
                     "asked": updated, "days": days,
                     "url": f"https://{domain}/browse/{i.get('key','')}"})
-    return out
+    return out, True
 
 
 def _slack(method, **params):
@@ -1496,6 +1554,13 @@ def build_ledger(repo, mrs):
     reporters would drown the three rows that are.
     """
     me = gitlab_me(repo)
+    if not me:
+        # glab can die between collect_mrs and here -- a token refresh, a network blip --
+        # and "who am I" is what both GitLab halves are built on. Without it they are
+        # unknown rather than empty, and the difference decides whether a dismissal on
+        # one of their rows may be pruned.
+        print("  ledger: GitLab would not say who you are — both GitLab sides of the "
+              "ledger are absent this run, not empty", file=sys.stderr)
     # The three sources share nothing, so they run at once -- measured serially they cost
     # 14s of wall clock, which is most of the whole tool's budget spent on one section.
     with futures.ThreadPoolExecutor(max_workers=4) as pool:
@@ -1503,9 +1568,10 @@ def build_ledger(repo, mrs):
         f_you = pool.submit(ledger_you_owe, repo, me) if me else None
         f_jira = pool.submit(ledger_jira_stalled)
         f_slack = pool.submit(ledger_slack)
-        they = f_they.result() if f_they else []
-        you, covered = f_you.result() if f_you else ([], 0)
-        they += f_jira.result()
+        they, they_whole = f_they.result() if f_they else ([], False)
+        you, covered, you_whole = f_you.result() if f_you else ([], 0, False)
+        jira_rows, jira_whole = f_jira.result()
+        they += jira_rows
         slack_they, slack_you, slack_seen, slack_whole = f_slack.result()
         they += slack_they
         you += slack_you
@@ -1534,7 +1600,15 @@ def build_ledger(repo, mrs):
             # Whether the Slack rows above are all of them. Separate from `slack` because
             # "not consulted" and "consulted and half-answered" support opposite decisions
             # about pruning an acknowledgement -- see ledger_slack's return contract.
-            "slack_complete": slack_whole}
+            "slack_complete": slack_whole,
+            # And the same question about the ledger as a whole: did every source it draws
+            # on answer for everything it holds. This is what the dismissal prune is gated
+            # on, because pruning deletes an acknowledgement on the grounds that its row is
+            # gone, and a source that half-answered cannot support that claim about
+            # anything. Four independent doors were open to it -- glab refusing `user`,
+            # glab refusing one MR's notes, Jira timing out, Slack losing a page -- and all
+            # four looked from here exactly like a quiet week.
+            "complete": bool(they_whole and you_whole and jira_whole and slack_whole)}
 
 
 # `!10481` as it is written in prose, and the merge request URL that carries the same
@@ -4591,16 +4665,21 @@ def main():
     # from scratch, and a mark applied any earlier would be recomputed away. Pruning
     # only on the full pipeline run, where every dismissable universe exists.
     #
-    # `slack_complete` and not just `ledger`: a truthy dict says the ledger was built, and
-    # the Slack rows are half of what it can hold. A partial Slack outage used to slip
-    # straight through this gate and take Kyle's acknowledgements with it -- see
-    # apply_dismissals. Note it is the *complete* flag and not `slack`: with no token
-    # configured there are no Slack rows to be missing, and blocking the prune there would
-    # mean a GitLab dismissal could never expire on a machine that has no Slack at all.
+    # `ledger["complete"]` and not just `ledger`: a truthy dict says the ledger was BUILT,
+    # and every source it draws on can half-answer without saying so. Four doors were open
+    # to this gate -- glab refusing `user`, glab refusing one MR's notes, Jira timing out,
+    # Slack losing a page of a sweep -- and through any of them the run deleted Kyle's
+    # acknowledgements while announcing that their facts had moved. See apply_dismissals.
+    #
+    # Note it is completeness and not presence: with no Slack token and no Jira credentials
+    # there are no rows from either and there never were, so nothing can be missing and a
+    # stale GitLab acknowledgement must still be able to expire. Gating on "was it
+    # consulted" would freeze the store forever on a machine configured for less.
+    #
     # Nothing else is conditional on this: the rows that DID arrive still get their
     # `dismissed` mark, so an outage costs a prune, never a shout.
     apply_dismissals(ledger, arcs, gap,
-                     prune=bool(ledger and ledger.get("slack_complete")
+                     prune=bool(ledger and ledger.get("complete")
                                 and gap is not None and args.json))
 
     # Before --active and --focus, and that is the whole point of the feature. The arcs

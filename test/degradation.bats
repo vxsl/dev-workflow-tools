@@ -41,6 +41,7 @@ teardown() {
 wa() {
     python3 - "$REPO_ROOT/bin/work-arcs" <<PY
 import importlib.machinery, importlib.util, sys, json, os
+from pathlib import Path
 loader = importlib.machinery.SourceFileLoader("wa", sys.argv[1])
 spec = importlib.util.spec_from_loader("wa", loader)
 wa = importlib.util.module_from_spec(spec)
@@ -76,12 +77,19 @@ def prune_run(ledger, arcs=(), gap={}):
     never pruning at all.
     """
     wa.apply_dismissals(ledger, list(arcs), gap,
-                        prune=bool(ledger and ledger.get("slack_complete")
+                        prune=bool(ledger and ledger.get("complete")
                                    and gap is not None))
 
 def led(consulted, complete, you=()):
+    """A ledger whose GitLab and Jira halves were fine and whose Slack half is the variable."""
     return {"they_owe": [], "you_owe": list(you), "you_owe_covered": 0,
-            "you_owe_closed": [], "slack": consulted, "slack_complete": complete}
+            "you_owe_closed": [], "slack": consulted, "slack_complete": complete,
+            "complete": complete}
+
+def only_slack():
+    """No Slack token, Jira quiet: whatever goes wrong is GitLab's, not a co-factor."""
+    os.environ.pop("SLACK_USER_TOKEN", None)
+    wa.ledger_jira_stalled = lambda *a, **k: ([], True)
 
 $1
 PY
@@ -168,6 +176,95 @@ prune_run(led(consulted, complete))
 print("survived", survives())'
     [ "$status" -eq 0 ]
     [[ "$output" == *"survived False"* ]]
+}
+
+# ── the other three doors into the same prune ─────────────────────────────────
+
+@test "glab refusing to say who you are leaves both GitLab sides absent, not empty" {
+    # The narrowest door and the one nothing guarded: collect_mrs succeeds, so mrs_known is
+    # true and the ledger is built, and glab then dies before `user`. Both GitLab halves
+    # are keyed on that username, so they come back empty -- and a prune deleted every
+    # acknowledgement on a GitLab row while announcing that its fact had moved.
+    run wa '
+only_slack()
+wa.glab = lambda *a, **k: None
+l = wa.build_ledger(Path("/nonexistent"), [])
+print("complete", l["complete"])
+dismissal("fp-gitlab")
+prune_run(l)
+print("survived", survives("fp-gitlab"))'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"complete False"* ]]
+    [[ "$output" == *"survived True"* ]]
+    [[ "$output" == *"would not say who you are"* ]]
+}
+
+@test "an MR whose notes GitLab will not return is left off, not called silent" {
+    # The false-positive direction, which is the more expensive one. _mr_notes ended in
+    # `or []`, and ledger_they_owe reads an empty note list as "nobody has said a word" --
+    # which IS the review-silence claim. So one failed call invented a row accusing five
+    # reviewers of ignoring a merge request they had already discussed.
+    run wa '
+only_slack()
+mr = {"iid": 10481, "reviewers": ["brian", "vadym"], "draft": False,
+      "title": "t", "url": "u", "updated": "2026-08-01"}
+calls = []
+def glab(repo, path, **k):
+    calls.append(path)
+    if path == "user":
+        return {"username": "kyle"}
+    return None                      # notes and approvals both refuse
+wa.glab = glab
+rows, whole = wa.ledger_they_owe(Path("/nonexistent"), [mr], "kyle")
+print("rows", len(rows), "complete", whole)'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"rows 0 complete False"* ]]
+    [[ "$output" == *"would not answer for 1 merge request"* ]]
+}
+
+@test "an MR GitLab will not discuss is not counted as already handled either" {
+    # `covered` is a claim -- somebody approved, or you already spoke -- and an unreadable
+    # MR fell into it, inflating "+N review requests already handled" with requests nobody
+    # had handled. Silently, and in the reassuring direction.
+    run wa '
+only_slack()
+def glab(repo, path, **k):
+    if path == "user":
+        return {"username": "kyle"}
+    if "merge_requests?state=opened" in path:
+        return [{"iid": 7, "title": "t", "web_url": "u", "draft": False,
+                 "author": {"username": "someone"}, "created_at": "2026-08-01"}]
+    return None                      # discussions refuse
+wa.glab = glab
+rows, covered, whole = wa.ledger_you_owe(Path("/nonexistent"), "kyle")
+print("rows", len(rows), "covered", covered, "complete", whole)'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"rows 0 covered 0 complete False"* ]]
+}
+
+@test "Jira timing out leaves its side absent, not empty" {
+    JIRA_DOMAIN=example.atlassian.net JIRA_EMAIL=a@b JIRA_API_TOKEN=t run wa '
+import urllib.error
+def boom(*a, **k):
+    raise urllib.error.URLError("timed out")
+wa.urllib.request.urlopen = boom
+rows, whole = wa.ledger_jira_stalled()
+print("rows", len(rows), "complete", whole)'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"rows 0 complete False"* ]]
+    [[ "$output" == *"Jira would not answer"* ]]
+}
+
+@test "Jira configured but absent is a complete answer" {
+    # The control for the gate reading completeness rather than presence: no credentials
+    # means no Jira rows and none ever, so a prune stays safe.
+    run wa '
+for k in ("JIRA_DOMAIN", "JIRA_EMAIL", "JIRA_API_TOKEN"):
+    os.environ.pop(k, None)
+rows, whole = wa.ledger_jira_stalled()
+print("rows", len(rows), "complete", whole)'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"rows 0 complete True"* ]]
 }
 
 # ── corrupt state must cost a cache, never a run ──────────────────────────────
