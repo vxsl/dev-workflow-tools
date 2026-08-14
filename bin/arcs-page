@@ -1570,10 +1570,10 @@ def render(data, lede, focus_days, limit, cost=None):
             return ""
         days = idle_ids.get(arc.get("id"))
         if days is not None:
-            return (f'<span class="sprintchip idle" title="in {esc(s.get("name",""))} '
+            return (f' <span class="sprintchip idle" title="in {esc(s.get("name",""))} '
                     f'and untouched for {esc(days)} days">sprint &middot; '
                     f'{esc(days)}d</span>')
-        return (f'<span class="sprintchip" title="in the current sprint, '
+        return (f' <span class="sprintchip" title="in the current sprint, '
                 f'{esc(s.get("name",""))}">sprint</span>')
 
     def plural(n, word):
