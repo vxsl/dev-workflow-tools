@@ -543,3 +543,65 @@ print(note, "|", am.text_of(parts))'
     [ "${lines[0]}" = "not attempted" ]
     [ "${lines[1]}" = "cached (m) | At 149 days, DE-1 is the oldest." ]
 }
+
+# ── the brief against a commitment that closed on evidence ────────────────────
+#
+# close_commitments removes a kept promise from `you_owe` and moves it to
+# `you_owe_closed`, and the overdue sentence is chosen from `you_owe`. So the interesting
+# case is the one where the row the overdue sentence WOULD have led with is the row that
+# closed: the sentence has to vanish rather than be composed out of a promise that was
+# kept, and the ledger sentence has to stop stepping aside for a row that is no longer
+# there.
+
+@test "a promise that closed on evidence is not still called overdue" {
+    run am '
+p = owed("commitment", "#eng", 6, who="Neville", promised="send the doc Monday",
+         asked="2026-08-06", fp="fp-promise")
+other = owed("review-owed", "!101", 3, who="Logan")
+open_led = {"they_owe": [], "you_owe": [p, other], "you_owe_closed": []}
+shut = dict(p, closed_how="thread", closed_by="you posted in-thread: \"here\"")
+shut_led = {"they_owe": [], "you_owe": [other], "you_owe_closed": [shut]}
+print("open", kinds(payload(ledger=open_led)))
+print("shut", kinds(payload(ledger=shut_led)))
+print("shut-overdue", repr(says(payload(ledger=shut_led), "overdue")))'
+    [ "$status" -eq 0 ]
+    # While it is open the promise earns its own sentence...
+    [[ "${lines[0]}" == *"overdue"* ]]
+    # ...and once it closes there is no overdue sentence at all, rather than one about a
+    # promise that was kept.
+    [[ "${lines[1]}" != *"overdue"* ]]
+    [[ "${lines[2]}" == "shut-overdue ''" ]]
+}
+
+@test "the ledger sentence stops standing aside for a row that closed" {
+    # `owed_sentence` is passed the fp of the row the overdue sentence is about to take, so
+    # the same fact does not open two consecutive sentences. When the overdue row closes
+    # there is no fp to skip, and the ledger sentence must lead with the real oldest row
+    # rather than keep a hole where the promise used to be.
+    run am '
+p = owed("commitment", "#eng", 6, who="Neville", promised="send the doc Monday",
+         asked="2026-08-06", fp="fp-promise")
+other = owed("review-owed", "!101", 3, who="Logan")
+shut = dict(p, closed_how="thread", closed_by="you posted in-thread: \"here\"")
+print(says(payload(ledger={"they_owe": [], "you_owe": [other],
+                           "you_owe_closed": [shut]}), "owed"))'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"!101"* ]]
+    [[ "$output" != *"send the doc"* ]]
+}
+
+@test "a ledger holding only a closed promise is all clear, not empty-handed" {
+    # The pathological shape: every row closed on evidence this run. `you_owe` is empty and
+    # `you_owe_closed` is not, and "nothing is owed in either direction" is then exactly
+    # true -- the promise was kept. The page shows what closed it separately.
+    run am '
+shut = dict(owed("commitment", "#eng", 6, promised="send the doc Monday",
+                 asked="2026-08-06", fp="fp-promise"),
+            closed_how="thread", closed_by="you posted in-thread: \"here\"")
+d = payload(ledger={"they_owe": [], "you_owe": [], "you_owe_closed": [shut]})
+print(kinds(d))
+print(says(d, "allclear"))'
+    [ "$status" -eq 0 ]
+    [[ "${lines[0]}" == *"allclear"* ]]
+    [[ "${lines[1]}" == *"Nothing is owed in either direction"* ]]
+}

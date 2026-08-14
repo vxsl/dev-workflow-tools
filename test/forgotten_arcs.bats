@@ -503,6 +503,46 @@ print(min(xs(pg.cliff_spark(act(3, 90), 20))))'
     [ "$output" = "7" ]
 }
 
+# ── it must not accuse what it cannot see ─────────────────────────────────────
+
+@test "an arc whose merge requests were never fetched is not accused" {
+    # Two of the three exemptions -- in-review and pre-landing -- are stages that only
+    # merge-request data can establish. Without it `stage` collapses to local-only, both
+    # exemptions become unreachable, and every heavily-worked quiet arc gets accused by
+    # default. Measured: 3 of the 5 arcs a --no-mr run called forgotten are pre-landing
+    # residue that the full run correctly exempts.
+    #
+    # And it is not only --no-mr. A GitLab outage during the 07:10 cron sets mrs_known
+    # False on its own, so the page would accuse Kyle of dropping three things he had
+    # actually landed -- with no cheap flag anywhere for him to blame.
+    run wa '
+spec = {14: (900, 8), 13: (700, 7), 12: (500, 4)}
+seen = arc(sess(spec))
+blind = arc(sess(spec), mrs_known=False)
+print("seen", v(seen)["verdict"])
+print("blind", v(blind)["verdict"], "|", v(blind)["why"])'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"seen True"* ]]
+    [[ "$output" == *"blind False"* ]]
+    [[ "$output" == *"GitLab was not asked"* ]]
+}
+
+@test "abstaining does not swallow the answers that need no merge request" {
+    # The abstention sits after every derivable negative on purpose. "Why is this not on
+    # the list?" deserves an answer wherever one is sound, and parked, settled, still-live
+    # and too-little-invested are all sound without GitLab. Only the accusation needs the
+    # whole picture.
+    run wa '
+print("parked", v(arc(sess({14: (900, 8)}), mrs_known=False,
+                      parked={"at": 1}))["why"])
+print("light", v(arc(sess({14: (10, 1)}), mrs_known=False))["why"])
+print("live", v(arc(sess({1: (900, 8)}), mrs_known=False))["why"])'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"parked parked on purpose"* ]]
+    [[ "$output" == *"light only 10 entries"* ]]
+    [[ "$output" == *"live still live"* ]]
+}
+
 # ── one day arithmetic, so no two numbers on a row can disagree ───────────────
 
 @test "a row's age and its cliff are the same number about the same silence" {

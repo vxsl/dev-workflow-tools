@@ -3348,6 +3348,11 @@ def mark_forgotten(arc):
     Runs after apply_parked and after the second finalize, because two of its three tests
     read `stage` and `parked` -- and recomputed rather than accumulated, so a verdict from
     an earlier pass can never outlive the facts that produced it.
+
+    And it abstains where it cannot see. `stage` is what carries the in-review and
+    pre-landing exemptions, both of which are derived from merge requests, so an arc whose
+    MRs were never fetched has no exemption available to it and would be accused by default.
+    See the mrs_known check at the bottom.
     """
     act = arc.get("activity")
     if not act:
@@ -3386,6 +3391,23 @@ def mark_forgotten(arc):
     if k < _knob("cliff_ratio") * gap:
         return verdict(False, f"quiet {k} days against a {gap}-day rhythm — a pause, "
                        "not a cliff")
+    # Last, and it is a refusal to answer rather than an answer. Two of the three exemptions
+    # above -- in-review and pre-landing -- are stages that only merge-request data can
+    # establish, so where GitLab was not asked or would not answer, `stage` collapses to
+    # local-only and both exemptions become unreachable. Measured on this corpus: 3 of the 5
+    # arcs a --no-mr run calls forgotten are pre-landing residue that the full run correctly
+    # exempts. Those are false accusations of exactly the kind this feature's own docstring
+    # says must never happen, and they arrive without anybody choosing a cheap run -- a
+    # GitLab outage during the 07:10 cron sets mrs_known False all by itself.
+    #
+    # Placed after every derivable negative rather than before them, deliberately. An arc can
+    # still be told it is NOT forgotten for any reason that needs no MR -- settled, parked,
+    # too little invested, still live, archaeology, a pause -- because those answers are
+    # sound and a reader asking "why not?" should still get one. It is only the accusation
+    # that needs the whole picture.
+    if not arc.get("mrs_known", True):
+        return verdict(False, "GitLab was not asked, so whether a reviewer or a landed "
+                       "sibling explains this silence cannot be known — not accused")
 
     verdict(True, _forgotten_why(arc, act), [
         f"{inv['entries']} transcript entries and {inv['commits']} commits over "
