@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+# wt-dedupe: Collapse byte-identical files across worktrees into shared btrfs extents.
+#
+# Every worktree gets its own physical copy of every git-tracked file. For large
+# static fixtures that is pure waste: test_data/ is ~685M and there are 200+
+# worktrees, so ~140G of the disk is the same bytes over and over.
+#
+# On btrfs the right primitive is a reflink (shared extent), not a symlink:
+#   - invisible to git, so worktrees stay clean (a symlink would make git report
+#     the whole directory as deleted, since these files are tracked)
+#   - copy-on-write, so a later write to one copy diverges instead of silently
+#     corrupting its siblings the way a hardlink would
+#
+# Files are only ever reflinked after a full byte comparison against the
+# canonical copy, and the destination's mtime and mode are preserved so git's
+# index stat cache stays valid.
+#
+# Usage: wt-dedupe [--subpath DIR] [--canonical WT] [--min-size BYTES]
+#                  [--repos DIR] [--apply]
+# Default is a dry run; pass --apply to actually reflink.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$(type -P "$0" || echo "$0")")")" && pwd)"
+if [ -f "$SCRIPT_DIR/../.env" ]; then
+    set -a; source "$SCRIPT_DIR/../.env"; set +a
+fi
+
+REPOS_DIR="${WT_DEDUPE_REPOS:-$HOME/work/repos}"
+SUBPATH="${WT_DEDUPE_SUBPATH:-test_data}"
+CANONICAL="${WT_DEDUPE_CANONICAL:-}"
+MIN_SIZE="${WT_DEDUPE_MIN_SIZE:-262144}"
+APPLY=0
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --subpath)   SUBPATH="${2:?--subpath needs a value}"; shift 2 ;;
+        --canonical) CANONICAL="${2:?--canonical needs a value}"; shift 2 ;;
+        --min-size)  MIN_SIZE="${2:?--min-size needs a value}"; shift 2 ;;
+        --repos)     REPOS_DIR="${2:?--repos needs a value}"; shift 2 ;;
+        --apply)     APPLY=1; shift ;;
+        -h|--help)   sed -n '2,22p' "$0" | sed 's/^# \?//'; exit 0 ;;
+        *)           echo "✗ Unknown argument: $1" >&2; exit 1 ;;
+    esac
+done
+
+[ -d "$REPOS_DIR" ] || { echo "✗ No such repos directory: $REPOS_DIR" >&2; exit 1; }
+
+# Collect every worktree that actually has the subpath.
+mapfile -t holders < <(find "$REPOS_DIR" -mindepth 2 -maxdepth 3 -type d \
+    -name "$(basename "$SUBPATH")" -path "*/$SUBPATH" 2>/dev/null | sort)
+
+if [ "${#holders[@]}" -lt 2 ]; then
+    echo "✗ Need at least two worktrees holding $SUBPATH (found ${#holders[@]})" >&2
+    exit 1
+fi
+
+# Canonical defaults to the first holder; everything else reflinks against it.
+if [ -n "$CANONICAL" ]; then
+    canonical_dir="$REPOS_DIR/$CANONICAL/$SUBPATH"
+    [ -d "$canonical_dir" ] || { echo "✗ No $SUBPATH under $CANONICAL" >&2; exit 1; }
+else
+    canonical_dir="${holders[0]}"
+fi
+
+echo "Canonical: ${canonical_dir#"$REPOS_DIR"/}" >&2
+echo "Holders:   ${#holders[@]} worktree(s) with $SUBPATH" >&2
+echo "Threshold: files >= $(numfmt --to=iec --suffix=B "$MIN_SIZE" 2>/dev/null || echo "$MIN_SIZE")" >&2
+
+# Physical offset of a file's first extent. Two files that already share extents
+# report the same offset, which lets repeat runs skip work cheaply.
+first_extent() {
+    filefrag -v "$1" 2>/dev/null \
+        | awk '/^ *0:/ { gsub(/\.\./, "", $4); print $4; exit }'
+}
+
+saved_bytes=0
+linked=0
+skipped_shared=0
+skipped_differ=0
+
+while IFS= read -r -d '' src; do
+    rel="${src#"$canonical_dir"/}"
+    src_size=$(stat -c %s "$src" 2>/dev/null) || continue
+    src_ext=$(first_extent "$src")
+
+    for holder in "${holders[@]}"; do
+        [ "$holder" = "$canonical_dir" ] && continue
+        dst="$holder/$rel"
+
+        [ -f "$dst" ] || continue
+        [ -L "$dst" ] && continue
+
+        dst_size=$(stat -c %s "$dst" 2>/dev/null) || continue
+        [ "$dst_size" = "$src_size" ] || { skipped_differ=$((skipped_differ + 1)); continue; }
+
+        # Already sharing extents from an earlier run.
+        if [ -n "$src_ext" ] && [ "$(first_extent "$dst")" = "$src_ext" ]; then
+            skipped_shared=$((skipped_shared + 1))
+            continue
+        fi
+
+        cmp -s "$src" "$dst" || { skipped_differ=$((skipped_differ + 1)); continue; }
+
+        saved_bytes=$((saved_bytes + src_size))
+        linked=$((linked + 1))
+
+        if [ "$APPLY" -eq 1 ]; then
+            tmp="$dst.wt-dedupe.$$"
+            dst_mtime=$(stat -c %Y "$dst")
+            if cp --reflink=always "$src" "$tmp" 2>/dev/null; then
+                chmod --reference="$dst" "$tmp" 2>/dev/null || true
+                touch -d "@$dst_mtime" "$tmp"
+                mv -f "$tmp" "$dst"
+            else
+                rm -f "$tmp"
+                echo "✗ reflink failed: ${dst#"$REPOS_DIR"/}" >&2
+                saved_bytes=$((saved_bytes - src_size))
+                linked=$((linked - 1))
+            fi
+        fi
+    done
+done < <(find "$canonical_dir" -type f -size +"$((MIN_SIZE / 1024 - 1))"k -print0 2>/dev/null)
+
+human=$(numfmt --to=iec --suffix=B "$saved_bytes" 2>/dev/null || echo "${saved_bytes}B")
+if [ "$APPLY" -eq 1 ]; then
+    echo "✓ Reflinked $linked file(s), reclaiming $human" >&2
+else
+    echo "✓ Would reflink $linked file(s), reclaiming $human" >&2
+    echo "  (dry run -- re-run with --apply)" >&2
+fi
+echo "  skipped: $skipped_shared already shared, $skipped_differ differing/absent" >&2

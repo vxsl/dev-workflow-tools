@@ -10,7 +10,14 @@
 # you still edit the worktree -- a target/ untouched for weeks is dead weight
 # even in an active worktree.
 #
-# Usage: wt-gc [--days N] [--apply] [--repos DIR] [--artifacts "a b c"]
+# A fixed age window cannot keep up on its own: a fleet of parallel agent
+# worktrees can regenerate 100G+ of target/ in a few hours, so whatever the
+# window is, the disk refills. --free-target instead evicts least-recently-built
+# artifacts until df reports enough free space, which self-corrects against
+# whatever rate the agents happen to be running at.
+#
+# Usage: wt-gc [--days N | --free-target SIZE] [--apply] [--repos DIR]
+#              [--artifacts "a b c"]
 # Default is a dry run; pass --apply to actually delete.
 
 set -euo pipefail
@@ -23,16 +30,18 @@ fi
 DAYS="${WT_GC_DAYS:-21}"
 REPOS_DIR="${WT_GC_REPOS:-$HOME/work/repos}"
 ARTIFACTS="${WT_GC_ARTIFACTS:-target node_modules}"
+FREE_TARGET="${WT_GC_FREE_TARGET:-}"
 APPLY=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --days)      DAYS="${2:?--days needs a value}"; shift 2 ;;
-        --repos)     REPOS_DIR="${2:?--repos needs a value}"; shift 2 ;;
-        --artifacts) ARTIFACTS="${2:?--artifacts needs a value}"; shift 2 ;;
-        --apply)     APPLY=1; shift ;;
-        -h|--help)   sed -n '2,17p' "$0" | sed 's/^# \?//'; exit 0 ;;
-        *)           echo "✗ Unknown argument: $1" >&2; exit 1 ;;
+        --days)        DAYS="${2:?--days needs a value}"; shift 2 ;;
+        --free-target) FREE_TARGET="${2:?--free-target needs a value}"; shift 2 ;;
+        --repos)       REPOS_DIR="${2:?--repos needs a value}"; shift 2 ;;
+        --artifacts)   ARTIFACTS="${2:?--artifacts needs a value}"; shift 2 ;;
+        --apply)       APPLY=1; shift ;;
+        -h|--help)     sed -n '2,24p' "$0" | sed 's/^# \?//'; exit 0 ;;
+        *)             echo "✗ Unknown argument: $1" >&2; exit 1 ;;
     esac
 done
 
@@ -60,42 +69,78 @@ mapfile -t candidates < <(
         \( "${find_args[@]:1}" \) -prune -print 2>/dev/null | sort
 )
 
-total_bytes=0
-stale_count=0
-kept_count=0
+# A cargo build holds target/.cargo-lock open. Never delete underneath one.
+build_in_progress() {
+    [ -e "$1/.cargo-lock" ] || return 1
+    fuser -s "$1/.cargo-lock" 2>/dev/null
+}
 
+avail_bytes() { df --output=avail -B1 "$REPOS_DIR" | tail -1; }
+
+protected=0
+eligible=()
 for dir in "${candidates[@]}"; do
     mtime=$(stat -c %Y "$dir" 2>/dev/null) || continue
 
     if [ -n "$current_wt" ] && [[ "$dir" == "$current_wt"/* ]]; then
-        kept_count=$((kept_count + 1))
-        continue
+        protected=$((protected + 1)); continue
+    fi
+    if build_in_progress "$dir"; then
+        echo "skipping ${dir#"$REPOS_DIR"/} -- build in progress" >&2
+        protected=$((protected + 1)); continue
     fi
 
-    if [ "$mtime" -ge "$cutoff" ]; then
-        kept_count=$((kept_count + 1))
-        continue
-    fi
-
-    bytes=$(du -sb "$dir" 2>/dev/null | cut -f1) || bytes=0
-    human=$(numfmt --to=iec --suffix=B "$bytes" 2>/dev/null || echo "${bytes}B")
-    total_bytes=$((total_bytes + bytes))
-    stale_count=$((stale_count + 1))
-
-    if [ "$APPLY" -eq 1 ]; then
-        printf 'removing %s (%s, last touched %s)\n' \
-            "${dir#"$REPOS_DIR"/}" "$human" "$(date -d "@$mtime" +%Y-%m-%d)" >&2
-        rm -rf "$dir"
-    else
-        printf 'would remove %s (%s, last touched %s)\n' \
-            "${dir#"$REPOS_DIR"/}" "$human" "$(date -d "@$mtime" +%Y-%m-%d)" >&2
-    fi
+    eligible+=("$mtime	$dir")
 done
 
+total_bytes=0
+reaped=0
+REAPED_BYTES=0
+
+reap() {
+    local dir=$1 mtime=$2 bytes human verb="would remove"
+    bytes=$(du -sb "$dir" 2>/dev/null | cut -f1) || bytes=0
+    human=$(numfmt --to=iec --suffix=B "$bytes" 2>/dev/null || echo "${bytes}B")
+    [ "$APPLY" -eq 1 ] && verb="removing"
+    printf '%s %s (%s du, last built %s)\n' \
+        "$verb" "${dir#"$REPOS_DIR"/}" "$human" "$(date -d "@$mtime" +%Y-%m-%d)" >&2
+    [ "$APPLY" -eq 1 ] && rm -rf "$dir"
+    total_bytes=$((total_bytes + bytes))
+    reaped=$((reaped + 1))
+    REAPED_BYTES=$bytes
+}
+
+if [ -n "$FREE_TARGET" ]; then
+    want=$(numfmt --from=iec "$FREE_TARGET" 2>/dev/null) \
+        || { echo "✗ Bad --free-target: $FREE_TARGET (try 120G)" >&2; exit 1; }
+
+    # Evict least-recently-built first. Under --apply we re-read df after each
+    # removal, so the stopping point reflects bytes actually returned rather
+    # than du's uncompressed figures.
+    simulated=$(avail_bytes)
+    while IFS=$'\t' read -r mtime dir; do
+        if [ "$APPLY" -eq 1 ]; then
+            [ "$(avail_bytes)" -ge "$want" ] && break
+        else
+            [ "$simulated" -ge "$want" ] && break
+        fi
+        reap "$dir" "$mtime"
+        simulated=$((simulated + REAPED_BYTES))
+    done < <(printf '%s\n' "${eligible[@]}" | sort -n)
+else
+    while IFS=$'\t' read -r mtime dir; do
+        [ "$mtime" -lt "$cutoff" ] || continue
+        reap "$dir" "$mtime"
+    done < <(printf '%s\n' "${eligible[@]}")
+fi
+
+kept=$(( ${#eligible[@]} - reaped + protected ))
 total_human=$(numfmt --to=iec --suffix=B "$total_bytes" 2>/dev/null || echo "${total_bytes}B")
 if [ "$APPLY" -eq 1 ]; then
-    echo "✓ Reclaimed $total_human from $stale_count stale artifact dir(s); kept $kept_count" >&2
+    echo "✓ Removed $reaped artifact dir(s) totalling $total_human du; kept $kept" >&2
+    echo "  $(numfmt --to=iec --suffix=B "$(avail_bytes)" 2>/dev/null) now free" >&2
 else
-    echo "✓ Would reclaim $total_human from $stale_count stale artifact dir(s); kept $kept_count" >&2
+    echo "✓ Would remove $reaped artifact dir(s) totalling $total_human du; kept $kept" >&2
     echo "  (dry run -- re-run with --apply to delete)" >&2
+    echo "  note: du overstates on this zstd-compressed btrfs; real reclaim is smaller" >&2
 fi
