@@ -47,6 +47,20 @@ STATE = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "
 CACHE = STATE / "briefs.json"
 TURNS = STATE / "turns.jsonl"
 
+# How long a brief nothing has asked for is kept. The cache is keyed on the evidence, the
+# model and the prompt together, so every prompt reword and every model switch retires the
+# whole generation before it in one go -- correctly, since a brief written by another model
+# from another question is not this one's to serve. What was missing is the other half of
+# that: nothing ever removed the generation being retired. Three weeks and a handful of
+# prompt edits had left 914 entries carrying their full evidence text for 157 live arcs,
+# about 2MB of answers to questions no longer being asked.
+#
+# By last use rather than by age, because the two differ exactly where it matters: an arc
+# you have not touched since June is still a cache hit the day you return to it, and its
+# brief should still be there. A month is well past the point where a prompt revision might
+# be reverted, and well short of the horizon on which real work goes quiet.
+CACHE_KEEP_DAYS = int(os.environ.get("ARC_BRIEF_KEEP_DAYS", "30"))
+
 # Naming an arc from mixed evidence is a judgement, not an extraction, and a bad name
 # here reproduces exactly the failure this tool exists to fix. `claude -p` resolves the
 # alias, so there is no model id to keep in sync.
@@ -705,11 +719,58 @@ def load_cache():
     return load_store(CACHE, "the brief cache")
 
 
-def save_cache(cache):
+def touched_at(entry):
+    """When this brief was last served or written, however old the entry's shape is.
+
+    Entries written before pruning existed carry no `last_used`, so they are dated by when
+    they were written. That is the conservative reading -- it can only make an entry look
+    older than it is, never newer -- and it is self-correcting: the first run that serves
+    one stamps it.
+    """
+    if not isinstance(entry, dict):
+        return 0
+    for key in ("last_used", "at"):
+        v = entry.get(key)
+        if isinstance(v, (int, float)):
+            return v
+    return 0
+
+
+def payload_of(entry):
+    """The brief as everything downstream sees it: all of it but this file's bookkeeping.
+
+    arc-morning keys its own cache on the prompt it builds, and that prompt embeds every
+    arc's brief -- so a last-use stamp riding along in the payload would reword the question
+    on every run and miss that cache every time, which is precisely the failure this file's
+    own cache exists to avoid. The bookkeeping belongs to the file, not to the answer.
+    """
+    return {k: v for k, v in entry.items() if k != "last_used"}
+
+
+def save_cache(cache, keep_days=CACHE_KEEP_DAYS, say=None):
+    """Write the cache, less whatever nothing has asked for in keep_days.
+
+    Pruning on write rather than on read, so the file the next run loads is already the
+    file this one decided on -- a prune that lived in load_cache would be undone by any
+    run that exits before saving.
+
+    It says what it dropped. A cache that quietly shrinks looks exactly like a cache that
+    is working and cold, and the difference is a run's worth of model calls -- the same
+    reason load_store announces a corrupt store rather than starting empty in silence.
+    """
+    if keep_days > 0:
+        cut = time.time() - keep_days * 86400
+        kept = {fp: b for fp, b in cache.items() if touched_at(b) >= cut}
+        dropped = len(cache) - len(kept)
+        if dropped and say is not None:
+            say(f"arc-brief: dropped {dropped} brief(s) unused for {keep_days}+ days, "
+                f"{len(kept)} kept")
+        cache = kept
     STATE.mkdir(parents=True, exist_ok=True)
     tmp = CACHE.with_suffix(".tmp")
     tmp.write_text(json.dumps(cache, indent=1, sort_keys=True))
     tmp.replace(CACHE)
+    return cache
 
 
 def do_split(data, repo, main_ref, args):
@@ -863,13 +924,17 @@ def main():
     todo += extra
 
     cache = load_cache()
+    now = int(time.time())
     work, hits = [], 0
     for arc in todo:
         ev = evidence_for(arc, repo, main_ref, turns)
         fp = fingerprint(ev, args.model, PROMPT)
         cached = None if args.refresh else cache.get(fp)
         if cached:
-            arc["brief"] = cached
+            # Reading is a use, and the stamp goes on the cache entry -- not on what is
+            # handed downstream. See payload_of.
+            cached["last_used"] = now
+            arc["brief"] = payload_of(cached)
             hits += 1
         else:
             work.append((arc, ev, fp))
@@ -898,12 +963,22 @@ def main():
                 cache[fp] = brief
                 print(f"  [{done}/{len(work)}] {arc.get('label','?')} -> "
                       f"{brief['name']}", file=sys.stderr)
-        save_cache(cache)
         if failed:
             print(f"arc-brief: {failed} arc(s) have no description; they fall back to "
                   f"their cluster label", file=sys.stderr)
     else:
         print(f"arc-brief: {hits} cached, nothing to write", file=sys.stderr)
+
+    # Unconditionally, which the write above was not. A fully warm run writes no new brief
+    # and used to skip saving entirely -- so the last-use stamps it just set were dropped on
+    # the floor, and a month of warm runs would have pruned the very entries being served
+    # every morning. Reading is a use, and a use has to be recorded to count.
+    try:
+        save_cache(cache, say=lambda m: print(m, file=sys.stderr))
+    except OSError as e:
+        # The briefs are already on the arcs; a cache that cannot be written costs the next
+        # run its model calls and costs this one nothing.
+        print(f"arc-brief: could not write the brief cache ({e})", file=sys.stderr)
 
     data["briefed"] = sum(1 for a in arcs if a.get("brief"))
     out = json.dumps(data, indent=1)
