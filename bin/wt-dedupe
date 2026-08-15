@@ -3,7 +3,7 @@
 #
 # Every worktree gets its own physical copy of every git-tracked file. For large
 # static fixtures that is pure waste: test_data/ is ~685M and there are 200+
-# worktrees, so ~140G of the disk is the same bytes over and over.
+# worktrees, so a big slice of the disk is the same bytes over and over.
 #
 # On btrfs the right primitive is a reflink (shared extent), not a symlink:
 #   - invisible to git, so worktrees stay clean (a symlink would make git report
@@ -11,9 +11,10 @@
 #   - copy-on-write, so a later write to one copy diverges instead of silently
 #     corrupting its siblings the way a hardlink would
 #
-# Files are only ever reflinked after a full byte comparison against the
-# canonical copy, and the destination's mtime and mode are preserved so git's
-# index stat cache stays valid.
+# Identity comes from git rather than from reading bytes. Two worktrees that
+# record the same blob hash for a path, with no unstaged modification to it,
+# hold identical content by definition -- so a full byte comparison would mean
+# re-reading a hundred-plus gigabytes to re-derive what the index already knows.
 #
 # Usage: wt-dedupe [--subpath DIR] [--canonical WT] [--min-size BYTES]
 #                  [--repos DIR] [--apply]
@@ -39,70 +40,79 @@ while [ $# -gt 0 ]; do
         --min-size)  MIN_SIZE="${2:?--min-size needs a value}"; shift 2 ;;
         --repos)     REPOS_DIR="${2:?--repos needs a value}"; shift 2 ;;
         --apply)     APPLY=1; shift ;;
-        -h|--help)   sed -n '2,22p' "$0" | sed 's/^# \?//'; exit 0 ;;
+        -h|--help)   sed -n '2,24p' "$0" | sed 's/^# \?//'; exit 0 ;;
         *)           echo "✗ Unknown argument: $1" >&2; exit 1 ;;
     esac
 done
 
 [ -d "$REPOS_DIR" ] || { echo "✗ No such repos directory: $REPOS_DIR" >&2; exit 1; }
 
-# Collect every worktree that actually has the subpath.
-mapfile -t holders < <(find "$REPOS_DIR" -mindepth 2 -maxdepth 3 -type d \
-    -name "$(basename "$SUBPATH")" -path "*/$SUBPATH" 2>/dev/null | sort)
+# Worktrees holding the subpath, canonical first.
+mapfile -t holders < <(
+    find "$REPOS_DIR" -mindepth 2 -maxdepth 3 -type d -path "*/$SUBPATH" 2>/dev/null \
+        | sed "s|/$SUBPATH\$||" | sort
+)
+[ "${#holders[@]}" -ge 2 ] || { echo "✗ Need >=2 worktrees with $SUBPATH" >&2; exit 1; }
 
-if [ "${#holders[@]}" -lt 2 ]; then
-    echo "✗ Need at least two worktrees holding $SUBPATH (found ${#holders[@]})" >&2
+if [ -n "$CANONICAL" ]; then
+    canonical_wt="$REPOS_DIR/$CANONICAL"
+else
+    canonical_wt="${holders[0]}"
+fi
+[ -d "$canonical_wt/$SUBPATH" ] || { echo "✗ No $SUBPATH under $canonical_wt" >&2; exit 1; }
+
+# The canonical copy must itself match its blobs, or we would propagate a
+# local edit into every other worktree.
+if [ -n "$(git -C "$canonical_wt" diff-files --name-only -- "$SUBPATH" 2>/dev/null)" ]; then
+    echo "✗ $canonical_wt has unstaged changes under $SUBPATH; pick another --canonical" >&2
     exit 1
 fi
 
-# Canonical defaults to the first holder; everything else reflinks against it.
-if [ -n "$CANONICAL" ]; then
-    canonical_dir="$REPOS_DIR/$CANONICAL/$SUBPATH"
-    [ -d "$canonical_dir" ] || { echo "✗ No $SUBPATH under $CANONICAL" >&2; exit 1; }
-else
-    canonical_dir="${holders[0]}"
-fi
+declare -A canon_blob=()
+while read -r _mode blob _stage path; do
+    canon_blob["$path"]="$blob"
+done < <(git -C "$canonical_wt" ls-files -s -- "$SUBPATH" 2>/dev/null)
 
-echo "Canonical: ${canonical_dir#"$REPOS_DIR"/}" >&2
-echo "Holders:   ${#holders[@]} worktree(s) with $SUBPATH" >&2
+echo "Canonical: ${canonical_wt#"$REPOS_DIR"/} (${#canon_blob[@]} tracked files under $SUBPATH)" >&2
+echo "Holders:   ${#holders[@]} worktree(s)" >&2
 echo "Threshold: files >= $(numfmt --to=iec --suffix=B "$MIN_SIZE" 2>/dev/null || echo "$MIN_SIZE")" >&2
 
-# Physical offset of a file's first extent. Two files that already share extents
-# report the same offset, which lets repeat runs skip work cheaply.
+# Physical offset of a file's first extent; two files already sharing extents
+# report the same offset, which makes repeat runs cheap. awk must consume all of
+# filefrag's output rather than exiting at the first match, or filefrag takes a
+# SIGPIPE and kills the run.
 first_extent() {
     filefrag -v "$1" 2>/dev/null \
-        | awk '/^ *0:/ { gsub(/\.\./, "", $4); print $4; exit }'
+        | awk '/^ *0:/ && !seen { gsub(/\.\./, "", $4); print $4; seen = 1 }' || true
 }
 
-saved_bytes=0
-linked=0
-skipped_shared=0
-skipped_differ=0
+saved_bytes=0; linked=0; already=0; skipped=0
 
-while IFS= read -r -d '' src; do
-    rel="${src#"$canonical_dir"/}"
-    src_size=$(stat -c %s "$src" 2>/dev/null) || continue
-    src_ext=$(first_extent "$src")
+for wt in "${holders[@]}"; do
+    [ "$wt" = "$canonical_wt" ] && continue
 
-    for holder in "${holders[@]}"; do
-        [ "$holder" = "$canonical_dir" ] && continue
-        dst="$holder/$rel"
+    declare -A dirty=()
+    while IFS= read -r p; do dirty["$p"]=1; done \
+        < <(git -C "$wt" diff-files --name-only -- "$SUBPATH" 2>/dev/null)
 
-        [ -f "$dst" ] || continue
-        [ -L "$dst" ] && continue
+    while read -r _mode blob _stage path; do
+        [ "${canon_blob[$path]:-}" = "$blob" ] || { skipped=$((skipped + 1)); continue; }
+        [ -n "${dirty[$path]:-}" ] && { skipped=$((skipped + 1)); continue; }
 
-        dst_size=$(stat -c %s "$dst" 2>/dev/null) || continue
-        [ "$dst_size" = "$src_size" ] || { skipped_differ=$((skipped_differ + 1)); continue; }
+        src="$canonical_wt/$path"
+        dst="$wt/$path"
+        [ -f "$src" ] && [ -f "$dst" ] || { skipped=$((skipped + 1)); continue; }
+        [ -L "$dst" ] && { skipped=$((skipped + 1)); continue; }
 
-        # Already sharing extents from an earlier run.
+        size=$(stat -c %s "$dst" 2>/dev/null) || continue
+        [ "$size" -ge "$MIN_SIZE" ] || { skipped=$((skipped + 1)); continue; }
+
+        src_ext=$(first_extent "$src")
         if [ -n "$src_ext" ] && [ "$(first_extent "$dst")" = "$src_ext" ]; then
-            skipped_shared=$((skipped_shared + 1))
-            continue
+            already=$((already + 1)); continue
         fi
 
-        cmp -s "$src" "$dst" || { skipped_differ=$((skipped_differ + 1)); continue; }
-
-        saved_bytes=$((saved_bytes + src_size))
+        saved_bytes=$((saved_bytes + size))
         linked=$((linked + 1))
 
         if [ "$APPLY" -eq 1 ]; then
@@ -115,18 +125,20 @@ while IFS= read -r -d '' src; do
             else
                 rm -f "$tmp"
                 echo "✗ reflink failed: ${dst#"$REPOS_DIR"/}" >&2
-                saved_bytes=$((saved_bytes - src_size))
-                linked=$((linked - 1))
+                saved_bytes=$((saved_bytes - size)); linked=$((linked - 1))
             fi
         fi
-    done
-done < <(find "$canonical_dir" -type f -size +"$((MIN_SIZE / 1024 - 1))"k -print0 2>/dev/null)
+    done < <(git -C "$wt" ls-files -s -- "$SUBPATH" 2>/dev/null)
+
+    unset dirty
+done
 
 human=$(numfmt --to=iec --suffix=B "$saved_bytes" 2>/dev/null || echo "${saved_bytes}B")
 if [ "$APPLY" -eq 1 ]; then
-    echo "✓ Reflinked $linked file(s), reclaiming $human" >&2
+    echo "✓ Reflinked $linked file(s), $human of duplicate logical bytes collapsed" >&2
 else
-    echo "✓ Would reflink $linked file(s), reclaiming $human" >&2
+    echo "✓ Would reflink $linked file(s), $human of duplicate logical bytes" >&2
     echo "  (dry run -- re-run with --apply)" >&2
 fi
-echo "  skipped: $skipped_shared already shared, $skipped_differ differing/absent" >&2
+echo "  $already already shared, $skipped skipped (below threshold, differing blob, or dirty)" >&2
+echo "  note: du/stat report uncompressed size on this zstd btrfs; real reclaim is smaller" >&2
