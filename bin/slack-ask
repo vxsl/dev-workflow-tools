@@ -1,32 +1,42 @@
 #!/usr/bin/env bash
-# Ask the user a question via Slack DM thread and block until they reply.
+# Ask the user a question via Slack thread and block until they reply.
 # Called by Claude during headless ticket-solve runs.
 #
 # Usage: slack-ask "Should I handle the empty state?"
 # Returns: The user's reply text on stdout
 #
 # Required env vars (set by ticket-solve):
-#   SLACK_DM_CHANNEL_ID      - DM channel ID
+#   SLACK_DM_CHANNEL_ID      - Channel to post in (DM or shared channel)
 #   SLACK_THREAD_TS          - Thread to post in
 #   TICKET_CREATOR_BOT_TOKEN - Bot token
 #   SLACK_NOTIFY_USER_ID     - User ID (to distinguish from bot messages)
 #
-# Timeout: 30 minutes (override with SLACK_ASK_TIMEOUT_SECONDS)
+# In a shared channel the reply must @mention the bot to count as an answer —
+# see select_ask_reply in lib/slack.sh for why. DMs need no mention.
+#
+# Timeout: 30 minutes (override with SLACK_ASK_TIMEOUT_SECONDS; poll cadence
+# with SLACK_ASK_POLL_INTERVAL)
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$(type -P "$0" || echo "$0")")")" && pwd)"
+source "$SCRIPT_DIR/../lib/slack.sh"
+
 QUESTION="$*"
 TIMEOUT="${SLACK_ASK_TIMEOUT_SECONDS:-1800}"
-POLL_INTERVAL=5
+POLL_INTERVAL="${SLACK_ASK_POLL_INTERVAL:-5}"
 
 case "${1:-}" in
     -h|--help)
         cat <<'EOF'
 Usage: slack-ask <question>
 
-Posts <question> to the current Slack DM thread and blocks until the user
+Posts <question> to the current Slack thread and blocks until the user
 replies (default timeout: 30 min; override via SLACK_ASK_TIMEOUT_SECONDS).
 The reply text is printed on stdout.
+
+In a shared channel, only replies that @mention the bot count as an answer;
+in a DM every reply does. When the user posts several, the last one wins.
 
 Requires SLACK_DM_CHANNEL_ID, SLACK_THREAD_TS, TICKET_CREATOR_BOT_TOKEN,
 and SLACK_NOTIFY_USER_ID in the environment (set by ticket-solve).
@@ -46,6 +56,31 @@ if [ -z "${SLACK_DM_CHANNEL_ID:-}" ] || [ -z "${SLACK_THREAD_TS:-}" ] || [ -z "$
     exit 0
 fi
 
+# Who must the answer be addressed to? Nobody in a DM; the bot itself in a
+# shared channel, so a message aimed at a teammate isn't mistaken for an
+# answer. Resolved before the question is posted, because the question has to
+# tell the user which rule applies.
+BOT_USER_ID=""
+if ! slack_channel_is_dm "$SLACK_DM_CHANNEL_ID"; then
+    AUTH=$(curl -sf -X POST "https://slack.com/api/auth.test" \
+        -H "Authorization: Bearer ${TICKET_CREATOR_BOT_TOKEN}" 2>/dev/null) || AUTH=""
+    BOT_USER_ID=$(printf '%s' "$AUTH" | jq -r '.user_id // empty' 2>/dev/null || true)
+    if [ -z "$BOT_USER_ID" ]; then
+        # Can't name ourselves, so can't require being named. Fall back to
+        # accepting any reply from the user rather than hanging for the full
+        # timeout — but say so, because this is the mode that once read a
+        # message meant for a teammate as an approval.
+        echo "WARNING: auth.test gave no user_id — accepting any reply in ${SLACK_DM_CHANNEL_ID}" >&2
+    fi
+fi
+
+QUESTION_TEXT=":thinking_face: *Question:* ${QUESTION}"
+if [ -n "$BOT_USER_ID" ]; then
+    QUESTION_TEXT="${QUESTION_TEXT}
+
+_Reply with <@${BOT_USER_ID}> to answer — in a channel I only read replies that tag me._"
+fi
+
 # Post the question
 RESPONSE=$(curl -sf -X POST "https://slack.com/api/chat.postMessage" \
     -H "Authorization: Bearer ${TICKET_CREATOR_BOT_TOKEN}" \
@@ -53,7 +88,7 @@ RESPONSE=$(curl -sf -X POST "https://slack.com/api/chat.postMessage" \
     -d "$(jq -n \
         --arg channel "$SLACK_DM_CHANNEL_ID" \
         --arg thread_ts "$SLACK_THREAD_TS" \
-        --arg text ":thinking_face: *Question:* ${QUESTION}" \
+        --arg text "$QUESTION_TEXT" \
         '{channel: $channel, thread_ts: $thread_ts, text: $text, mrkdwn: true}')" 2>/dev/null) || {
     echo "Failed to post question to Slack" >&2
     echo "(no response — failed to post)"
@@ -69,30 +104,41 @@ fi
 
 echo "Posted question to Slack, waiting for reply (timeout: ${TIMEOUT}s)..." >&2
 
+# Fetch the thread replies posted after our question.
+fetch_replies() {
+    curl -sf -G "https://slack.com/api/conversations.replies" \
+        -H "Authorization: Bearer ${TICKET_CREATOR_BOT_TOKEN}" \
+        --data-urlencode "channel=${SLACK_DM_CHANNEL_ID}" \
+        --data-urlencode "ts=${SLACK_THREAD_TS}" \
+        --data-urlencode "oldest=${QUESTION_TS}" 2>/dev/null
+}
+
 # Poll for reply
 ELAPSED=0
 while [ $ELAPSED -lt $TIMEOUT ]; do
     sleep $POLL_INTERVAL
     ELAPSED=$((ELAPSED + POLL_INTERVAL))
 
-    # Get thread replies newer than our question
-    REPLIES=$(curl -sf -G "https://slack.com/api/conversations.replies" \
-        -H "Authorization: Bearer ${TICKET_CREATOR_BOT_TOKEN}" \
-        --data-urlencode "channel=${SLACK_DM_CHANNEL_ID}" \
-        --data-urlencode "ts=${SLACK_THREAD_TS}" \
-        --data-urlencode "oldest=${QUESTION_TS}" 2>/dev/null) || continue
+    REPLIES=$(fetch_replies) || continue
 
-    # Find first reply from the user (not the bot) after our question
-    REPLY_TEXT=$(echo "$REPLIES" | jq -r \
-        --arg qts "$QUESTION_TS" \
-        --arg uid "${SLACK_NOTIFY_USER_ID:-}" \
-        '[.messages[] | select(.ts > $qts and .user == $uid)] | first | .text // empty')
+    REPLY_TEXT=$(select_ask_reply "$REPLIES" "$QUESTION_TS" "${SLACK_NOTIFY_USER_ID:-}" "$BOT_USER_ID")
+    [ -n "$REPLY_TEXT" ] || continue
 
-    if [ -n "$REPLY_TEXT" ]; then
-        echo "Got reply" >&2
-        echo "$REPLY_TEXT"
-        exit 0
+    # Let the thought finish. A reply is often the first of two messages —
+    # the reasoning, then the decision — and at a 5s poll the second one is
+    # usually still being typed. One extra interval, then take the latest.
+    sleep $POLL_INTERVAL
+    SETTLED=$(fetch_replies) || SETTLED=""
+    if [ -n "$SETTLED" ]; then
+        LATER=$(select_ask_reply "$SETTLED" "$QUESTION_TS" "${SLACK_NOTIFY_USER_ID:-}" "$BOT_USER_ID")
+        if [ -n "$LATER" ]; then
+            REPLY_TEXT="$LATER"
+        fi
     fi
+
+    echo "Got reply" >&2
+    echo "$REPLY_TEXT"
+    exit 0
 done
 
 echo "Timed out waiting for reply (${TIMEOUT}s)" >&2

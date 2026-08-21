@@ -3051,9 +3051,12 @@ def handle_message(channel, ts, user, text, thread_ts=None):
         elif state.get("status") == "in_progress":
             # Claude is still running. slack-ask polls the thread directly
             # and will pick up the reply if it's waiting on one — ticket-bot
-            # doesn't need to resume here. Ack with :loading: so the user
-            # sees we noticed; check_running_procs swaps to :eyes: when the
-            # pass exits (slack-ask has presumably consumed the reply by then).
+            # doesn't need to resume here. slack-ask applies the same
+            # addressed-to-the-bot gate we just passed (select_ask_reply in
+            # lib/slack.sh), so anything that reaches here is something it
+            # would also accept. Ack with :loading: so the user sees we
+            # noticed; check_running_procs swaps to :eyes: when the pass
+            # exits (slack-ask has presumably consumed the reply by then).
             job_ticket = state.get("ticket")
             if job_ticket and job_ticket in running_procs:
                 react(channel, ts, "loading")

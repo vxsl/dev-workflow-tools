@@ -377,7 +377,7 @@ If you encounter ambiguities, need clarification, or face a design decision that
 slack-ask \"Your question here\"
 \`\`\`
 
-This posts to our Slack DM thread and blocks until I reply (up to 30 min). Use sparingly — only for genuine blockers or important design decisions where guessing wrong would waste significant effort. If no reply comes, proceed with your best judgment and note the assumption in REVIEW.md.
+This posts to the Slack thread for this job and blocks until I reply (up to 30 min). In a shared channel I have to tag the bot for my reply to count as an answer, so a timeout there may just mean I didn't — don't read silence as agreement. Use sparingly — only for genuine blockers or important design decisions where guessing wrong would waste significant effort. If no reply comes, proceed with your best judgment and note the assumption in REVIEW.md.
 
 ## When you are done
 

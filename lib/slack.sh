@@ -9,10 +9,12 @@
 #   parse_slack_url <url>             → sets SLACK_CHANNEL / SLACK_THREAD_TS, returns 1 if not a Slack URL
 #   verify_slack_channel_access <ch>  → returns 0 if bot can post (or can't be sure), 1 if definitively blocked
 #   post_to_slack <ch> <thread_ts> <ticket|mr> <url> <title>
+#   slack_channel_is_dm <ch>          → 0 for a DM channel, 1 for a shared channel
+#   select_ask_reply <json> <qts> <uid> [bot_uid] → the answer to a slack-ask question
 #   save_pending_slack / load_pending_slack / clear_pending_slack — see below
 
 # Prevent multiple loads
-if [ -n "$SLACK_LIB_LOADED" ]; then
+if [ -n "${SLACK_LIB_LOADED:-}" ]; then
     return 0
 fi
 SLACK_LIB_LOADED=1
@@ -105,6 +107,56 @@ clear_pending_slack() {
 # Order matters: escape '&' first so the entities we add aren't re-escaped.
 slack_escape() {
     printf '%s' "$1" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g'
+}
+
+# A DM channel ID starts with D; everything else (C…, G…) is a room that other
+# people can be talking in. The distinction decides whether a message needs to
+# name the bot to count as addressed to it.
+slack_channel_is_dm() {
+    case "$1" in
+        D*) return 0 ;;
+        *)  return 1 ;;
+    esac
+}
+
+# select_ask_reply <replies_json> <question_ts> <user_id> [bot_user_id]
+#
+# Pick the user's answer out of a conversations.replies payload, or print
+# nothing if they haven't answered yet. Prints the reply with the bot's own
+# mention stripped.
+#
+# Two rules, both learned the hard way:
+#
+# A reply must be ADDRESSED to the bot when bot_user_id is given. slack-ask
+# posts its questions into whatever thread the job lives in, and that is
+# routinely a thread full of humans — so "<@teammate> yep you are right" is not
+# an answer to the bot merely because it arrived after the question. Pass an
+# empty bot_user_id in a DM, where every message is aimed at the bot anyway.
+# This is the same gate ticket-bot applies in should_engage_thread_reply.
+#
+# The LAST qualifying reply wins, not the first. People break a thought across
+# two messages, and the closing one ("approved") is the decision; the opening
+# one is the reasoning. Taking the first read a preamble as the whole answer.
+select_ask_reply() {
+    local replies_json="$1" question_ts="$2" user_id="$3" bot_user_id="${4:-}"
+
+    printf '%s' "$replies_json" | jq -r \
+        --arg qts "$question_ts" \
+        --arg uid "$user_id" \
+        --arg bot "$bot_user_id" \
+        '
+        # Slack renders a mention as <@U123> or, legacily, <@U123|name>.
+        ($bot | if . == "" then "" else "<@" + . + "(\\|[^>]*)?>" end) as $m
+        | [ .messages[]?
+            | select(.ts > $qts and .user == $uid)
+            | select($m == "" or (.text | test($m)))
+            | .text
+            | if $m == "" then . else gsub($m; "") end
+            | gsub("^\\s+|\\s+$"; "")
+            | select(. != "")
+          ]
+        | last // empty
+        '
 }
 
 # Parse a Slack URL into SLACK_CHANNEL and SLACK_THREAD_TS (global).
