@@ -53,6 +53,7 @@ import shutil
 import subprocess
 import sys
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -893,6 +894,169 @@ def _slack(method, **params):
     return d if d and d.get("ok") else None
 
 
+SLACK_PEOPLE = (Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
+                / "work-arcs" / "slack-people.json")
+
+# How long a resolved name and face are trusted. Neither moves often, and a users.info per
+# person per morning buys nothing; a month is short enough that somebody who renamed
+# themselves is not misquoted under the old name for a year.
+PEOPLE_TTL = 30 * 86400
+
+# Smallest first. Slack offers a 512px original and the page draws an 18px chip, and every
+# byte of it is inlined -- see _avatar for why there is no third option.
+AVATAR_FIELDS = ("image_24", "image_32", "image_48")
+AVATAR_MAX = 24_000
+
+# Resolved people, id -> entry, for this process. A lookup table and not state: it only ever
+# gains entries, an id it does not hold renders as itself, and nothing downstream behaves
+# differently for having consulted it. That is what lets `_slack_text` read it directly
+# rather than every one of its eight callers threading a directory through.
+_PEOPLE = {}
+
+
+def _avatar(profile):
+    """A Slack avatar as an inline data URI, or "" if that cannot be had cheaply.
+
+    Inline because the page is a Claude Code artifact and its CSP refuses every external
+    host: an avatar served from avatars.slack-edge.com is not a slow avatar, it is no
+    avatar. The smallest size Slack offers is asked for and anything over AVATAR_MAX is
+    dropped rather than embedded -- twenty faces are worth ~60KB on a 240KB page, and a
+    workspace where someone uploaded a 2MB PNG must not quietly triple it.
+    """
+    for f in AVATAR_FIELDS:
+        url = profile.get(f)
+        if not url:
+            continue
+        try:
+            with urllib.request.urlopen(url, timeout=15) as r:
+                raw = r.read(AVATAR_MAX + 1)
+                mime = (r.headers.get("Content-Type") or "").split(";")[0].strip()
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+            continue
+        if not raw or len(raw) > AVATAR_MAX or not mime.startswith("image/"):
+            continue
+        return f"data:{mime};base64," + base64.b64encode(raw).decode()
+    return ""
+
+
+def _one_person(uid):
+    d = _slack("users.info", user=uid)
+    u = (d or {}).get("user") or {}
+    if not u:
+        return None
+    p = u.get("profile") or {}
+    name = (p.get("display_name") or p.get("real_name") or u.get("real_name")
+            or u.get("name") or "").strip()
+    return {"at": int(time.time()), "name": name, "avatar": _avatar(p),
+            "bot": bool(u.get("is_bot"))}
+
+
+def _learn_people(ids):
+    """Resolve Slack user ids to a name and a face, cached across runs.
+
+    conversations.replies names a message's author `U0A5LKV7E0K` and nothing else, and a
+    mention inside the text arrives the same way -- so every quote the thread lens printed
+    was attributed to a machine identifier, or to nobody. search.messages happens to carry
+    `username`, which is the whole reason the ledger's rows have names on them and these
+    did not.
+
+    A refusal is cached like an answer, for the same month. A bot with no profile, or a
+    member of a workspace this token cannot enumerate, is a permanent no, and asking again
+    every morning is a call a day to be told it.
+    """
+    want = {i for i in ids if isinstance(i, str)
+            and re.fullmatch(r"[UWB][A-Z0-9]{6,}", i)}
+    if not want:
+        return _PEOPLE
+    store = load_store(SLACK_PEOPLE, "the Slack people cache")
+    now = int(time.time())
+    for i, e in store.items():
+        if isinstance(e, dict) and now - (e.get("at") or 0) < PEOPLE_TTL:
+            _PEOPLE.setdefault(i, e)
+    missing = sorted(want - set(_PEOPLE))
+    if not missing:
+        return _PEOPLE
+    jobs = max(1, int(os.environ.get("WORK_ARCS_SLACK_THREAD_JOBS", "6")))
+    with futures.ThreadPoolExecutor(max_workers=jobs) as pool:
+        got = list(pool.map(_one_person, missing))
+    for i, e in zip(missing, got):
+        store[i] = _PEOPLE[i] = e or {"at": now, "name": "", "avatar": ""}
+    try:
+        SLACK_PEOPLE.parent.mkdir(parents=True, exist_ok=True)
+        SLACK_PEOPLE.write_text(json.dumps(store, indent=1, sort_keys=True))
+    except OSError:
+        # A cache that cannot be written costs a call next run, and nothing else.
+        pass
+    return _PEOPLE
+
+
+def _person(uid):
+    """What is known about one Slack id: a name and a face, either possibly empty."""
+    e = _PEOPLE.get(uid) or {}
+    return {"who": e.get("name") or "", "avatar": e.get("avatar") or ""}
+
+
+def _slack_day(ts):
+    """A message ts as the day a reader recognises, or "" where it is not a time."""
+    try:
+        return datetime.fromtimestamp(float(ts)).strftime("%-d %b")
+    except (TypeError, ValueError, OSError, OverflowError):
+        return ""
+
+
+def _ids_in(text):
+    """Every user id a message's raw text mentions, so they resolve with its author."""
+    return re.findall(r"<@([A-Z0-9]+)(?:\|[^>]*)?>", text or "")
+
+
+# Slack shortcodes worth rendering, and the deliberate blanks. Kyle's own bot posts
+# `:pencil: … :heavy_check_mark: … :mag:` around every line it writes, and unrendered that
+# is the largest single source of noise in a quote on this page.
+#
+# Unknown shortcodes are left exactly as they arrived. That is the whole safety rule here:
+# `ratio 3:4:5` holds a shortcode-shaped `:4:`, and a substitution that fires on anything it
+# cannot name would silently print `ratio 35`. Only a name this table or unicodedata can
+# resolve is ever replaced.
+EMOJI = {
+    "+1": "\N{THUMBS UP SIGN}", "-1": "\N{THUMBS DOWN SIGN}",
+    "tada": "\N{PARTY POPPER}", "eyes": "\N{EYES}", "mag": "\N{LEFT-POINTING MAGNIFYING GLASS}",
+    "white_check_mark": "\N{WHITE HEAVY CHECK MARK}", "heavy_check_mark": "\u2714",
+    "x": "\u2716", "warning": "\u26a0", "rocket": "\N{ROCKET}", "fire": "\N{FIRE}",
+    "pencil": "\u270f", "pencil2": "\u270f", "memo": "\N{MEMO}",
+    "arrow_down": "\u2193", "arrow_up": "\u2191", "arrow_right": "\u2192",
+    "arrow_left": "\u2190", "point_right": "\N{WHITE RIGHT POINTING BACKHAND INDEX}",
+    "bulb": "\N{ELECTRIC LIGHT BULB}", "bug": "\N{BUG}", "wave": "\N{WAVING HAND SIGN}",
+    "clap": "\N{CLAPPING HANDS SIGN}", "pray": "\N{PERSON WITH FOLDED HANDS}",
+    "raised_hands": "\N{PERSON RAISING BOTH HANDS IN CELEBRATION}",
+    "thinking_face": "\N{THINKING FACE}", "joy": "\N{FACE WITH TEARS OF JOY}",
+    "sob": "\N{LOUDLY CRYING FACE}", "ok_hand": "\N{OK HAND SIGN}",
+    "muscle": "\N{FLEXED BICEPS}", "100": "\N{HUNDRED POINTS SYMBOL}",
+    "green_circle": "\N{LARGE GREEN CIRCLE}", "red_circle": "\N{LARGE RED CIRCLE}",
+    "large_blue_circle": "\N{LARGE BLUE CIRCLE}", "no_entry": "\N{NO ENTRY}",
+    "hourglass": "\u231b", "hourglass_flowing_sand": "\N{HOURGLASS WITH FLOWING SAND}",
+    "calendar": "\N{TEAR-OFF CALENDAR}", "link": "\N{LINK SYMBOL}",
+    "lock": "\N{LOCK}", "key": "\N{KEY}", "wrench": "\N{WRENCH}",
+    "hammer": "\N{HAMMER}", "gear": "\u2699", "package": "\N{PACKAGE}",
+    "chart_with_upwards_trend": "\N{CHART WITH UPWARDS TREND}",
+    "inbox_tray": "\N{INBOX TRAY}", "outbox_tray": "\N{OUTBOX TRAY}",
+    # Rendered as nothing on purpose: an animated workspace emoji is decoration in a chat
+    # window and pure noise in a quote, and a skin-tone modifier has nothing to modify once
+    # the emoji before it is a plain codepoint.
+    "party_parrot": "", "spinner": "", "loading": "", "blob-wave": "",
+}
+
+
+def _emoji(name):
+    if name in EMOJI:
+        return EMOJI[name]
+    if re.fullmatch(r"skin-tone-\d+", name):
+        return ""
+    try:
+        return unicodedata.lookup(name.replace("_", " ").replace("-", " ").upper())
+    except KeyError:
+        return None
+
+
 # Sweeps already made this process, by query. Two features want the same `from:me` window --
 # the ledger reads it for commitments and answered mentions, slack_threads reads it for
 # which threads Kyle took part in -- and they run at different points in main for reasons of
@@ -952,7 +1116,14 @@ def _slack_window():
 
 
 def _slack_text(body):
-    """Slack markup fit to quote: links keep their label, mentions keep a readable @.
+    """Slack markup fit to quote: links keep their label, mentions name a person.
+
+    A mention resolves through `_PEOPLE` where that id has been resolved and falls back to
+    the id itself where it has not, which is the pre-existing behaviour and the only honest
+    one: `@U0A5LKV7E0K` is unreadable, and inventing a name for it would be worse.
+
+    Emoji shortcodes are replaced only where they can be named -- see EMOJI for why a
+    substitution that fires on anything shortcode-shaped corrupts `ratio 3:4:5`.
 
     The three entities go last, and they were missing entirely. Slack escapes exactly `&`,
     `<` and `>` in message text, so `A -> B` arrives as `A -&gt; B` -- and every Slack quote
@@ -966,9 +1137,14 @@ def _slack_text(body):
     mention. And `&amp;` comes last of the three, or `&amp;gt;`, which Slack means as the
     literal text "&gt;", would arrive as a bare `>`.
     """
-    body = re.sub(r"<[^|>]+\|([^>]+)>", r"\1", body or "")
-    body = re.sub(r"<@([A-Z0-9]+)>", r"@\1", body)
+    body = re.sub(r"<@([A-Z0-9]+)(?:\|[^>]*)?>",
+                  lambda m: "@" + (_person(m.group(1))["who"] or m.group(1)), body or "")
+    body = re.sub(r"<!(here|channel|everyone)\b[^>]*>", r"@\1", body)
+    body = re.sub(r"<[^|>]+\|([^>]+)>", r"\1", body)
     body = re.sub(r"<([^>]+)>", r"\1", body)
+    body = re.sub(r":([a-z0-9_+'-]{2,}):",
+                  lambda m: m.group(0) if _emoji(m.group(1)) is None else _emoji(m.group(1)),
+                  body)
     body = body.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
     return _clean_note(body)
 
@@ -1412,6 +1588,10 @@ def ledger_slack():
     mentions, ok_mentions = _slack_sweep(f"<@{me}> after:{after}", pages=1)
     dms, ok_dms = _slack_sweep(f"is:dm after:{after}")
     complete = ok_mine and ok_mentions and ok_dms
+    # Before a word of any of it is quoted. A search match carries `username`, so these rows
+    # always had a name on the row -- but the message text is written in ids, and a quote
+    # reading "@U0A5LKV7E0K not sure how undefined made it here" names nobody at all.
+    _learn_people([i for m in mine + mentions + dms for i in _ids_in(m.get("text"))])
     if not complete:
         print("  ledger: Slack answered some of its sweeps and not others — the Slack "
               "rows this run are incomplete, so nothing is pruned on their absence",
@@ -1819,6 +1999,11 @@ def _synthesise_threads(items, ledger):
                 used.add(f.get("ts"))
                 rows.append({"what": f["what"],
                              "quote": _clip(_slack_text(m.get("text")), 220),
+                             # Who said it, and their face where Slack gives us one. A
+                             # quote with no name on it makes the reader work out whose
+                             # voice it is from the words, four times a card.
+                             **_person(m.get("user")),
+                             "at": _slack_day(m.get("ts")),
                              "url": _thread_link(t["base"], t["chan"],
                                                  m.get("ts", ""), t["ts"])})
             sides[side] = rows[:2]
@@ -1948,6 +2133,14 @@ def slack_threads(arcs, ledger):
     jobs = max(1, int(os.environ.get("WORK_ARCS_SLACK_THREAD_JOBS", "6")))
     with futures.ThreadPoolExecutor(max_workers=jobs) as pool:
         fetched = list(pool.map(lambda k: _thread_messages(k[0], k[1]), order))
+
+    # Names and faces first, because everything after this reads message text: the join, the
+    # model prompt and the quote on the card. conversations.replies is the one Slack call
+    # here that gives an author as a bare id, so without this pass the thread lens was the
+    # one lens on the page whose quotes were attributed to nobody.
+    _learn_people([m.get("user") for msgs, _ in fetched for m in msgs]
+                  + [i for msgs, _ in fetched for m in msgs
+                     for i in _ids_in(m.get("text"))])
 
     index = _thread_join_index(arcs)
     by_arc = defaultdict(list)
@@ -4140,7 +4333,13 @@ def demands(arc):
             # unchanged. Who spoke last and how many notes deep it is are the fields that
             # actually move, so they are what the fingerprint is taken over.
             out.append({"kind": kind, "what": what,
-                        "quotes": [t["quote"] for t in group if t.get("quote")],
+                        # Who asked, with what they asked. The names were already in the
+                        # sentence and the quotes underneath it were anonymous, so on a
+                        # thread with three reviewers the page stated who was waiting and
+                        # then showed three unattributed slabs for the reader to match up.
+                        "quotes": [{"text": t["quote"], "who": t.get("author") or "",
+                                    "at": t.get("at") or ""}
+                                   for t in group if t.get("quote")],
                         "url": m.get("url", ""), "at": newest,
                         "sig": sorted(
                             "|".join((t.get("author", ""), t.get("at", ""),
@@ -4669,7 +4868,9 @@ def slack_marks(arc):
                             + f"{verb}: {it.get('what') or ''}",
                     "ref": where,
                     "url": it.get("url") or "",
-                    "quotes": [it.get("quote")],
+                    "quotes": [{"text": it.get("quote"), "who": it.get("who") or "",
+                                "avatar": it.get("avatar") or "",
+                                "at": it.get("at") or "", "url": it.get("url") or ""}],
                 }
     return out
 
@@ -4985,7 +5186,7 @@ def diff_runs(prev, cur, arcs, ledger):
                 text = (say(_who(e), e.get("ref") or "")
                         if say else f"{e.get('ref','')}: {e.get('kind','')} ({_who(e)})")
                 add("ledger", text, e.get("ref") or "", e.get("url") or "",
-                    [e.get("quote")])
+                    [{"text": e.get("quote"), "who": _who(e)}] if e.get("quote") else [])
 
         # The Slack lens. A new item, or an item on a thread somebody has replied to since
         # the last build -- see slack_marks for what is and is not in that key. Read off the

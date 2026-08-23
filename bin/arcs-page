@@ -163,6 +163,34 @@ section{margin-bottom:3rem}
 blockquote{margin:.1rem 0 .1rem .2rem;padding:.35rem .6rem;background:var(--quote);
            border-left:2px solid var(--hairline);border-radius:0 2px 2px 0;
            font-size:.8rem;color:var(--ink-soft);text-wrap:pretty}
+/* A quote is a message somebody sent, and it is now set as one. Before this every quote on
+   the page was an anonymous grey slab and the reader had to work out whose voice it was
+   from the words -- four times on a card, which is most of why the page was going unread.
+   The attribution line is sans against the quote's own text so the frame reads as the
+   page's voice and the words inside read as theirs. */
+blockquote.msg{display:flex;flex-direction:column;gap:.18rem;padding:.4rem .6rem .45rem}
+blockquote.msg .voice{display:flex;align-items:center;gap:.34rem;line-height:1.2;
+                      font-family:var(--sans);font-size:.72rem;color:var(--ink-faint)}
+blockquote.msg .voice .nm{font-weight:600;color:var(--ink-soft)}
+blockquote.msg .voice .at{font-family:var(--mono);font-size:.66rem;margin-left:auto}
+blockquote.msg .said{display:block}
+/* Underlined on hover only. A quote whose every word is a link reads as a link with a
+   sentence in it, which is the shape the From Slack block was explicitly built to avoid. */
+blockquote.msg a.said-l{color:inherit;text-decoration:none}
+blockquote.msg a.said-l:hover,blockquote.msg a.said-l:focus-visible{
+  text-decoration:underline;text-decoration-color:var(--hairline);
+  text-underline-offset:2px}
+.av{width:18px;height:18px;border-radius:3px;flex:none;object-fit:cover;
+    background:var(--surface-2)}
+.av-i{display:inline-flex;align-items:center;justify-content:center;font-size:.58rem;
+      font-weight:600;letter-spacing:.01em;color:#fff;background:var(--av,var(--parked))}
+/* Slack's own markup, rendered. A bot that decorates every line it writes was arriving as
+   `:pencil: _Add reportError alert_ :heavy_check_mark: *slack-FDV0-1787162578*`. */
+blockquote code{font-family:var(--mono);font-size:.92em;background:var(--surface-2);
+                border-radius:2px;padding:0 .22em}
+blockquote code.blk{display:block;margin:.25rem 0 0;padding:.3rem .45rem;
+                    white-space:pre-wrap;overflow-x:auto}
+blockquote b{font-weight:600;color:var(--ink)}
 /* What Slack decided about this workstream. Deliberately quieter than the demands above it:
    a decision is a fact to be recalled, not something being asked of you, so nothing here
    takes a severity colour. The DECIDED mark is check-shaped and ink-faint rather than
@@ -184,6 +212,7 @@ blockquote{margin:.1rem 0 .1rem .2rem;padding:.35rem .6rem;background:var(--quot
 .slk-i .opn .mk{color:var(--warm)}
 .slk-i .what{color:var(--ink);text-wrap:pretty}
 .slk-i blockquote{grid-column:2;margin-left:0}
+.slk-i blockquote a{text-decoration:none}
 .slk-i a{color:inherit;text-decoration:underline;
          text-decoration-color:var(--hairline);text-underline-offset:2px}
 .slk-i a:hover{text-decoration-color:currentColor}
@@ -1174,6 +1203,114 @@ def link(url, text, cls=""):
     return f'<a{c} href="{esc(url)}" target="_blank" rel="noopener">{text}</a>'
 
 
+MRKDWN_HOLD = "\x00%d\x00"
+
+
+def rich(text):
+    """Slack&rsquo;s own markup, set as type rather than printed as punctuation.
+
+    `_slack_text` hands the page plain text with Slack&rsquo;s markers still in it, and
+    deliberately: the model that reads a thread should see the words, not this page&rsquo;s
+    HTML. Here is where `*bold*`, `_italic_`, `~struck~`, `` `code` `` and fenced blocks
+    become what they mean. Unrendered, a quote from a bot that decorates every line arrived
+    as `:pencil: _Add reportError alert_ :heavy_check_mark: *slack-FDV0-1787162578*`, which
+    is the single largest source of noise in a quote on this page.
+
+    Escaped first and matched second, so a message containing `<b>` is text and a message
+    containing `*b*` is bold. Code spans are lifted out before the emphasis passes and put
+    back after, because a `*` inside a code span is a `*`.
+    """
+    out = esc(text or "")
+    held = []
+
+    def hold(body, cls):
+        held.append(f'<code class="{cls}">{body}</code>')
+        return MRKDWN_HOLD % (len(held) - 1)
+
+    out = re.sub(r"```(.+?)```", lambda m: hold(m.group(1).strip("\n"), "blk"),
+                 out, flags=re.S)
+    out = re.sub(r"`([^`\n]+)`", lambda m: hold(m.group(1), "in"), out)
+    # Delimiters only where Slack itself takes them: flanked by a non-word character, so
+    # `snake_case_name` and `a*b*c` are left alone.
+    out = re.sub(r"(?<![*\w])\*([^*\n]+)\*(?!\w)", r"<b>\1</b>", out)
+    out = re.sub(r"(?<![_\w])_([^_\n]+)_(?!\w)", r"<i>\1</i>", out)
+    out = re.sub(r"(?<![~\w])~([^~\n]+)~(?!\w)", r"<s>\1</s>", out)
+    for i, h in enumerate(held):
+        out = out.replace(MRKDWN_HOLD % i, h)
+    return out
+
+
+def face(who, avatar=""):
+    """A person, at 18px: their Slack avatar where there is one, their initials otherwise.
+
+    The avatar arrives as an inline data URI because this page is an artifact and its CSP
+    refuses every external host -- work-arcs fetches the bytes and stores them, so there is
+    nothing here to load. It is decoration and takes an empty alt: the name beside it is the
+    label, and a screen reader saying it twice is worse than not drawing it at all.
+
+    The initials chip is not a placeholder for a missing avatar so much as the same job done
+    without one. Its hue is a hash of the name, which is stable across runs and across
+    sections, so the same person is the same colour everywhere on the page.
+    """
+    if avatar.startswith("data:image/"):
+        return f'<img class="av" src="{esc(avatar)}" alt="" width="18" height="18">'
+    letters = "".join(w[0] for w in re.split(r"[\s._-]+", who or "") if w)[:2].upper()
+    if not letters:
+        return ""
+    hue = int(hashlib.sha1((who or "").encode()).hexdigest()[:4], 16) % 360
+    return (f'<span class="av av-i" aria-hidden="true" '
+            f'style="--av:hsl({hue} 34% 42%)">{esc(letters)}</span>')
+
+
+# Whose message a ledger row quotes. Every other row quotes the other person; these two
+# quote Kyle -- a commitment is read out of his own promise, and "you asked X, no reply"
+# quotes the question he asked. Attributing either to the counterpart would put words in
+# their mouth, which is the one failure a quote cannot survive.
+MINE = ("commitment", "slack-asked")
+
+
+def ledger_say(e, who):
+    """A ledger row&rsquo;s quote, attributed to whoever actually said it."""
+    if not e.get("quote"):
+        return ""
+    if e.get("kind") in MINE:
+        return say({"text": e["quote"], "who": "you", "at": e.get("asked", "")})
+    return say({"text": e["quote"], "who": who, "at": e.get("asked", "")})
+
+
+def say(q, url="", clip=0):
+    """One quoted message, set as a message: whose voice it is, then what they said.
+
+    Every quote on this page used to be an unattributed grey slab. The names were in the
+    sentence above -- "3 threads awaiting your reply -- brian, vadym spoke last" -- and then
+    three anonymous slabs underneath for the reader to match back up, which is work, and
+    doing it four times on one card is most of why the page was going unread.
+
+    Takes either a string or a `{who, text, at, avatar, url}` record, because not every
+    quote on the page has an author to name: a stacked merge request quotes the files it
+    conflicts in, and those are paths, not speech. A string renders exactly as it always did.
+    """
+    if isinstance(q, str):
+        q = {"text": q}
+    if not isinstance(q, dict):
+        return ""
+    text = q.get("text") or q.get("quote") or ""
+    if not text:
+        return ""
+    if clip and len(text) > clip:
+        text = text[:clip].rstrip() + "\u2026"
+    who, at = (q.get("who") or "").strip(), (q.get("at") or "").strip()
+    body = f'<span class="said">{rich(text)}</span>'
+    if not who:
+        return f"<blockquote>{body}</blockquote>"
+    return ('<blockquote class="msg"><span class="voice">'
+            + face(who, q.get("avatar") or "")
+            + f'<b class="nm">@{esc(who)}</b>'
+            + (f'<span class="at">{esc(at)}</span>' if at else "")
+            + "</span>"
+            + link(q.get("url") or url, body, "said-l") + "</blockquote>")
+
+
 def fmt_day(epoch):
     """An epoch as a date a person reads, or a shrug when there is nothing to show."""
     if not epoch:
@@ -1758,7 +1895,7 @@ def render(data, lede, focus_days, limit, cost=None):
                   'on its own if anything changes" title="acknowledge — returns on its '
                   'own if anything changes">&#x2715;</button></div>')
                 for q in (d.get("quotes") or ([d["quote"]] if d.get("quote") else []))[:3]:
-                    a(f"<blockquote>{esc(q)}</blockquote>")
+                    a(say(q, d.get("url", "")))
                 a("</li>")
             a("</ul>")
         elif brief.get("blocker"):
@@ -1818,12 +1955,11 @@ def render(data, lede, focus_days, limit, cost=None):
                 for cls, mark, items in (("dec", "&#x2713;", s.get("decided") or []),
                                          ("opn", "?", s.get("open") or [])):
                     for it in items:
-                        q, u = esc(it.get("quote", "")), it.get("url", "")
+                        q, u = it.get("quote", ""), it.get("url", "")
                         what = esc(it.get("what", ""))
                         a(f'<li class="{cls}"><span class="mk">{mark}</span>'
                           + (f'<span class="what">{link(u, what)}</span>' if q in quoted
-                             else f'<span class="what">{what}</span><blockquote>'
-                                  + link(u, "&ldquo;" + q + "&rdquo;") + "</blockquote>")
+                             else f'<span class="what">{what}</span>' + say(it))
                           + "</li>")
                         quoted.add(q)
                 a("</ul></div>")
@@ -1886,7 +2022,7 @@ def render(data, lede, focus_days, limit, cost=None):
               + "</span>")
             a(f'<span>{link(d.get("url",""), esc(d["what"]))}</span>')
             for q in (d.get("quotes") or [])[:3]:
-                a(f"<blockquote>{esc(q)}</blockquote>")
+                a(say(q, d.get("url", "")))
             a("</div>")
         a("</div>")
     a("</section>")
@@ -1960,7 +2096,10 @@ def render(data, lede, focus_days, limit, cost=None):
                 a(f'<span class="cl" data-k="{esc(e.get("kind",""))}">'
                   + link(e.get("url", ""), esc(e.get("what", ""))) + "</span>")
                 for q in (e.get("quotes") or [])[:2]:
-                    a(f"<blockquote>{esc(q)}</blockquote>")
+                    # Tighter than on a card. This strip is one line per workstream and the
+                    # quote is corroboration for a sentence already read, not the thing
+                    # itself -- at full length four of them make the section a transcript.
+                    a(say(q, e.get("url", ""), clip=140))
             a("</span></li>")
         a("</ul></section>")
 
@@ -2065,8 +2204,7 @@ def render(data, lede, focus_days, limit, cost=None):
                 a(row(e, link(e.get("url", ""), esc(e.get("ref", "")), "ref")
                       + f' {esc(e.get("title",""))}'
                       + f'<span class="who">{sub}</span>'
-                      + (f"<blockquote>{esc(e['quote'])}</blockquote>"
-                         if e.get("quote") else "")))
+                      + ledger_say(e, who)))
             a("</ul>")
             a('<button class="showdis" type="button" hidden></button>')
         else:
@@ -2117,8 +2255,7 @@ def render(data, lede, focus_days, limit, cost=None):
                 a(row(e, link(e.get("url", ""), esc(e.get("ref", "")), "ref")
                       + f' {esc(e.get("title",""))}'
                       + f'<span class="who">{sub}</span>'
-                      + (f"<blockquote>{esc(e['quote'])}</blockquote>"
-                         if e.get("quote") else "")))
+                      + ledger_say(e, who)))
             a("</ul>")
             a('<button class="showdis" type="button" hidden></button>')
         else:
