@@ -267,6 +267,55 @@ print(a["authoritative"], "|", a["authoritative_via"])'
     [[ "${lines[1]}" == "UL-1852 | you filed this as UL-1852 — source of !10502" ]]
 }
 
+# ── naming the workstream ────────────────────────────────────────────────────
+
+@test "a bare key names the one workstream that holds it" {
+    # The alternative asks you to type the arc's derived name beside the key -- "Derive
+    # dataset geometry from metadata declarations=UL-1852" -- which is saying the same
+    # thing twice and getting it wrong once.
+    run wa '
+a = arc([br("UL-1852", commits_ahead=4), br("spike", unpushed=9)], [mr(10502, "UL-1852")])
+b = arc([br("other", unpushed=3)])
+b["id"] = b["label"] = "other-work"
+got, key = wa._ta_named([a, b], "UL-1852", {})
+print(got["label"], key)
+got, key = wa._ta_named([a, b], "metadata-latlng=UL-1852", {})
+print(got["label"], key)'
+    [ "${lines[0]}" = "metadata-latlng UL-1852" ]
+    [ "${lines[1]}" = "metadata-latlng UL-1852" ]
+}
+
+@test "two workstreams holding the key refuse to guess and list them" {
+    run wa '
+a = arc([br("UL-1852", commits_ahead=4)], [mr(10502, "UL-1852")])
+b = arc([br("UL-1852-followup", unpushed=3)], issues=[{"key": "UL-1852", "url": ""}])
+b["id"] = b["label"] = "followup"
+wa._ta_named([a, b], "UL-1852", {})'
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"2 workstreams hold UL-1852"* ]]
+    [[ "$output" == *"metadata-latlng"* ]]
+    [[ "$output" == *"followup"* ]]
+}
+
+@test "an entry already filed names its own workstream, whatever the derivation says" {
+    # Undoing must not depend on the derivation still agreeing about who holds the key --
+    # the reason to undo is often that it no longer does.
+    run wa '
+a = arc([br("nothing-here", unpushed=3)])
+got, key = wa._ta_named([a], "UL-1852",
+                        {"metadata-latlng": {"key": "UL-1852", "branch": "x"}})
+print(got["label"], key)'
+    [ "${lines[0]}" = "metadata-latlng UL-1852" ]
+}
+
+@test "a spec that is neither a key nor ARC=KEY says which it needed" {
+    run wa '
+a = arc([br("UL-1852", commits_ahead=4)], [mr(10502, "UL-1852")])
+wa._ta_named([a], "metadata-latlng", {})'
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"neither a ticket key nor ARC=KEY"* ]]
+}
+
 @test "an arc nobody declared anything about is untouched" {
     run wa '
 a = arc([br("UL-1852", commits_ahead=4), br("metadata-spike", unpushed=9)],

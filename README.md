@@ -509,8 +509,9 @@ pre-squash copy, a spike that went nowhere — and every one of them held the ar
 count was right; what they were counts **of** was the question.
 
 ```bash
-work-arcs --authoritative-ticket metadata-latlng=UL-1852
-work-arcs --derive-ticket metadata-latlng      # back to the derivation
+work-arcs --authoritative-ticket UL-1852       # the key alone, where one arc holds it
+work-arcs --authoritative-ticket "Derive dataset geometry…=UL-1852"
+work-arcs --derive-ticket UL-1852              # back to the derivation
 ```
 
 Filing the work as a ticket files it as the merge request under that ticket, so the rung

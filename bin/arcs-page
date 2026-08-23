@@ -88,8 +88,8 @@ h1{font-family:var(--serif);font-weight:500;font-size:clamp(1.8rem,4vw,2.4rem);
    lines reads as a menu, which is the shape this block exists to stop being. The rule
    thickens on hover, so the page still says plainly that every subject here is one click
    from what it is a claim about. */
-.brief{list-style:none;margin:.2rem 0 2.5rem;padding:0;max-width:46em;
-       display:flex;flex-direction:column;gap:.5rem}
+.brief{list-style:none;margin:.2rem 0 2.5rem;padding:0;max-width:64em;
+       display:flex;flex-direction:column;gap:.7rem}
 /* The label is a fixed rail, so five kickers form a column a reader can run down rather
    than five differently-indented starts. It collapses below the text on a narrow viewport,
    where a 9rem rail would leave the sentence six words wide. */
@@ -156,6 +156,7 @@ section{margin-bottom:3rem}
    link, and there is nowhere to go. */
 .arc-sub .filed{color:var(--accent);border:1px solid currentColor;border-radius:2px;
   padding:0 .3em;letter-spacing:.02em}
+.metrics .filed-m{color:var(--accent)}
 /* Where a merge request points, when that is not main. Warm rather than faint: an MR aimed
    at another branch is a condition of the work, not a footnote about it. */
 .arc-sub .stack{color:var(--warm)}
@@ -406,7 +407,7 @@ td .dis{vertical-align:middle}
 /* Work a declaration filed elsewhere. Struck through and dimmed, and still drawn: the
    reason to declare the ticket was that these were being counted as outstanding, and the
    reason to keep them on the page is that "there are eleven drafts here" is still true. */
-.tree text.hist,.tree .c.hist{text-decoration:line-through;opacity:.42}
+.tree text.hist,.tree .c.hist{text-decoration:line-through;opacity:.6}
 .tree .dot.hist{fill:var(--ink-faint);opacity:.4}
 #interactbar{position:sticky;bottom:0;margin-top:1rem;display:none;gap:.8rem;
   align-items:center;flex-wrap:wrap;padding:.7rem .9rem;border:1px solid var(--parked);
@@ -583,6 +584,9 @@ td .dis{vertical-align:middle}
   color:var(--accent);opacity:.75;white-space:nowrap;vertical-align:.08em}
 .ws>summary:hover .sprintchip{opacity:1}
 .sprintchip.idle{color:var(--warm);opacity:1}
+/* The one chip on a row that a person put there. Full opacity because it is not a lens the
+   row happens to fall under -- it is the reason the row says what it says. */
+.sprintchip.filed{opacity:1;letter-spacing:.08em}
 
 .rung{display:flex;flex-wrap:wrap;align-items:baseline;gap:.2rem .6rem;margin:0 0 .2rem}
 .rung h2{margin:0}
@@ -1883,19 +1887,6 @@ def render(data, lede, focus_days, limit, cost=None):
                 sub.append(f'<span class="auth" title="the branch that IS this work '
                            f'({esc(arc.get("authoritative_via",""))})">'
                            f'{" &middot; ".join(bits)}</span>')
-        # Said on the card, because everything below it is quieter for having been said:
-        # the rung, the commit count and the demands are all downstream of this declaration,
-        # and a reader who cannot see that it is in force cannot audit any of them.
-        ta = arc.get("ticket_authority") or {}
-        if ta.get("key"):
-            n = arc.get("historical_branches") or 0
-            sub.append('<span class="filed" title="you filed this work as '
-                       f'{esc(ta["key"])} — {esc(ta.get("via",""))}. Branches outside '
-                       'that lineage are history: still drawn, no longer counted, and '
-                       'back the moment a commit lands on one">filed as '
-                       f'{esc(ta["key"])}'
-                       + (f", {n} branch{'' if n == 1 else 'es'} history" if n else "")
-                       + "</span>")
         if arc.get("state"):
             sub.append(f'<span class="arc-state">{esc(arc["state"])}</span>')
         return f'<div class="arc-sub">{"".join(sub)}</div>' if sub else ""
@@ -1956,9 +1947,21 @@ def render(data, lede, focus_days, limit, cost=None):
         # near-identical lat/lng-in-metadata names, two of them finished, and with no key and
         # no branch on the row there was nothing on screen to tell them apart.
         auth = arc.get("authoritative")
+        # Everything else on this row is derived; this one thing was declared. It rides
+        # here because the row's own state is downstream of it -- "in qualification" where
+        # the derivation said "85 commits exist only here" -- and a reader who cannot see
+        # the declaration is in force cannot audit the rung it produced.
+        ta = arc.get("ticket_authority") or {}
+        hn = arc.get("historical_branches") or 0
+        filed = ("" if not ta.get("key") else
+                 f'<span class="sprintchip filed" title="you filed this work as '
+                 f'{esc(ta["key"])} — {esc(ta.get("via",""))}'
+                 + (f", so {hn} branch{'' if hn == 1 else 'es'} outside it are history: "
+                    "still drawn, no longer counted, and back the moment a commit lands "
+                    "on one" if hn else "") + '">filed</span>')
         a(f'<span class="nm">{nm}'
           + (f' <span class="onbr">{esc(auth)}</span>' if auth and not tkt else "")
-          + sprint_chip(arc)
+          + sprint_chip(arc) + (" " + filed if filed else "")
           + "</span>")
         a(f'<span class="st">{esc(arc.get("state",""))}</span>')
         a(f'<span class="ag">{esc(when)}</span>')
@@ -2062,7 +2065,19 @@ def render(data, lede, focus_days, limit, cost=None):
         if lv and arc.get("stage") != "local-only":
             a(f"<span><b>{lv}</b> unpushed</span>")
         if arc.get("unpushed_only_on_copies"):
-            a(f"<span>{arc['unpushed_only_on_copies']} only on a superseded copy</span>")
+            # Under a declaration the same number means something more specific, and
+            # saying "only on a superseded copy" about work a person filed elsewhere would
+            # be attributing their decision to a derivation.
+            n = arc["unpushed_only_on_copies"]
+            a(f"<span>{n} not on {esc(ta['key'])}</span>" if ta.get("key")
+              else f"<span>{n} only on a superseded copy</span>")
+        if ta.get("key"):
+            a('<span class="filed-m">filed as '
+              + link((next((m.get("url", "") for m in arc.get("mrs") or []
+                            if m.get("branch") == ta.get("branch")), "")),
+                     esc(ta["key"]))
+              + (f", {hn} branch{'' if hn == 1 else 'es'} history" if hn else "")
+              + "</span>")
         a(f"<span>{plural(c.get('branches',0),'branch').replace('branchs','branches')}</span>")
         # Says outright that part of this arc is finished. Both of the "isn't this already
         # done?" reports were arcs where some branches had merged and some had not, and

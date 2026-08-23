@@ -3404,22 +3404,71 @@ def apply_ticket_authority(arcs, store, repo=None, main_ref="origin/main"):
     return stale
 
 
+def _ta_holders(arcs, key):
+    """Every workstream that could honestly be called `key`'s.
+
+    Only exact evidence, the same rule the Slack join is held to: the arc's own ticket, an
+    issue joined onto it, or a branch or merge request that names the key. A near miss here
+    would file the wrong workstream and suppress its counts, which is the one failure this
+    whole feature has to avoid.
+    """
+    out = []
+    for a in arcs:
+        if a.get("ticket") == key or any(i.get("key") == key for i in a.get("issues") or []):
+            out.append(a)
+            continue
+        if _ta_resolve(a, key)[0]:
+            out.append(a)
+    return out
+
+
+def _ta_named(arcs, spec, store):
+    """(arc, key) for `ARC=KEY`, or for a bare `KEY` where one workstream holds it.
+
+    The bare form exists because the other one asks you to type the arc's derived name --
+    "Derive dataset geometry from metadata declarations" -- beside the key, which is saying
+    the same thing twice and getting it wrong once. A key is already an identity; where
+    exactly one workstream holds it, that is the whole spec.
+    """
+    left, sep, right = spec.partition("=")
+    left, right = left.strip(), right.strip().upper()
+    if sep:
+        match = [a for a in arcs if a.get("label") == left or a.get("id") == left]
+        if not match:
+            sys.exit(f"work-arcs: no workstream named {left!r}")
+        return match[0], right
+    key = left.upper()
+    if not TICKET_RE.search(key):
+        sys.exit(f"work-arcs: {left!r} is neither a ticket key nor ARC=KEY "
+                 "(JIRA_PROJECTS decides what a key looks like)")
+    # An entry already filed under this key names its own workstream, so undoing one never
+    # depends on the derivation still agreeing about who holds the key.
+    filed = [lbl for lbl, e in store.items() if (e.get("key") or "").upper() == key]
+    if len(filed) == 1:
+        match = [a for a in arcs if a.get("label") == filed[0] or a.get("id") == filed[0]]
+        if match:
+            return match[0], key
+    holders = _ta_holders(arcs, key)
+    if not holders:
+        sys.exit(f"work-arcs: no workstream holds {key}")
+    if len(holders) > 1:
+        sys.exit(f"work-arcs: {len(holders)} workstreams hold {key} — name the one you "
+                 "mean as ARC=KEY:\n  "
+                 + "\n  ".join(a.get("label", "?") for a in holders))
+    return holders[0], key
+
+
 def set_ticket_authority(arcs, spec, undo=False):
-    """`--authoritative-ticket ARC=KEY`, stamped with the residue it sets aside."""
-    label, _, key = spec.partition("=")
-    label, key = label.strip(), key.strip().upper()
-    match = [a for a in arcs if a.get("label") == label or a.get("id") == label]
-    if not match:
-        sys.exit(f"work-arcs: no workstream named {label!r}")
-    arc = match[0]
+    """`--authoritative-ticket ARC=KEY` (or a bare KEY), stamped with what it sets aside."""
     store = load_store(TICKET_AUTHORITY, "the ticket-authority store")
+    arc, key = _ta_named(arcs, spec, store)
+    label = arc.get("label")
     if undo:
+        if label not in store:
+            print(f"⚠ {label} was not filed as anything", file=sys.stderr)
         store.pop(label, None)
         print(f"✓ {label} is derived again", file=sys.stderr)
     else:
-        if not TICKET_RE.search(key):
-            sys.exit(f"work-arcs: {key!r} is not a ticket key "
-                     "(JIRA_PROJECTS decides what one looks like)")
         branch, why = _ta_resolve(arc, key)
         if not branch:
             sys.exit(f"work-arcs: cannot file {label!r} as {key} — {why}\n  "
@@ -5536,13 +5585,14 @@ def main():
                    help="name the branch that IS an arc's work when the derivation gets it "
                         "wrong. Optional: it only corrects, nothing depends on it, and it "
                         "expires itself once the derivation changes underneath")
-    p.add_argument("--authoritative-ticket", metavar="ARC=KEY",
+    p.add_argument("--authoritative-ticket", metavar="KEY|ARC=KEY",
                    help="say what an arc's work IS: the ticket it is filed under, and so "
                         "the merge request under that ticket. Branches outside that "
                         "lineage become history — still drawn, no longer counted as risk, "
                         "no longer holding the rung down. Expires itself the moment a "
-                        "commit lands on any of them")
-    p.add_argument("--derive-ticket", metavar="ARC",
+                        "commit lands on any of them. The key alone is enough where "
+                        "one workstream holds it")
+    p.add_argument("--derive-ticket", metavar="KEY|ARC",
                    help="drop the hand-filed ticket and derive it again")
     p.add_argument("--no-split", action="store_true",
                    help="skip arc-brief's pass over arcs that hold several bodies of "
