@@ -93,6 +93,20 @@ def ref(text, **kw):
     return {"t": text, **{k: v for k, v in kw.items() if v}}
 
 
+# What each line is a fact ABOUT, in three words, set as a label beside it. The brief used
+# to be one serif paragraph and it was not being read: five sentences each carrying a claim,
+# a number, a superlative and a subordinate clause, run together with nothing to tell a
+# reader which one was about what. The facts were right and the form hid them. These are the
+# only presentation this stage holds, and they are here rather than in the page because the
+# kind is this stage's own vocabulary -- the page has no business knowing that `contradiction`
+# means Jira.
+LEAD = {
+    "changed": "since the build", "quiet": "since the build", "owed": "open loop",
+    "overdue": "past due", "forgotten": "dropped", "contradiction": "jira disagrees",
+    "allclear": "all clear",
+}
+
+
 def sentence(kind, parts):
     """One sentence, and the flat text that is a projection of it.
 
@@ -568,28 +582,28 @@ def compose(data):
 
 
 MODEL_PROMPT = """\
-Below is the opening paragraph of Kyle's daily work page. Every fact in it was derived by
-the page's own pipeline. Rewrite it so it reads as one considered paragraph rather than a
-run of independent statements -- join what belongs together, vary the openings, cut a word
-where a word can go.
+Below are the {n} line(s) that open Kyle's daily work page. Each one is an independent fact
+the page's own pipeline derived. They are read as a list, one label and one line each, and
+they are never to be joined into a paragraph.
+
+Rewrite each line so it can be read at a glance: cut every word a reader does not need,
+lead with the thing the line is about, keep the fact whole.
 
 You are editing prose. You are not adding judgement.
 
 Hard rules:
-- Add no fact, number, name, ticket, date or inference that is not already in the text.
-- Drop none either. Every numeral must appear in your version exactly as written here.
-- These phrases are hyperlinks. Each must appear in your version verbatim, exactly once,
-  and unbroken:
+- Reply with exactly {n} line(s), one per input line, in the same order, and nothing else.
+- Add no fact, number, name, ticket, date or inference that is not already in that line.
+- Drop none either. Every numeral in a line must appear in your version of that line.
+- These phrases are hyperlinks. Each must appear in the line it came from, verbatim,
+  exactly once, and unbroken:
 {anchors}
-- Keep the same order of subjects, and keep it to {n} sentence(s).
 - Keep the punctuation you are given. The curly quotation marks and the em dashes are
   the page's own, and straightening them is a change to how it is set.
-- Second person, plain declarative, no headings, no bullets, no preamble, no sign-off.
-  Do not tell him what to do about any of it; state what is true.
+- Second person, plain declarative. No headings, no bullets, no numbering, no preamble,
+  no sign-off. Do not tell him what to do about any of it; state what is true.
 
-Reply with the paragraph and nothing else.
-
-The paragraph:
+The lines:
 {para}
 """
 
@@ -599,7 +613,7 @@ def _numbers(s):
 
 
 def check(det, out, anchors):
-    """Why the model's rewrite cannot be used, or None if it can.
+    """Why the model's rewrite of one line cannot be used, or None if it can.
 
     Prose-smoothing is the only licence granted, so the checks are about what must have
     survived rather than about what was written. Together they make "no new facts" a thing
@@ -624,8 +638,8 @@ def check(det, out, anchors):
                 + (f" — invented {', '.join(new)}" if new else ""))
     if not 0.5 * len(det) <= len(out) <= 1.9 * len(det):
         return f"the rewrite is {len(out)} characters against {len(det)}"
-    if re.search(r"^\s*[-*#>]|\n\s*[-*#>]", out):
-        return "the rewrite is formatted as a list or a heading"
+    if re.search(r"^\s*(?:[-*#>]|\d+[.)])", out):
+        return "the rewrite is formatted as a list item or a heading"
     return None
 
 
@@ -683,34 +697,46 @@ def cache_write(key, value):
 
 
 def smooth(sentences, model, generated, offline=False):
-    """One small call that may reword the paragraph and may do nothing else.
+    """One small call that may tighten each line and may do nothing else.
 
-    Cached on a fingerprint of the paragraph *and the prompt*, which is the whole of item
-    1c's lesson: an evidence-keyed cache goes stale in exactly one way, and it is that the
-    question changed while the evidence did not. The paragraph carries every count and
-    clock in it, so a morning where nothing moved re-reads the same key and pays nothing,
-    and a morning where one clock ticked pays once.
+    Its job changed with the shape of the block. It used to be handed a paragraph and asked
+    to join the sentences into one considered whole -- which was the right instruction for a
+    paragraph and is exactly wrong for a list: fusing five independent facts is what made the
+    opening unreadable. Now each line is rewritten on its own, shorter, and the lines stay
+    lines. One call either way; the model sees them together only so it does not repeat a
+    construction five times.
 
-    Returns (parts, note). `note` always says what happened, because a model pass that has
-    silently stopped running looks identical to one that ran and changed little.
+    Cached on a fingerprint of the lines *and the prompt*, which is the whole of item 1c's
+    lesson: an evidence-keyed cache goes stale in exactly one way, and it is that the
+    question changed while the evidence did not.
+
+    Returns (list of parts-lists, note) -- one entry per input line, or None for the whole
+    pass. Rejection is all-or-nothing on purpose: a block where two lines are the model's
+    and three are the pipeline's reads as two registers arguing, and the deterministic
+    lines are good enough that there is nothing to salvage by mixing them.
     """
-    parts = flat(sentences)
-    det = text_of(parts)
-    anchors = [p["t"] for p in parts if not isinstance(p, str)]
-    dupes = [a for a in anchors if det.count(a) != 1]
+    per = [s["parts"] for s in sentences]
+    dets = [text_of(p) for p in per]
+    anchors = [[p["t"] for p in ps if not isinstance(p, str)] for ps in per]
+    whole = "\n".join(dets)
+    flatanchors = [a for line in anchors for a in line]
+    dupes = [a for a in flatanchors if whole.count(a) != 1]
     if dupes:
         # Two spans with the same words cannot be told apart in the rewrite, so there is
         # no honest way to re-attach them. Rare, and cheaper to decline than to guess.
-        return None, f"skipped — {dupes[0]!r} is not unique in the paragraph"
+        return None, f"skipped — {dupes[0]!r} is not unique in the brief"
+    if any("\n" in d for d in dets):
+        # A line-per-line contract cannot survive a line that is already two.
+        return None, "skipped — a line holds a newline of its own"
 
     prompt = MODEL_PROMPT.format(
-        anchors="\n".join(f"    {a}" for a in anchors) or "    (none)",
-        n=len(sentences), para=det)
+        anchors="\n".join(f"    {a}" for a in flatanchors) or "    (none)",
+        n=len(per), para=whole)
     key = cache_key(model, prompt)
 
     hit = cache_read(key)
     if hit and hit.get("prose"):
-        return reparts(hit["prose"], parts), f"cached ({model})"
+        return _relines(hit["prose"], per, dets, anchors)[0], f"cached ({model})"
     if hit and hit.get("why"):
         return None, f"cached refusal — {hit['why']}"
     if offline:
@@ -728,13 +754,30 @@ def smooth(sentences, model, generated, offline=False):
         # Nothing is cached on a failed call, so the next run asks again rather than
         # remembering an accident as a verdict.
         return None, f"unavailable — {type(exc).__name__}"
-    out = re.sub(r"\s*\n\s*", " ", out).strip()
 
-    why = check(det, out, anchors)
+    built, why = _relines(out, per, dets, anchors)
     cache_write(key, {"at": generated, "prose": "" if why else out, "why": why or ""})
     if why:
         return None, f"rejected — {why}"
-    return reparts(out, parts), f"rewritten ({model})"
+    return built, f"rewritten ({model})"
+
+
+def _relines(out, per, dets, anchors):
+    """Split the model's answer back into one parts-list per line, or say why not.
+
+    Position is the whole contract: line i of the answer is the rewrite of line i, so an
+    anchor the model moved to a different line has nowhere to attach. That is checked rather
+    than trusted -- an unlinked claim in the opening block is the one thing this page is not
+    allowed to print.
+    """
+    lines = [ln.strip() for ln in (out or "").splitlines() if ln.strip()]
+    if len(lines) != len(per):
+        return None, f"{len(lines)} line(s) came back for {len(per)}"
+    for ln, det, anc in zip(lines, dets, anchors):
+        why = check(det, ln, anc)
+        if why:
+            return None, why
+    return [reparts(ln, ps) for ln, ps in zip(lines, per)], None
 
 
 # --------------------------------------------------------------------------- main
@@ -742,22 +785,32 @@ def smooth(sentences, model, generated, offline=False):
 
 def build(data, model="", offline=False):
     sentences = compose(data)
-    parts = flat(sentences)
+    # Snapshotted before anything is rewritten: `derived` is what a rewrite is auditable
+    # against, so it cannot be read back off lines the rewrite has already replaced.
+    derived = text_of(flat(sentences))
+    lines = [{"kind": s["kind"], "lead": LEAD.get(s["kind"], ""),
+              "parts": s["parts"], "text": s["text"]} for s in sentences]
     note, source = "not attempted", "deterministic"
     if sentences and model:
         smoothed, note = smooth(sentences, model, data.get("generated", ""), offline)
         if smoothed:
-            parts, source = smoothed, "model"
+            for ln, parts in zip(lines, smoothed):
+                ln["parts"], ln["text"] = parts, text_of(parts)
+            source = "model"
     return {
-        "v": 1,
+        "v": 2,
+        # What arcs-page renders: one labelled line per fact, in reading order. The page
+        # never asks whether a model was involved -- that is this stage's business and
+        # nobody else's.
+        "lines": lines,
+        # The deterministic composition, kept whole even when the rewrite is used.
         "sentences": sentences,
-        # What arcs-page renders, whoever composed it. The page never asks whether a model
-        # was involved -- that is this stage's business and nobody else's.
-        "parts": parts,
-        "text": text_of(parts),
-        # The deterministic paragraph is kept even when the model's is used, because it is
-        # the thing the rewrite is auditable against.
-        "derived": text_of(flat(sentences)),
+        # The same lines as one paragraph's worth of parts. Still emitted, because `--text`
+        # and any reader of a v1 payload want one string of prose rather than nothing, and
+        # because it costs a join.
+        "parts": flat(lines),
+        "text": " ".join(ln["text"] for ln in lines),
+        "derived": derived,
         "source": source,
         "model": {"name": model, "note": note},
         "interval": interval_phrase(data.get("since_last_run") or {},
@@ -795,12 +848,14 @@ def main():
     data["brief"] = build(data, "" if args.no_model else args.model, args.offline)
 
     b = data["brief"]
-    print(f"  brief: {len(b['sentences'])} sentence"
-          + ("" if len(b["sentences"]) == 1 else "s")
+    print(f"  brief: {len(b['lines'])} line"
+          + ("" if len(b["lines"]) == 1 else "s")
           + f" — {b['model']['note']}", file=sys.stderr)
 
     if args.text:
-        out = b["text"] + "\n"
+        # One line per line, with its label, because that is now the shape of the block and
+        # `--text` exists to show what the page will show.
+        out = "".join(f"{ln['lead']:>16}  {ln['text']}\n" for ln in b["lines"])
     else:
         out = json.dumps(data, indent=1) + "\n"
     if args.out:

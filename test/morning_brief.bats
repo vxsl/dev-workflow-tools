@@ -490,7 +490,7 @@ print(am.check(det, "- DE-1 has been with Neville for 149 days.", ["DE-1"]))
 print(am.check(det, det, ["DE-1"]))'
     [[ "${lines[0]}" == *"appeared 0 times"* ]]
     [[ "${lines[1]}" == *"appeared 2 times"* ]]
-    [[ "${lines[2]}" == *"list or a heading"* ]]
+    [[ "${lines[2]}" == *"list item or a heading"* ]]
     [ "${lines[3]}" = "None" ]
 }
 
@@ -512,7 +512,7 @@ s = [am.sentence("x", ["see ", am.ref("DM", fp="a", of="ledger"), " and ",
                        am.ref("DM", fp="b", of="ledger"), "."])]
 parts, note = am.smooth(s, "sonnet", "2026-08-14T07:30:00-0700")
 print(parts, note)'
-    [[ "$output" == "None skipped — 'DM' is not unique in the paragraph" ]]
+    [[ "$output" == "None skipped — 'DM' is not unique in the brief" ]]
 }
 
 @test "no model is a supported way to run, and it says so" {
@@ -557,9 +557,75 @@ k = am.cache_key("m", am.MODEL_PROMPT.format(anchors="    (none)", n=1, para=det
 print(am.smooth(s, "m", "", offline=True)[1])
 am.cache_write(k, {"at": "", "prose": "At 149 days, DE-1 is the oldest.", "why": ""})
 parts, note = am.smooth(s, "m", "", offline=True)
-print(note, "|", am.text_of(parts))'
+print(note, "|", am.text_of(parts[0]))'
     [ "${lines[0]}" = "not attempted" ]
     [ "${lines[1]}" = "cached (m) | At 149 days, DE-1 is the oldest." ]
+}
+
+# ── the block is a list of facts, and the model may not turn it back into prose ──
+#
+# This is the whole shape of the opening: five independent facts, each on its own line with
+# its kind named beside it. The old block was one paragraph and the model's instruction was
+# to join the sentences into it -- which is the right instruction for a paragraph and exactly
+# wrong for a list. So the contract is now positional: line i out is the rewrite of line i
+# in, and everything below is a way that contract can be broken.
+
+@test "a line comes back for every line, and a count that does not match is refused" {
+    run am '
+s = [am.sentence("owed", ["DE-1 is 149 days old."]),
+     am.sentence("forgotten", ["dove went cold 12 days ago."])]
+per = [x["parts"] for x in s]
+dets = [am.text_of(p) for p in per]
+print(am._relines("DE-1 is 149 days old.", per, dets, [[], []])[1])
+print(am._relines("DE-1: 149 days.\ndove: cold 12 days.\nand a third line.",
+                  per, dets, [[], []])[1])
+built, why = am._relines("DE-1: 149 days.\ndove: cold 12 days.", per, dets, [[], []])
+print(why, [am.text_of(b) for b in built])'
+    [ "${lines[0]}" = "1 line(s) came back for 2" ]
+    [ "${lines[1]}" = "3 line(s) came back for 2" ]
+    [ "${lines[2]}" = "None ['DE-1: 149 days.', 'dove: cold 12 days.']" ]
+}
+
+@test "a fact moved to another line is refused, not silently relinked" {
+    # Position is the contract, so an anchor the model carried onto the neighbouring line
+    # has nowhere to attach on the line it came from -- and a link that resolves to the
+    # wrong evidence is worse than a plainer sentence.
+    run am '
+s = [am.sentence("owed", [am.ref("DE-1", fp="a", of="ledger"), " is 149 days old."]),
+     am.sentence("forgotten", ["dove went cold 12 days ago."])]
+per = [x["parts"] for x in s]
+dets = [am.text_of(p) for p in per]
+anc = [["DE-1"], []]
+print(am._relines("149 days old.\nDE-1 dropped, dove cold 12 days ago.",
+                  per, dets, anc)[1])'
+    [[ "${lines[0]}" == *"appeared 0 times"* ]]
+}
+
+@test "each line keeps its own numbers, so a number cannot drift between lines" {
+    run am '
+s = [am.sentence("owed", ["DE-1 is 149 days old."]),
+     am.sentence("forgotten", ["dove went cold 12 days ago."])]
+per = [x["parts"] for x in s]
+dets = [am.text_of(p) for p in per]
+print(am._relines("DE-1 is old.\ndove cold 12 days, DE-1 149 days.",
+                  per, dets, [[], []])[1])'
+    [[ "${lines[0]}" == *"dropped 149"* ]]
+}
+
+@test "every line carries the label its kind is filed under" {
+    # The label is arc-morning vocabulary and not the page's: the page has no business
+    # knowing that `contradiction` means Jira.
+    run am '
+d = payload(ledger={"they_owe": [owed("ticket-stalled", "DE-1", 40, who="Neville")],
+                    "you_owe": []},
+            forgotten=["a1"], arcs=[dropped("a1", "dove", "3 sessions, then nothing")],
+            gap={"status_mismatch": [mismatch("UL-9", "In Review", 85)]})
+b = am.build(d, model="")
+for ln in b["lines"]:
+    print(ln["kind"], "|", ln["lead"], "|", bool(ln["text"]))'
+    [ "${lines[0]}" = "owed | open loop | True" ]
+    [ "${lines[1]}" = "forgotten | dropped | True" ]
+    [ "${lines[2]}" = "contradiction | jira disagrees | True" ]
 }
 
 # ── the brief against a commitment that closed on evidence ────────────────────
