@@ -149,6 +149,13 @@ section{margin-bottom:3rem}
 .arc-sub .key-2nd{color:var(--ink-faint)}
 .arc-sub .label{font-style:italic;color:var(--ink-faint)}
 .arc-sub .auth{color:var(--ink-soft)}
+/* The one thing on a card that a person declared rather than the pipeline derived, and it
+   is the loudest thing in this row for that reason: the rung, the commit count and the
+   demands above it are all downstream of it, and a reader who cannot see it is in force
+   cannot audit any of them. Bracketed rather than coloured -- accent here would read as a
+   link, and there is nowhere to go. */
+.arc-sub .filed{color:var(--accent);border:1px solid currentColor;border-radius:2px;
+  padding:0 .3em;letter-spacing:.02em}
 /* Where a merge request points, when that is not main. Warm rather than faint: an MR aimed
    at another branch is a condition of the work, not a footnote about it. */
 .arc-sub .stack{color:var(--warm)}
@@ -396,6 +403,11 @@ td .dis{vertical-align:middle}
 .tree .det:hover{fill:var(--hot)}
 .tree .det.on{fill:var(--hot);font-weight:700}
 .tree text.detached{text-decoration:line-through;opacity:.45}
+/* Work a declaration filed elsewhere. Struck through and dimmed, and still drawn: the
+   reason to declare the ticket was that these were being counted as outstanding, and the
+   reason to keep them on the page is that "there are eleven drafts here" is still true. */
+.tree text.hist,.tree .c.hist{text-decoration:line-through;opacity:.42}
+.tree .dot.hist{fill:var(--ink-faint);opacity:.4}
 #interactbar{position:sticky;bottom:0;margin-top:1rem;display:none;gap:.8rem;
   align-items:center;flex-wrap:wrap;padding:.7rem .9rem;border:1px solid var(--parked);
   border-radius:4px;background:var(--surface);font-size:.85rem;
@@ -1142,6 +1154,8 @@ def spawn_svg(arc, limit=12, base="", detachable=False):
     def tail_len(b):
         if b["name"] == auth:
             return 11
+        if b.get("historical"):
+            return len(b["historical"]) + 12
         if b.get("superseded_by"):
             return len(b["superseded_by"]) + 6
         return len(str(b.get("unpushed") or "")) + 2
@@ -1169,16 +1183,23 @@ def spawn_svg(arc, limit=12, base="", detachable=False):
     for b, d in rows:
         cx, cy = x_of(d), y_of(at[b["name"]])
         dup = b.get("superseded_by")
+        # Struck through, not removed. The whole reason to declare a ticket is that these
+        # branches were being counted as outstanding work; the whole reason to keep drawing
+        # them is that "you have eleven drafts here" is still true and still worth knowing.
+        hist = b.get("historical")
         # A copy's unpushed commits are not risk -- they already exist on the branch it
         # copies -- so it is marked as the copy it is instead of flagged red.
-        cls = (" dup" if dup else (" auth" if b["name"] == auth
-                                   else (" risk" if b.get("unpushed") else "")))
+        cls = (" hist" if hist else
+               (" dup" if dup else (" auth" if b["name"] == auth
+                                    else (" risk" if b.get("unpushed") else ""))))
         head = " head" if b.get("worktree") else ""
         svg.append(f'<circle class="dot{cls}{head}" cx="{cx}" cy="{cy}" r="3.2"/>')
         # The tail rides in the same <text> as a dx-offset tspan. Positioning it with
         # its own x means guessing the font's advance width, and the guess ran short
         # often enough to jam `+13` against the branch name.
-        if dup:
+        if hist:
+            tail = f'<tspan class="c hist" dx="7">history · {esc(hist)}</tspan>'
+        elif dup:
             tail = (f'<tspan class="c dup" dx="7">= {esc(dup)}</tspan>')
         elif b["name"] == auth:
             tail = '<tspan class="c" dx="7">← the work</tspan>'
@@ -1204,6 +1225,9 @@ def spawn_svg(arc, limit=12, base="", detachable=False):
     legend = []
     if any(kind.get(b["name"]) == "copy" for b, _ in rows):
         legend.append("dashed = the same commits again, not separate work")
+    if any(b.get("historical") for b, _ in rows):
+        legend.append("struck through = you filed this work elsewhere, so these are "
+                      "drafts from before it")
     hidden = len(branches) - len(rows)
     if hidden > 0:
         legend.append(f"{hidden} more branch{'es' if hidden != 1 else ''} in this arc")
@@ -1773,6 +1797,13 @@ def render(data, lede, focus_days, limit, cost=None):
         a(f'<p class="note">Ignoring your hand-set authoritative branch '
           f'<code>{esc(s.get("branch",""))}</code> for {esc(s.get("label",""))}: '
           f'{esc(s.get("why",""))}. Re-set it if it is still right.</p>')
+    # A declaration that no longer holds says so, loudly, and in the direction that
+    # matters: it was suppressing counts, and a suppression that has quietly lapsed is the
+    # one thing worse than one that never existed.
+    for s in data.get("stale_tickets") or []:
+        a(f'<p class="note">No longer filing {esc(s.get("label",""))} as '
+          f'<code>{esc(s.get("key",""))}</code>: {esc(s.get("why",""))}. Everything it '
+          'set aside is counted again — re-file it if it is still right.</p>')
 
     # Which sprint arcs have gone quiet, by id, so a row can wear the fact without
     # re-deriving the threshold. work-arcs owns that judgement -- it is the one that knows
@@ -1852,6 +1883,19 @@ def render(data, lede, focus_days, limit, cost=None):
                 sub.append(f'<span class="auth" title="the branch that IS this work '
                            f'({esc(arc.get("authoritative_via",""))})">'
                            f'{" &middot; ".join(bits)}</span>')
+        # Said on the card, because everything below it is quieter for having been said:
+        # the rung, the commit count and the demands are all downstream of this declaration,
+        # and a reader who cannot see that it is in force cannot audit any of them.
+        ta = arc.get("ticket_authority") or {}
+        if ta.get("key"):
+            n = arc.get("historical_branches") or 0
+            sub.append('<span class="filed" title="you filed this work as '
+                       f'{esc(ta["key"])} — {esc(ta.get("via",""))}. Branches outside '
+                       'that lineage are history: still drawn, no longer counted, and '
+                       'back the moment a commit lands on one">filed as '
+                       f'{esc(ta["key"])}'
+                       + (f", {n} branch{'' if n == 1 else 'es'} history" if n else "")
+                       + "</span>")
         if arc.get("state"):
             sub.append(f'<span class="arc-state">{esc(arc["state"])}</span>')
         return f'<div class="arc-sub">{"".join(sub)}</div>' if sub else ""

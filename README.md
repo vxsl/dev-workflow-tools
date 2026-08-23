@@ -501,6 +501,33 @@ a different action:
 count, session count, recent commit subjects — then drops into `create-jira-ticket`'s
 board picker, because UL vs UB is a judgment call. Add `--dry-run` to see it first.
 
+**`--authoritative-ticket` says what an arc’s work IS**, which is the one thing neither
+git nor Jira can settle. `UL-1852` reached review as one merge request; file overlap had
+already gathered eleven other branches into the same arc — experiments, backups, a
+pre-squash copy, a spike that went nowhere — and every one of them held the arc on the
+`local-only` rung, reporting *85 commits exist only here* about work that had shipped. Every
+count was right; what they were counts **of** was the question.
+
+```bash
+work-arcs --authoritative-ticket metadata-latlng=UL-1852
+work-arcs --derive-ticket metadata-latlng      # back to the derivation
+```
+
+Filing the work as a ticket files it as the merge request under that ticket, so the rung
+falls to whatever that merge request says. Branches outside its lineage — its stack
+parents and its own copies are inside it — become **history**: still drawn in the tree,
+struck through, still counted in `branches`, but no longer counted as risk, no longer
+holding the rung down, and no longer asking for anything. Once the merge request merges the
+arc can finally read *landed*, which it never could while eleven drafts from before it were
+outstanding.
+
+It is a suppression, so it expires like every other declaration here: it records a
+fingerprint of the tips it set aside and applies only while those are still the tips. A
+commit landing on any of them means you went back to that branch, and a branch you went
+back to is not history — the page then says it has stopped filing the arc that way, and
+everything is counted again. Two things it deliberately does not touch: unpushed commits on
+the declared branch itself, and anything the merge request is asking for.
+
 **The Slack lens: what was decided, on the card for the work it decided about.** The
 graph knows what the code says and what the tickets say, and both are records of
 decisions already taken. The taking happens in Slack — a week later the only trace of
@@ -521,6 +548,17 @@ missed. DM and group-DM history this token cannot read and does not ask for, so 
 those 219 were never opened — the block reports that count rather than implying it saw
 everything.
 
+**Every quote is a message, and it is set as one:** who said it, their avatar, and their
+words with Slack’s own markup rendered. `conversations.replies` names an author as a bare
+`U0A5LKV7E0K` — which is what the cards used to print — so `users.info` is asked once
+per person per month and cached in `slack-people.json`, avatar bytes included. Those are
+stored as inline data URIs because the page is an artifact whose CSP refuses every external
+host: an avatar served from `avatars.slack-edge.com` is not a slow avatar, it is no avatar.
+Where Slack gives us no face the chip is the person’s initials, in a hue hashed from their
+name, so they are the same colour in every section. Emoji shortcodes are resolved only where
+they can be named — `ratio 3:4:5` holds a shortcode-shaped `:4:`, and a substitution
+firing on anything shortcode-shaped would silently print `ratio 35`.
+
 `✕` acknowledges a thread; the fingerprint carries the thread's last message, so anyone
 adding to it brings the block back. One cached model call per thread: the first run of
 the day costs about 13¢ a thread and every rerun costs nothing.
@@ -534,6 +572,17 @@ thread contributes nothing: no line, and no arc in the "N workstreams moved unde
 count. Threads are compared only between two runs that both read the lens whole, so the
 first run after an outage or a `--no-slack-threads` says nothing about Slack rather than
 reporting a week-old conversation as this morning's news.
+
+**The block at the top of the page is a list, not a paragraph.** It used to be one serif
+paragraph carrying five facts, and it was not readable: five sentences each with a claim, a
+number, a superlative and a subordinate clause, run together with nothing to tell a skimming
+reader which one was about what. `arc-morning` already composed one sentence per topic, so
+each now takes a row with its kind named in the margin — *open loop*, *past due*,
+*dropped*, *jira disagrees* — and its subject linked to the row below that is the evidence
+for it. The one model call it makes changed job with the shape: it tightens each line on its
+own, and the contract is positional, so a line count that does not match, an anchor carried
+onto the neighbouring line, or a numeral that drifted between lines rejects the whole pass
+rather than half of it.
 
 Env: `WORK_ARCS_REPO` (default `~/work/repos/ul`), `WORK_ARCS_MAIN` (`origin/main`),
 `WORK_ARCS_PROJECTS` (`~/.claude/projects`), plus the `JIRA_*` vars for `--gap`. For the

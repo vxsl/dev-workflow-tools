@@ -3292,6 +3292,157 @@ def set_override(arcs, spec):
     print(f"  expires itself if that derivation changes — {OVERRIDES}", file=sys.stderr)
 
 
+TICKET_AUTHORITY = (Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
+                    / "work-arcs" / "authoritative-ticket.json")
+
+
+def _ta_lineage(arc, branch):
+    """The declared branch and everything already inside it.
+
+    Its ancestors, because a stack's lower branches are commits the tip already contains;
+    and anything superseded by a member, transitively, because a pre-squash copy of the work
+    is the work. Everything outside this set is what the declaration calls history.
+    """
+    lineage = {branch}
+    by_name = {b["name"]: b for b in arc.get("branches", [])}
+    lineage |= {p for p in (by_name.get(branch, {}).get("parents") or []) if p in by_name}
+    for _ in range(len(by_name)):
+        grew = {n for n, b in by_name.items()
+                if b.get("superseded_by") in lineage} - lineage
+        if not grew:
+            break
+        lineage |= grew
+    return lineage
+
+
+def _ta_residue_fp(arc, lineage):
+    """A fingerprint of the tips the declaration is setting aside.
+
+    The expiry mechanism, and it expires in the one direction that matters. "The work of
+    this arc is UL-1852 and the rest is history" stops being true the moment a commit lands
+    on one of those other branches -- you went back to it, so it is not history. Keyed on
+    the tips rather than on the arc's name, exactly as parking is, so going back expires the
+    declaration on its own and nothing has to remember to.
+    """
+    h = hashlib.sha256()
+    for b in sorted(arc.get("branches", []), key=lambda x: x["name"]):
+        if b["name"] not in lineage:
+            h.update(f'{b["name"]}:{b["sha"]}\n'.encode())
+    return h.hexdigest()[:16]
+
+
+def _ta_resolve(arc, key):
+    """Which branch of this arc IS ticket `key`, and why, or (None, why not).
+
+    The merge request first, because that is what "up for review" means and it is the whole
+    point of the declaration: filing the work as a ticket is filing it as the merge request
+    under that ticket. A branch naming the key is the fallback for work not yet proposed.
+    """
+    names = {b["name"] for b in arc.get("branches", [])}
+    for m in arc.get("mrs", []):
+        if mr_ticket(m) == key and m.get("branch") in names:
+            return m["branch"], f"source of !{m.get('iid')}"
+    named = [n for n in sorted(names)
+             if TICKET_RE.search(n.upper())
+             and TICKET_RE.search(n.upper()).group(0) == key]
+    if len(named) == 1:
+        return named[0], f"the one branch naming {key}"
+    if named:
+        return None, f"{len(named)} branches name {key} and no merge request picks one"
+    return None, f"nothing in this workstream is {key}"
+
+
+def apply_ticket_authority(arcs, store, repo=None, main_ref="origin/main"):
+    """Let a human say what an arc's work IS, when the clustering has buried it.
+
+    The one thing neither git nor Jira can settle. `UL-1852` reached review as one merge
+    request; file overlap had already gathered eleven other branches into the same arc --
+    experiments, backups, a pre-squash copy, a spike that went nowhere -- and every one of
+    them kept the arc on the `local-only` rung, reporting "85 commits exist only here" about
+    work that had shipped. The counts were right. What they were counts *of* was the
+    question, and nothing on the machine could answer it.
+
+    So this says it: the work is this ticket, and the branches outside its lineage are
+    history. They are not hidden -- they stay in the tree, struck through, and the card says
+    how many and under whose declaration -- but they stop being counted as risk, stop
+    holding the rung down, and stop asking for anything. The rung then falls to whatever the
+    merge request says, which is what "it is up for review" means.
+
+    Held to the same contract as every other declaration here. It records the residue it was
+    declared about and applies only while that is still the residue: a commit on any branch
+    it set aside means you went back to that branch, and a branch you went back to is not
+    history. Then it reports itself stale rather than quietly outvoting the evidence.
+
+    Returns the entries that could not be applied, so the page can say so.
+    """
+    stale = []
+    for arc in arcs:
+        entry = store.get(arc.get("label")) or store.get(arc.get("id"))
+        if not entry:
+            continue
+        key = (entry.get("key") or "").upper()
+        branch, why = _ta_resolve(arc, key)
+        if not branch:
+            stale.append({"label": arc.get("label"), "key": key, "why": why})
+            continue
+        lineage = _ta_lineage(arc, branch)
+        residue = sorted(b["name"] for b in arc["branches"] if b["name"] not in lineage)
+        now = _ta_residue_fp(arc, lineage)
+        was = entry.get("residue")
+        if was and was != now:
+            stale.append({"label": arc.get("label"), "key": key,
+                          "why": "a commit has landed on work you set aside, so it is "
+                                 "not history"})
+            continue
+        for b in arc["branches"]:
+            b["historical"] = None if b["name"] in lineage else key
+        arc["ticket_authority"] = {"key": key, "branch": branch, "via": why,
+                                   "at": entry.get("at"), "residue": residue}
+        # Everything the mark changes is computed in finalize, so it is recomputed rather
+        # than patched: the rung, the live commit count, the arc's own age, the demands.
+        finalize(arc, repo, main_ref)
+    return stale
+
+
+def set_ticket_authority(arcs, spec, undo=False):
+    """`--authoritative-ticket ARC=KEY`, stamped with the residue it sets aside."""
+    label, _, key = spec.partition("=")
+    label, key = label.strip(), key.strip().upper()
+    match = [a for a in arcs if a.get("label") == label or a.get("id") == label]
+    if not match:
+        sys.exit(f"work-arcs: no workstream named {label!r}")
+    arc = match[0]
+    store = load_store(TICKET_AUTHORITY, "the ticket-authority store")
+    if undo:
+        store.pop(label, None)
+        print(f"✓ {label} is derived again", file=sys.stderr)
+    else:
+        if not TICKET_RE.search(key):
+            sys.exit(f"work-arcs: {key!r} is not a ticket key "
+                     "(JIRA_PROJECTS decides what one looks like)")
+        branch, why = _ta_resolve(arc, key)
+        if not branch:
+            sys.exit(f"work-arcs: cannot file {label!r} as {key} — {why}\n  "
+                     + "\n  ".join(b["name"] for b in arc["branches"]))
+        lineage = _ta_lineage(arc, branch)
+        residue = sorted(b["name"] for b in arc["branches"] if b["name"] not in lineage)
+        store[label] = {"key": key, "branch": branch,
+                        "residue": _ta_residue_fp(arc, lineage),
+                        "at": int(time.time())}
+        print(f"✓ {label} is {key} — {branch} ({why})", file=sys.stderr)
+        if residue:
+            print(f"  {len(residue)} branch(es) become history and stop being counted:",
+                  file=sys.stderr)
+            for n in residue[:8]:
+                print(f"    {n}", file=sys.stderr)
+            if len(residue) > 8:
+                print(f"    … and {len(residue) - 8} more", file=sys.stderr)
+        print(f"  comes back on its own if a commit lands on any of them — "
+              f"{TICKET_AUTHORITY}", file=sys.stderr)
+    TICKET_AUTHORITY.parent.mkdir(parents=True, exist_ok=True)
+    TICKET_AUTHORITY.write_text(json.dumps(store, indent=1, sort_keys=True))
+
+
 def jira_ify(repo, arc, dry_run):
     """File a ticket for work that already exists, using what the arc already knows."""
     branches = ", ".join(b["name"] for b in arc["branches"][:6])
@@ -3813,7 +3964,17 @@ def authoritative(arc):
     ties ahead of anything else, because standing in a branch is the strongest statement of
     intent available without asking.
     """
+    # A hand-filed ticket is the strongest statement there is, because it is the only one
+    # that is not an inference. See apply_ticket_authority for what it is allowed to say
+    # and how it expires.
+    ta = arc.get("ticket_authority") or {}
+    if ta.get("branch") in {b["name"] for b in arc.get("branches", [])}:
+        return ta["branch"], f"you filed this as {ta['key']} — {ta.get('via', '')}"
     branches = [b for b in arc.get("branches", []) if not b.get("superseded_by")]
+    # Branches a declaration set aside as history cannot be what the work currently is.
+    outside = [b for b in branches if not b.get("historical")]
+    if outside:
+        branches = outside
     if not branches:
         branches = arc.get("branches", [])
     # A branch whose MR merged is finished; it cannot be what the work currently is unless
@@ -4416,7 +4577,8 @@ def demands(arc):
 
     for b in arc.get("branches", []):
         pipe = b.get("pipeline") or {}
-        if pipe.get("status") == "failed" and not b.get("superseded_by"):
+        if (pipe.get("status") == "failed" and not b.get("superseded_by")
+                and not b.get("historical")):
             out.append({"kind": "pipeline",
                         "what": f"{b['name']} pipeline failed on {pipe.get('at','')}",
                         "url": pipe.get("url", "")})
@@ -4531,6 +4693,11 @@ def finalize(arc, repo=None, main_ref="origin/main"):
     by_name = {b["name"]: b for b in arc["branches"]}
     fate_of = {n: (b.get("mr_fate") or {}).get("state") for n, b in by_name.items()}
     settled_names = {n for n, f in fate_of.items() if f in ("merged", "closed")}
+    # A branch a declaration set aside is accounted for by the branch that shipped, exactly
+    # as a superseded copy is. Without this the arc could never reach `landed`: the merge
+    # request would merge and eleven drafts from before it would keep the workstream open
+    # forever, which is the shape of wrongness the declaration exists to correct.
+    settled_names |= {n for n, b in by_name.items() if b.get("historical")}
     for _ in range(len(by_name)):
         grew = False
         for n, b in by_name.items():
@@ -4548,12 +4715,18 @@ def finalize(arc, repo=None, main_ref="origin/main"):
     else:
         arc["settled"] = None
 
+    # Counted over the whole arc still, because it is the fact about the refs. What the
+    # declaration changes is `unpushed_live` below -- what is genuinely outstanding.
     arc["unpushed"] = sum(b["unpushed"] for b in arc["branches"])
     # Commits on a branch whose MR already merged are not work waiting to be pushed. Both
     # this and supersession answer the same question -- is this commit's content already
     # somewhere safe -- and both have to be excluded before a number is called risk.
     def dead(b):
-        return bool(b.get("superseded_by")) or \
+        # `historical` is the third way a commit can already be accounted for, and the only
+        # one a person rather than the repo asserts: the work went out as another branch and
+        # this one is a draft from before it. Same consequence as supersession -- its commits
+        # are not risk and its absence of an MR is not a demand.
+        return bool(b.get("superseded_by")) or bool(b.get("historical")) or \
             b.get("mr_fate", {}).get("state") in ("merged", "closed")
 
     held = [b["name"] for b in arc["branches"] if b["unpushed"]]
@@ -4567,8 +4740,13 @@ def finalize(arc, repo=None, main_ref="origin/main"):
         arc["unpushed_only_on_copies"] = (distinct_unpushed(repo, held)
                                           - arc["unpushed_live"])
     else:
+        # No repo to ask, so commits cannot be counted once each across branches -- but
+        # WHICH branches count is the same question either way, and it is `dead` that
+        # answers it. This used to test supersession alone, which meant the degraded path
+        # disagreed with the real one about merged branches as well as about declared
+        # history.
         arc["unpushed_live"] = sum(b["unpushed"] for b in arc["branches"]
-                                   if not b.get("superseded_by"))
+                                   if not dead(b))
         arc["unpushed_only_on_copies"] = arc["unpushed"] - arc["unpushed_live"]
     arc["superseded"] = sum(1 for b in arc["branches"] if b.get("superseded_by"))
     arc["landed_branches"] = sum(1 for b in arc["branches"]
@@ -4592,6 +4770,10 @@ def finalize(arc, repo=None, main_ref="origin/main"):
             arc["ticket"] = m.group(0)
     if not arc["ticket"] and arc.get("issues"):
         arc["ticket"] = arc["issues"][0]["key"]
+    # And a hand-filed ticket is the ticket, whatever the branch name happens to say.
+    if (arc.get("ticket_authority") or {}).get("key"):
+        arc["ticket"] = arc["ticket_authority"]["key"]
+    arc["historical_branches"] = sum(1 for b in arc["branches"] if b.get("historical"))
 
     # Which merge requests are out being qualified, joined per MR through its own ticket.
     # Empty on the first pass, when no Jira call has happened yet -- like everything else
@@ -4630,7 +4812,8 @@ def finalize(arc, repo=None, main_ref="origin/main"):
     # different one from "this is outstanding". Not hidden: the whole reason to derive it is
     # that it is a signal, and papering over it was explicitly not wanted.
     live_b = [b for b in arc["branches"]
-              if not b.get("mr_fate") and not b.get("superseded_by")]
+              if not b.get("mr_fate") and not b.get("superseded_by")
+              and not b.get("historical")]
     arc["predates_landing"] = sum(1 for b in live_b if b.get("predates_landing"))
     stale_draft = bool(live_b) and all(b.get("predates_landing") for b in live_b)
 
@@ -5353,6 +5536,14 @@ def main():
                    help="name the branch that IS an arc's work when the derivation gets it "
                         "wrong. Optional: it only corrects, nothing depends on it, and it "
                         "expires itself once the derivation changes underneath")
+    p.add_argument("--authoritative-ticket", metavar="ARC=KEY",
+                   help="say what an arc's work IS: the ticket it is filed under, and so "
+                        "the merge request under that ticket. Branches outside that "
+                        "lineage become history — still drawn, no longer counted as risk, "
+                        "no longer holding the rung down. Expires itself the moment a "
+                        "commit lands on any of them")
+    p.add_argument("--derive-ticket", metavar="ARC",
+                   help="drop the hand-filed ticket and derive it again")
     p.add_argument("--no-split", action="store_true",
                    help="skip arc-brief's pass over arcs that hold several bodies of "
                         "work; file overlap alone decides membership")
@@ -5412,7 +5603,8 @@ def main():
     # that turns 9s of its own wall clock into none. The write-side commands skip it --
     # --park does not need to know who owes whom.
     writing = (args.park or args.unpark or args.authoritative or args.jira_ify
-               or args.detach or args.undetach)
+               or args.detach or args.undetach or args.authoritative_ticket
+               or args.derive_ticket)
     ledger_f = None
     if mrs_known and not args.shallow_mr and not writing:
         ledger_f = futures.ThreadPoolExecutor(max_workers=1).submit(
@@ -5504,6 +5696,11 @@ def main():
         set_override(arcs, args.authoritative)
         return
 
+    if args.authoritative_ticket or args.derive_ticket:
+        set_ticket_authority(arcs, args.authoritative_ticket or args.derive_ticket,
+                             undo=bool(args.derive_ticket))
+        return
+
     if args.jira_ify:
         match = [a for a in arcs if a["label"] == args.jira_ify or a["id"] == args.jira_ify]
         if not match:
@@ -5586,6 +5783,16 @@ def main():
     stale_overrides = apply_overrides(arcs, load_overrides())
     for s in stale_overrides:
         print(f"⚠ ignoring authoritative={s['branch']} for {s['label']}: {s['why']}",
+              file=sys.stderr)
+
+    # After the branch override and before mark_forgotten, which is the only order that
+    # works: this one re-runs finalize, so it would overwrite a branch the override had just
+    # named, and the forgotten verdict reads the rung this settles.
+    stale_tickets = apply_ticket_authority(
+        arcs, load_store(TICKET_AUTHORITY, "the ticket-authority store"),
+        args.repo, args.main)
+    for s in stale_tickets:
+        print(f"⚠ ignoring authoritative-ticket={s['key']} for {s['label']}: {s['why']}",
               file=sys.stderr)
 
     # Both of its exclusions -- parked, and whose clock is running -- are only settled by
@@ -5762,6 +5969,7 @@ def main():
             "sprint": sprint,
             "unattached_stashes": unattached,
             "stale_overrides": stale_overrides,
+            "stale_tickets": stale_tickets,
             "stale_parks": stale_parks,
             "stale_detached": stale_detached,
             "gap": gap,
