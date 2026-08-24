@@ -508,6 +508,29 @@ pre-squash copy, a spike that went nowhere — and every one of them held the ar
 `local-only` rung, reporting *85 commits exist only here* about work that had shipped. Every
 count was right; what they were counts **of** was the question.
 
+**Filed from the page, in one click.** Every workstream this applies to carries a *this
+work is* row above its tree: one button per ticket it could be filed as, each labelled with
+what the row will say once it is — `UL-1852 → in qualification`, `UL-1853 → landed`. Click
+it and the page applies it there and then: the rung changes, the counts change, the branches
+outside that ticket go struck through in the tree, and the demands it silences disappear.
+Click it again to unfile.
+
+None of that is worked out in the browser. `work-arcs` precomputes every state the control
+can reach — one per offerable key, plus the underived state to return to — by actually
+applying each filing and reading `finalize`'s answer, so the page records intent and swaps
+in the pipeline's own numbers. A second implementation of the rung ladder in JavaScript is a
+ladder that eventually disagrees with this one. Only keys that change something are offered,
+at most three, the one the derivation already chose first.
+
+Like parking and detaching, it applies in the page and survives reloads (the artifact's own
+`localStorage`), and **Save filings** writes `authoritative-ticket.json` for
+`~/.local/state/work-arcs/` so `work-arcs`' own counts agree with what you are looking at.
+The store the page keeps is seeded from the file `work-arcs` read, not from the rows on
+screen — a workstream outside the focus window has no row, and a store built from rows alone
+would drop its filing the first time the page saved one.
+
+There is a command-line twin, as there is for every control on the page:
+
 ```bash
 work-arcs --authoritative-ticket UL-1852       # the key alone, where one arc holds it
 work-arcs --authoritative-ticket "Derive dataset geometry…=UL-1852"

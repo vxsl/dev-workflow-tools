@@ -584,6 +584,30 @@ td .dis{vertical-align:middle}
   color:var(--accent);opacity:.75;white-space:nowrap;vertical-align:.08em}
 .ws>summary:hover .sprintchip{opacity:1}
 .sprintchip.idle{color:var(--warm);opacity:1}
+/* The one control on the card for the one judgement no derivation can make. It sits above
+   the tree because the tree is the consequence: choosing an option strikes through the
+   branches it sets aside, on the same click. Quiet until hovered -- it is an answer the
+   page is waiting for, not something it is asking for. */
+.fileas{display:flex;flex-wrap:wrap;align-items:baseline;gap:.3rem .5rem;
+  margin:.6rem 0 .1rem;padding-top:.5rem;border-top:1px solid var(--hairline)}
+.fileas .fa-h{font-family:var(--mono);font-size:.63rem;text-transform:uppercase;
+  letter-spacing:.09em;color:var(--ink-faint)}
+.fileas .fa-o{font:inherit;font-size:.72rem;font-family:var(--mono);cursor:pointer;
+  display:inline-flex;align-items:baseline;gap:.35rem;padding:.1rem .4rem;
+  border:1px solid var(--hairline);border-radius:2px;background:transparent;
+  color:var(--ink-soft)}
+.fileas .fa-o:hover{border-color:var(--accent);color:var(--ink)}
+/* What the row will say once it is filed, on the button that will make it say it. A control
+   whose outcome you have to click to discover is one you click once and distrust after. */
+.fileas .fa-o .fa-to{color:var(--ink-faint);font-size:.92em}
+.fileas .fa-o .fa-to::before{content:"→ ";opacity:.85}
+.fileas .fa-o.on{border-color:var(--accent);color:var(--accent);font-weight:600}
+.fileas .fa-o.on .fa-to{color:var(--accent)}
+.fileas .fa-why{flex-basis:100%;font-size:.72rem;color:var(--ink-faint);
+  text-wrap:pretty}
+/* A demand a filing silenced. Not display:none on the acknowledgement path -- nobody read
+   it, so it must not be offered back under "N acknowledged" or saved to dismissed.json. */
+.needs li[data-filed-out="1"]{display:none}
 /* The one chip on a row that a person put there. Full opacity because it is not a lens the
    row happens to fall under -- it is the reason the row says what it says. */
 .sprintchip.filed{opacity:1;letter-spacing:.08em}
@@ -748,7 +772,8 @@ INTERACT_JS = r"""
   var bar=document.getElementById('interactbar'),
       msg=document.getElementById('intmsg'),
       saveDis=document.getElementById('savedis'),
-      saveDet=document.getElementById('savedet');
+      saveDet=document.getElementById('savedet'),
+      saveFil=document.getElementById('savefil');
 
   // --- acknowledgements ----------------------------------------------------
   var DKEY='work-arcs:dismissed:v1', dstore=read(DKEY), ddirty=false;
@@ -797,14 +822,104 @@ INTERACT_JS = r"""
     if(!keep){ delete tstore[b]; twrite(); }
   });
 
+  // --- filings ---------------------------------------------------------------
+  // The one judgement on this page that no derivation can make: which ticket a workstream's
+  // work IS, and therefore which of its branches are drafts from before it. Every state
+  // this can reach was computed by work-arcs -- see filing() there -- so nothing here
+  // derives a rung, a commit count or a demand. It records intent and swaps in the
+  // pipeline's own answer.
+  //
+  // Seeded from the file work-arcs read, not only from the rows on screen: a workstream
+  // outside the focus window has no row here, and a store built from rows alone would drop
+  // its filing the moment this page saved one.
+  var FKEY='work-arcs:filed:v1', fstore=read(FKEY), fdirty=false;
+  function fwrite(){ try{ localStorage.setItem(FKEY,JSON.stringify(fstore)); }catch(e){} }
+  var fblocks=[].slice.call(document.querySelectorAll('.fileas')), fexpired=[];
+  (function(){
+    var seed=document.getElementById('filedseed');
+    var on={};
+    try{ on=JSON.parse((seed&&seed.textContent)||'{}')||{}; }catch(e){ on={}; }
+    Object.keys(on).forEach(function(k){ if(!(k in fstore)) fstore[k]=on[k]; });
+  })();
+  function fjson(el,attr){ try{ return JSON.parse(el.dataset[attr]||'null'); }
+                           catch(e){ return null; } }
+  var fby={};
+  fblocks.forEach(function(el){
+    el.__opts=fjson(el,'opts')||[];
+    el.__off=fjson(el,'off');
+    el.__ws=el.closest('.ws');
+    fby[el.dataset.key]=el;
+  });
+  // Expired only where this page can see that it is. A filing whose workstream has no row
+  // here was not checked, and "not rendered" is not "no longer true" -- the same rule the
+  // dismissal prune is held to, for the same reason.
+  Object.keys(fstore).forEach(function(k){
+    var el=fby[k];
+    if(!el) return;
+    var want=(fstore[k]||{}).key, res=(fstore[k]||{}).residue;
+    var o=el.__opts.filter(function(x){ return x.key===want; })[0];
+    if(!o||(res&&o.residue_fp!==res)){ delete fstore[k]; fexpired.push(k); }
+  });
+  if(fexpired.length) fwrite();
+
+  function fstate(el){
+    var e=fstore[el.dataset.key];
+    var o=e?el.__opts.filter(function(x){ return x.key===e.key; })[0]:null;
+    return [o, o||el.__off];
+  }
+  function fapply(el){
+    var pair=fstate(el), o=pair[0], st=pair[1], ws=el.__ws;
+    el.querySelectorAll('.fa-o').forEach(function(b){
+      b.classList.toggle('on', !!(o&&el.__opts[+b.dataset.i]
+                                  &&el.__opts[+b.dataset.i].key===o.key)); });
+    if(!ws||!st) return;
+    ws.dataset.stage=st.stage||'';
+    var sst=ws.querySelector(':scope > summary .st');
+    if(sst) sst.textContent=st.state||'';
+    var chip=ws.querySelector(':scope > summary .sprintchip.filed');
+    if(chip) chip.hidden=!o;
+    var live=ws.querySelector('.m-live'), b=live&&live.querySelector('b');
+    if(live){ if(b) b.textContent=st.live;
+      live.hidden=!(st.live&&st.stage!=='local-only'); }
+    var cop=ws.querySelector('.m-copies');
+    if(cop){ cop.hidden=!st.copies;
+      cop.textContent=st.copies+(o?(' not on '+o.key):' only on a superseded copy'); }
+    var fm=ws.querySelector('.filed-m');
+    if(fm){ fm.hidden=!o;
+      if(o) fm.textContent='filed as '+o.key
+        +(o.residue.length?(', '+o.residue.length+' branch'
+           +(o.residue.length===1?'':'es')+' history'):''); }
+    var hist={}; (st.history||[]).forEach(function(n){ hist[n]=1; });
+    ws.querySelectorAll('.tree text.n').forEach(function(n){
+      n.classList.toggle('hist', !!hist[n.dataset.branch]); });
+    // A demand the filing silences is not acknowledged -- nobody read it -- so it takes an
+    // attribute of its own rather than borrowing the ✕ store's, which would have offered
+    // it back under "N acknowledged" and saved it to dismissed.json.
+    var keep={}; (st.demands||[]).forEach(function(f){ keep[f]=1; });
+    ws.querySelectorAll('.needs li[data-fp]').forEach(function(li){
+      li.dataset.filedOut=keep[li.dataset.fp]?'0':'1'; });
+  }
+
+  if(fexpired.length){
+    var fp=document.createElement('p'); fp.className='note';
+    var fone=fexpired.length===1;
+    fp.textContent=fexpired.length+' filing'+(fone?'':'s')+' came back on '
+      +(fone?'its':'their')+' own: a commit has landed on work '+(fone?'it':'they')
+      +' set aside, so it is not history. '+(fone?'It is':'They are')+' counted again.';
+    var host=fby[fexpired[0]];
+    if(host&&host.parentNode) host.parentNode.insertBefore(fp,host);
+  }
+
   function setBar(){
     if(!bar) return;
-    bar.classList.toggle('on', ddirty||tdirty);
+    bar.classList.toggle('on', ddirty||tdirty||fdirty);
     if(saveDis) saveDis.hidden=!ddirty;
     if(saveDet) saveDet.hidden=!tdirty;
-    if(msg&&(ddirty||tdirty))
+    if(saveFil) saveFil.hidden=!fdirty;
+    if(msg&&(ddirty||tdirty||fdirty))
       msg.textContent=Object.keys(dstore).length+' acknowledged, '
-        +Object.keys(tstore).length+' detached in this browser';
+        +Object.keys(tstore).length+' detached, '
+        +Object.keys(fstore).length+' filed in this browser';
   }
 
   function apply(){
@@ -821,12 +936,14 @@ INTERACT_JS = r"""
     });
     // Everywhere else gets an auto-appended disclosure so nothing is concealed.
     document.querySelectorAll('[data-disgroup]').forEach(function(g){
-      var hid=g.querySelectorAll('[data-fp][data-dismissed="1"]').length, t=g.__tog;
+      var hid=g.querySelectorAll(
+        '[data-fp][data-dismissed="1"]:not([data-filed-out="1"])').length, t=g.__tog;
       // A group whose heading carries its own count keeps the two honest: a section
       // reading 6 above a list showing 2 is the sort of small lie that costs a page its
       // credit for everything else on it.
       var cf=g.dataset.countfor&&document.querySelector(g.dataset.countfor);
-      if(cf) cf.textContent=g.querySelectorAll('[data-fp]').length-hid;
+      if(cf) cf.textContent=g.querySelectorAll(
+        '[data-fp]:not([data-filed-out="1"])').length-hid;
       if(!t){ t=document.createElement('button'); t.type='button';
         t.className='showdis'; g.__tog=t; g.insertAdjacentElement('afterend',t);
         t.addEventListener('click',function(){
@@ -840,6 +957,7 @@ INTERACT_JS = r"""
       n.style.display=(items.length&&n.querySelectorAll(
         '.item[data-dismissed="1"]').length===items.length
         &&n.closest('[data-disgroup]').dataset.show!=='1')?'none':''; });
+    fblocks.forEach(fapply);
     dets.forEach(function(el){
       var on=el.dataset.branch in tstore;
       el.classList.toggle('on', on);
@@ -866,6 +984,17 @@ INTERACT_JS = r"""
       else tstore[b]={from:det.dataset.arc,'with':peersOf(det).sort().slice(0,12),
                       at:Math.floor(Date.now()/1000)};
       tdirty=true; twrite(); apply(); return; }
+    var fo=t.closest?t.closest('.fileas .fa-o'):null;
+    if(fo){ ev.preventDefault(); ev.stopPropagation();   // do not toggle the disclosure
+      var blk=fo.closest('.fileas'), opt=blk.__opts[+fo.dataset.i];
+      if(opt){
+        var k=blk.dataset.key;
+        if((fstore[k]||{}).key===opt.key) delete fstore[k];
+        else fstore[k]={key:opt.key,branch:opt.branch,residue:opt.residue_fp,
+                        at:Math.floor(Date.now()/1000)};
+        fdirty=true; fwrite(); apply();
+      }
+      return; }
     var sh=t.closest?t.closest('.ledger .showdis'):null;
     if(sh&&!sh.hidden){ var side=sh.closest('.side');
       if(side){ side.dataset.show=(side.dataset.show==='1')?'0':'1'; apply(); } }
@@ -892,6 +1021,10 @@ INTERACT_JS = r"""
   if(saveDet) saveDet.addEventListener('click',function(){
     saveFile('detached.json', JSON.stringify(tstore,null,1), msg,
              function(){ tdirty=false; setBar(); });
+  });
+  if(saveFil) saveFil.addEventListener('click',function(){
+    saveFile('authoritative-ticket.json', JSON.stringify(fstore,null,1), msg,
+             function(){ fdirty=false; setBar(); });
   });
   apply();
 })();
@@ -1953,12 +2086,13 @@ def render(data, lede, focus_days, limit, cost=None):
         # the declaration is in force cannot audit the rung it produced.
         ta = arc.get("ticket_authority") or {}
         hn = arc.get("historical_branches") or 0
-        filed = ("" if not ta.get("key") else
-                 f'<span class="sprintchip filed" title="you filed this work as '
-                 f'{esc(ta["key"])} — {esc(ta.get("via",""))}'
-                 + (f", so {hn} branch{'' if hn == 1 else 'es'} outside it are history: "
-                    "still drawn, no longer counted, and back the moment a commit lands "
-                    "on one" if hn else "") + '">filed</span>')
+        # Emitted either way and hidden when it does not apply, for the same reason the
+        # metrics below are: the page's own control has to be able to put it back.
+        filed = ('<span class="sprintchip filed"'
+                 + ("" if ta.get("key") else " hidden")
+                 + ' title="this workstream is filed as the ticket named on it, so the '
+                   'branches outside that ticket are history: still drawn, no longer '
+                   'counted, and back the moment a commit lands on one">filed</span>')
         a(f'<span class="nm">{nm}'
           + (f' <span class="onbr">{esc(auth)}</span>' if auth and not tkt else "")
           + sprint_chip(arc) + (" " + filed if filed else "")
@@ -2056,28 +2190,57 @@ def render(data, lede, focus_days, limit, cost=None):
                         quoted.add(q)
                 a("</ul></div>")
             a(f'<p class="slk-note">{slack_note}</p></div>')
+        # What this work IS, which is the one judgement on the card that no derivation can
+        # make -- see filing() in work-arcs, which precomputes every state this control can
+        # reach so the page only ever records intent. Placed directly above the tree because
+        # the tree is where the consequence shows: the branches an option sets aside are the
+        # ones drawn struck through the moment it is chosen.
+        fl = arc.get("filing")
+        if fl:
+            opts = fl.get("options") or []
+            a('<div class="fileas" data-key="' + esc(arc.get("label", "")) + '"'
+              + ' data-filed="' + esc(fl.get("filed") or "") + '"'
+              + ' data-off="' + esc(json.dumps(fl.get("off") or {})) + '"'
+              + ' data-opts="' + esc(json.dumps(opts)) + '">'
+              + '<span class="fa-h">this work is</span>')
+            for i, o in enumerate(opts):
+                n = len(o.get("residue") or [])
+                a('<button class="fa-o" type="button" data-i="' + str(i) + '" '
+                  + 'title="file this workstream as ' + esc(o["key"]) + ' — '
+                  + esc(o.get("via", "")) + '. The ' + str(n) + ' branch(es) outside it '
+                  + 'become history: still drawn, no longer counted, and back the moment a '
+                  + 'commit lands on one">' + esc(o["key"])
+                  + '<span class="fa-to">' + esc(o.get("state") or "") + '</span></button>')
+            # Said in the markup rather than written by the script, so the block still
+            # explains itself where the frame has no storage to offer.
+            a('<span class="fa-why">Filing says what this work IS. Branches outside that '
+              "ticket become history &mdash; still drawn, no longer counted as risk "
+              "&mdash; and come back on their own the moment a commit lands on one."
+              "</span>")
+            a("</div>")
         # Detachable only where the clustering decided membership: an arc keyed on a
         # ticket or a prefix got its members from their own names, and the only way to
         # detach a branch from its own name is to rename it.
         a(spawn_svg(arc, base=base, detachable=arc.get("kind") == "cluster"))
         a('<div class="metrics">')
+        # These three are the metrics a filing moves, and they are emitted in both states --
+        # hidden rather than absent -- because the control has to correct them in either
+        # direction, and a number that exists in only one of the two states cannot be.
         lv = arc.get("unpushed_live", 0)
-        if lv and arc.get("stage") != "local-only":
-            a(f"<span><b>{lv}</b> unpushed</span>")
-        if arc.get("unpushed_only_on_copies"):
-            # Under a declaration the same number means something more specific, and
-            # saying "only on a superseded copy" about work a person filed elsewhere would
-            # be attributing their decision to a derivation.
-            n = arc["unpushed_only_on_copies"]
-            a(f"<span>{n} not on {esc(ta['key'])}</span>" if ta.get("key")
-              else f"<span>{n} only on a superseded copy</span>")
-        if ta.get("key"):
-            a('<span class="filed-m">filed as '
-              + link((next((m.get("url", "") for m in arc.get("mrs") or []
-                            if m.get("branch") == ta.get("branch")), "")),
-                     esc(ta["key"]))
-              + (f", {hn} branch{'' if hn == 1 else 'es'} history" if hn else "")
-              + "</span>")
+        shown = bool(lv) and arc.get("stage") != "local-only"
+        a('<span class="m-live"' + ("" if shown else " hidden")
+          + "><b>" + str(lv) + "</b> unpushed</span>")
+        cp = arc.get("unpushed_only_on_copies") or 0
+        # Under a filing the same number means something more specific, and calling it
+        # "only on a superseded copy" would credit a person's decision to a derivation.
+        a('<span class="m-copies"' + ("" if cp else " hidden") + ">"
+          + (str(cp) + " not on " + esc(ta["key"]) if ta.get("key")
+             else str(cp) + " only on a superseded copy") + "</span>")
+        a('<span class="filed-m"' + ("" if ta.get("key") else " hidden") + ">"
+          + ("filed as " + esc(ta["key"]) if ta.get("key") else "")
+          + ((", " + str(hn) + " branch" + ("" if hn == 1 else "es") + " history")
+             if ta.get("key") and hn else "")
+          + "</span>")
         a(f"<span>{plural(c.get('branches',0),'branch').replace('branchs','branches')}</span>")
         # Says outright that part of this arc is finished. Both of the "isn't this already
         # done?" reports were arcs where some branches had merged and some had not, and
@@ -2607,14 +2770,20 @@ def render(data, lede, focus_days, limit, cost=None):
       '<span class="muted">Parking already applies here and survives reloads. Saving '
       'writes <code>parked.json</code> for <code>work-arcs</code>, so its own counts '
       'agree with this page.</span></div>')
+    # The filings work-arcs itself read, so the store this page keeps is whole rather
+    # than only what happens to be inside the focus window — see the note on FKEY.
+    a('<script type="application/json" id="filedseed">'
+      + json.dumps(data.get("filings") or {}) + "</script>")
     a('<div id="interactbar"><span id="intmsg"></span>'
       '<button type="button" id="savedis" hidden>Save acknowledgements</button>'
       '<button type="button" id="savedet" hidden>Save detachments</button>'
-      '<span class="muted">Both apply here and survive reloads. Saving writes '
-      '<code>dismissed.json</code> / <code>detached.json</code> into '
+      '<button type="button" id="savefil" hidden>Save filings</button>'
+      '<span class="muted">All three apply here and survive reloads. Saving writes '
+      '<code>dismissed.json</code> / <code>detached.json</code> / '
+      '<code>authoritative-ticket.json</code> into '
       '<code>~/.local/state/work-arcs/</code> — acknowledgements keep the CLI in '
-      'agreement, and a detachment only takes effect when <code>work-arcs</code> next '
-      'builds the page.</span></div>')
+      'agreement, while a detachment or a filing takes full effect when '
+      '<code>work-arcs</code> next builds the page.</span></div>')
     a(f"<script>{PARK_JS}</script>")
     a(f"<script>{INTERACT_JS}</script>")
 

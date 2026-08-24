@@ -3195,6 +3195,15 @@ def apply_overrides(arcs, store):
         entry = store.get(arc.get("label")) or store.get(arc.get("id"))
         if not entry:
             continue
+        # A filing already names the branch -- it is the source of the merge request under
+        # the ticket -- and it is the more specific statement of the two. Two hand-set
+        # answers fighting over one field is the one outcome neither can survive.
+        ta = arc.get("ticket_authority") or {}
+        if ta.get("key"):
+            stale.append({"label": arc.get("label"), "branch": entry.get("branch"),
+                          "why": f"you have filed this workstream as {ta['key']}, which "
+                                 f"names {ta.get('branch')} as its own branch"})
+            continue
         want = entry.get("branch")
         if want not in {b["name"] for b in arc.get("branches", [])}:
             stale.append({"label": arc.get("label"), "branch": want,
@@ -3402,6 +3411,112 @@ def apply_ticket_authority(arcs, store, repo=None, main_ref="origin/main"):
         # than patched: the rung, the live commit count, the arc's own age, the demands.
         finalize(arc, repo, main_ref)
     return stale
+
+
+def _ta_candidates(arc):
+    """Every ticket key this workstream could honestly be filed as, best first.
+
+    Its own ticket leads, because that is the key the derivation already picked out of the
+    five an arc can carry. After it come the keys its merge requests are about, then the
+    rest of its Jira issues.
+    """
+    keys = []
+    if arc.get("ticket"):
+        keys.append(arc["ticket"])
+    for m in arc.get("mrs") or []:
+        k = mr_ticket(m)
+        if k and k not in keys:
+            keys.append(k)
+    for i in arc.get("issues") or []:
+        if i.get("key") and i["key"] not in keys:
+            keys.append(i["key"])
+    return keys
+
+
+def _ta_outcome(arc):
+    """The part of a workstream's state a filing moves, as the page needs to see it."""
+    return {"stage": arc.get("stage") or "", "state": arc.get("state") or "",
+            "live": arc.get("unpushed_live", 0),
+            "copies": arc.get("unpushed_only_on_copies", 0),
+            "history": sorted(b["name"] for b in arc["branches"]
+                              if b.get("historical")),
+            "demands": [d.get("fp") for d in arc.get("demands") or [] if d.get("fp")]}
+
+
+def _ta_mark(arc, key, branch, why, repo, main_ref):
+    """Apply a filing (or clear one, with key=None) and recompute what it changes."""
+    lineage = _ta_lineage(arc, branch) if key else set()
+    for b in arc["branches"]:
+        b["historical"] = None if (not key or b["name"] in lineage) else key
+    arc["ticket_authority"] = ({"key": key, "branch": branch, "via": why} if key
+                               else None)
+    finalize(arc, repo, main_ref)
+    return lineage
+
+
+def filing(arc, repo=None, main_ref="origin/main"):
+    """What filing this workstream as each of its keys would do, worked out here.
+
+    The page is where this decision gets made -- a workstream is filed by clicking the row
+    it is wrong on, not by retyping its derived name into a shell -- and the page must not
+    work out the consequences for itself. The rung, the live commit count, which branches
+    become history and which demands fall silent are all `finalize`'s answers, and a second
+    implementation of that ladder in JavaScript is a ladder that eventually disagrees with
+    this one.
+
+    So every state the control can reach is computed here, by actually applying the filing
+    and reading the result: one entry per offerable key, plus `off` for the underived state,
+    so the page can move in either direction and only ever record intent. Each carries the
+    residue fingerprint the store entry is keyed on, so a filing made on the page expires
+    on exactly the evidence one made anywhere else does.
+
+    The arc is left exactly as found. finalize recomputes every field it owns from the
+    branch marks, so applying, reading and putting back is a no-op on everything else.
+    """
+    # Screened before anything is recomputed. Every arc on the page reaches this and only
+    # a dozen have anything to offer, so the pure set work goes first and the finalize
+    # passes are paid for the few -- measured, 4.8s over the corpus against 0.6s.
+    offerable = []
+    for key in _ta_candidates(arc):
+        branch, why = _ta_resolve(arc, key)
+        if not branch:
+            continue
+        lineage = _ta_lineage(arc, branch)
+        if len(lineage) < len(arc["branches"]):
+            offerable.append((key, branch, why, lineage))
+    # Three at most. A workstream can hold five keys and a control with five ways to be
+    # wrong is one nobody uses; these are in _ta_candidates' order, which puts the key the
+    # derivation already chose first.
+    offerable = offerable[:3]
+    if not offerable:
+        return None
+    was_ta = arc.get("ticket_authority") or None
+    was_marks = {b["name"]: b.get("historical") for b in arc["branches"]}
+
+    _ta_mark(arc, None, None, "", repo, main_ref)
+    off = _ta_outcome(arc)
+
+    options = []
+    for key, branch, why, _ in offerable:
+        lineage = _ta_mark(arc, key, branch, why, repo, main_ref)
+        residue = sorted(b["name"] for b in arc["branches"]
+                         if b["name"] not in lineage)
+        got = _ta_outcome(arc)
+        # A key whose filing changes nothing is not offered. Every branch is already the
+        # work, or the rung and the counts land where they already are -- and a control
+        # that does nothing when clicked is worse than no control.
+        if residue and got != off:
+            options.append({**got, "key": key, "branch": branch, "via": why,
+                            "residue": residue,
+                            "residue_fp": _ta_residue_fp(arc, lineage)})
+
+    for b in arc["branches"]:
+        b["historical"] = was_marks[b["name"]]
+    arc["ticket_authority"] = was_ta
+    finalize(arc, repo, main_ref)
+    if not options:
+        return None
+    return {"filed": (was_ta or {}).get("key") or "", "off": off, "options": options}
 
 
 def _ta_holders(arcs, key):
@@ -5826,6 +5941,30 @@ def main():
               file=sys.stderr)
         return
 
+    # Before apply_parked, and that order is load-bearing: both this and `filing` below
+    # re-run finalize, which recomputes `stage` from scratch -- and `parked` IS a stage,
+    # asserted by apply_parked and derived by nothing. Run either of these after it and the
+    # park is silently recomputed away while `arc["parked"]` still says it is parked.
+    # Conceptually the same order: a filing says what the work IS, and parking is intent
+    # layered on top of that.
+    filing_store = load_store(TICKET_AUTHORITY, "the ticket-authority store")
+    stale_tickets = apply_ticket_authority(arcs, filing_store, args.repo, args.main)
+    for s in stale_tickets:
+        print(f"⚠ ignoring authoritative-ticket={s['key']} for {s['label']}: {s['why']}",
+              file=sys.stderr)
+    # What survived, which is what the page seeds its own store from. The stale ones are
+    # left out deliberately: the page would otherwise carry a filing this run refused, and
+    # the next thing it saved would write it straight back.
+    filings_live = {k: v for k, v in filing_store.items()
+                    if k not in {s["label"] for s in stale_tickets}}
+
+    # What the page's own filing control would do, per workstream and per key. Computed
+    # here because the page must record intent and never derive consequences -- see filing.
+    for arc in arcs:
+        f = filing(arc, args.repo, args.main)
+        if f:
+            arc["filing"] = f
+
     stale_parks = apply_parked(arcs)
     for s in stale_parks:
         print(f"⚠ {s['label']} is no longer parked: {s['why']}", file=sys.stderr)
@@ -5833,16 +5972,6 @@ def main():
     stale_overrides = apply_overrides(arcs, load_overrides())
     for s in stale_overrides:
         print(f"⚠ ignoring authoritative={s['branch']} for {s['label']}: {s['why']}",
-              file=sys.stderr)
-
-    # After the branch override and before mark_forgotten, which is the only order that
-    # works: this one re-runs finalize, so it would overwrite a branch the override had just
-    # named, and the forgotten verdict reads the rung this settles.
-    stale_tickets = apply_ticket_authority(
-        arcs, load_store(TICKET_AUTHORITY, "the ticket-authority store"),
-        args.repo, args.main)
-    for s in stale_tickets:
-        print(f"⚠ ignoring authoritative-ticket={s['key']} for {s['label']}: {s['why']}",
               file=sys.stderr)
 
     # Both of its exclusions -- parked, and whose clock is running -- are only settled by
@@ -6020,6 +6149,11 @@ def main():
             "unattached_stashes": unattached,
             "stale_overrides": stale_overrides,
             "stale_tickets": stale_tickets,
+            # The filings in force, whole. The page keeps its own copy and cannot rebuild
+            # this from the rows it renders: a workstream outside the focus window has no
+            # row, and a store built from rows alone would drop its filing the first time
+            # the page saved one.
+            "filings": filings_live,
             "stale_parks": stale_parks,
             "stale_detached": stale_detached,
             "gap": gap,

@@ -324,3 +324,104 @@ print(wa.apply_ticket_authority([a], {}), a["stage"], a["unpushed_live"],
       a.get("ticket_authority"), a["historical_branches"])'
     [ "${lines[0]}" = "[] local-only 9 None 0" ]
 }
+
+# ── what the page's own control is handed ────────────────────────────────────
+#
+# Filing is a page interaction, so `filing()` precomputes every state the control can
+# reach. The page records intent and swaps in these answers; it derives nothing. That
+# makes one invariant load-bearing above all others: what filing() SAYS will happen has
+# to be what apply_ticket_authority actually does, or the page previews one thing and the
+# next build shows another.
+
+@test "what filing promises is what applying it actually does" {
+    run wa '
+def fresh():
+    return arc([br("UL-1852", commits_ahead=8), br("metadata-full", unpushed=40),
+                br("spike", unpushed=45)], [mr(10502, "UL-1852")])
+f = wa.filing(fresh())
+o = f["options"][0]
+a = fresh()
+wa.apply_ticket_authority([a], declare(a, o["key"]))
+print(o["key"], o["stage"], o["state"], o["live"])
+print(o["key"], a["stage"], a["state"], a["unpushed_live"])
+print(o["residue"] == sorted(b["name"] for b in a["branches"] if b.get("historical")))
+print(o["demands"] == [d["fp"] for d in a["demands"]])'
+    [ "${lines[0]}" = "${lines[1]}" ]
+    [ "${lines[2]}" = "True" ]
+    [ "${lines[3]}" = "True" ]
+}
+
+@test "working out the options leaves the workstream exactly as it was" {
+    # It computes each outcome by applying it for real, so the restore is the whole
+    # correctness argument: 165 arcs go through this on every run.
+    run wa '
+def snap(a):
+    return (a["stage"], a["state"], a["unpushed_live"], a["authoritative"],
+            [d["fp"] for d in a["demands"]],
+            sorted((b["name"], b.get("historical")) for b in a["branches"]))
+a = arc([br("UL-1852", commits_ahead=8), br("spike", unpushed=45)],
+        [mr(10502, "UL-1852")])
+was = snap(a)
+wa.filing(a)
+print(snap(a) == was)
+wa.apply_ticket_authority([a], declare(a, "UL-1852"))
+filed = snap(a)
+wa.filing(a)
+print(snap(a) == filed)'
+    [ "${lines[0]}" = "True" ]
+    [ "${lines[1]}" = "True" ]
+}
+
+@test "an already-filed workstream is handed the state it would return to" {
+    run wa '
+a = arc([br("UL-1852", commits_ahead=8), br("spike", unpushed=45)],
+        [mr(10502, "UL-1852")])
+wa.apply_ticket_authority([a], declare(a, "UL-1852"))
+f = wa.filing(a)
+print(f["filed"], f["off"]["stage"], f["off"]["live"])
+print([o["key"] for o in f["options"]])'
+    [ "${lines[0]}" = "UL-1852 local-only 45" ]
+    [ "${lines[1]}" = "['UL-1852']" ]
+}
+
+@test "a key whose filing changes nothing is not offered" {
+    # A control that does nothing when clicked is worse than no control.
+    run wa '
+a = arc([br("UL-1852", commits_ahead=8)], [mr(10502, "UL-1852")])
+print(wa.filing(a))
+b = arc([br("UL-1852", commits_ahead=8),
+         br("UL-1852-bak", superseded_by="UL-1852")], [mr(10502, "UL-1852")])
+[x for x in b["branches"] if x["name"] == "UL-1852-bak"][0]["superseded_by"] = "UL-1852"
+print(wa.filing(b))'
+    [ "${lines[0]}" = "None" ]
+    [ "${lines[1]}" = "None" ]
+}
+
+@test "at most three keys are offered, best first" {
+    run wa '
+a = arc([br("latlng", commits_ahead=4), br("UL-1852", unpushed=2),
+         br("UL-1853", unpushed=3), br("UL-1854", unpushed=4),
+         br("UL-1855", unpushed=5), br("spike", unpushed=9)],
+        [mr(10502, "latlng", title="UL-1852 geometry")],
+        issues=[{"key": "UL-1853", "url": ""}, {"key": "UL-1854", "url": ""},
+                {"key": "UL-1855", "url": ""}])
+print(a["ticket"])
+print([o["key"] for o in wa.filing(a)["options"]])'
+    # UL-1853 leads because it is the key the derivation already chose for this arc, not
+    # because of its number -- then the merge request's key, then the remaining issues.
+    [ "${lines[0]}" = "UL-1853" ]
+    [ "${lines[1]}" = "['UL-1853', 'UL-1852', 'UL-1854']" ]
+}
+
+@test "a hand-set branch stands aside for a filing, which names its own branch" {
+    # Two hand-set answers fighting over one field is the outcome neither survives, and
+    # the filing is the more specific of the two.
+    run wa '
+a = arc([br("UL-1852", commits_ahead=4), br("spike", unpushed=9)], [mr(10502, "UL-1852")])
+wa.apply_ticket_authority([a], declare(a, "UL-1852"))
+stale = wa.apply_overrides([a], {"metadata-latlng": {"branch": "spike", "over": None}})
+print(a["authoritative"])
+print(stale[0]["why"])'
+    [ "${lines[0]}" = "UL-1852" ]
+    [[ "${lines[1]}" == *"you have filed this workstream as UL-1852"* ]]
+}
