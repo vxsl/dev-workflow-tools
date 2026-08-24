@@ -6110,6 +6110,15 @@ def main():
             # prompts. The split pass was unaffected because work-arcs hands it a real path.
             "repo_path": str(args.repo),
             "main": args.main,
+            # Your GitLab username, already resolved for "who spoke last" on every review
+            # thread. Emitted because a consumer that needs to tell your reply from a
+            # reviewer's cannot derive it: `last_by` is a name, and the only thing that
+            # makes one of those names yours is this call. A downstream stage guessing --
+            # from the commit author, from the most frequent speaker -- would be a second
+            # author for an identity that already has one, and would be wrong on exactly
+            # the MRs where somebody else pushed to your branch. Empty string when GitLab
+            # was skipped, so a reader can tell "not me" from "we never asked".
+            "me": gitlab_me(args.repo) if not args.no_mr else "",
             "project_url": project_url(args.repo, mrs),
             "mr_error": mr_error,
             "arc_count": len(arcs),

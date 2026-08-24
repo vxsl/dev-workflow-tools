@@ -1,0 +1,813 @@
+#!/usr/bin/env -S python3 -u
+"""
+arc-standup: what to say at the next standup, assembled from what already happened.
+
+The page answers "what is true about my work". A standup asks a different question --
+"what do the other people in this call need to hear from me" -- and the difference is not
+a matter of trimming. Three things change at once:
+
+**The window is the cadence, not the build.** Every interval on this page is measured from
+the last time `arcs` ran, which is whenever Kyle happened to open it. A standup covers the
+interval since the *last standup*, and that boundary is a property of the calendar. It is
+derived here from the clock and nothing else -- no state file, no marker, nothing to get
+out of step -- so it is right on a laptop that has not been opened for a week.
+
+**The audience is the team.** The rest of this pipeline writes to Kyle: *you* owe, *you*
+dropped it, it *fell off a cliff*. None of that is sayable out loud. A rung, a workstream
+and an arc are this page's vocabulary for its own structures and mean nothing to a
+reviewer; what a reviewer knows is a ticket key, an MR number, a channel and a person's
+name. So every line here leads with the reference the room already shares.
+
+**Selection is by what the room can act on.** The morning brief picks what will bite Kyle
+soonest, which is why it opens on a 159-day stall: that is a real cost and he is the only
+one carrying it. A standup that opens on the same fact for the fortieth consecutive time
+is one nobody hears. What earns a standup line is what moved in the window, and what a
+person on the call can unstick today.
+
+Four beats, in the order a standup is actually given, each dropped when it holds nothing:
+
+    moved       what happened to the code -- MRs, commits, tickets
+    discussed   what was worked out in Slack and in review threads
+    blocked     who you are waiting on, and who is waiting on you
+    next        what is in front of you -- a prompt, not a claim
+
+Read `work-arcs --json` (through arc-brief, whose names this uses) on stdin, add one
+top-level `standup` key, pass everything else through unchanged.
+
+    work-arcs --json | arc-brief | arc-morning | arc-standup | arcs-page --out page.html
+
+`--text` prints the notes as they will read and is the way to check this without building
+a page. It is also, deliberately, exactly the string the page's copy button puts on the
+clipboard: one composition, so the spoken version and the pasted version cannot drift.
+
+Nothing here counts or ranks anything that arrived already counted or ranked. The ledger
+comes down the wire sorted worst-first and is consumed in that order; `own_activity` is
+work-arcs' own answer to "when did Kyle last touch this"; the arc's name is arc-brief's.
+A ranking re-implemented here would be a second author for the same judgement and the two
+would differ inside a month. The one partition this stage does make -- fresh debts from
+long-stalled ones -- is a split on an age threshold rather than a competing score, and it
+preserves the ledger's order inside each half. See `blocked_beat`.
+"""
+
+import argparse
+import json
+import os
+import re
+import sys
+from datetime import datetime, time as dtime, timedelta
+from pathlib import Path
+
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:                                            # pragma: no cover
+    ZoneInfo = None
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+from timespan import fmt_interval  # noqa: E402
+
+
+# --------------------------------------------------------------------------- the cadence
+
+# The standup calendar. Defaults are Kyle's; every one is an env knob because the cadence
+# is a property of one team's calendar and not of the idea, and a hard-coded Monday would
+# make this tool useless to the next person who reads it.
+DAY_NUMS = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
+DAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+
+DEFAULT_DAYS = "mon,wed,fri"
+DEFAULT_TIME = "10:30"
+DEFAULT_TZ = "America/Los_Angeles"
+
+# How many arcs, conversations, debts and next-ups each beat will say. A standup is two
+# minutes; a beat that lists fourteen things is the ledger read aloud, which is the
+# failure this tool exists to avoid. Truncation is always announced -- see `capped` -- so
+# a short list never reads as a complete one.
+CAPS = {
+    "moved": int(os.environ.get("STANDUP_MOVED_MAX", "6")),
+    "discussed": int(os.environ.get("STANDUP_DISCUSSED_MAX", "6")),
+    # Six, because the blocked beat caps *groups* rather than rows and there are six kinds
+    # of debt: a cap under that would cut a whole category of thing he owes rather than
+    # shortening a list.
+    "blocked": int(os.environ.get("STANDUP_BLOCKED_MAX", "6")),
+    "next": int(os.environ.get("STANDUP_NEXT_MAX", "4")),
+}
+
+# Where a debt stops being news and becomes weather. Past this, a ledger row is still said
+# -- dropping it would let a real stall go quiet -- but it is said once, in a tail line,
+# rather than taking one of the four slots a person on this call could actually act on.
+STALE_DAYS = int(os.environ.get("STANDUP_STALE_DAYS", "30"))
+
+# A window this short means the page was rebuilt within minutes of a standup, so "nothing
+# moved" is a fact about the clock rather than about the work, and saying it without the
+# caveat would be the page's own stamp line said as an accusation.
+JUST_OPENED_SECONDS = 90 * 60
+
+
+def parse_days(raw):
+    """The weekdays a standup happens on, as Python weekday numbers.
+
+    Returns the fallback rather than raising on junk: a typo in `STANDUP_DAYS` should cost
+    the correct cadence, not the whole page.
+    """
+    out, bad = [], []
+    for tok in re.split(r"[,\s]+", (raw or "").strip().lower()):
+        if not tok:
+            continue
+        n = DAY_NUMS.get(tok[:3])
+        if n is None:
+            bad.append(tok)
+        elif n not in out:
+            out.append(n)
+    if not out:
+        return sorted(DAY_NUMS[d] for d in ("mon", "wed", "fri")), (
+            f"could not read STANDUP_DAYS={raw!r}" if raw else "")
+    return sorted(out), (f"ignored {', '.join(bad)} in STANDUP_DAYS" if bad else "")
+
+
+def parse_time(raw):
+    m = re.match(r"^\s*(\d{1,2})[:.]?(\d{2})?\s*$", raw or "")
+    if not m:
+        return dtime(10, 30), (f"could not read STANDUP_TIME={raw!r}" if raw else "")
+    h, mi = int(m.group(1)), int(m.group(2) or 0)
+    if not (0 <= h <= 23 and 0 <= mi <= 59):
+        return dtime(10, 30), f"STANDUP_TIME={raw!r} is not a time of day"
+    return dtime(h, mi), ""
+
+
+def zone(name):
+    """The standup's timezone, or the machine's with a note saying so.
+
+    The timezone is load-bearing and not a nicety: the whole window is defined by a wall
+    clock in one city, and computing it in UTC on a laptop that travels would silently
+    move the boundary by hours. Where the database is missing, saying which clock was used
+    beats being confidently wrong in a way nothing on the page discloses.
+    """
+    if ZoneInfo is None:
+        return None, "no zoneinfo on this python — using the machine's clock"
+    try:
+        return ZoneInfo(name), ""
+    except Exception:
+        return None, f"no timezone {name!r} on this machine — using the machine's clock"
+
+
+def standup_at(day, days, at, tz):
+    """The standup instants on and around one date, as an ordered list."""
+    return [datetime.combine(day, at, tzinfo=tz)] if day.weekday() in days else []
+
+
+def window(now, days, at, tz):
+    """The interval this script covers, and the standup it is for.
+
+    One rule, and it wants stating because the alternative readings are all worse: **the
+    window opens at the most recent standup that has already happened, and runs to now.**
+
+    At 09:00 on a Monday the last standup was Friday, so the window is Friday 10:30 to now
+    and the notes are for the meeting in ninety minutes -- which is what he opened the page
+    to prepare. At 11:00 that same Monday the meeting is over; the last standup is now this
+    morning's, the window collapses to the half hour since it, and the notes are for
+    Wednesday. Nothing switches mode and there is no "is he before or after" branch: the
+    same sentence describes both, because "since the last one, for the next one" is what a
+    standup interval *is*.
+
+    The one rough edge is deliberate. Rebuild the page at 10:35 and the window is five
+    minutes long and empty, correctly -- everything before it was said aloud five minutes
+    ago. `JUST_OPENED_SECONDS` is what stops that reading as "you did nothing".
+    """
+    day, opened = now.date(), None
+    for back in range(0, 15):                    # a fortnight covers any sane cadence
+        d = day - timedelta(days=back)
+        for inst in standup_at(d, days, at, tz):
+            if inst < now:
+                opened = inst
+                break
+        if opened:
+            break
+    nxt = None
+    for fwd in range(0, 15):
+        d = day + timedelta(days=fwd)
+        for inst in standup_at(d, days, at, tz):
+            if inst >= now:
+                nxt = inst
+                break
+        if nxt:
+            break
+    return opened, nxt
+
+
+def cadence(now=None):
+    """The whole calendar answer: what the cadence is, what it covers, what it is for."""
+    days, why_d = parse_days(os.environ.get("STANDUP_DAYS", DEFAULT_DAYS))
+    at, why_t = parse_time(os.environ.get("STANDUP_TIME", DEFAULT_TIME))
+    tzname = os.environ.get("STANDUP_TZ", DEFAULT_TZ)
+    tz, why_z = zone(tzname)
+    now = now or datetime.now(tz)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=tz)
+    opened, nxt = window(now, days, at, tz)
+    why = "; ".join(w for w in (why_d, why_t, why_z) if w)
+    hhmm = at.strftime("%H:%M")
+    secs = int((now - opened).total_seconds()) if opened else 0
+    return {
+        "days": days,
+        "day_names": [DAY_NAMES[d][:3] for d in days],
+        "time": hhmm,
+        "tz": tzname if not why_z else "",
+        "why": why,
+        "now": now,
+        "for": ({"iso": nxt.isoformat(), "day": DAY_NAMES[nxt.weekday()],
+                 "when": f"{DAY_NAMES[nxt.weekday()]} {hhmm}"} if nxt else {}),
+        "since": ({"iso": opened.isoformat(), "day": DAY_NAMES[opened.weekday()],
+                   "when": f"{DAY_NAMES[opened.weekday()]} {hhmm}",
+                   "epoch": int(opened.timestamp()),
+                   "date": opened.date().isoformat(),
+                   "seconds": secs, "ago": fmt_interval(secs)} if opened else {}),
+        "just_opened": bool(opened) and secs < JUST_OPENED_SECONDS,
+    }
+
+
+# --------------------------------------------------------------------------- in the window
+#
+# Two clocks, and the difference between them is the one honest compromise in this file.
+#
+# Commits, sessions and Slack messages carry a real instant, so "did this happen after
+# Monday 10:30" is answerable exactly. Merge dates, Jira `updated`, review-thread dates and
+# ledger `asked` fields arrive as bare dates -- work-arcs truncates them at the source,
+# because everywhere else on the page a day is the resolution anybody reads at.
+#
+# For a bare date the question is unanswerable at the boundary: a thread stamped the same
+# day the window opened might be from an hour before it or six hours after. It is resolved
+# toward *inclusion*, and the asymmetry is the argument -- mentioning something on Wednesday
+# that you already mentioned on Monday costs a sentence, and forgetting what you did on
+# Monday costs the thing the tool was built for.
+
+
+def in_window(epoch, since):
+    return bool(epoch) and bool(since) and epoch >= since.get("epoch", 0)
+
+
+def date_in_window(datestr, since):
+    """A bare `YYYY-MM-DD` against the window, resolved toward including it."""
+    d = (datestr or "")[:10]
+    return bool(d) and bool(since) and d >= since.get("date", "9999")
+
+
+PERMA_RE = re.compile(r"/p(\d{10})(\d{6})")
+
+
+def perma_epoch(url):
+    """The instant a Slack permalink points at.
+
+    Slack writes the message ts into the path as sixteen digits with the dot removed, so
+    the precise time of a decision is recoverable from the link the lens already carries.
+    That matters here more than anywhere else on the page: a thread runs for days and a
+    block's own timestamps describe the thread, while a standup needs to know which of its
+    conclusions were reached *in this window* and which were already said out loud.
+    """
+    m = PERMA_RE.search(url or "")
+    return int(m.group(1)) if m else 0
+
+
+# --------------------------------------------------------------------------- composition
+#
+# The parts convention is arc-morning's, unchanged, so arcs-page resolves a link the same
+# way in both blocks: a plain string is text, and a dict is a span that becomes an anchor
+# to a row on this page (`arc`), a row in an evidence list (`of` + `fp`) or an outside URL.
+
+
+def span(t, **kw):
+    return {"t": t, **{k: v for k, v in kw.items() if v}}
+
+
+def text_of(parts):
+    return "".join(p if isinstance(p, str) else p.get("t", "") for p in parts)
+
+
+def line(parts, subs=None):
+    parts = [p for p in parts if p != ""]
+    return {"parts": parts, "text": text_of(parts),
+            "subs": [s for s in (subs or []) if s]}
+
+
+def capped(items, kind):
+    """The first N, plus a line saying what the N left out.
+
+    A cap that says nothing is indistinguishable from a complete list, and a standup given
+    off a silently truncated list is one where the thing you forgot was cut by a constant.
+    """
+    n = CAPS.get(kind, 6)
+    if len(items) <= n:
+        return items
+    rest = len(items) - n
+    return items[:n] + [line([f"— {rest} more not listed"])]
+
+
+def arc_name(arc):
+    return ((arc.get("brief") or {}).get("name") or arc.get("label")
+            or arc.get("id") or "unnamed")
+
+
+def arc_ref(arc):
+    """How the room refers to this work: its ticket if it has one, its name if not."""
+    return arc.get("ticket") or ""
+
+
+def arc_head(arc):
+    """The workstream named the way it would be said: key first, then what it is.
+
+    The key is dropped when the name already is it. arc-brief names an arc after its
+    ticket whenever the ticket summary is the best description of the work, which is
+    right and produced "UL-1918 UL-1918" here -- a stutter that reads as a bug in the
+    page rather than as the two facts it was trying to be.
+    """
+    ref, name, aid = arc_ref(arc), arc_name(arc), arc.get("id")
+    if ref and name.upper().startswith(ref.upper()):
+        return [span(name, arc=aid)]
+    if ref:
+        return [span(ref, arc=aid), " ", span(name, arc=aid)]
+    return [span(name, arc=aid)]
+
+
+def plural(n, one, many=None):
+    return f"{n} {one}" if n == 1 else f"{n} {many or one + 's'}"
+
+
+# --------------------------------------------------------------------------- moved
+
+
+def mr_state_words(m):
+    """What a reviewer needs to know about an open MR, in the fewest words that are true.
+
+    Ordered by what stops it landing. A conflict or a red pipeline is Kyle's to fix and is
+    said first; approval is somebody else's and is said last, because that is the half of
+    the sentence a standup exists to prompt.
+    """
+    bits = []
+    if m.get("draft"):
+        bits.append("draft")
+    if m.get("conflicts"):
+        bits.append("conflicts")
+    pipe = (m.get("pipeline") or {}).get("status") or ""
+    if pipe == "failed":
+        bits.append("pipeline red")
+    elif pipe == "success":
+        bits.append("green")
+    elif pipe in ("running", "pending"):
+        bits.append("pipeline " + pipe)
+    if m.get("approved"):
+        bits.append("approved")
+    else:
+        who = [r for r in (m.get("reviewers") or []) if r]
+        bits.append("not approved" + (f" ({', '.join(who)})" if who else
+                                      ", no reviewer asked"))
+    return ", ".join(bits)
+
+
+def moved_beat(data, since):
+    """What happened to the code, one entry per workstream, newest first.
+
+    Membership is `own_activity` -- work-arcs' own answer to "when did Kyle last commit or
+    open a session here" -- against the window, plus any workstream whose MR landed inside
+    it. The second clause matters: a branch you finished last week and a reviewer merged on
+    Tuesday has no activity of yours in this window at all, and it is the single most
+    standup-worthy thing that can happen to a piece of work.
+
+    Order is `own_activity` descending, which is not a ranking this stage invented: it is
+    the same recency the arcs list is already sorted by, and the freshest thing is the one
+    you can still remember the details of when asked.
+    """
+    out = []
+    for arc in data.get("arcs") or []:
+        own = arc.get("own_activity") or 0
+        landed = [(b, (b.get("mr_fate") or {})) for b in arc.get("branches") or []]
+        landed = [(b, f) for b, f in landed
+                  if f.get("state") in ("merged", "closed")
+                  and date_in_window(f.get("at"), since)]
+        touched = in_window(own, since)
+        if not touched and not landed:
+            continue
+
+        subs = []
+        # Landings first: it is the only thing here that is finished.
+        for b, f in sorted(landed, key=lambda x: x[1].get("at") or "", reverse=True):
+            iid = f.get("iid")
+            ref = f"!{iid}" if iid else b.get("name", "")
+            verb = "landed" if f.get("state") == "merged" else "closed unmerged"
+            subs.append(line([span(ref, url=f.get("url")), f" {verb}"]))
+
+        for m in arc.get("mrs") or []:
+            subs.append(line([span(f"!{m.get('iid')}", url=m.get("url")),
+                              " " + mr_state_words(m)]))
+
+        # Commits nobody else can see. On the page this is the loudest demand there is;
+        # at a standup it is a small honest aside, and it is said in those terms.
+        local = arc.get("unpushed_live") or 0
+        if touched and local:
+            subs.append(line([f"{plural(local, 'commit')} still local"]))
+
+        for it in arc.get("issues") or []:
+            if not date_in_window(it.get("updated"), since):
+                continue
+            # Stated as a status and a date, never as a transition. Nothing here saw the
+            # ticket before the window, so "moved to In Review" would be an inference and
+            # this file does not make those.
+            subs.append(line([span(it.get("key", ""), url=it.get("url")),
+                              f" {it.get('status') or 'no status'}"]))
+
+        if not subs:
+            subs = [line([arc.get("state") or "no visible change"])]
+
+        out.append((own, line(arc_head(arc), subs)))
+
+    out.sort(key=lambda x: (-x[0], x[1]["text"]))
+    return capped([ln for _, ln in out], "moved")
+
+
+# --------------------------------------------------------------------------- discussed
+
+
+# How much of a quoted question survives into a spoken note. The lens and GitLab both hand
+# over the whole message, which is right for a card you read and wrong for a line you glance
+# at mid-sentence: past about this much you lose your place looking for the end of it. The
+# link is on the line, so the rest is one click away rather than gone.
+QUOTE_MAX = int(os.environ.get("STANDUP_QUOTE_MAX", "110"))
+
+
+def clip(text, n=None):
+    t = " ".join((text or "").split())
+    n = n or QUOTE_MAX
+    return t if len(t) <= n else t[:n].rsplit(" ", 1)[0] + "…"
+
+
+def discussed_beat(data, since):
+    """What got worked out, in Slack and in review threads.
+
+    This is the half of the work a commit log cannot show and the half a standup most
+    wants. "We settled that the geo_filter pushes down to Postgres" is the outcome of two
+    days of thinking; the commit that follows it is a diff.
+
+    Slack items are windowed on the permalink of the message being quoted rather than on
+    the thread, because a thread runs for a week and its conclusions do not: a decision
+    reached last Tuesday in a thread somebody replied to this morning was already said at
+    the last standup, and repeating it is how these notes stop being listened to.
+
+    Review threads are windowed on either end -- somebody asked in the window, or you
+    answered in it -- and the two are different sentences. `me` comes down the wire from
+    work-arcs, which resolved it against GitLab; there is nothing here to guess with.
+    """
+    me = (data.get("me") or "").lower()
+    out = []
+
+    for arc in data.get("arcs") or []:
+
+        for blk in arc.get("slack") or []:
+            chan = "#" + (blk.get("channel") or "") if blk.get("channel") else "a DM"
+            for side, word in (("decided", "settled"), ("open", "still open")):
+                for it in blk.get(side) or []:
+                    at = perma_epoch(it.get("url")) or perma_epoch(blk.get("url"))
+                    if not in_window(at, since):
+                        continue
+                    who = it.get("who") or ""
+                    # No arc name on the line. It was there and it was the longest thing
+                    # on it, restating in this page's vocabulary what the channel and the
+                    # sentence had already said in the room's -- and a line you cannot get
+                    # to the end of is one you skip while talking.
+                    out.append((at, line(
+                        [span(chan, url=it.get("url") or blk.get("url")),
+                         f" {word}: ", clip(it.get("what")),
+                         f" — {who}" if who else ""])))
+
+        for m in arc.get("mrs") or []:
+            ref, url = f"!{m.get('iid')}", m.get("url")
+            for t in m.get("threads") or []:
+                author, last_by = t.get("author") or "", (t.get("last_by") or "").lower()
+                quote = clip((t.get("quote") or "").strip().rstrip("."))
+                mine = bool(me) and last_by == me
+                if mine and date_in_window(t.get("last_at"), since):
+                    said = f" answered {author}" if author else " answered"
+                elif date_in_window(t.get("at"), since) and not mine:
+                    said = f" {author} asked" if author else " asked"
+                else:
+                    continue
+                out.append((0, line([span(ref, url=url), said,
+                                     f": {quote}" if quote else "",
+                                     "" if t.get("answered") or mine
+                                     else " — unanswered"])))
+
+    # Commitments this stage did not make and cannot rank: work-arcs closed them on
+    # evidence, in its own order, and they are said in it.
+    for c in (data.get("ledger") or {}).get("you_owe_closed") or []:
+        # `promised` is what he said he would do and `closed_by` is the evidence work-arcs
+        # accepted that he did it. Both, because "I said I'd look at the MR and I did" is
+        # one of the few things at a standup that is worth saying about the past.
+        promised = clip(c.get("promised") or c.get("title") or "")
+        if not promised:
+            continue
+        out.append((0, line([f"closed: {promised}",
+                             f" — {clip(c.get('closed_by'), 80)}"
+                             if c.get("closed_by") else ""])))
+
+    out.sort(key=lambda x: (-x[0], x[1]["text"]))
+    return capped([ln for _, ln in out], "discussed")
+
+
+# --------------------------------------------------------------------------- blocked
+
+
+def who_of(row, cap=3):
+    """The person on the other end, whether the ledger named one or a review panel.
+
+    `review-silence` carries the whole reviewer list, which is right for the ledger and
+    unsayable at a standup: five names read aloud is a list, and what the room needs is
+    who to look at plus how many others. A panel of one is just a person.
+    """
+    who = row.get("who")
+    if isinstance(who, (list, tuple)):
+        names = [str(w) for w in who if w]
+        if not names:
+            return "no one"
+        head = ", ".join(names[:cap])
+        return head + (f" +{len(names) - cap}" if len(names) > cap else "")
+    return str(who or "someone")
+
+
+def ref_span(row):
+    ref = row.get("ref") or ""
+    return span(ref, of="ledger", fp=row.get("fp"), url=row.get("url")) if ref else ""
+
+
+def age_of(row):
+    days = row.get("days")
+    return f" ({days}d)" if isinstance(days, int) and days else ""
+
+
+# The ledger's kinds, in the order a standup gives them, each with the two sentences it is
+# said in: one for a handful, which names them all, and one for a pile, which names the
+# worst and counts the rest. Two templates rather than one clever one, because "I owe a
+# review on 9" is what one template produces and it is not English.
+#
+# Everything the room can unstick comes before everything Kyle owes, because the ask is the
+# only part of a standup that needs the other people to be in the room -- and his own debts
+# are said straight after, out loud, because an ask from someone who volunteers what he is
+# sitting on is an ask that gets taken seriously.
+#
+# The grouping itself is the fix for the shape this beat had first, which was twenty-nine
+# lines: eleven of them "nobody has reviewed !104xx", differing only in a number. That is
+# one sentence about one problem, and reading it eleven times buries the two rows next to
+# it that were about something else. Grouping is a partition on the `kind` each row already
+# carries -- not a re-ranking -- and inside every group the ledger's worst-first order is
+# preserved exactly, so the row this names is the row work-arcs would have named.
+DEBT_GROUPS = [
+    ("they", "review-silence",
+     "nobody has reviewed {refs}", "nobody has reviewed {n} MRs — oldest {refs}",
+     "reviewers "),
+    ("they", "ticket-stalled",
+     "sitting with someone else: {refs}",
+     "{n} tickets sitting with other people — oldest {refs}", ""),
+    ("you", "review-owed",
+     "I owe a review on {refs}", "I owe {n} reviews — oldest {refs}", ""),
+    ("you", "reply-owed",
+     "I owe a reply on {refs}", "I owe {n} replies — oldest {refs}", ""),
+    ("you", "slack-mention",
+     "waiting on me in Slack: {refs}",
+     "{n} Slack threads waiting on me — oldest {refs}", ""),
+    ("you", "slack-dm",
+     "waiting on me in a DM: {refs}", "{n} DMs waiting on me — oldest {refs}", ""),
+]
+
+# Where a handful stops being a handful. Three references is still a sentence a person can
+# say without losing the end of it; four is a list, and a list wants counting instead.
+FEW = 3
+
+
+def fill(tpl, rows, n):
+    """One template, with the reference spans dropped into its `{refs}` hole.
+
+    The spans cannot be formatted in as text -- they are what the page turns into links to
+    the ledger row each one came from -- so the template is split around the placeholder
+    and the parts are assembled either side of them.
+    """
+    before, _, after = tpl.replace("{n}", str(n)).partition("{refs}")
+    parts = [before]
+    for i, r in enumerate(rows):
+        if i:
+            parts.append(", ")
+        parts += [ref_span(r), age_of(r)]
+    parts.append(after)
+    return parts
+
+
+def group_line(rows, few, many, who_label):
+    """One group of debts as one thing to say.
+
+    Under four they are all named, because four references is still a sentence. Past that
+    the first is named -- the ledger's own worst -- and the rest are counted, which is the
+    form a person actually uses out loud: "the oldest is eighteen days and there are ten
+    behind it".
+
+    The person is appended only where the whole group shares one, since "reviewers brian,
+    vadym, ajit +2" said once about ten MRs is a fact and said about a group of three
+    different panels is a guess.
+    """
+    few_enough = len(rows) <= FEW
+    parts = fill(few if few_enough else many,
+                 rows if few_enough else rows[:1], len(rows))
+    who = {who_of(r) for r in rows} if few_enough else {who_of(rows[0])}
+    if len(who) == 1 and who != {"someone"}:
+        parts.append(f" — {who_label}{who.pop()}")
+    return line(parts)
+
+
+def blocked_beat(data, since):
+    """Who is waiting on whom, split by whether this call can move it.
+
+    The ledger arrives sorted worst-first and that order is not re-litigated here. What
+    this does is *partition* it -- by kind, so eleven unreviewed MRs are one sentence, and
+    by age, so a five-month stall is not read out in front of a five-day one.
+
+    The age split is on a threshold rather than on a competing score, and it exists because
+    the failure it fixes is specific and fatal to the tool. `they_owe` is led by a 159-day
+    ticket stall, correctly: it is the largest open loop Kyle has. Read that out on Monday,
+    Wednesday and Friday for five months and the room learns that these notes open with
+    something nobody is going to do anything about, and stops listening before the item
+    somebody could have fixed on the call. So the stalled rows are still said -- dropping
+    them would let a real stall go quiet -- but once, in a tail line, and never in front of
+    a live one.
+    """
+    led = data.get("ledger") or {}
+    rows = ([("they", r) for r in led.get("they_owe") or []]
+            + [("you", r) for r in led.get("you_owe") or []])
+    live = [(s, r) for s, r in rows
+            if not (isinstance(r.get("days"), int) and r["days"] > STALE_DAYS)]
+    stale = [(s, r) for s, r in rows
+             if isinstance(r.get("days"), int) and r["days"] > STALE_DAYS]
+
+    out, claimed = [], set()
+    for side, kind, few, many, who_label in DEBT_GROUPS:
+        grp = [r for s2, r in live if s2 == side and r.get("kind") == kind]
+        if not grp:
+            continue
+        claimed.add((side, kind))
+        out.append(group_line(grp, few, many, who_label))
+    # Anything the table above has no phrase for is still said, in the ledger's own words,
+    # rather than silently dropped: a new kind upstream must not make this beat quieter.
+    for side, r in live:
+        if (side, r.get("kind")) in claimed:
+            continue
+        verb = "waiting on" if side == "they" else "I owe"
+        out.append(line([f"{verb} {who_of(r)}: ", ref_span(r), age_of(r)]))
+
+    out = capped(out, "blocked")
+    if stale:
+        refs = ", ".join(f"{r.get('ref') or who_of(r)} ({r.get('days')}d)"
+                         for _, r in stale[:5])
+        more = f", +{len(stale) - 5} more" if len(stale) > 5 else ""
+        out.append(line([f"still open, unchanged: {refs}{more}"]))
+    return out
+
+
+# --------------------------------------------------------------------------- next
+
+
+def next_beat(data, since):
+    """What is in front of you — offered as a prompt, because it cannot be derived.
+
+    Nothing in this pipeline knows Kyle's intentions, and a page that stated them would be
+    guessing in the one beat where a standup is a commitment to other people. What it does
+    know is what he was in the middle of and what the board says is his, and those two put
+    together are enough to remember the answer from.
+
+    Sprint tickets that are handed off are excluded on purpose: `handed_off` is work-arcs'
+    word for "the status says this is somebody else's move now", and reading one out as
+    today's plan is how you promise a room something you are waiting on them for.
+    """
+    out = []
+    arcs = sorted((a for a in data.get("arcs") or [] if a.get("own_activity")),
+                  key=lambda a: -(a.get("own_activity") or 0))
+    for arc in arcs[:2]:
+        if (arc.get("settled") or arc.get("stage") == "parked"):
+            continue
+        out.append(line(arc_head(arc)
+                        + ([f" — {arc.get('state')}"] if arc.get("state") else [])))
+
+    sprint = data.get("sprint") or {}
+    for it in sprint.get("issues") or []:
+        if it.get("done") or it.get("handed_off"):
+            continue
+        out.append(line([span(it.get("key", ""), url=it.get("url")),
+                         f" {it.get('status') or ''} — {it.get('summary') or ''}"]))
+    return capped(out, "next")
+
+
+# --------------------------------------------------------------------------- assembly
+
+BEATS = [("moved", "moved", moved_beat),
+         ("discussed", "discussed", discussed_beat),
+         ("blocked", "blocked / asks", blocked_beat),
+         ("next", "in front of you", next_beat)]
+
+
+def as_text(st):
+    """The notes as they read — the same string the page's copy button hands over.
+
+    Composed once, here, rather than once here and once in the renderer. Two projections of
+    one composition is how the thing on the screen and the thing on the clipboard end up
+    disagreeing about what you did on Tuesday.
+    """
+    head = st.get("for") or {}
+    since = st.get("since") or {}
+    out = [f"FOR {head.get('day','the next').upper()}'S STANDUP"
+           + (f" — since {since.get('when')}" if since.get("when") else "")]
+    if st.get("note"):
+        out.append(f"({st['note']})")
+    for b in st.get("beats") or []:
+        if not b.get("items"):
+            continue
+        out += ["", b["lead"].upper()]
+        for it in b["items"]:
+            out.append("  " + it["text"])
+            for s in it.get("subs") or []:
+                out.append("    " + s["text"])
+    if not any(b.get("items") for b in st.get("beats") or []):
+        out += ["", "  nothing to report in this window"]
+    return "\n".join(out) + "\n"
+
+
+def build(data, now=None):
+    cad = cadence(now)
+    since = cad.get("since") or {}
+    beats = []
+    for kind, lead, fn in BEATS:
+        items = fn(data, since) if since else []
+        beats.append({"kind": kind, "lead": lead, "items": items})
+
+    note = ""
+    if cad.get("just_opened") and not any(b["items"] for b in beats[:2]):
+        ago = since.get("ago") or "moments"
+        note = (f"this window opened {ago} ago — everything before it was said at "
+                f"{since.get('when', 'the last standup')}")
+    elif cad.get("why"):
+        note = cad["why"]
+
+    st = {
+        "v": 1,
+        "cadence": {k: cad[k] for k in ("days", "day_names", "time", "tz", "why")},
+        "for": cad.get("for") or {},
+        "since": since,
+        "beats": beats,
+        "empty": not any(b["items"] for b in beats),
+        "note": note,
+        "source": "deterministic",
+    }
+    st["text"] = as_text(st)
+    return st
+
+
+def main():
+    p = argparse.ArgumentParser(
+        description="Assemble the next standup's notes from a work-arcs graph.")
+    p.add_argument("--from", dest="src", default="",
+                   help="read the graph from a file instead of stdin")
+    p.add_argument("--out", default="", help="write to a file instead of stdout")
+    p.add_argument("--text", action="store_true",
+                   help="print the notes instead of the graph")
+    p.add_argument("--at", default="",
+                   help="pretend it is this instant (ISO 8601), to see any standup's "
+                        "window without waiting for it")
+    args = p.parse_args()
+
+    now = None
+    if args.at:
+        try:
+            now = datetime.fromisoformat(args.at)
+        except ValueError:
+            sys.exit(f"arc-standup: --at {args.at!r} is not an ISO 8601 instant")
+
+    raw = Path(args.src).read_text() if args.src else sys.stdin.read()
+    try:
+        data = json.loads(raw)
+    except ValueError as e:
+        sys.exit(f"arc-standup: the graph on {args.src or 'stdin'} is not JSON ({e}). "
+                 "Nothing upstream of here wrote it as JSON, so there are no notes to "
+                 "assemble and no payload to pass on.")
+    if not isinstance(data, dict):
+        sys.exit(f"arc-standup: the graph on {args.src or 'stdin'} parsed as "
+                 f"{type(data).__name__}, not the object arc-brief passes on — there is "
+                 "nothing here to assemble notes from")
+
+    data["standup"] = build(data, now)
+    st = data["standup"]
+    said = sum(len(b["items"]) for b in st["beats"])
+    print(f"  standup: {said} line" + ("" if said == 1 else "s")
+          + f" for {(st.get('for') or {}).get('day', '?')}"
+          + (f", since {(st.get('since') or {}).get('when', '?')}" if st.get("since")
+             else ""), file=sys.stderr)
+
+    out = st["text"] if args.text else json.dumps(data, indent=1) + "\n"
+    if args.out:
+        Path(args.out).write_text(out)
+    else:
+        sys.stdout.write(out)
+
+
+if __name__ == "__main__":
+    main()
