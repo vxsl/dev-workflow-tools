@@ -3101,7 +3101,11 @@ if [ "$GENERATE_MORE_MODE" = true ]; then
                 "$display_branch" "$title_column" "$display_status" "$display_assignee" "$time_info" "$commit_info" "$full_branch" "$title" "$SEARCH_KEY"
         elif [ "$is_branchless" = true ]; then
             # Check if abandoned/terminal status — dim the entire row
-            local _status_lc="${status,,}"
+            # No `local`: this loop is a group command, not a function, so `local`
+            # here failed on every ticket row -- 453 lines of stderr, and _status_lc
+            # never assigned, which made the dim-abandoned branch below unreachable.
+            # 56 abandoned tickets were drawing as ordinary green rows.
+            _status_lc="${status,,}"
             if [[ "$_status_lc" == *abandon* || "$_status_lc" == *cancelled* || "$_status_lc" == *"won't do"* || "$_status_lc" == *wontdo* ]]; then
                 printf -v display_branch "\033[2m+ \033[2m%-${branch_width}s\033[0m" "$branch_display"
                 printf "%s │ \033[2m%s\033[0m │ %s │ \033[2m%s\033[0m │ \033[2m%-${TIME_MAX_LENGTH}s\033[0m │ \033[2m%-${COMMIT_MAX_LENGTH}s\033[0m │ %s │ %s │ %s\n" \
@@ -3343,7 +3347,8 @@ mkfifo "$_data_fifo"
                     "$display_branch" "$display_title" "$display_status" "$display_assignee" "$time_info" "$commit_info" "$full_branch" "$title" "$SEARCH_KEY"
             elif [ "$is_branchless" = true ]; then
                 # Check if abandoned/terminal status — dim the entire row
-                local _status_lc="${status,,}"
+                # See the reload loop above: `local` cannot be used here either.
+                _status_lc="${status,,}"
                 if [[ "$_status_lc" == *abandon* || "$_status_lc" == *cancelled* || "$_status_lc" == *"won't do"* || "$_status_lc" == *wontdo* ]]; then
                     printf -v display_branch "\033[2m+ \033[2m%-${branch_width}s\033[0m" "$branch_display"
                     printf "%s │ \033[2m%s\033[0m │ %s │ \033[2m%s\033[0m │ \033[2m%-${TIME_MAX_LENGTH}s\033[0m │ \033[2m%-${COMMIT_MAX_LENGTH}s\033[0m │ %s │ %s │ %s\n" \
