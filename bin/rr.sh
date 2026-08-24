@@ -1804,7 +1804,7 @@ generate_branch_data() {
            ! grep -q "^$ticket:" ~/.jira_assignee_cache 2>/dev/null; then
             # Fetch in background to parallelize
             (
-                response=$(curl -s --max-time 8 -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
+                response=$(curl -s --max-time 3 -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
                     "https://${JIRA_DOMAIN}/rest/api/2/issue/${ticket}" \
                     -H "Content-Type: application/json" 2>/dev/null)
 
@@ -1821,14 +1821,13 @@ generate_branch_data() {
             _fetch_pids+=($!)
         fi
     done
-    # Wait for JIRA fetches, but kill stragglers after 3s so selecting a branch is never
-    # held up by in-flight network requests.
+    # Wait for the JIRA fetches. The 3s straggler cap is curl's own --max-time above,
+    # not a watchdog: `( sleep 3 && kill ... ) &` inherited this function's stdout, and
+    # killing the subshell left its `sleep` behind holding that pipe open, so whoever
+    # was reading saw no end-of-data for the full three seconds even when every fetch
+    # had answered in a fraction of one. Every run with a single uncached ticket paid it.
     if [ ${#_fetch_pids[@]} -gt 0 ]; then
-        ( sleep 3 && kill "${_fetch_pids[@]}" 2>/dev/null ) &
-        local _killer_pid=$!
         wait "${_fetch_pids[@]}" 2>/dev/null
-        kill "$_killer_pid" 2>/dev/null
-        wait "$_killer_pid" 2>/dev/null
     fi
 
     # Reload caches to pick up newly fetched data
@@ -2381,7 +2380,7 @@ generate_remote_only_data() {
                ! grep -q "^$ticket:" ~/.jira_status_cache 2>/dev/null || \
                ! grep -q "^$ticket:" ~/.jira_assignee_cache 2>/dev/null; then
                 (
-                    response=$(curl -s --max-time 8 -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
+                    response=$(curl -s --max-time 3 -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
                         "https://${JIRA_DOMAIN}/rest/api/2/issue/${ticket}" \
                         -H "Content-Type: application/json" 2>/dev/null)
 
@@ -2399,12 +2398,10 @@ generate_remote_only_data() {
             fi
         done <<< "$remote_lines"
 
+        # Straggler cap is curl's --max-time above; see generate_branch_data for what
+        # the `sleep`-based watchdog that used to be here cost every run.
         if [ ${#_remote_fetch_pids[@]} -gt 0 ]; then
-            ( sleep 3 && kill "${_remote_fetch_pids[@]}" 2>/dev/null ) &
-            local _killer_pid=$!
             wait "${_remote_fetch_pids[@]}" 2>/dev/null
-            kill "$_killer_pid" 2>/dev/null
-            wait "$_killer_pid" 2>/dev/null
         fi
 
         # Reload caches to pick up newly fetched data
