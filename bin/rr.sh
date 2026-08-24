@@ -2817,11 +2817,16 @@ fi
 # Pre-load ticket-bot auto-created worktree set and prepare the bottom-tier
 # accumulator file. generate_worktree_data (_emit_worktree_data_row) runs in a
 # subshell at both call sites, so we append rows to a file that survives the
-# subshell boundary, then the outer pipeline cats it after remote-only rows.
+# subshell boundary, then the outer pipeline cats it after the ticket tier.
 declare -A AUTO_WORKTREES=()
 AUTO_WT_ROWS_FILE=$(mktemp -t rr_auto_rows.XXXXXX)
 export AUTO_WT_ROWS_FILE
-trap 'rm -f "$AUTO_WT_ROWS_FILE"' EXIT
+# Landing files for the two tiers the streaming pipeline generates ahead of time.
+# Owned by the parent so an early fzf exit, which kills the pipeline mid-write,
+# still takes them with it.
+_remote_rows_file=$(mktemp -t rr_remote_rows.XXXXXX)
+_branchless_rows_file=$(mktemp -t rr_ticket_rows.XXXXXX)
+trap 'rm -f "$AUTO_WT_ROWS_FILE" "$_remote_rows_file" "$_branchless_rows_file"' EXIT
 load_auto_worktrees
 
 # Pre-load valid branch refs (eliminates git show-ref per branch)
@@ -3145,15 +3150,36 @@ mkfifo "$_data_fifo"
     echo "$header_text"
 
         # Two-phase data loading:
-        # Phase 1 (generate_instant_data): worktrees + top reflog branches, pre-sorted,
-        #   streamed directly — fzf gets data immediately (<100ms).
+        # Phase 1 (generate_instant_data): every worktree and every local branch,
+        #   pre-sorted, streamed directly — fzf gets data immediately (<100ms).
         # Phase 2: full pipeline through sort buffer — dedup handles overlap with Phase 1.
         _wt_claimed_file=$(mktemp)
         {
+            # The remote-only and branchless-ticket tiers read git refs and the Jira
+            # caches and nothing else — neither needs a single answer from the worktree
+            # or branch passes. Queued behind them, a branch that exists only on origin
+            # was the last row in the stream and took tens of seconds to become
+            # searchable; started here, both tiers cost whatever the passes ahead of
+            # them cost anyway.
+            generate_remote_only_data > "$_remote_rows_file" 2>/dev/null &
+            _remote_gen_pid=$!
+            _branchless_gen_pid=""
+            if [ "${JIRA_ENABLED:-false}" = "true" ] && [ -n "$JIRA_EMAIL" ] && [ -n "$JIRA_API_TOKEN" ]; then
+                generate_branchless_ticket_data "" > "$_branchless_rows_file" 2>/dev/null &
+                _branchless_gen_pid=$!
+            fi
+
             # Phase 1: Instant display — bypasses sort buffer
             if [ "${RR_DISABLE_INSTANT:-false}" != "true" ]; then
                 generate_instant_data "$_wt_claimed_file"
             fi
+
+            # Remote-only branches, right behind phase 1 rather than at the end of the
+            # stream. They sit above the three-odd local rows phase 1 leaves for phase 2
+            # (it emits 488 of the 491 this repo has) and above the ticket tier, which is
+            # the whole cost of them arriving in about a second instead of thirteen.
+            wait "$_remote_gen_pid" 2>/dev/null
+            cat "$_remote_rows_file"
 
             # Phase 2: Full data — through sort buffer (dedup catches duplicates)
             {
@@ -3164,10 +3190,10 @@ mkfifo "$_data_fifo"
                 if (n >= 2 && a[n] ~ /^[0-9]+$/) ts = a[n]
                 print ts "\t" $0
             }' | sort -t$'\t' -k1,1nr | cut -f2-
-            if [ "${JIRA_ENABLED:-false}" = "true" ] && [ -n "$JIRA_EMAIL" ] && [ -n "$JIRA_API_TOKEN" ]; then
-                generate_branchless_ticket_data ""
+            if [ -n "$_branchless_gen_pid" ]; then
+                wait "$_branchless_gen_pid" 2>/dev/null
+                cat "$_branchless_rows_file"
             fi
-            generate_remote_only_data
             # Bottom tier: ticket-bot auto-created non-ticket worktrees that
             # the user hasn't navigated to yet. Populated by generate_worktree_data.
             [ -s "$AUTO_WT_ROWS_FILE" ] && cat "$AUTO_WT_ROWS_FILE"
