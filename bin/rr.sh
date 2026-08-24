@@ -3328,8 +3328,16 @@ selected_line=$(
             pane_bindings="$pane_bindings --bind 'alt-enter:execute-silent(echo \"SET_ALL_PANES:{7}\" > ~/.cache/rr/action)+accept'"
         fi
 
+        # No --no-sort. The list arrives in the order the tiers built it -- worktrees
+        # and branches by recency, then tickets, then remote-only -- and fzf keeps that
+        # order for as long as the query is empty, so the recency ranking is not paid
+        # for by turning scoring off. With --no-sort it was: typing 1874 against the
+        # branch, title, status and assignee text of a thousand rows matched 689 of
+        # them (fuzzy matching finds 1-8-7-4 scattered through any of those fields),
+        # and UL-1874 -- the one exact hit -- sat at position 642 because that is where
+        # the remote-only tier put it. --tiebreak below was dead config: it only
+        # applies when there is a score to break a tie in.
         eval "fzf --ansi \
-            --no-sort \
             --reverse \
             --height=$($FULL_HEIGHT && echo "100%" || echo $((DISPLAY_COUNT + 7))) \
             $RR_PANEL \
