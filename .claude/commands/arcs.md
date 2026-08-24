@@ -10,9 +10,10 @@ Any arguments after the command pass straight through to `arcs` (e.g. `/arcs --f
 
 ## Steps
 
-1. Run `arcs $ARGUMENTS`. It runs `work-arcs → arc-brief → arcs-page`, writes the HTML, and
-   prints the output path and the artifact URL. It takes about a minute — most of that is
-   GitLab and the model pass, and both are cached, so a second run in the same hour is fast.
+1. Run `arcs $ARGUMENTS`. It runs `work-arcs → arc-brief → arc-morning → arc-standup →
+   arcs-page`, writes the HTML, and prints the output path and the artifact URL. It takes
+   about a minute — most of that is GitLab and the model passes, and both are cached, so a
+   second run in the same hour is fast.
 
 2. Publish the file it printed with the **Artifact** tool, passing:
    - `file_path`: the path `arcs` printed
@@ -32,9 +33,13 @@ Any arguments after the command pass straight through to `arcs` (e.g. `/arcs --f
    `no reviewer asked` or newly `approved, stacked`. The page states everything else — the
    only thing worth saying in chat is the delta.
 
+   On a standup morning, say what is in the standup block too — it is the reason he opened
+   the page at that hour, and its window is the one interval on the page a rebuild does not
+   change. `arc-standup --text` prints it on its own if he asks for it without a rebuild.
+
 ## Notes
 
 - Publishing is a Claude Code step by necessity: the page is an artifact, and only a session
   can write to that URL. `arcs` on its own does every part that a shell can do.
-- If `arcs` fails, say which stage. It runs the three programs separately so the failing one
-  is named rather than surfacing as "stdin is not work-arcs --json".
+- If `arcs` fails, say which stage. It runs the programs separately so the failing one is
+  named rather than surfacing as "stdin is not work-arcs --json".

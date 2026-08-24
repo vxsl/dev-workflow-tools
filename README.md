@@ -608,11 +608,52 @@ own, and the contract is positional, so a line count that does not match, an anc
 onto the neighbouring line, or a numeral that drifted between lines rejects the whole pass
 rather than half of it.
 
+**Under the brief is what to say at the next standup.** The page answers "what is true
+about my work"; a standup asks what the other people on the call need to hear, and the
+difference is not a matter of trimming. Three things change at once. The window is the
+cadence rather than the build — every other interval on this page is measured from the last
+time `arcs` ran, and a standup covers the interval since the last *standup*. The audience is
+the team, so the vocabulary is ticket keys, MR numbers, channels and names rather than rungs
+and workstreams. And the pick is what somebody on the call can unstick, not what will bite
+you soonest — which is why the morning brief opens on a 159-day stall and this does not.
+
+Four beats, each dropped when it holds nothing: **moved** (MRs, commits and tickets that
+changed), **discussed** (what was settled or left open in Slack, and review threads where
+somebody asked or you answered), **blocked / asks** (who is waiting on whom), and **in front
+of you** (the two workstreams you were last in, plus your sprint tickets that are not handed
+off — a prompt, since nothing here knows your plans). *copy* puts the whole thing on the
+clipboard as the same plain text the block shows, composed once so the two cannot drift.
+
+The window is derived from the clock alone — **the most recent standup that has already
+happened, running to now** — so there is no state to get out of step and it is right on a
+laptop that has not been opened for a week. At 09:00 on a Monday it covers Friday onward and
+the notes are for the meeting in ninety minutes; at 11:00 the same morning the last standup
+is that one, and the notes are already Wednesday's. A window only minutes old says so, so
+"nothing moved" reads as a fact about the clock rather than about you.
+
+Two things it will not do. It infers nothing — a ticket is said as a status and a date,
+never as a transition, because nothing here saw the ticket before the window opened. And it
+invents no ranking: the ledger arrives sorted worst-first and is consumed in that order. The
+one judgement it makes is a partition, twice over. Debts group by kind, so eleven "nobody
+has reviewed !104xx" rows are one sentence naming the oldest instead of eleven lines
+differing by a number; and they split by age, so a five-month stall is still said but in a
+tail line rather than opening the fortieth consecutive standup with something nobody is
+going to act on.
+
 Env: `WORK_ARCS_REPO` (default `~/work/repos/ul`), `WORK_ARCS_MAIN` (`origin/main`),
 `WORK_ARCS_PROJECTS` (`~/.claude/projects`), plus the `JIRA_*` vars for `--gap`. For the
 Slack lens: `WORK_ARCS_SLACK_LOOKBACK` (14 days), `WORK_ARCS_SLACK_THREADS_MAX` (150
 threads a run), `WORK_ARCS_SLACK_THREAD_JOBS` (6 concurrent) and
-`WORK_ARCS_SLACK_THREAD_MODEL` (falls back to `WORK_ARCS_COMMIT_MODEL`, then `sonnet`).
+`WORK_ARCS_SLACK_THREAD_MODEL` (falls back to `WORK_ARCS_COMMIT_MODEL`, then `sonnet`). For
+the standup block: `STANDUP_DAYS` (`mon,wed,fri`), `STANDUP_TIME` (`10:30`), `STANDUP_TZ`
+(`America/Los_Angeles`), `STANDUP_STALE_DAYS` (30 — where a debt stops being news),
+`STANDUP_QUOTE_MAX` (110 characters) and the per-beat caps `STANDUP_MOVED_MAX` (6),
+`STANDUP_DISCUSSED_MAX` (6), `STANDUP_BLOCKED_MAX` (6) and `STANDUP_NEXT_MAX` (4).
+
+```bash
+arc-standup --text                 # the notes, without building a page
+arc-standup --at 2026-08-24T09:00  # any standup's window, without waiting for it
+```
 
 ### `arcs-refresh`
 `arcs` rebuilds the work-arcs page; this runs it at 07:10 so the page is already fresh

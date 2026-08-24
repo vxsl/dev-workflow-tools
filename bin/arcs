@@ -18,7 +18,8 @@
 #   arcs                 # rebuild with your usual window
 #   arcs --focus 30      # any arcs-page flag passes through
 #   arcs --no-brief      # skip both model passes: faster, the cards lose their names and
-#                        # the morning brief falls back to its deterministic prose
+#                        # the morning brief falls back to its deterministic prose. The
+#                        # standup block is unaffected -- it makes no model call.
 #
 set -euo pipefail
 
