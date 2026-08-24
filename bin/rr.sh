@@ -22,6 +22,11 @@ JIRA_DOMAIN="${JIRA_DOMAIN}"
 JIRA_PROJECT="${JIRA_PROJECT}"
 JIRA_ME="${JIRA_ME:-}"  # Your JIRA username - used to highlight your assigned branches
 RR_REMOTE_MAX_AGE_DAYS="${RR_REMOTE_MAX_AGE_DAYS:-90}"  # Max age of remote-only branches to show (0 = no limit)
+# How many worktrees to ask about dirtiness at once. The answers are independent
+# and the slow ones are CPU-bound (git re-hashing large tracked files), so this
+# wants to be around the core count; 1 restores the old one-at-a-time behaviour.
+RR_DIRTY_JOBS="${RR_DIRTY_JOBS:-$(( $(nproc 2>/dev/null || echo 4) * 2 ))}"
+[[ "$RR_DIRTY_JOBS" =~ ^[0-9]+$ ]] && [ "$RR_DIRTY_JOBS" -ge 1 ] || RR_DIRTY_JOBS=8
 
 # Auto-detect Jira from JIRA_REPO: enable when running inside that repo or any of its worktrees
 if [ -n "${JIRA_REPO:-}" ]; then
@@ -1377,12 +1382,8 @@ generate_worktree_data() {
             jira_assignee="${JIRA_ASSIGNEE_CACHE[$ticket]:-<UNASSIGNED>}"
         fi
 
-        # Dirty status
-        local wt_status="CLEAN"
-        if ! git -C "$wt_path" diff --quiet HEAD 2>/dev/null || \
-           ! git -C "$wt_path" diff --quiet --cached 2>/dev/null; then
-            wt_status="DIRTY"
-        fi
+        # Dirty status — answered by the parallel pass below, before this loop ran
+        local wt_status="${_wt_dirty[$wt_path]:-CLEAN}"
 
         # Commit info + author + timestamp in one git call (%cr = human-readable relative time)
         local log_line
@@ -1481,6 +1482,34 @@ generate_worktree_data() {
         fi
     }
 
+    # One porcelain listing, read twice: once to ask every worktree whether it is
+    # dirty, then again to build the rows.
+    local _wt_porcelain
+    _wt_porcelain=$(git worktree list --porcelain 2>/dev/null)
+
+    # Ask all of them at once. Two `git diff` calls per worktree used to run one
+    # after another inside the row loop, and on 248 worktrees that was 27 of the
+    # list's 45 seconds: most answer in a few ms, but the handful holding hundreds
+    # of MB of tracked test_data cost 1.5s each, because `git diff` re-hashes a
+    # stat-dirty file every time and never writes back the refreshed index. None of
+    # those answers depends on any other, so they all go out together.
+    local -A _wt_dirty=()
+    local _dirty_state _dirty_path
+    while IFS=$'\t' read -r _dirty_state _dirty_path; do
+        [ -n "$_dirty_path" ] && _wt_dirty["$_dirty_path"]="$_dirty_state"
+    done < <(
+        printf '%s\n' "$_wt_porcelain" |
+        sed -n 's/^worktree //p' |
+        grep -vxF -- "$main_wt" |
+        xargs -r -P "$RR_DIRTY_JOBS" -I{} bash -c '
+            if git -C "$1" diff --quiet HEAD 2>/dev/null &&
+               git -C "$1" diff --quiet --cached 2>/dev/null; then
+                printf "CLEAN\t%s\n" "$1"
+            else
+                printf "DIRTY\t%s\n" "$1"
+            fi' _ {}
+    )
+
     local _collected_rows=""
     while IFS= read -r line; do
         if [[ "$line" =~ ^worktree[[:space:]](.+)$ ]]; then
@@ -1507,7 +1536,7 @@ generate_worktree_data() {
         elif [[ "$line" == "bare" ]]; then
             current_is_bare=true
         fi
-    done < <(git worktree list --porcelain 2>/dev/null)
+    done < <(printf '%s\n' "$_wt_porcelain")
 
     # Emit last entry
     if [ -n "$current_wt" ] && [ "$current_wt" != "$main_wt" ] && [ "$current_is_bare" = false ]; then
