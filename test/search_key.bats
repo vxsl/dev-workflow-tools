@@ -65,9 +65,10 @@ render_via() {
     local _current_branch_name="__none__" _jira_me_lower="" _format_now_sec=1770000000
     declare -A _seen_branches=()
     declare -A _pane_dirs=() _pane_ind_width=()
+    declare -A _status_fmt=()
     eval "_render() {
         local _current_branch_name=\"__none__\" _jira_me_lower=\"\" _format_now_sec=1770000000
-        declare -A _seen_branches=() _pane_dirs=() _pane_ind_width=()
+        declare -A _seen_branches=() _pane_dirs=() _pane_ind_width=() _status_fmt=()
         $body
     }"
     _render

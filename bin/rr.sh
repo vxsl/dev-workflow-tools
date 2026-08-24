@@ -2433,8 +2433,10 @@ generate_remote_only_data() {
 # Function to format status with color/emoji - returns padded colored string
 format_status() {
     local status=$1
-    local status_lower=$(echo "$status" | tr '[:upper:]' '[:lower:]')
-    local status_upper=$(echo "$status" | tr '[:lower:]' '[:upper:]')
+    # Case-folded by the shell, not by two `echo | tr` pipelines: four forks per
+    # call, and this is called once per row of a thousand-row list.
+    local status_lower="${status,,}"
+    local status_upper="${status^^}"
     local icon color text
     
     case "$status_lower" in
@@ -2484,15 +2486,18 @@ format_status() {
             ;;
     esac
     
-    # Truncate text to fit, accounting for icon + space
+    # Truncate text to fit, accounting for icon + space. Inline rather than through
+    # truncate() and a $(printf) for the padding — same two forks per row again.
     local max_text_len=$((STATUS_MAX_LENGTH - 2))
-    local truncated_text=$(truncate "$text" $max_text_len)
-    local text_len=${#truncated_text}
-    local pad_len=$((STATUS_MAX_LENGTH - text_len - 2))
+    local truncated_text="$text"
+    if (( ${#truncated_text} > max_text_len )); then
+        truncated_text="${truncated_text:0:$((max_text_len-3))}..."
+    fi
+    local pad_len=$((STATUS_MAX_LENGTH - ${#truncated_text} - 2))
     local padding=""
-    [ $pad_len -gt 0 ] && padding=$(printf "%${pad_len}s" "")
-    
-    echo -e "\033[${color}m${icon} ${truncated_text}${padding}\033[0m"
+    (( pad_len > 0 )) && printf -v padding "%${pad_len}s" ""
+
+    printf '\033[%sm%s %s%s\033[0m\n' "$color" "$icon" "$truncated_text" "$padding"
 }
 
 # Cache format version — bump this whenever the TSV field layout changes.
@@ -3081,42 +3086,42 @@ if [ "$GENERATE_MORE_MODE" = true ]; then
         if [ "$is_auto" = true ]; then
             # Bottom tier: ticket-bot auto-created, user hasn't navigated yet.
             # Dim the whole row and use ~ prefix to distinguish from other tiers.
-            display_branch=$(printf "\033[2m~ %-${branch_width}s\033[0m" "$branch_display")
+            printf -v display_branch "\033[2m~ %-${branch_width}s\033[0m" "$branch_display"
             printf "%s │ \033[2m%s\033[0m │ %s │ \033[2m%s\033[0m │ \033[2m%-${TIME_MAX_LENGTH}s\033[0m │ \033[2m%-${COMMIT_MAX_LENGTH}s\033[0m │ %s │ %s │ %s\n" \
                 "$display_branch" "$title_column" "$display_status" "$display_assignee" "$time_info" "$commit_info" "$full_branch" "$title" "$SEARCH_KEY"
         elif [ "$is_remote" = true ]; then
             # Remote-only branch - dim steel blue with ↑ prefix
-            display_branch=$(printf "\033[38;5;67m↑ \033[38;5;67m%-${branch_width}s\033[0m" "$branch_display")
+            printf -v display_branch "\033[38;5;67m↑ \033[38;5;67m%-${branch_width}s\033[0m" "$branch_display"
             printf "%s │ \033[38;5;67m%s\033[0m │ %s │ \033[38;5;244m%s\033[0m │ \033[2;37m%-${TIME_MAX_LENGTH}s\033[0m │ \033[2;37m%-${COMMIT_MAX_LENGTH}s\033[0m │ %s │ %s │ %s\n" \
                 "$display_branch" "$title_column" "$display_status" "$display_assignee" "$time_info" "$commit_info" "$full_branch" "$title" "$SEARCH_KEY"
         elif [ "$is_branchless" = true ]; then
             # Check if abandoned/terminal status — dim the entire row
             local _status_lc="${status,,}"
             if [[ "$_status_lc" == *abandon* || "$_status_lc" == *cancelled* || "$_status_lc" == *"won't do"* || "$_status_lc" == *wontdo* ]]; then
-                display_branch=$(printf "\033[2m+ \033[2m%-${branch_width}s\033[0m" "$branch_display")
+                printf -v display_branch "\033[2m+ \033[2m%-${branch_width}s\033[0m" "$branch_display"
                 printf "%s │ \033[2m%s\033[0m │ %s │ \033[2m%s\033[0m │ \033[2m%-${TIME_MAX_LENGTH}s\033[0m │ \033[2m%-${COMMIT_MAX_LENGTH}s\033[0m │ %s │ %s │ %s\n" \
                     "$display_branch" "$title_column" "$display_status" "$display_assignee" "$time_info" "no branch" "$full_branch" "$title" "$SEARCH_KEY"
             else
                 # Branchless ticket - use + prefix with green color
-                display_branch=$(printf "\033[38;5;71m+ \033[38;5;71m%-${branch_width}s\033[0m" "$branch_display")
+                printf -v display_branch "\033[38;5;71m+ \033[38;5;71m%-${branch_width}s\033[0m" "$branch_display"
                 printf "%s │ \033[38;5;71m%s\033[0m │ %s │ \033[38;5;244m%s\033[0m │ \033[2;37m%-${TIME_MAX_LENGTH}s\033[0m │ \033[38;5;241m%-${COMMIT_MAX_LENGTH}s\033[0m │ %s │ %s │ %s\n" \
                     "$display_branch" "$title_column" "$display_status" "$display_assignee" "$time_info" "no branch" "$full_branch" "$title" "$SEARCH_KEY"
             fi
         elif [ -n "$JIRA_ME" ] && [ "$assignee_lower" = "$jira_me_lower" ]; then
             if [ "$is_authoritative" = true ]; then
                 # Authoritative branch assigned to me - full star, bright purple
-                display_branch=$(printf "\033[38;5;141m★ %s%-${branch_width}s\033[0m%s" "$WT_BRANCH_SGR" "$branch_display" "$wt_display")
+                printf -v display_branch "\033[38;5;141m★ %s%-${branch_width}s\033[0m%s" "$WT_BRANCH_SGR" "$branch_display" "$wt_display"
                 printf "%s │ \033[38;5;141m%s\033[0m │ %s │ \033[38;5;109m%s\033[0m │ \033[2;37m%-${TIME_MAX_LENGTH}s\033[0m │ \033[2;37m%-${COMMIT_MAX_LENGTH}s\033[0m │ %s │ %s │ %s\n" \
                     "$display_branch" "$title_column" "$display_status" "$display_assignee" "$time_info" "$commit_info" "$full_branch" "$title" "$SEARCH_KEY"
             else
                 # Variant branch assigned to me - dim dot, grayed purple (103)
-                display_branch=$(printf "\033[38;5;244m· \033[38;5;103m%s%-${branch_width}s\033[0m%s" "$WT_BRANCH_SGR" "$branch_display" "$wt_display")
+                printf -v display_branch "\033[38;5;244m· \033[38;5;103m%s%-${branch_width}s\033[0m%s" "$WT_BRANCH_SGR" "$branch_display" "$wt_display"
                 printf "%s │ \033[38;5;103m%s\033[0m │ %s │ \033[38;5;244m%s\033[0m │ \033[2;37m%-${TIME_MAX_LENGTH}s\033[0m │ \033[2;37m%-${COMMIT_MAX_LENGTH}s\033[0m │ %s │ %s │ %s\n" \
                     "$display_branch" "$title_column" "$display_status" "$display_assignee" "$time_info" "$commit_info" "$full_branch" "$title" "$SEARCH_KEY"
             fi
         else
             # Normal formatting with 2-space indent for alignment
-            display_branch=$(printf "  \033[38;5;250m%s%-${branch_width}s\033[0m%s" "$WT_BRANCH_SGR" "$branch_display" "$wt_display")
+            printf -v display_branch "  \033[38;5;250m%s%-${branch_width}s\033[0m%s" "$WT_BRANCH_SGR" "$branch_display" "$wt_display"
             printf "%s │ \033[38;5;109m%s\033[0m │ %s │ \033[38;5;244m%s\033[0m │ \033[2;37m%-${TIME_MAX_LENGTH}s\033[0m │ \033[2;37m%-${COMMIT_MAX_LENGTH}s\033[0m │ %s │ %s │ %s\n" \
                 "$display_branch" "$title_column" "$display_status" "$display_assignee" "$time_info" "$commit_info" "$full_branch" "$title" "$SEARCH_KEY"
         fi
@@ -3171,6 +3176,11 @@ mkfifo "$_data_fifo"
         # Use │ as delimiter with proper column spacing
         {
         declare -A _seen_branches=()
+        # A thousand rows share about a dozen distinct Jira statuses, and the coloured,
+        # padded rendering of one is a pure function of its text — so it is rendered
+        # once per distinct status rather than once per row, which is the difference
+        # between a dozen $() forks and a thousand.
+        declare -A _status_fmt=()
         # Hoist loop-invariants outside: saves 1 git call + 1 tr call per row
         _current_branch_name=$(resolve_current_branch)
         _jira_me_lower="${JIRA_ME,,}"
@@ -3220,8 +3230,11 @@ mkfifo "$_data_fifo"
             # Format status with color
             if [ -z "$status" ] || [ "$status" = "<EMPTY>" ]; then
                 printf -v display_status "%-${STATUS_MAX_LENGTH}s" ""
+            elif [ -n "${_status_fmt[$status]+x}" ]; then
+                display_status="${_status_fmt[$status]}"
             else
                 display_status="$(format_status "$status")"
+                _status_fmt["$status"]="$display_status"
             fi
             # Ensure assignee field is exactly 15 characters (no subshell)
             if [ -z "$assignee" ] || [ "$assignee" = "<UNASSIGNED>" ]; then
@@ -3294,42 +3307,42 @@ mkfifo "$_data_fifo"
             if [ "$is_auto" = true ]; then
                 # Bottom tier: ticket-bot auto-created, user hasn't navigated yet.
                 # Dim the whole row and use ~ prefix to distinguish from other tiers.
-                display_branch=$(printf "\033[2m~ %-${branch_width}s\033[0m" "$branch_display")
+                printf -v display_branch "\033[2m~ %-${branch_width}s\033[0m" "$branch_display"
                 printf "%s │ \033[2m%s\033[0m │ %s │ \033[2m%s\033[0m │ \033[2m%-${TIME_MAX_LENGTH}s\033[0m │ \033[2m%-${COMMIT_MAX_LENGTH}s\033[0m │ %s │ %s │ %s\n" \
                     "$display_branch" "$display_title" "$display_status" "$display_assignee" "$time_info" "$commit_info" "$full_branch" "$title" "$SEARCH_KEY"
             elif [ "$is_remote" = true ]; then
                 # Remote-only branch - dim steel blue with ↑ prefix
-                display_branch=$(printf "\033[38;5;67m↑ \033[38;5;67m%-${branch_width}s\033[0m" "$branch_display")
+                printf -v display_branch "\033[38;5;67m↑ \033[38;5;67m%-${branch_width}s\033[0m" "$branch_display"
                 printf "%s │ \033[38;5;67m%s\033[0m │ %s │ \033[38;5;244m%s\033[0m │ \033[2;37m%-${TIME_MAX_LENGTH}s\033[0m │ \033[2;37m%-${COMMIT_MAX_LENGTH}s\033[0m │ %s │ %s │ %s\n" \
                     "$display_branch" "$display_title" "$display_status" "$display_assignee" "$time_info" "$commit_info" "$full_branch" "$title" "$SEARCH_KEY"
             elif [ "$is_branchless" = true ]; then
                 # Check if abandoned/terminal status — dim the entire row
                 local _status_lc="${status,,}"
                 if [[ "$_status_lc" == *abandon* || "$_status_lc" == *cancelled* || "$_status_lc" == *"won't do"* || "$_status_lc" == *wontdo* ]]; then
-                    display_branch=$(printf "\033[2m+ \033[2m%-${branch_width}s\033[0m" "$branch_display")
+                    printf -v display_branch "\033[2m+ \033[2m%-${branch_width}s\033[0m" "$branch_display"
                     printf "%s │ \033[2m%s\033[0m │ %s │ \033[2m%s\033[0m │ \033[2m%-${TIME_MAX_LENGTH}s\033[0m │ \033[2m%-${COMMIT_MAX_LENGTH}s\033[0m │ %s │ %s │ %s\n" \
                         "$display_branch" "$display_title" "$display_status" "$display_assignee" "$time_info" "no branch" "$full_branch" "$title" "$SEARCH_KEY"
                 else
                     # Branchless ticket - use + prefix with green color
-                    display_branch=$(printf "\033[38;5;71m+ \033[38;5;71m%-${branch_width}s\033[0m" "$branch_display")
+                    printf -v display_branch "\033[38;5;71m+ \033[38;5;71m%-${branch_width}s\033[0m" "$branch_display"
                     printf "%s │ \033[38;5;71m%s\033[0m │ %s │ \033[38;5;244m%s\033[0m │ \033[2;37m%-${TIME_MAX_LENGTH}s\033[0m │ \033[38;5;241m%-${COMMIT_MAX_LENGTH}s\033[0m │ %s │ %s │ %s\n" \
                         "$display_branch" "$display_title" "$display_status" "$display_assignee" "$time_info" "no branch" "$full_branch" "$title" "$SEARCH_KEY"
                 fi
             elif [ -n "$JIRA_ME" ] && [ "$assignee_lower" = "$_jira_me_lower" ]; then
                 if [ "$is_authoritative" = true ]; then
                     # Authoritative branch assigned to me - full star, bright purple
-                    display_branch=$(printf "\033[38;5;141m★ %s%-${branch_width}s\033[0m%s" "$WT_BRANCH_SGR" "$branch_display" "$wt_display")
+                    printf -v display_branch "\033[38;5;141m★ %s%-${branch_width}s\033[0m%s" "$WT_BRANCH_SGR" "$branch_display" "$wt_display"
                     printf "%s │ \033[38;5;141m%s\033[0m │ %s │ \033[38;5;109m%s\033[0m │ \033[2;37m%-${TIME_MAX_LENGTH}s\033[0m │ \033[2;37m%-${COMMIT_MAX_LENGTH}s\033[0m │ %s │ %s │ %s\n" \
                         "$display_branch" "$display_title" "$display_status" "$display_assignee" "$time_info" "$commit_info" "$full_branch" "$title" "$SEARCH_KEY"
                 else
                     # Variant branch assigned to me - dim dot, grayed purple (103)
-                    display_branch=$(printf "\033[38;5;244m· \033[38;5;103m%s%-${branch_width}s\033[0m%s" "$WT_BRANCH_SGR" "$branch_display" "$wt_display")
+                    printf -v display_branch "\033[38;5;244m· \033[38;5;103m%s%-${branch_width}s\033[0m%s" "$WT_BRANCH_SGR" "$branch_display" "$wt_display"
                     printf "%s │ \033[38;5;103m%s\033[0m │ %s │ \033[38;5;244m%s\033[0m │ \033[2;37m%-${TIME_MAX_LENGTH}s\033[0m │ \033[2;37m%-${COMMIT_MAX_LENGTH}s\033[0m │ %s │ %s │ %s\n" \
                         "$display_branch" "$display_title" "$display_status" "$display_assignee" "$time_info" "$commit_info" "$full_branch" "$title" "$SEARCH_KEY"
                 fi
             else
                 # Normal formatting with 2-space indent for alignment
-                display_branch=$(printf "  \033[38;5;250m%s%-${branch_width}s\033[0m%s" "$WT_BRANCH_SGR" "$branch_display" "$wt_display")
+                printf -v display_branch "  \033[38;5;250m%s%-${branch_width}s\033[0m%s" "$WT_BRANCH_SGR" "$branch_display" "$wt_display"
                 printf "%s │ \033[38;5;109m%s\033[0m │ %s │ \033[38;5;244m%s\033[0m │ \033[2;37m%-${TIME_MAX_LENGTH}s\033[0m │ \033[2;37m%-${COMMIT_MAX_LENGTH}s\033[0m │ %s │ %s │ %s\n" \
                     "$display_branch" "$display_title" "$display_status" "$display_assignee" "$time_info" "$commit_info" "$full_branch" "$title" "$SEARCH_KEY"
             fi
