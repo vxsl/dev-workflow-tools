@@ -2997,36 +2997,73 @@ if [ "$GENERATE_MORE_MODE" = true ]; then
         get_header_text
     fi
 
+    # The invariants first. This loop asked for the current branch, folded JIRA_ME to
+    # lowercase and read every pane's directory once per row -- a git fork, two tr
+    # forks and four tmux forks each, for three answers that cannot change between
+    # rows. The streaming loop hoists exactly these; so does this one now.
+    _current_branch_name=$(resolve_current_branch)
+    _jira_me_lower="${JIRA_ME,,}"
+    _format_now_sec=$(date +%s)
+    declare -A _status_fmt=()
+    declare -A _pane_dirs=() _pane_ind_width=()
+    if [ "$RR_PANE_MGMT_ENABLED" = "true" ] && [ "$PANE_COUNT" -gt 0 ]; then
+        for i in "${!PANE_IDS[@]}"; do
+            _pane_dirs[$i]=$(get_pane_current_dir "${PANE_IDS[$i]}")
+            _pane_ind_width[$i]=$(printf '%s' "${PANE_INDICATORS[$i]}" | wc -L)
+        done
+    fi
+
     # Buffer all formatted output before writing to stdout so fzf receives it atomically.
     # This prevents the spinner/partial-list flash during ctrl-r reload.
     printf "%s" "$(echo "$processed_data" |
     while IFS=$'\t' read -r branch title status author time_info commit_info full_branch assignee wt_indicator wt_path wt_status; do
-        # Convert timestamp to human-readable format
-        time_info=$(convert_timestamp_to_relative "$time_info")
+        # Skip the current branch early (avoids all formatting work below)
+        if [ "$branch" = "$_current_branch_name" ]; then continue; fi
+
+        # Convert timestamp to human-readable format (inline, no subshell)
+        if [[ "$time_info" =~ ^(checked|updated):([0-9]+)$ ]]; then
+            _ts_prefix="${BASH_REMATCH[1]}"
+            _ts_diff=$(( _format_now_sec - BASH_REMATCH[2] ))
+            if   (( _ts_diff < 60 ));      then _ts_rel="seconds ago"
+            elif (( _ts_diff < 3600 ));    then _ts_m=$((_ts_diff/60));   ((_ts_m==1)) && _ts_rel="1 minute ago"  || _ts_rel="$_ts_m minutes ago"
+            elif (( _ts_diff < 86400 ));   then _ts_h=$((_ts_diff/3600)); ((_ts_h==1)) && _ts_rel="1 hour ago"    || _ts_rel="$_ts_h hours ago"
+            elif (( _ts_diff < 2592000 )); then _ts_d=$((_ts_diff/86400)); ((_ts_d==1)) && _ts_rel="1 day ago"    || _ts_rel="$_ts_d days ago"
+            else                                _ts_mo=$((_ts_diff/2592000)); ((_ts_mo==1)) && _ts_rel="1 month ago" || _ts_rel="$_ts_mo months ago"
+            fi
+            time_info="${_ts_prefix}: ${_ts_rel}"
+        fi
 
         if [ -z "$title" ] || [ "$title" = " " ] || [ "$title" = "<EMPTY>" ]; then
-            display_title="$(printf "%-${TITLE_MAX_LENGTH}s" "")"
+            printf -v display_title "%-${TITLE_MAX_LENGTH}s" ""
         else
-            # Truncate if needed (adds ... for long titles), then pad to exact width
-            truncated_title=$(truncate "$title" $TITLE_MAX_LENGTH)
-            display_title="$(printf "%-${TITLE_MAX_LENGTH}s" "$truncated_title")"
+            # Truncate if needed (inline, no subshell), then pad to exact width
+            if (( ${#title} > TITLE_MAX_LENGTH )); then
+                printf -v display_title "%-${TITLE_MAX_LENGTH}s" "${title:0:$((TITLE_MAX_LENGTH-3))}..."
+            else
+                printf -v display_title "%-${TITLE_MAX_LENGTH}s" "$title"
+            fi
         fi
         if [ -z "$status" ] || [ "$status" = "<EMPTY>" ]; then
-            display_status="$(printf "%-${STATUS_MAX_LENGTH}s" "")"
+            printf -v display_status "%-${STATUS_MAX_LENGTH}s" ""
+        elif [ -n "${_status_fmt[$status]+x}" ]; then
+            display_status="${_status_fmt[$status]}"
         else
             display_status="$(format_status "$status")"
+            _status_fmt["$status"]="$display_status"
         fi
         if [ -z "$assignee" ] || [ "$assignee" = "<UNASSIGNED>" ]; then
-            display_assignee="$(printf "%-15s" "")"
+            printf -v display_assignee "%-15s" ""
         else
-            display_assignee="$(printf "%-15s" "$assignee")"
+            printf -v display_assignee "%-15s" "$assignee"
         fi
-        # Check if assigned to me AND branch is authoritative (exact ticket match)
-        assignee_lower=$(echo "$assignee" | tr '[:upper:]' '[:lower:]')
-        jira_me_lower=$(echo "$JIRA_ME" | tr '[:upper:]' '[:lower:]')
+        # Check if assigned to me AND branch is authoritative (bash builtins, no fork)
+        assignee_lower="${assignee,,}"
         # Extract ticket from branch name and check if branch IS the ticket (not a variant like -wip, -good)
-        ticket_from_branch=$(echo "$branch" | grep -oiE "${JIRA_PROJECT_REGEX}-[0-9]+" | tr '[:lower:]' '[:upper:]' | head -1)
-        branch_upper=$(echo "$branch" | tr '[:lower:]' '[:upper:]')
+        ticket_from_branch=""
+        if [[ "$branch" =~ (${JIRA_PROJECT_REGEX}-[0-9]+) ]]; then
+            ticket_from_branch="${BASH_REMATCH[1]^^}"
+        fi
+        branch_upper="${branch^^}"
         is_authoritative=false
         [ "$branch_upper" = "$ticket_from_branch" ] && is_authoritative=true
         
@@ -3045,17 +3082,15 @@ if [ "$GENERATE_MORE_MODE" = true ]; then
             # " ⊙≠ " / " ⊙ !" / " ⊙  " = 4 visual cols each
             wt_visual_width=4
 
-            # Add pane indicators if enabled (based on real-time current directory)
+            # Add pane indicators if enabled (pane dirs read once, before the loop)
             if [ "$RR_PANE_MGMT_ENABLED" = "true" ] && [ "$PANE_COUNT" -gt 0 ]; then
                 for i in "${!PANE_IDS[@]}"; do
-                    pane_current_dir=$(get_pane_current_dir "${PANE_IDS[$i]}")
+                    pane_current_dir="${_pane_dirs[$i]}"
                     # Check if pane is in this worktree (exact match or subdirectory with / separator)
-                    if [ -n "$pane_current_dir" ] && ( [ "$pane_current_dir" = "$wt_path" ] || [[ "$pane_current_dir" == "$wt_path/"* ]] ); then
-                        indicator="${PANE_INDICATORS[$i]}"
-                        wt_display="${wt_display}$(printf '\033[38;5;114m%s\033[0m' "$indicator")"
-                        # Calculate visual width of this indicator (use wc -L)
-                        indicator_width=$(echo -n "$indicator" | wc -L)
-                        wt_visual_width=$((wt_visual_width + indicator_width))
+                    if [ -n "$pane_current_dir" ] && { [ "$pane_current_dir" = "$wt_path" ] || [[ "$pane_current_dir" == "$wt_path/"* ]]; }; then
+                        printf -v _pane_ind '\033[38;5;114m%s\033[0m' "${PANE_INDICATORS[$i]}"
+                        wt_display="${wt_display}${_pane_ind}"
+                        wt_visual_width=$((wt_visual_width + ${_pane_ind_width[$i]}))
                     fi
                 done
             fi
@@ -3064,17 +3099,16 @@ if [ "$GENERATE_MORE_MODE" = true ]; then
             branch_width=$((BRANCH_MAX_LENGTH - 2 - wt_visual_width))
         fi
 
-        # Skip the current branch - you're already on it
-        current_branch_name=$(resolve_current_branch)
-        if [ "$branch" = "$current_branch_name" ]; then
-            continue
-        fi
-
         # Show the title (worktree badge is now in the branch column)
         title_column="$display_title"
 
-        # Truncate branch to correct width (handles pre-truncated branches with "...")
-        branch_display=$(truncate "$branch" $branch_width)
+        # Truncate branch to correct width (inline, no subshell; handles
+        # pre-truncated branches that already carry a "...")
+        if (( ${#branch} > branch_width )); then
+            branch_display="${branch:0:$((branch_width-3))}..."
+        else
+            branch_display="$branch"
+        fi
 
         # Detect row type from full_branch prefix
         is_branchless=false
@@ -3116,7 +3150,7 @@ if [ "$GENERATE_MORE_MODE" = true ]; then
                 printf "%s │ \033[38;5;71m%s\033[0m │ %s │ \033[38;5;244m%s\033[0m │ \033[2;37m%-${TIME_MAX_LENGTH}s\033[0m │ \033[38;5;241m%-${COMMIT_MAX_LENGTH}s\033[0m │ %s │ %s │ %s\n" \
                     "$display_branch" "$title_column" "$display_status" "$display_assignee" "$time_info" "no branch" "$full_branch" "$title" "$SEARCH_KEY"
             fi
-        elif [ -n "$JIRA_ME" ] && [ "$assignee_lower" = "$jira_me_lower" ]; then
+        elif [ -n "$JIRA_ME" ] && [ "$assignee_lower" = "$_jira_me_lower" ]; then
             if [ "$is_authoritative" = true ]; then
                 # Authoritative branch assigned to me - full star, bright purple
                 printf -v display_branch "\033[38;5;141m★ %s%-${branch_width}s\033[0m%s" "$WT_BRANCH_SGR" "$branch_display" "$wt_display"
