@@ -11,6 +11,10 @@
 # deterministic part and then prints exactly what the publish step needs. `/arcs` is the
 # one-word version that does both.
 #
+# The standup notes are part of the rebuild and not a mode of it: what to say on Monday is
+# a projection of the same graph as everything else, and a second command to remember on a
+# standup morning is a command that gets forgotten on a standup morning.
+#
 #   arcs                 # rebuild with your usual window
 #   arcs --focus 30      # any arcs-page flag passes through
 #   arcs --no-brief      # skip both model passes: faster, the cards lose their names and
@@ -57,7 +61,7 @@ SNAP="$STATE/snapshot.json"
 finished=0
 graph="$(mktemp)"
 cleanup() {
-    rm -f "$graph" "$graph.brief" "$graph.morning" "$COST.tmp"
+    rm -f "$graph" "$graph.brief" "$graph.morning" "$graph.standup" "$COST.tmp"
     if [ "$finished" = 0 ] && [ -f "$SNAP.prev" ]; then
         mv -f "$SNAP.prev" "$SNAP"
         echo "  the rebuild did not finish, so the run-over-run baseline was put back —" >&2
@@ -93,6 +97,13 @@ morning_args=()
 if [ "$brief" = 0 ]; then morning_args+=(--no-model); fi
 arc-morning --from "$graph" ${morning_args+"${morning_args[@]}"} >"$graph.morning"
 mv "$graph.morning" "$graph"
+
+# After arc-brief for the same reason arc-morning is, and after arc-morning only because
+# the pipeline then reads in the order the page does: brief the arcs, brief the morning,
+# script the standup. It makes no model call and needs no network -- the window comes off
+# the clock -- so nothing here is behind --no-brief.
+arc-standup --from "$graph" >"$graph.standup"
+mv "$graph.standup" "$graph"
 
 # After both model passes, because that is where the model calls are; before the page,
 # which is what reads the result.

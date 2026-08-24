@@ -1318,11 +1318,17 @@ def _commitment_delivered(pairs, mine):
 
     # Newest delivering message wins the evidence slot: if he said "on it" and later
     # "done", the later one is the one worth quoting back.
-    for (i, _), c in sorted(cands.items(), key=lambda kv: float(kv[0][1] or 0)):
+    for (i, cts), c in sorted(cands.items(), key=lambda kv: float(kv[0][1] or 0)):
         if verdicts.get(key(i, c)):
             row = pairs[i][0]
             text = _slack_text(c.get("text"))
             row["closed_how"] = "thread"
+            # When it was closed, not only that it was. Every close path below computes
+            # this instant to decide whether the evidence postdates the promise and then
+            # threw it away, which left "you did what you said you would" as a fact with
+            # no date on it -- unusable to anything asking about an interval rather than
+            # about the standing state.
+            row["closed_ts"] = float(cts or 0)
             row["closed_by"] = f'you posted in-thread: "{_clip(text, 64)}"'
             # The whole message as well as the sentence, because the two have different
             # readers: the sentence is a line on a page and this is what an audit of "why
@@ -2513,10 +2519,12 @@ def close_commitments(ledger, fates):
         at = float(e.get("asked_ts") or _day_epoch(e.get("asked", "")))
         for iid in sorted(iids):
             f = merged.get(iid)
-            if not f or _iso_epoch(f.get("at_ts") or f.get("at")) <= at:
+            when = _iso_epoch(f.get("at_ts") or f.get("at")) if f else 0
+            if not f or when <= at:
                 continue
-            late = max(0, int((_iso_epoch(f.get("at_ts") or f.get("at")) - at) // 86400))
+            late = max(0, int((when - at) // 86400))
             e["closed_how"] = "mr"
+            e["closed_ts"] = float(when)
             e["closed_by"] = (f"!{iid} merged "
                               + ("the same day" if late == 0 else f"{late}d after"))
             e["closed_url"] = f.get("url", "")
@@ -2536,6 +2544,7 @@ def close_commitments(ledger, fates):
                 continue
             late = max(0, int((when - at) // 86400))
             e["closed_how"] = "ticket"
+            e["closed_ts"] = float(when)
             e["closed_by"] = (f"{key} moved to {d.get('status') or 'Done'} "
                               + ("the same day" if late == 0 else f"{late}d after"))
             e["closed_url"] = d.get("url", "")

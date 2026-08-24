@@ -559,6 +559,53 @@ td .dis{vertical-align:middle}
    things themselves on the line rather than a count pointing at a section elsewhere. Both
    lists are bounded by the sprint, so they cannot run away, and a count you have to go
    somewhere else to cash in is a count you stop believing. */
+/* The standup block. Every other block on this page is written to be read; this one is
+   written to be talked from, and the two want opposite things. Reading wants prose, one
+   column, generous measure. Talking wants a shape your eye can fall back into after you
+   have looked away to answer somebody -- which means short lines, hard indentation, and
+   the beat you are on findable without re-reading the one above it.
+
+   So: the brief's margin-label grid for the beats, and inside each beat a plain indented
+   list rather than prose. The nesting is one level and stops there. A workstream and what
+   happened to it is two facts; a third level would be a tree, and nobody reads a tree out
+   loud. */
+.standup{border:1px solid var(--hairline);border-left:3px solid var(--calm);
+  background:var(--surface);border-radius:4px;padding:.7rem .9rem .8rem;margin:0 0 2.5rem}
+.standup .hd{display:flex;flex-wrap:wrap;align-items:baseline;gap:.25rem .6rem;
+  margin-bottom:.5rem}
+.standup .tag{font-family:var(--mono);font-size:.68rem;text-transform:uppercase;
+  letter-spacing:.09em;color:var(--calm)}
+.standup .when{font-family:var(--mono);font-size:.7rem;color:var(--ink-faint)}
+.standup .sunote{font-size:.74rem;color:var(--ink-faint);text-wrap:pretty;
+  max-width:54em;margin:-.25rem 0 .55rem}
+/* Pushed to the end of the header rather than floated: it is the one control here and it
+   should be findable, not prominent. */
+.standup .cp{margin-left:auto;font:inherit;font-family:var(--mono);font-size:.68rem;
+  cursor:pointer;padding:.1rem .45rem;border:1px solid var(--hairline);border-radius:2px;
+  background:transparent;color:var(--ink-soft)}
+.standup .cp:hover{border-color:var(--calm);color:var(--ink)}
+.standup .cp[data-done="1"]{border-color:var(--calm);color:var(--calm)}
+.standup .beats{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;
+  gap:.55rem}
+.standup .beats>li{display:grid;grid-template-columns:8.5rem 1fr;gap:.1rem .9rem}
+.standup .bk{font-family:var(--mono);font-size:.66rem;text-transform:uppercase;
+  letter-spacing:.09em;color:var(--ink-faint);text-align:right;padding-top:.22rem}
+.standup .items{list-style:none;margin:0;padding:0}
+.standup .items>li{font-size:.88rem;line-height:1.45;color:var(--ink);
+  text-wrap:pretty;margin:0 0 .12rem}
+/* The second level is set quieter and smaller than the first, because the first is the
+   thing you name and the second is the detail you give if anybody asks. */
+.standup .sub{list-style:none;margin:0 0 .25rem;padding:0 0 0 1.1rem}
+.standup .sub>li{font-size:.8rem;line-height:1.4;color:var(--ink-soft)}
+.standup .sub>li::before{content:"·";color:var(--ink-faint);margin-right:.4rem}
+.standup a{color:inherit;text-decoration:none;
+  box-shadow:inset 0 -1px 0 0 color-mix(in srgb,var(--calm) 45%,transparent)}
+.standup a:hover,.standup a:focus-visible{box-shadow:inset 0 -2px 0 0 var(--calm)}
+.standup .none{font-size:.85rem;color:var(--ink-soft)}
+@media (max-width:640px){
+  .standup .beats>li{grid-template-columns:1fr;gap:.05rem}
+  .standup .bk{text-align:left;padding-top:0}
+}
 .sprint{border:1px solid var(--hairline);border-left:3px solid var(--accent);
   background:var(--surface);border-radius:4px;padding:.6rem .85rem;margin:0 0 2.5rem;
   display:flex;flex-direction:column;gap:.28rem}
@@ -1099,6 +1146,132 @@ def brief_block(data, here, fps):
                    + f'<span class="bs">{body}</span></li>')
     out.append("</ul>")
     return "".join(out) if len(out) > 2 else ""
+
+
+# What the copy button does, and the whole of why it is a button rather than a link to a
+# file. The notes exist to be talked from, which is a thing you do with the page open --
+# but the same person pastes them into a thread when he misses the call, and re-composing
+# them in JavaScript from the rendered DOM would be a second author for a string arc-standup
+# already built. So the exact text arc-standup composed rides along in a data attribute and
+# the button hands that over untouched.
+#
+# `navigator.clipboard` is tried first and is not assumed: this page runs sandboxed, and
+# where the permission is refused the fallback selects the text so the keyboard shortcut
+# does what the button could not. Failing silently would be the worse outcome by far --
+# a person finds out the copy did nothing when they paste into the thread.
+STANDUP_JS = r"""
+(function(){
+  var btn=document.getElementById('sucopy');
+  if(!btn) return;
+  var text=btn.getAttribute('data-text')||'';
+  function flash(msg){
+    var was=btn.textContent;
+    btn.textContent=msg; btn.dataset.done='1';
+    setTimeout(function(){ btn.textContent=was; btn.dataset.done='0'; },1600);
+  }
+  function fallback(){
+    var ta=document.createElement('textarea');
+    ta.value=text; ta.setAttribute('readonly','');
+    ta.style.position='fixed'; ta.style.top='-1000px';
+    document.body.appendChild(ta); ta.select();
+    var ok=false;
+    try{ ok=document.execCommand('copy'); }catch(e){ ok=false; }
+    document.body.removeChild(ta);
+    flash(ok?'copied':'press ⌘/ctrl-C');
+  }
+  btn.addEventListener('click',function(){
+    if(navigator.clipboard&&navigator.clipboard.writeText){
+      navigator.clipboard.writeText(text).then(function(){ flash('copied'); },fallback);
+    } else { fallback(); }
+  });
+})();
+"""
+
+
+def standup_block(data, here, fps):
+    """The next standup's notes, as something to talk from rather than something to read.
+
+    arc-standup did the assembling; this does the setting, and the two decisions worth
+    naming are both about what is *not* here.
+
+    There is no per-line evidence control -- no ✕, no park, no file-as. Every other block
+    on this page is a thing to act on and carries the controls for acting on it. This one
+    is a thing to say out loud in twenty minutes' time, and it is a projection: the rows it
+    is made of already exist below, with their controls, and acknowledging a debt in the
+    ledger correctly makes it vanish from here on the next build. Controls here would be a
+    second place to dismiss one fact.
+
+    And there is no state. The block never remembers that it was read, whether the standup
+    happened, or what was said last time. It cannot: the window is derived from the clock,
+    so the honest thing for it to show after the meeting is the next meeting's -- which is
+    exactly what it does, the moment the clock passes 10:30.
+    """
+    st = data.get("standup") or {}
+    beats = [b for b in st.get("beats") or [] if b.get("items")]
+    if not st.get("since"):
+        return ""
+
+    def spans(parts):
+        out = []
+        for p in parts or []:
+            if isinstance(p, str):
+                out.append(esc(p))
+                continue
+            t, of, fp = esc(p.get("t", "")), p.get("of"), p.get("fp")
+            if of and fp and fp in fps.get(of, ()):
+                out.append(f'<a href="#{EVIDENCE_ID[of]}{esc(fp)}">{t}</a>')
+            elif p.get("arc") in here:
+                out.append(f'<a href="#{anchor(p["arc"])}">{t}</a>')
+            elif p.get("url"):
+                out.append(link(p["url"], t))
+            else:
+                out.append(t)
+        return "".join(out)
+
+    head, since = st.get("for") or {}, st.get("since") or {}
+    when = " &middot; ".join(x for x in (
+        f'for {esc(head.get("when"))}' if head.get("when") else "",
+        f'since {esc(since.get("when"))}' if since.get("when") else "") if x)
+
+    out = ['<section class="standup" id="standup">', '<div class="hd">',
+           '<span class="tag">Next standup</span>',
+           f'<span class="when">{when}</span>',
+           f'<button class="cp" id="sucopy" type="button" '
+           f'data-text="{esc(st.get("text") or "")}">copy</button>']
+    out.append("</div>")
+    # Outside the header rather than a wrapping item inside it. As a flex child it was
+    # inheriting `.note`'s 54em max-width, which clamped its hypothetical size to something
+    # that fit beside the title -- so a caveat about the clock read as a third field of the
+    # heading. A sibling has no such argument to lose.
+    if st.get("note"):
+        out.append(f'<p class="sunote">{esc(st["note"])}</p>')
+
+    if not beats:
+        # Said, not omitted. A block that disappears on a quiet window is indistinguishable
+        # from one that broke, and the difference matters most on the morning you are about
+        # to stand up and talk.
+        out.append('<p class="none">Nothing in this window — the last standup covered it.'
+                   "</p></section>")
+        return "".join(out)
+
+    out.append('<ul class="beats">')
+    for b in beats:
+        rows = []
+        for it in b["items"]:
+            body = spans(it.get("parts"))
+            if not body:
+                continue
+            subs = "".join(f"<li>{spans(sb.get('parts'))}</li>"
+                           for sb in it.get("subs") or []
+                           if spans(sb.get("parts")))
+            rows.append(f"<li>{body}"
+                        + (f'<ul class="sub">{subs}</ul>' if subs else "") + "</li>")
+        if not rows:
+            continue
+        out.append(f'<li><span class="bk">{esc(b.get("lead") or b.get("kind") or "")}'
+                   f'</span><ul class="items">{"".join(rows)}</ul></li>')
+    out.append("</ul></section>")
+    return "".join(out)
 
 
 def derive_lede(data, focus_days):
@@ -1847,13 +2020,27 @@ def render(data, lede, focus_days, limit, cost=None):
     # The brief when there is one, the derived lede when there is not, and never both --
     # see brief_block and derive_lede. A hand-passed --lede still wins over either, because
     # it is the one opening paragraph a person typed on purpose.
-    block = brief_block(data, {x.get("id") for x in arcs}, evidence_fps)
+    here = {x.get("id") for x in arcs}
+    block = brief_block(data, here, evidence_fps)
     if lede:
         a(f'<p class="lede">{lede}</p>')
     elif block:
         a(block)
     else:
         a(f'<p class="lede">{derive_lede(data, focus_days)}</p>')
+
+    # --- the next standup, one block wide -----------------------------------
+    # Directly under the brief and above the sprint strip, which is an argument about what
+    # the top of this page is for. The brief is what will bite him and is right to lead
+    # every day. Under it, on the three mornings a week when it is not empty, is the only
+    # other thing he opens the page at 10:15 to get. The sprint strip is a fortnight's
+    # frame and is still there underneath, where a fortnight belongs.
+    #
+    # It is not gated on the day. A block that exists on Monday, Wednesday and Friday and
+    # is absent on Tuesday is one whose absence you have to diagnose; the window is always
+    # well-defined, so on an off day it simply shows what has piled up for the next one,
+    # which is a useful thing to have seen before you get there.
+    a(standup_block(data, here, evidence_fps))
 
     # --- the declared lens, one strip wide ---------------------------------
     # The only thing on this page that comes from a plan rather than from evidence. Every
@@ -2786,6 +2973,7 @@ def render(data, lede, focus_days, limit, cost=None):
       '<code>work-arcs</code> next builds the page.</span></div>')
     a(f"<script>{PARK_JS}</script>")
     a(f"<script>{INTERACT_JS}</script>")
+    a(f"<script>{STANDUP_JS}</script>")
 
     a("<footer>Derived, never declared — arcs come from the files your work "
       "touched, not from what branches were named, and which branch is the work comes "

@@ -320,10 +320,10 @@ def arc_head(arc):
     page rather than as the two facts it was trying to be.
     """
     ref, name, aid = arc_ref(arc), arc_name(arc), arc.get("id")
-    if ref and name.upper().startswith(ref.upper()):
-        return [span(name, arc=aid)]
-    if ref:
-        return [span(ref, arc=aid), " ", span(name, arc=aid)]
+    if ref and not name.upper().startswith(ref.upper()):
+        name = f"{ref} {name}"
+    # One span and not two. Both halves point at the same card, so two spans render as two
+    # underlined links with a gap between them, which reads as two destinations.
     return [span(name, arc=aid)]
 
 
@@ -499,12 +499,20 @@ def discussed_beat(data, since):
         # `promised` is what he said he would do and `closed_by` is the evidence work-arcs
         # accepted that he did it. Both, because "I said I'd look at the MR and I did" is
         # one of the few things at a standup that is worth saying about the past.
+        #
+        # Windowed on when it was *closed* and not on when it was promised. A commitment
+        # made three weeks ago and delivered on Tuesday is Tuesday's news; the version of
+        # this that read `asked` put every commitment ever closed into every standup,
+        # which is how a beat stops being about an interval.
+        at = int(float(c.get("closed_ts") or 0))
+        if not in_window(at, since):
+            continue
         promised = clip(c.get("promised") or c.get("title") or "")
         if not promised:
             continue
-        out.append((0, line([f"closed: {promised}",
-                             f" — {clip(c.get('closed_by'), 80)}"
-                             if c.get("closed_by") else ""])))
+        out.append((at, line([f"closed: {promised}",
+                              f" — {clip(c.get('closed_by'), 80)}"
+                              if c.get("closed_by") else ""])))
 
     out.sort(key=lambda x: (-x[0], x[1]["text"]))
     return capped([ln for _, ln in out], "discussed")
@@ -530,8 +538,17 @@ def who_of(row, cap=3):
     return str(who or "someone")
 
 
+# Ledger refs that identify a kind of place rather than a place. `!10408` and `UB-6663`
+# are things you can say and somebody can go to; two rows both reading "DM (6d)" name
+# nothing at all, and the person is the only handle a DM has.
+VAGUE_REFS = {"DM", "dm", ""}
+
+
 def ref_span(row):
     ref = row.get("ref") or ""
+    if ref in VAGUE_REFS:
+        who = row.get("who")
+        ref = (who if isinstance(who, str) else "") or ref
     return span(ref, of="ledger", fp=row.get("fp"), url=row.get("url")) if ref else ""
 
 
@@ -612,7 +629,10 @@ def group_line(rows, few, many, who_label):
     parts = fill(few if few_enough else many,
                  rows if few_enough else rows[:1], len(rows))
     who = {who_of(r) for r in rows} if few_enough else {who_of(rows[0])}
-    if len(who) == 1 and who != {"someone"}:
+    # Not when the reference already is the person. A DM has no ref of its own, so
+    # `ref_span` falls back to whoever is in it, and appending the name again gives
+    # "waiting on me in a DM: billcheung — billcheung".
+    if len(who) == 1 and who != {"someone"} and next(iter(who)) not in text_of(parts):
         parts.append(f" — {who_label}{who.pop()}")
     return line(parts)
 
@@ -741,7 +761,10 @@ def build(data, now=None):
         beats.append({"kind": kind, "lead": lead, "items": items})
 
     note = ""
-    if cad.get("just_opened") and not any(b["items"] for b in beats[:2]):
+    # Said whenever the window is short, not only when it came back empty. "There is one
+    # thing here because the last standup was an hour ago" and "there is one thing here
+    # because you did one thing since Friday" are very different facts to stand up on.
+    if cad.get("just_opened"):
         ago = since.get("ago") or "moments"
         note = (f"this window opened {ago} ago — everything before it was said at "
                 f"{since.get('when', 'the last standup')}")
