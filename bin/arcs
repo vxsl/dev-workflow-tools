@@ -128,6 +128,26 @@ fi
 arcs-page --focus "$FOCUS" --out "$OUT" ${cost_arg+"${cost_arg[@]}"} \
     ${page_args+"${page_args[@]}"} <"$graph"
 
+# The standup block, kept beside the page where something other than a browser can read it.
+# The page is the only artifact this pipeline used to leave behind, which made the notes
+# reachable exactly one way: by opening it. arc-standup-notify reads this at 10:15 on a
+# standup morning, and reads `.text` -- the same field the copy button carries -- so the
+# spoken version, the pasted version and the notified version stay one composition.
+#
+# Written here rather than in arc-standup, because arc-standup is a filter and a filter
+# that writes to a state directory would let a test or an `--at` experiment clobber the
+# real prep. And written after the page rather than before it: a sidecar from a build that
+# died is notes for a page nobody is looking at.
+# `else empty end` and not a bare `.standup`: jq reads `null + {...}` as the object alone,
+# so a graph that never reached this stage would leave a sidecar with a build time and no
+# notes in it -- which arc-standup-notify would then have to refuse for the wrong reason.
+if jq -e 'if .standup then .standup + {built_at: (now | floor)} else empty end' \
+        <"$graph" >"$STATE/standup.json.tmp" 2>/dev/null; then
+    mv "$STATE/standup.json.tmp" "$STATE/standup.json"
+else
+    rm -f "$STATE/standup.json.tmp"
+fi
+
 finished=1
 echo
 echo "  page:  $OUT"

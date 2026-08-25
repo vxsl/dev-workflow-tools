@@ -719,12 +719,60 @@ threads a run), `WORK_ARCS_SLACK_THREAD_JOBS` (6 concurrent) and
 `WORK_ARCS_SLACK_THREAD_MODEL` (falls back to `WORK_ARCS_COMMIT_MODEL`, then `sonnet`). For
 the standup block: `STANDUP_DAYS` (`mon,wed,fri`), `STANDUP_TIME` (`10:30`), `STANDUP_TZ`
 (`America/Los_Angeles`), `STANDUP_STALE_DAYS` (30 — where a debt stops being news),
-`STANDUP_QUOTE_MAX` (110 characters) and the per-beat caps `STANDUP_MOVED_MAX` (6),
-`STANDUP_DISCUSSED_MAX` (6), `STANDUP_BLOCKED_MAX` (6) and `STANDUP_NEXT_MAX` (4).
+`STANDUP_QUOTE_MAX` (110 characters) and the per-beat caps `STANDUP_MOVED_MAX` (3),
+`STANDUP_DISCUSSED_MAX` (3), `STANDUP_BLOCKED_MAX` (2) and `STANDUP_NEXT_MAX` (2).
 
 ```bash
 arc-standup --text                 # the notes, without building a page
 arc-standup --at 2026-08-24T09:00  # any standup's window, without waiting for it
+```
+
+### `arc-standup-notify`
+The block above was correct for weeks and was not being used, because correct is not the
+same as present: it sits on a page you have to remember to open, and the quarter hour
+before a call is exactly when nobody remembers a page exists. Two weeks of measurement
+found not one of the page's own controls ever touched. So the same eight lines now arrive
+on the screen at 10:15 on a standup morning — a desktop notification carrying the block
+verbatim, with the artifact URL as its last line.
+
+**It delivers the morning's composition rather than a fresh one**, and that is a choice
+rather than a shortcut. A re-run at 10:10 would cost model calls, would have to sit behind
+the quota guard and the lock, and would make the notification only as reliable as five
+minutes of git, GitLab, Jira and Slack on a laptop that has been awake for ten. And the
+staleness is not where it looks: the window opens at the *last* standup and closes at the
+*next* one, so the 07:10 build and a 10:15 read on the same morning are asking about the
+same interval. What the morning's text is missing is the three hours before the call, which
+is the part still in your head. `arcs` leaves the block in `standup.json` beside the page,
+carrying the same `text` field the *copy* button carries, so the spoken, pasted and
+notified versions are one composition.
+
+**It skips rather than catches up.** The timer sets `Persistent=false`, the exact opposite
+of the refresh timer and for the mirror-image reason: a rebuild missed at 07:10 is worth
+doing at 08:04 when the lid opens, and prep missed at 10:15 is worth nothing at 11:00
+because the standup has happened. The schedule is a convenience and not the authority —
+`--install-timer` derives `OnCalendar` (days, time, timezone) from `STANDUP_DAYS`,
+`STANDUP_TIME` and `STANDUP_TZ` minus the lead, and the program re-derives the same
+calendar on every run through `arc-standup`'s own `cadence()`. A cadence changed in `.env`
+and never reinstalled costs a wasted wake-up, never a wrong one.
+
+**It gives and never asks**, which is the whole difference between this and a status bot.
+No question, no queue, at most one notification per standup, and silence when the block has
+nothing in it. It is silent on failure too — every refusal writes a sentence to
+`refresh.log` instead, because an unexplained absence is the failure this workstream keeps
+rediscovering. Five refusals it will log by name: no prep on disk, prep composed for a
+standup that has been and gone, an empty block, the wrong quarter hour, and one already
+delivered this morning.
+
+Env: `STANDUP_NOTIFY_LEAD` (15 minutes before the standup), `WORK_ARCS_ARTIFACT_URL` (the
+line that makes the page reachable from the popup) and `WORK_ARCS_NOTIFY` (the notifier,
+`~/bin/notification/claude-notify.sh`). The cadence knobs are `arc-standup`'s, shared
+rather than duplicated.
+
+```bash
+arc-standup-notify --install-timer   # Mon,Wed,Fri 10:15, derived from the cadence
+arc-standup-notify --check           # what it would do right now, and why
+arc-standup-notify --print           # the prep it is holding
+arc-standup-notify --force           # send it anyway, whatever the clock says
 ```
 
 ### `arcs-refresh`

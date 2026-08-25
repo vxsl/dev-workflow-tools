@@ -1,0 +1,38 @@
+# work-arcs-standup.timer -- fifteen minutes before each standup, and never afterwards.
+#
+# Persistent is FALSE here, and that is the one line worth reading twice, because the timer
+# beside this one sets it true for the mirror-image reason. A rebuild missed at 07:10 while
+# the lid was shut is worth doing at 08:04 when it opens: the page is the same page whenever
+# it is built. Prep missed at 10:15 is worth nothing at 11:00, because the standup has
+# happened and what would arrive is a reminder to prepare for a meeting you already gave.
+# Skip, do not catch up.
+#
+# Being false is systemd's default, so the line below is redundant to systemd and not to
+# the next person to read the two files together. It is stated so that the difference is
+# visible rather than inferred from an absence.
+#
+# WakeSystem is not set, for the same reason it is not set on the refresh: a laptop in a
+# bag should not come out of suspend to tell nobody about a standup.
+#
+# The schedule is a convenience, not the authority. `arc-standup-notify --install-timer`
+# derives OnCalendar -- days, time, timezone -- from STANDUP_DAYS/STANDUP_TIME/STANDUP_TZ
+# minus the lead, so it agrees with the program at install time; the program re-derives the
+# same calendar on every run and refuses outside the window regardless. A cadence changed
+# in .env and never reinstalled therefore costs a wasted wake-up, never a wrong one.
+
+[Unit]
+Description=Deliver the standup prep before each standup
+
+[Timer]
+OnCalendar=Mon,Wed,Fri 10:15 America/Los_Angeles
+Persistent=false
+
+# The window the program will accept is fifteen minutes wide and closes at the standup, so
+# a minute of systemd's default slack is harmless -- but this one is named after a time of
+# day in the README and may as well mean it.
+AccuracySec=30s
+
+Unit=work-arcs-standup.service
+
+[Install]
+WantedBy=timers.target

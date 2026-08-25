@@ -1,0 +1,499 @@
+#!/usr/bin/env -S python3 -u
+"""
+arc-standup-notify: hand the standup prep over fifteen minutes before the standup.
+
+The eight lines this delivers have been correct for weeks and were still not being used,
+because correct is not the same as present. They sit on a page that has to be opened, and
+the quarter hour before a Monday, Wednesday or Friday call is exactly the moment nobody
+remembers a page exists -- measured, over two weeks: not one of the page's own controls
+was ever touched. So this is the same composition, pushed instead of pulled.
+
+**A program of its own rather than a flag on arcs-refresh.** arcs-refresh is a build
+runner, and its whole body -- a quota guard, a lock, a preflight, a pipeline -- is there
+because a rebuild spends money and moves a run-over-run baseline. This spends nothing,
+builds nothing and takes no lock: it reads one string off the disk and puts it on a
+screen. Arriving as a flag would mean inheriting a preflight for programs it never runs
+and a guard against a bill it cannot incur. What it does share is the log. `refresh.log`
+is where the unattended half of this workstream accounts for itself, and a second file to
+forget to look in is worse than one shared file with a prefix on the line.
+
+**Why the morning's text and not a fresh one.** The 07:10 build's composition is three
+hours old by 10:15, and re-running the pipeline slice at 10:10 was the alternative. It
+loses on three counts, and only the third is interesting.
+
+The dull two: a run costs model calls, so it would have to sit behind the quota guard and
+the lock, and the notification's reliability would become the pipeline's -- five minutes
+of git, GitLab, Jira and Slack between the timer and the screen, on a laptop that has been
+awake for ten minutes. Prep that arrives at 10:22, or not at all because the wifi was
+still associating, is worse than prep that arrives at 10:15 slightly short.
+
+The third is that the staleness is not where it looks. arc-standup's window opens at the
+*last* standup and closes at the *next* one, so the 07:10 build on a Wednesday and a 10:15
+read on the same Wednesday are answering about the same interval: Monday 10:30 to now. The
+selection is not stale at all. What the morning's text is missing is what happened between
+07:10 and 10:15 -- which is the one part of the last two days still in his head. The prep
+is here to recover Friday afternoon, not this morning.
+
+That is also the freshness test, and it is exact rather than a guess at an age: the sidecar
+records the standup it was composed for, and it is delivered only when that is the standup
+about to happen. A page built any time since Monday's call is prep for Wednesday's. A page
+built before Monday's call is prep for a meeting that has been and gone -- and that is
+silence plus a line in the log, never the wrong eight lines.
+
+The sidecar is `standup.json` beside the page, written by `arcs` at the end of a finished
+build. It carries `text` verbatim, which is the field the page's copy button also carries,
+so the spoken version, the pasted version and the notified version stay one composition --
+arc-standup's rule, and the reason nothing here re-composes anything.
+
+**The clock is checked twice, and nothing catches up.** The timer this installs sets
+`Persistent=false`, which is the exact opposite of the refresh timer beside it and for the
+exact same reason read backwards: a rebuild missed at 07:10 is worth doing at 08:04 when
+the lid opens, and prep missed at 10:15 is worth nothing at 11:00 because the standup has
+happened. Skip, do not catch up. But a schedule is a convenience and not the authority --
+the cadence lives in `STANDUP_DAYS`/`STANDUP_TIME`/`STANDUP_TZ` and is read here through
+arc-standup's own `cadence()`, so a knob changed in .env changes what this does on the
+next run whether or not anybody remembered to reinstall the unit. The gate is therefore in
+the program: it speaks only in the window that closes when the standup opens, and a unit
+that fires at the wrong time produces a logged refusal rather than a late interruption.
+
+**It gives, and never asks.** No question, no queue, no "did you update the board" -- the
+shape being avoided here is a status bot, and a prompt that arrives uninvited is one the
+eye learns to skip. At most one notification per standup, recorded in a marker beside the
+sidecar. Silence when the block has nothing to say, and silence on every failure: what a
+failure gets is a line in refresh.log, because a job nobody watches has to be able to say
+what it did and an unexplained silence is the one thing this whole workstream keeps
+relearning.
+
+    arc-standup-notify                  gate on the clock, then notify -- what the timer runs
+    arc-standup-notify --check          say what it would do and why, and do nothing
+    arc-standup-notify --print          print the prep it holds, to stdout
+    arc-standup-notify --force          notify now, whatever the clock and the marker say
+    arc-standup-notify --at 2026-08-26T10:16   pretend it is that instant
+    arc-standup-notify --install-timer  the systemd user timer, derived from the cadence
+    arc-standup-notify --uninstall-timer
+
+Tuning, read from .env or the environment:
+    STANDUP_NOTIFY_LEAD    minutes before the standup this speaks in       (default 15)
+    STANDUP_DAYS/TIME/TZ   arc-standup's cadence, shared and not duplicated
+    WORK_ARCS_ARTIFACT_URL the published page, named in the last line of the notification
+    WORK_ARCS_NOTIFY       the notifier to hand the text to
+                                        (~/bin/notification/claude-notify.sh)
+
+Exit codes are distinct because a unit reads them: 0 delivered, 3 decided not to
+speak and said why in the log, 1 it should have spoken and the delivery failed, 2 a
+bad argument. Only 1 is a failure -- the timer's unit names 3 in SuccessExitStatus,
+because "today is not a standup day" sitting in `systemctl --user status` as a red
+line is how a status command trains you to stop reading it.
+"""
+
+import argparse
+import importlib.machinery
+import importlib.util
+import os
+import json
+import re
+import subprocess
+import sys
+from datetime import datetime, timedelta
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+REPO = HERE.parent
+
+STATE = (Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
+         / "work-arcs")
+SIDECAR = STATE / "standup.json"
+MARKER = STATE / "standup-notified.json"
+LOG_FILE = STATE / "refresh.log"
+
+UNIT_DIR = (Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+            / "systemd" / "user")
+SERVICE_UNIT = "work-arcs-standup.service"
+TIMER_UNIT = "work-arcs-standup.timer"
+
+SYSTEMD_DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+
+# --------------------------------------------------------------------------- the environment
+#
+# Read here rather than left to the unit, and the reason is the same one the arcs-refresh
+# header spends four paragraphs on: a systemd user service gets an environment nobody
+# tested against, and the cadence knobs live in .env. `EnvironmentFile=` would half-work --
+# it does not know about `export`, quotes or anything else a shell file may carry -- so the
+# parse is here, where the same call serves a timer, a cron line and a person typing the
+# name. Anything already set wins: an override on the command line is an override.
+
+def load_env(path=None):
+    path = Path(path or REPO / ".env")
+    if not path.is_file():
+        return
+    for raw in path.read_text(errors="replace").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].strip()
+        m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$", line)
+        if not m:
+            continue
+        key, val = m.group(1), m.group(2).strip()
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in "\"'":
+            val = val[1:-1]
+        os.environ.setdefault(key, val)
+
+
+def arc_standup():
+    """arc-standup as a module, for its cadence and nothing else.
+
+    Imported rather than shelled out to because the question being asked -- when is the
+    next standup, in which timezone, with which fallbacks for a typo in STANDUP_DAYS -- is
+    already answered there in sixty lines that are already tested. A second implementation
+    of a calendar is a second calendar, and the two disagree the first time daylight
+    saving moves.
+    """
+    src = HERE / "arc-standup"
+    loader = importlib.machinery.SourceFileLoader("arc_standup", str(src))
+    spec = importlib.util.spec_from_loader("arc_standup", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+# --------------------------------------------------------------------------- saying what happened
+
+def log(msg):
+    """One line in the refresh log, prefixed so the two programs sharing it stay legible."""
+    stamp = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S%z")
+    try:
+        STATE.mkdir(parents=True, exist_ok=True)
+        with LOG_FILE.open("a") as fh:
+            fh.write(f"{stamp}  standup-notify: {msg}\n")
+    except OSError:
+        pass
+    if sys.stdout.isatty():
+        print(msg)
+
+
+# --------------------------------------------------------------------------- the gate
+#
+# Every refusal is a sentence rather than a boolean, because the only witness to a morning
+# this said nothing on is the log, and "no" is not a diagnosis. The order is the order a
+# person would ask in: is there prep, is it for this meeting, does it say anything, is it
+# time, and have I already handed it over.
+
+def read_sidecar():
+    try:
+        data = json.loads(SIDECAR.read_text())
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def read_marker():
+    try:
+        data = json.loads(MARKER.read_text())
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def write_marker(target_iso, now):
+    try:
+        STATE.mkdir(parents=True, exist_ok=True)
+        MARKER.write_text(json.dumps(
+            {"v": 1, "for": target_iso, "at": now.isoformat()}, indent=1) + "\n")
+    except OSError:
+        pass
+
+
+def fmt_minutes(mins):
+    if mins < 90:
+        return f"{int(round(mins))} min"
+    hours = mins / 60
+    if hours < 36:
+        return f"{hours:.0f}h"
+    return f"{hours / 24:.0f}d"
+
+
+def decide(cad, st, now, lead, force=False):
+    """Whether to speak, and the sentence that says why either way.
+
+    Returns (fire, why, overrode) -- `overrode` naming the gates --force walked past, so a
+    forced delivery cannot be mistaken in the log for one the clock asked for.
+    """
+    overrode = []
+    if st is None:
+        return False, ("no prep on disk — nothing has built "
+                       f"{SIDECAR} yet (run arcs)"), overrode
+
+    target = (cad.get("for") or {}).get("iso")
+    if not target:
+        return False, "the cadence names no upcoming standup", overrode
+
+    # The freshness test, and the whole of it: the prep names the meeting it was composed
+    # for. Same meeting, right window -- a build from any time since the last standup was
+    # computing this exact interval. A different meeting means the page has not been
+    # rebuilt since that one happened, and its notes are a record of a call already given.
+    built_for = (st.get("for") or {}).get("iso")
+    if built_for != target:
+        was = (st.get("for") or {}).get("when") or "an earlier standup"
+        why = (f"the prep on disk is for {was}, which has been and gone — nothing has "
+               "rebuilt the page since")
+        if not force:
+            return False, why, overrode
+        overrode.append("staleness")
+
+    if st.get("empty"):
+        why = "nothing to report in this window — saying so out loud is the standup's job"
+        if not force:
+            return False, why, overrode
+        overrode.append("an empty block")
+
+    try:
+        when = datetime.fromisoformat(target)
+    except ValueError:
+        return False, f"the cadence gave an unreadable instant ({target!r})", overrode
+    minutes = (when - now).total_seconds() / 60.0
+
+    # Open on one side only. Below zero cannot happen -- arc-standup's `for` is the next
+    # standup at or after `now` -- but the standup minute itself is deliberately outside:
+    # at 10:30 the call is starting and an interruption is no longer prep.
+    if not (0 < minutes <= lead):
+        day = (cad.get("for") or {}).get("day", "the next standup")
+        why = (f"{day}'s standup is {fmt_minutes(minutes)} away — this speaks in the "
+               f"{lead} minutes before one, and never after it has started")
+        if not force:
+            return False, why, overrode
+        overrode.append("the clock")
+
+    seen = read_marker().get("for")
+    if seen == target:
+        why = f"already delivered for {(cad.get('for') or {}).get('day', 'this standup')}"
+        if not force:
+            return False, why, overrode
+        overrode.append("the once-a-standup marker")
+
+    ago = fmt_minutes(minutes)
+    return True, (f"{(cad.get('for') or {}).get('when', 'the standup')} is {ago} away"
+                  + (f" (--force past {', '.join(overrode)})" if overrode else "")), overrode
+
+
+# --------------------------------------------------------------------------- delivery
+
+def summary_line(cad, now):
+    head = cad.get("for") or {}
+    try:
+        mins = (datetime.fromisoformat(head["iso"]) - now).total_seconds() / 60.0
+        lead = f"in {fmt_minutes(mins)}"
+    except (KeyError, ValueError):
+        lead = "soon"
+    return f"Standup {lead} — {head.get('when', 'next')}"
+
+
+def body_text(st):
+    """The block, plus the one line that makes the page reachable from the popup.
+
+    The URL is a line of the body rather than a notification action: claude-notify.sh
+    fires and forgets, so there is no process left alive for an action to call back into,
+    and dunst offers a URL in a notification body to the middle click and the context menu
+    on its own. Inventing a second notifier to gain a button would be a worse trade than
+    the one line costs.
+    """
+    text = (st.get("text") or "").rstrip("\n")
+    url = os.environ.get("WORK_ARCS_ARTIFACT_URL", "").strip()
+    if url:
+        text += f"\n\n{url}"
+    return text
+
+
+def pango_escape(s):
+    """dunst is configured with markup=full, so the body is parsed as Pango markup.
+
+    An ampersand in a ticket subject would make the whole block fail to parse, and what
+    dunst shows for that is not the block. Three characters, escaped where the notifier
+    cannot do it for us -- it takes a body and passes it straight through.
+    """
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def notifier():
+    return Path(os.environ.get(
+        "WORK_ARCS_NOTIFY", str(Path.home() / "bin/notification/claude-notify.sh")))
+
+
+def deliver(summary, body):
+    exe = notifier()
+    if not os.access(exe, os.X_OK):
+        return False, f"no notifier at {exe}"
+    try:
+        r = subprocess.run([str(exe), summary, pango_escape(body)],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                           timeout=30)
+    except OSError as e:
+        return False, f"could not run {exe} ({e})"
+    except subprocess.TimeoutExpired:
+        return False, f"{exe} did not return within 30s"
+    if r.returncode != 0:
+        err = (r.stderr or b"").decode(errors="replace").strip().splitlines()
+        return False, f"{exe.name} exited {r.returncode}" + (f": {err[-1]}" if err else "")
+    return True, ""
+
+
+# --------------------------------------------------------------------------- the timer
+#
+# Derived from the cadence at install time rather than typed, so the unit and the program
+# cannot disagree about which mornings are standup mornings -- and the program is still the
+# authority, because a knob changed after an install changes the gate and only the gate.
+# The timezone rides in the OnCalendar expression: the whole cadence is a wall clock in one
+# city, and a unit that says 10:15 in whatever zone the laptop woke up in is the same
+# silent hours-off bug arc-standup's `zone()` exists to avoid.
+
+def oncalendar(cad, lead):
+    days = ",".join(SYSTEMD_DAYS[d] for d in cad.get("days") or [])
+    hh, mm = (cad.get("time") or "10:30").split(":")
+    at = (datetime(2000, 1, 1, int(hh), int(mm)) - timedelta(minutes=lead)).strftime("%H:%M")
+    tz = cad.get("tz") or ""
+    return f"{days} {at}" + (f" {tz}" if tz else "")
+
+
+def have_systemd_user():
+    try:
+        return subprocess.run(["systemctl", "--user", "show-environment"],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                              timeout=15).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def install_timer(cad, lead):
+    tmpl = REPO / "systemd"
+    for unit in (SERVICE_UNIT, TIMER_UNIT):
+        if not (tmpl / unit).is_file():
+            print(f"arc-standup-notify: no {unit} in {tmpl}", file=sys.stderr)
+            return 2
+    if not have_systemd_user():
+        print("arc-standup-notify: no systemd user manager answering here.",
+              file=sys.stderr)
+        return 2
+
+    when = oncalendar(cad, lead)
+    UNIT_DIR.mkdir(parents=True, exist_ok=True)
+    svc = (tmpl / SERVICE_UNIT).read_text()
+    svc = re.sub(r"(?m)^ExecStart=.*$", f"ExecStart={Path(__file__).resolve()}", svc)
+    (UNIT_DIR / SERVICE_UNIT).write_text(svc)
+    tmr = (tmpl / TIMER_UNIT).read_text()
+    tmr = re.sub(r"(?m)^OnCalendar=.*$", f"OnCalendar={when}", tmr)
+    (UNIT_DIR / TIMER_UNIT).write_text(tmr)
+
+    subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
+    subprocess.run(["systemctl", "--user", "enable", "--now", TIMER_UNIT], check=False)
+    print(f"installed: {UNIT_DIR / TIMER_UNIT} (OnCalendar={when}, Persistent=false)")
+    print(f"           derived from STANDUP_DAYS/STANDUP_TIME/STANDUP_TZ minus {lead} min")
+    subprocess.run(["systemctl", "--user", "list-timers", "--all", "--no-pager", TIMER_UNIT],
+                   check=False)
+    return 0
+
+
+def uninstall_timer():
+    if have_systemd_user():
+        subprocess.run(["systemctl", "--user", "disable", "--now", TIMER_UNIT],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    for unit in (TIMER_UNIT, SERVICE_UNIT):
+        try:
+            (UNIT_DIR / unit).unlink()
+        except FileNotFoundError:
+            pass
+    if have_systemd_user():
+        subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
+    print(f"removed {TIMER_UNIT} and {SERVICE_UNIT} from {UNIT_DIR}")
+    return 0
+
+
+# --------------------------------------------------------------------------- entry
+
+def main(argv=None):
+    p = argparse.ArgumentParser(
+        description="Deliver the standup prep shortly before the standup.",
+        add_help=False)
+    p.add_argument("-h", "--help", action="store_true")
+    p.add_argument("--check", action="store_true",
+                   help="say what it would do and why, and do nothing")
+    p.add_argument("--print", dest="show", action="store_true",
+                   help="print the prep it holds")
+    p.add_argument("--force", action="store_true",
+                   help="notify whatever the clock and the marker say")
+    p.add_argument("--at", default="",
+                   help="pretend it is this instant (ISO 8601)")
+    p.add_argument("--install-timer", action="store_true")
+    p.add_argument("--uninstall-timer", action="store_true")
+    args = p.parse_args(argv)
+
+    if args.help:
+        sys.stdout.write(__doc__.lstrip("\n"))
+        return 0
+
+    load_env()
+    lead = 15
+    raw_lead = os.environ.get("STANDUP_NOTIFY_LEAD", "")
+    if raw_lead:
+        try:
+            lead = int(raw_lead)
+        except ValueError:
+            log(f"could not read STANDUP_NOTIFY_LEAD={raw_lead!r} — using 15")
+    if lead <= 0:
+        log(f"STANDUP_NOTIFY_LEAD={lead} is not a lead time — using 15")
+        lead = 15
+
+    su = arc_standup()
+
+    now = None
+    if args.at:
+        try:
+            now = datetime.fromisoformat(args.at)
+        except ValueError:
+            print(f"arc-standup-notify: --at {args.at!r} is not an ISO 8601 instant",
+                  file=sys.stderr)
+            return 2
+
+    if args.uninstall_timer:
+        return uninstall_timer()
+
+    cad = su.cadence(now)
+    if args.install_timer:
+        return install_timer(cad, lead)
+
+    now = cad["now"]
+    st = read_sidecar()
+
+    if args.show:
+        if st is None:
+            print(f"arc-standup-notify: no prep at {SIDECAR}", file=sys.stderr)
+            return 3
+        sys.stdout.write(body_text(st) + "\n")
+        return 0
+
+    fire, why, _ = decide(cad, st, now, lead, force=args.force)
+
+    # The same code the real run would exit with, so `--check && something` reads the way
+    # it looks and a person comparing the two is not comparing two conventions.
+    if args.check:
+        print(("would notify: " if fire else "would say nothing: ") + why)
+        return 0 if fire else 3
+
+    if not fire:
+        log(f"said nothing — {why}")
+        return 3
+
+    ok, err = deliver(summary_line(cad, now), body_text(st))
+    if not ok:
+        log(f"prep was ready and could not be delivered — {err}")
+        return 1
+
+    write_marker((cad.get("for") or {}).get("iso"), now)
+    said = sum(len(b.get("items") or []) for b in st.get("beats") or [])
+    log(f"delivered {said} line" + ("" if said == 1 else "s") + f" — {why}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
