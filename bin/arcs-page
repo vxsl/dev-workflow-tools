@@ -3130,6 +3130,12 @@ def render(data, lede, focus_days, limit, cost=None):
               + esc(q["arc"]) + "? <br>" + esc(q.get("why") or "")
               + (f'.<br>Its strongest tie here is <code>{esc(q["with"])}</code>'
                  + (f", on {esc(files)}" if files else "") if q.get("with") else "")
+              # Said with the question because it is a fact about the answer, not about
+              # the doubt: this branch carries the arc's merge request, so prying it
+              # out moves the arc's subject and its ticket too.
+              + ("<br>This is the branch the arc&rsquo;s merge request points at — "
+                 "prying it out takes the arc&rsquo;s subject with it."
+                 if q.get("authoritative") else "")
               + "</span>")
             a("</div>")
         a("</div>")

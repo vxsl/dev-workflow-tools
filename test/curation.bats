@@ -151,20 +151,50 @@ print(mm["UB-1000"]["confidence"], mm["UB-1000"]["named"])
     [[ "$output" == "1.0 True"* ]]
 }
 
-@test "the authoritative branch and superseded copies never reach the queue" {
-    # These two are work-arcs' to see, not the clusterer's: which branch IS the work
-    # depends on which one an open merge request points at, and whether a branch is a
-    # copy depends on patch-ids. Both would otherwise sit at the top of every queue,
-    # since a backup shares its original's files and nothing else.
+@test "a superseded copy never reaches the queue" {
+    # Whether a branch is a copy depends on patch-ids, which is work-arcs' to see and not
+    # the clusterer's. A backup shares its original's files and nothing else, so it would
+    # otherwise sit near the top of every queue -- asking the question its original has
+    # already been asked.
     run wa '
-mem = {"the-work": m(0.05), "the-work-bak": m(0.05), "stranger": m(0.05)}
-a = arc("UB-1000", [br("the-work", authoritative=True),
-                    br("the-work-bak", superseded_by="the-work"),
+mem = {"the-work": m(1.0), "the-work-bak": m(0.05), "stranger": m(0.05)}
+a = arc("UB-1000", [br("the-work"), br("the-work-bak", superseded_by="the-work"),
                     br("stranger")])
 print(names(wa.curation_queue([a], mem, {})))
 '
     [ "$status" -eq 0 ]
     [[ "$output" == "['stranger']" ]]
+}
+
+@test "a thin authoritative branch is asked about, and the question says what it costs" {
+    # Authority follows the newest merge request, not the weight of the work, so an arc's
+    # subject can be decided by a stranger: UL-1852 is two commits of geo_filter migration
+    # holding a fifteen-branch metadata-geometry arc'"'"'s merge request, in on the two-file
+    # floor. Excluding the authoritative branch hid exactly that -- the one case where the
+    # arc is wrong about its own subject, which is worse than a stranger merely standing
+    # in it.
+    run wa '
+mem = {"stranger": m(0.05), "the-bulk": m(1.0)}
+a = arc("UB-1000", [br("stranger", authoritative=True), br("the-bulk")])
+q = wa.curation_queue([a], mem, {})
+print(names(q), q[0]["authoritative"])
+print("MR" in wa.question_line(q[0]), "merge request" in wa.question_preview(q[0]))
+'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"['stranger'] True"* ]]
+    [[ "$output" == *"True True"* ]]
+}
+
+@test "a well-corroborated authoritative branch is still never asked about" {
+    # The score does the work the exclusion used to: measured on this corpus, 51 of 64
+    # authoritative branches in clustered arcs are above the line on their own evidence.
+    run wa '
+mem = {"the-work": m(0.9), "other": m(1.0)}
+a = arc("UB-1000", [br("the-work", authoritative=True), br("other")])
+print(names(wa.curation_queue([a], mem, {})))
+'
+    [ "$status" -eq 0 ]
+    [[ "$output" == "[]" ]]
 }
 
 @test "an arc the clustering did not group is not asked about at all" {

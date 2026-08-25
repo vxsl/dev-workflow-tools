@@ -23,6 +23,15 @@ applying one k everywhere: a hub needs proportionally more evidence to pull a ne
 in. At resolution 3.0 the nine-way TDAT fragmentation becomes one arc while the largest
 component is 6% of entities -- both at once, which neither earlier method managed.
 
+Every membership also carries how confident it is, because the residual error has a
+shape none of the three algorithms can reach: two tickets that edit the same module are
+structurally identical however the weights are set. Rather than tune past that, the
+clusterer states where it is guessing -- what evidence holds each branch in its arc, and
+how thin that evidence is -- and work-arcs turns the thinnest into questions a person
+answers. See membership() and placement_margin(); --score-labels replays this clustering
+against the answers already given, which is how a change to any knob above is shown to be
+an improvement rather than argued to be one.
+
 Read-only, and deliberately so: this tool and its siblings never write to Jira, Slack,
 or a repo. Anything outward-facing happens only when you run it yourself.
 

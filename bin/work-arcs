@@ -29,6 +29,16 @@ rename.
   work-arcs                        a summary, most recently touched first
   work-arcs --active 14            only arcs touched in the last 14 days
   work-arcs --json --snapshot      the graph, and leave a baseline for the next run
+  work-arcs --curate               answer the memberships it is least sure of
+
+One thing the derivation cannot settle, and it is not a bug to be tuned out: two tickets
+that edit the same module are identical by file overlap however the weights are set. The
+model split pass reads the commits and covers the readable part of that; what survives it
+needs a person. So the doubt is published rather than hidden -- every clustered membership
+carries a confidence, the least confident five become a queue, and answering one either
+pins it or pries the branch out. Both answers append to curation-labels.jsonl, which is
+what makes the next proposed change to the clustering measurable instead of arguable:
+`arc-cluster --score-labels` replays a clustering against every judgement already made.
 
 Read-only by default. Runs git, glab, Jira and Slack; the two nuances are that an MR with no
 cached mergeability verdict gets a recompute requested (see collect_mrs), which changes no
@@ -4203,6 +4213,55 @@ def log_answer(row):
         pass
 
 
+def log_from_stores():
+    """Answers the stores hold that the eval set has not seen, added to it.
+
+    The CLI writes a label as it writes a store, but it is not the only thing that
+    answers a question. The page saves confirmed.json and detached.json through the
+    browser's own download, which cannot append to a log; `--detach` predates the eval
+    set entirely and is the same kind of judgement. An eval set missing every answer
+    given anywhere but one command is an eval set that under-counts exactly the
+    surface a person actually used, so the stores are the record and the log is caught
+    up from them.
+
+    Keyed on (branch, answer, timestamp), which is what a store entry and its label
+    share. Idempotent by construction: a row already logged is recognised whichever
+    surface wrote it, so a build can only ever add answers that were genuinely new.
+    """
+    seen = set()
+    try:
+        with CURATION_LABELS.open(errors="replace") as f:
+            for line in f:
+                try:
+                    r = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(r, dict):
+                    seen.add((r.get("branch"), r.get("answer"), r.get("at")))
+    except OSError:
+        pass
+    added = 0
+    for path, answer in ((CONFIRMED, "keep"), (DETACHED, "pry")):
+        store = load_store(path, "the confirmation store" if answer == "keep"
+                           else "the detachment store")
+        for branch, e in sorted(store.items()):
+            if not isinstance(e, dict):
+                continue
+            at = e.get("at")
+            if (branch, answer, at) in seen:
+                continue
+            peers = list(e.get("with") or ())
+            log_answer({"at": at, "answer": answer, "branch": branch,
+                        "arc": e.get("from"), "fp": question_fp(branch, peers),
+                        "with": peers,
+                        # Surface unknown, and said so rather than guessed at: the
+                        # store does not record which control wrote it, and the eval
+                        # set is worth less if one of its fields is a supposition.
+                        "via": "store"})
+            added += 1
+    return added
+
+
 def answer_question(q, keep, cluster_assign):
     """Record one verdict: a pin if the membership is right, a detachment if it is not.
 
@@ -4253,8 +4312,9 @@ def question_line(q):
     scanning for; the claim last because it is the longest and reads as a sentence.
     """
     size = f"+{q['commits']}" if q["commits"] else "no commits"
+    mark = " ← the arc's own MR" if q.get("authoritative") else ""
     return (f"{q['branch'][:38]:<38}  {size:>10}  "
-            f"same work as {q['arc']}?  ({q['why']})")
+            f"same work as {q['arc']}?{mark}  ({q['why']})")
 
 
 def question_preview(q):
@@ -4275,6 +4335,10 @@ def question_preview(q):
     if q.get("files"):
         out.append(f"  shared files            {', '.join(q['files'])}")
     out.append("")
+    if q.get("authoritative"):
+        out.append("  this is the branch the arc's merge request points at, so prying it")
+        out.append("  out takes the arc's subject and ticket with it.")
+        out.append("")
     out.append("  y  yes, same work — pin it, and stop asking while it keeps this company")
     out.append("  n  no, different work — pry it out; it falls back to its own name")
     out.append("  s  skip — no record either way; it comes back next build")
@@ -4361,19 +4425,34 @@ def curation_queue(arcs, membership, cluster_assign, uncertain=(), cap=CURATION_
     curation -- and curation that is not guided is curation that does not happen. So the
     system publishes where it is least sure and asks exactly there.
 
-    Four classes are never asked about, and each is a fact rather than an inference:
+    Three classes are never asked about, and each is a fact rather than an inference:
 
-      the authoritative branch  it IS the work; an arc cannot be wrong about its own
-                                subject, only about who else is standing next to it
       superseded copies         a backup or pre-squash copy belongs wherever the branch
-                                it copies belongs, and asking about it is asking the
-                                same question twice
+                                it copies belongs -- checked by patch-id, not guessed at
+                                from the name -- so asking about it is asking the same
+                                question twice
       ancestry and aliases      a branch cut from another, or the same commit under a
                                 second name (arc-cluster settles these)
       the arc's own ticket      a branch whose name carries the key the arc is named for
 
-    Of those, the first two need merge requests and squash detection to see, which is why
-    they are applied here and not in the clusterer.
+    The authoritative branch was a fourth, on the reasoning that it IS the work and an arc
+    cannot be wrong about its own subject. That reasoning fails in precisely the case this
+    queue exists for. `UL-1852` is two commits of geo_filter migration, held into a
+    fifteen-branch metadata-geometry arc by the two-file corroboration floor, and it is
+    that arc's authoritative branch -- because authority follows the newest merge request,
+    not the weight of the work. Excluding it did not protect a fact; it hid the one arc
+    whose *subject* had been decided by a stranger, which is worse than a stranger merely
+    standing in it.
+
+    So authority is reported with the question rather than suppressing it. It costs
+    nothing to leave in: measured on this corpus, 51 of 64 authoritative branches in
+    clustered arcs score above the line on their own evidence and are never asked about
+    anyway. The thirteen that do not are thirteen arcs whose subject rests on two shared
+    files. What the flag is for is the answer: prying an authoritative branch out takes
+    the arc's merge request with it, and a person should be told that before pressing n.
+
+    Superseded copies and authority both need merge requests and squash detection to see,
+    which is why they are applied here and not in the clusterer.
 
     Ranked by confidence ascending, then by how recently the branch was touched, then by
     how much work is on it, then by name so the order is total and two runs over one
@@ -4408,11 +4487,10 @@ def curation_queue(arcs, membership, cluster_assign, uncertain=(), cap=CURATION_
     for arc in arcs:
         if arc.get("kind") != "cluster" or len(arc.get("branches") or []) < 2:
             continue
-        auth = next((b["name"] for b in arc["branches"] if b.get("authoritative")), None)
         members = [b["name"] for b in arc["branches"]]
         for b in arc["branches"]:
             name = b["name"]
-            if name == auth or b.get("superseded_by"):
+            if b.get("superseded_by"):
                 continue
             m = membership.get(name)
             if not m:
@@ -4457,6 +4535,10 @@ def curation_queue(arcs, membership, cluster_assign, uncertain=(), cap=CURATION_
                 "commits": b.get("commits_ahead", 0),
                 "age_days": b.get("age_days", 999),
                 "flagged_by_model": flagged,
+                # Not a reason to ask and not a reason to stay silent -- a warning about
+                # the answer. Prying this one out takes the arc's merge request, its
+                # ticket and its subject with it.
+                "authoritative": bool(b.get("authoritative")),
             })
     out.sort(key=lambda q: (q["confidence"], q["age_days"], -q["commits"], q["branch"]))
     seen, once = set(), []
@@ -4592,10 +4674,11 @@ def split_assignment(arcs, args):
     Returns (assignment, uncertain) -- the refined branch -> arc-label map, and the
     branches the model kept in a body while saying it could not justify keeping them.
     The second is what the model knows that no structural signal does: it read the
-    commits, decided not to cut, and is not sure. Those go to the front of the curation
+    commits, decided not to cut, and is not sure. Those become eligible for the curation
     queue whatever their structural confidence says, because "the evidence I have does
-    not settle this" is a stronger reason to ask a human than any number derived from
-    file overlap.
+    not settle this" is a reason to ask a human that no amount of file overlap supplies.
+    Eligible, not first: see curation_queue for why a talkative model must not be able
+    to take the queue over.
 
     Degrades the same way every other step does: no arc-brief, no model, or a reply that
     fails to account for every branch leaves the clustering exactly as it was.
@@ -6694,6 +6777,13 @@ def main():
     pinned, stale_confirmed = apply_confirmed(cluster_assign)
     for s in stale_confirmed:
         print(f"⚠ {s['branch']} is no longer confirmed in its arc: {s['why']}",
+              file=sys.stderr)
+    # Before the stores can expire anything else out from under them: an answer given
+    # on the page and saved yesterday is a judgement whether or not the clustering has
+    # since moved past it, and the eval set is the one place that must keep it.
+    caught_up = log_from_stores()
+    if caught_up:
+        print(f"  {caught_up} answer(s) given elsewhere added to the eval set",
               file=sys.stderr)
     if refined or detached:
         arcs, unattached = build_arcs(branches, stashes, mrs, sessions, args.main,

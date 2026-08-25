@@ -130,6 +130,13 @@ Evidence:
 
 SPLIT_CACHE = STATE / "splits.json"
 
+# Editing the text below retires the whole cached generation: the fingerprint keys on the
+# prompt as well as the evidence, deliberately, because a reworded question silently
+# reusing an old reply is the one way a cache keyed on evidence can still go stale. So an
+# edit here is not free, and the price is worth knowing before making one. Measured on the
+# run that bought the `uncertain` field: 48 arcs to re-decide, 22 of them large enough for
+# three votes, 104 headless calls, $28.68 at list prices and about $28 of that opus. The
+# split pass kept opus after the A/B (bec7348) and this is what that costs to re-buy.
 SPLIT_PROMPT = """\
 You are deciding whether a group of git branches is one body of work or several.
 
