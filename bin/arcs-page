@@ -105,138 +105,195 @@ from timespan import fmt_interval  # noqa: E402
 from workscale import work_scale  # noqa: E402
 
 CSS = """
+/* The palette runs warm, and that is the whole of the change. It was blue-black on
+   blue-white -- the temperature of a terminal and of every dashboard anyone has ever been
+   made to read -- and the verdict was "the styling is kind of bad. something about it just
+   doesn\u2019t grab me when i look at it". Paper is warm and ink is warm, so this is warm
+   paper and warm charcoal. Nothing about the severity vocabulary moved: hot is still the
+   thing that has failed, warm the thing that wants an answer, calm the thing somebody else
+   is holding, and they have enough chroma now to register without being read.
+
+   Three families, one job each. Fraunces carries the display voice -- the headline, the
+   section heads, the door numerals -- and its optical-size axis is why: at 3rem it is a
+   masthead and at 1.2rem it is a heading, from one file. Inter is the body and every label.
+   JetBrains Mono is data and only data: a sha, a branch, an iid, a ticket key, a clock, a
+   count. Every face has a real stack behind it, because a page that reads as a fallback
+   grid the one morning fonts.googleapis.com is slow is a page that has been designed once
+   and shipped twice. */
 :root{
-  --ground:#F6F7FA;--surface:#FFFFFF;--surface-2:#EFF1F6;
-  --ink:#161922;--ink-soft:#59616F;--ink-faint:#8A91A0;
-  --hairline:#E2E5EC;--accent:#4453C4;
-  --hot:#A93826;--warm:#9C6414;--calm:#3F6E52;--parked:#6E7585;
-  --hot-wash:#FBF0EE;--warm-wash:#FBF5EC;--calm-wash:#EFF5F1;
-  --quote:#F3F4F8;
-  --serif:ui-serif,Charter,"Bitstream Charter",Georgia,serif;
-  --sans:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
-  --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
+  --ground:#F7F4EE;--surface:#FFFDF9;--surface-2:#EFEAE1;
+  --ink:#1A1712;--ink-soft:#5C554A;--ink-faint:#8B8377;
+  --hairline:#E3DCD1;--accent:#3D48B8;
+  --hot:#B3361F;--warm:#A36A0E;--calm:#3E7050;--parked:#7A7368;
+  --hot-wash:#FAEBE6;--warm-wash:#FAF2E1;--calm-wash:#EBF3EC;
+  --quote:#F1ECE2;
+  --display:"Fraunces",Charter,"Bitstream Charter",Georgia,serif;
+  --serif:var(--display);
+  --sans:"Inter",system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  --mono:"JetBrains Mono",ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
 }
 @media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
-  --ground:#0F1218;--surface:#161A22;--surface-2:#1C212B;
-  --ink:#E3E6EC;--ink-soft:#8F97A6;--ink-faint:#6B7382;
-  --hairline:#262B36;--accent:#93A0F7;
-  --hot:#E27B63;--warm:#DFA24C;--calm:#7CB690;--parked:#79808F;
-  --hot-wash:#241A18;--warm-wash:#241E14;--calm-wash:#16211A;
-  --quote:#1A1F29;}}
+  --ground:#171511;--surface:#1F1C17;--surface-2:#282420;
+  --ink:#EDE7DD;--ink-soft:#A79E90;--ink-faint:#7F776A;
+  --hairline:#302B25;--accent:#A5B0FF;
+  --hot:#F27D5C;--warm:#E8AC4E;--calm:#86C79A;--parked:#8A8275;
+  --hot-wash:#2A1B15;--warm-wash:#291F10;--calm-wash:#18241A;
+  --quote:#221E18;}}
 :root[data-theme="dark"]{
-  --ground:#0F1218;--surface:#161A22;--surface-2:#1C212B;
-  --ink:#E3E6EC;--ink-soft:#8F97A6;--ink-faint:#6B7382;
-  --hairline:#262B36;--accent:#93A0F7;
-  --hot:#E27B63;--warm:#DFA24C;--calm:#7CB690;--parked:#79808F;
-  --hot-wash:#241A18;--warm-wash:#241E14;--calm-wash:#16211A;
-  --quote:#1A1F29;}
+  --ground:#171511;--surface:#1F1C17;--surface-2:#282420;
+  --ink:#EDE7DD;--ink-soft:#A79E90;--ink-faint:#7F776A;
+  --hairline:#302B25;--accent:#A5B0FF;
+  --hot:#F27D5C;--warm:#E8AC4E;--calm:#86C79A;--parked:#8A8275;
+  --hot-wash:#2A1B15;--warm-wash:#291F10;--calm-wash:#18241A;
+  --quote:#221E18;}
 
 *,*::before,*::after{box-sizing:border-box}
 body{margin:0;background:var(--ground);color:var(--ink);font-family:var(--sans);
-     font-size:15px;line-height:1.55;-webkit-font-smoothing:antialiased}
-.page{max-width:72rem;margin:0 auto;padding:2.2rem 1.5rem 5rem}
-/* The masthead: what this page is, and whether to trust this build of it. In the corner,
-   because "Work Arcs" is not news and was never worth 2.4rem on a page whose whole claim is
-   that it opens with the most consequential fact. Every field the stamp ever carried is
-   still here -- the build time, the repo, the window and how it splits, the run-over-run
-   chip -- because those are the facts a reader audits everything below against, and they
-   read perfectly well small. */
-.masthead{display:flex;flex-wrap:wrap;align-items:baseline;gap:.15rem 1rem;
-  margin:0 0 1.4rem;padding-bottom:.5rem;border-bottom:1px solid var(--hairline)}
-h1{font-family:var(--sans);font-weight:600;font-size:.9rem;letter-spacing:.02em;
-   margin:0;flex:none;color:var(--ink-soft)}
-.stamp{font-family:var(--mono);font-size:.72rem;color:var(--ink-faint);
-       display:flex;flex-wrap:wrap;gap:.15rem 1rem;margin:0}
+     font-size:15.5px;line-height:1.55;-webkit-font-smoothing:antialiased;
+     font-feature-settings:"cv05" 1,"cv08" 1}
 
-/* The headline. One sentence, set as the biggest thing on the page, stating the single most
-   consequential fact -- arc-morning's first line, promoted, with that stage's own label for
-   it as an eyebrow above. Display serif and a 33em measure: a headline is read in one pass
-   or it is not a headline, and at the brief's 64em it would be read in three.
+/* The rail, and the reason this reads as a companion rather than as a document. Every
+   section of the page, its own count, and the build stamp, standing still on the left while
+   the work scrolls past on the right -- so "where am I" and "what else is there" are
+   answered without a scroll, and the page has an edge to be laid out against instead of
+   floating in a centred column.
 
-   The eyebrow is mono and tiny against it on purpose. It says what KIND of fact is coming
-   -- "jira disagrees", "open loop", "dropped" -- which is the one thing a display sentence
-   cannot say about itself, and it costs a line of nothing to say it. */
-.headline{margin:0 0 1.1rem}
-.headline .eyebrow{display:block;font-family:var(--mono);font-size:.66rem;
-  text-transform:uppercase;letter-spacing:.11em;color:var(--ink-faint);
-  margin-bottom:.32rem}
-.headline p{font-family:var(--serif);font-weight:500;margin:0;max-width:23em;
-  font-size:clamp(1.5rem,3.5vw,2.25rem);line-height:1.16;letter-spacing:-.022em;
+   position:sticky over position:fixed, so the rail is a grid column with a real width and
+   the content column can be measured against it rather than padded away from a fixed
+   overlay. Under 60rem there is no room for a column, so the grid collapses to one and the
+   nav inside the rail becomes the sticky strip along the top -- same markup, same anchors,
+   same counts, one media query. */
+.shell{display:grid;grid-template-columns:13rem minmax(0,66rem);gap:0 2.6rem;
+  max-width:83rem;margin:0 auto;padding:0 1.6rem}
+.rail{position:sticky;top:0;align-self:start;height:100vh;display:flex;
+  flex-direction:column;gap:1.2rem;padding:2.4rem 0 1.6rem;min-width:0}
+.page{padding:2.4rem 0 6rem;min-width:0}
+@media (max-width:60rem){
+  .shell{display:block;padding:0 1.2rem}
+  .rail{position:static;height:auto;display:block;padding:1.6rem 0 0}
+  .page{padding:1rem 0 5rem}
+}
+/* The masthead: what this page is, at the head of the rail. A title is the one thing on a
+   dashboard that is never news, so it stopped being the largest type here -- but it is the
+   first thing in the rail, because a rail with no name at the top of it is a widget. */
+.masthead h1{font-family:var(--display);font-weight:600;font-size:1.22rem;
+  letter-spacing:-.01em;margin:0;color:var(--ink);line-height:1.1}
+.masthead .sub{font-family:var(--sans);font-weight:600;font-size:.66rem;
+  letter-spacing:.1em;color:var(--ink-faint);margin-top:.3rem}
+/* Whether to trust this build, at the foot of the rail: the build time, the repo, the
+   window and how it splits, and the run-over-run chip. All of it data, so all of it mono,
+   and it sits under the nav because it is the thing you go looking for rather than the
+   thing you read. margin-top:auto pins it to the bottom of a full-height rail; in the
+   collapsed layout the rail is a normal block and it simply follows the nav. */
+.stamp{font-family:var(--mono);font-size:.7rem;line-height:1.5;color:var(--ink-faint);
+  display:flex;flex-direction:column;gap:.15rem;margin-top:auto}
+@media (max-width:60rem){
+  .stamp{flex-direction:row;flex-wrap:wrap;gap:.1rem 1rem;margin:.7rem 0 0}
+}
+
+/* The rail\u2019s nav, which is the mini-map. Every section this run rendered, its own count,
+   one click each. No box, no dividers, no active state: the counts do the work, and an
+   active-section highlight would need a scroll listener to be honest about which one you
+   are in. */
+.minimap{display:flex;flex-direction:column;gap:.04rem;min-width:0;overflow-y:auto}
+.minimap a{display:flex;align-items:baseline;gap:.5rem;text-decoration:none;
+  color:var(--ink-soft);font-size:.86rem;padding:.28rem .5rem;border-radius:5px;
+  margin-left:-.5rem}
+.minimap a:hover{background:var(--surface-2);color:var(--ink)}
+.minimap .mn{font-family:var(--mono);font-size:.72rem;color:var(--ink-faint);
+  font-variant-numeric:tabular-nums;margin-left:auto}
+.minimap a:hover .mn{color:var(--accent)}
+@media (max-width:60rem){
+  /* The strip. Sticky in CSS and nothing else -- navigation is the last thing on a page
+     that should need a script, and this one runs sandboxed. The negative side margins let
+     its ground colour cover the shell\u2019s own padding, so rows do not slide out from under
+     it at the edges, and it stays one line and scrolls sideways rather than stacking. */
+  .minimap{position:sticky;top:0;z-index:5;flex-direction:row;flex-wrap:nowrap;
+    align-items:baseline;gap:0 .1rem;overflow-x:auto;overscroll-behavior-x:contain;
+    margin:.8rem -1.2rem 0;padding:.4rem 1.2rem;background:var(--ground);
+    border-bottom:1px solid var(--hairline);scrollbar-width:none}
+  .minimap::-webkit-scrollbar{display:none}
+  .minimap a{flex:none;white-space:nowrap;margin-left:0;font-size:.8rem}
+  .minimap .mn{margin-left:0}
+}
+
+/* The headline. One sentence, the largest thing on the page, stating the single most
+   consequential fact -- arc-morning\u2019s first line, promoted, with that stage\u2019s own label
+   for it as an eyebrow above. Fraunces at 3rem with its optical-size axis doing the work,
+   on a 21em measure: a headline is read in one pass or it is not a headline.
+
+   The eyebrow is Inter 600 and letterspaced, not caps-mono. A caps-mono kicker over a
+   serif sentence is the voice of a printout, and that voice on every label was most of why
+   this page read as a report. It still says what KIND of fact is coming -- the one thing a
+   display sentence cannot say about itself -- and it now says it in the page\u2019s own voice. */
+.headline{margin:0 0 1.6rem}
+.headline .eyebrow{display:block;font-family:var(--sans);font-weight:600;font-size:.7rem;
+  letter-spacing:.1em;color:var(--accent);margin-bottom:.5rem}
+.headline p{font-family:var(--display);font-weight:500;margin:0;max-width:21em;
+  font-size:clamp(2rem,4.5vw,3rem);line-height:1.08;letter-spacing:-.025em;
   color:var(--ink);text-wrap:balance}
+/* Two steps down for a long sentence. arc-morning composes anything from forty characters
+   to two hundred and twenty -- "Nothing outstanding" and a run-over-run line naming five
+   reviewers and a merge request are both its first line on some morning -- and one size
+   cannot serve both: the long one at 3rem is six lines deep and stops being a headline at
+   about the third. The step is taken off the sentence\u2019s own length, so it is as derived as
+   everything else here and cannot be got wrong by hand. */
+.headline p.hl-m{font-size:clamp(1.7rem,3.4vw,2.3rem);line-height:1.13;max-width:24em}
+.headline p.hl-s{font-size:clamp(1.45rem,2.7vw,1.85rem);line-height:1.2;max-width:28em;
+  letter-spacing:-.018em}
 /* The degradation is several facts rather than one, so it is set a step down. derive_lede
    composes up to two sentences, and two sentences at full display size read as a paragraph
    that has been shouted rather than as a headline. */
-.headline p.lede{font-size:clamp(1.22rem,2.5vw,1.66rem);line-height:1.26;
-  letter-spacing:-.014em;max-width:29em;text-wrap:pretty}
+.headline p.lede{font-size:clamp(1.5rem,3vw,2.1rem);line-height:1.2;
+  letter-spacing:-.02em;max-width:26em;text-wrap:pretty}
 .headline em{color:var(--accent);font-style:normal;font-weight:600}
 .headline a{color:inherit;text-decoration:none;
-  box-shadow:inset 0 -2px 0 0 color-mix(in oklab,var(--accent) 38%,transparent)}
+  box-shadow:inset 0 -2px 0 0 color-mix(in oklab,var(--accent) 45%,transparent)}
 .headline a:hover,.headline a:focus-visible{box-shadow:inset 0 -3px 0 0 var(--accent)}
 
 /* The doors. The same three, in the same order, every time this page is opened: the
    standup, the ledger, what is in play. The first arrangement tried here chose what to
-   lead with from the viewer's clock, and the verdict on that was "i dont like the idea of
+   lead with from the viewer\u2019s clock, and the verdict on that was "i dont like the idea of
    it being unpredictable. emphasizing different sections depending on the time of day is
    not a good solution to what im asking for" -- so nothing on this strip moves, ever.
    Spatial memory is the feature. Everything has a place; nothing has a time.
 
-   Each door carries three lines: what it is, its section's own figure, and its section's
-   own next item. Not tiles and deliberately not shaped like .conditions: those are peers
-   with no exchange rate between them and no order worth claiming, and these are three
-   destinations with one door each. The left edge takes the colour its own section's left
-   edge already takes -- calm for the standup, accent for what is in play -- so the door and
-   the place it lands you are the same object seen twice. That is wayfinding and not
-   severity: nothing here is ranked against anything else here. */
-.cockpit{display:grid;grid-template-columns:repeat(auto-fit,minmax(14rem,1fr));
-  gap:.55rem;margin:0 0 1.4rem;padding:0;list-style:none}
-.cockpit .door{display:flex;flex-direction:column;gap:.15rem;text-decoration:none;
-  background:var(--surface);border:1px solid var(--hairline);border-radius:5px;
-  border-left:3px solid var(--edge,var(--hairline));padding:.6rem .8rem;min-width:0}
-.cockpit .door:hover{border-color:var(--accent);
-  border-left-color:var(--edge,var(--accent))}
+   Each door carries three lines: what it is, its section\u2019s own figure, and its section\u2019s
+   own next item. Borderless surfaces one step off the ground, with a single accent edge on
+   the left -- the same edge its own section wears, so the door and the place it lands you
+   are the same object seen twice. That is wayfinding and not severity: nothing here is
+   ranked against anything else here. */
+.cockpit{display:grid;grid-template-columns:repeat(auto-fit,minmax(13rem,1fr));
+  gap:.7rem;margin:0 0 2.2rem;padding:0;list-style:none}
+.cockpit .door{display:flex;flex-direction:column;gap:.2rem;text-decoration:none;
+  background:var(--surface);border-radius:6px;padding:.85rem 1rem .9rem;min-width:0;
+  box-shadow:inset 3px 0 0 var(--edge,var(--hairline))}
+.cockpit .door:hover{background:var(--surface-2)}
 .cockpit .door[data-door="standup"]{--edge:var(--calm)}
 .cockpit .door[data-door="ledger"]{--edge:var(--warm)}
 .cockpit .door[data-door="play"]{--edge:var(--accent)}
-.cockpit .dk{font-family:var(--mono);font-size:.63rem;text-transform:uppercase;
-  letter-spacing:.09em;color:var(--ink-faint)}
-.cockpit .dv{font-size:.86rem;color:var(--ink-soft);line-height:1.35;
-  display:flex;flex-wrap:wrap;align-items:baseline;gap:.05rem .35rem}
-/* Proportional, like the .conditions figures and for the same reason: tabular-nums gives
-   every digit the width of a zero, which reads loose at display size. Tabular is for
-   columns, and a door is not one. */
-.cockpit .dn{font-family:var(--sans);font-size:1.3rem;font-weight:600;color:var(--ink);
-  letter-spacing:-.02em;line-height:1.05}
-/* One line, and it gives up its tail rather than the door's shape -- the same trade the
+.cockpit .dk{font-family:var(--sans);font-weight:600;font-size:.68rem;
+  letter-spacing:.1em;color:var(--ink-faint)}
+.cockpit .dv{font-size:.9rem;color:var(--ink-soft);line-height:1.3;
+  display:flex;flex-wrap:wrap;align-items:baseline;gap:.05rem .4rem}
+/* Tabular, because these are figures read against each other across three doors, and a
+   column of numerals that jumps by a digit\u2019s width reads as a wobble. */
+.cockpit .dn{font-family:var(--display);font-size:2.4rem;font-weight:600;
+  color:var(--ink);letter-spacing:-.03em;line-height:.95;
+  font-variant-numeric:tabular-nums}
+/* One line, and it gives up its tail rather than the door\u2019s shape -- the same trade the
    fold headers make with .fl, for the same reason: the figure is the contract and this is
    the illustration of it. */
-.cockpit .dl{font-size:.75rem;color:var(--ink-faint);line-height:1.35;min-width:0;
-  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-
-/* The mini-map: every section of this page, its own count, one click away, pinned to the
-   top the moment you scroll past the briefing. Three screenfuls of standing picture is
-   three screenfuls you have to scroll through to reach the one section you opened the page
-   for, and scrolling is the cost that made this page a chore.
-
-   position:sticky and nothing else -- no observer, no scroll listener, no state. It works
-   with scripting off, which is the whole argument for doing it in CSS: navigation is the
-   last thing on a page that should need a script. The negative side margins let its
-   background cover .page's own padding, so rows do not slide out from under it at the
-   edges, and it stays one line and scrolls sideways rather than wrapping into two. */
-.minimap{position:sticky;top:0;z-index:5;display:flex;flex-wrap:nowrap;
-  align-items:baseline;gap:0 .1rem;overflow-x:auto;overscroll-behavior-x:contain;
-  margin:0 -1.5rem 1.6rem;padding:.35rem 1.5rem;background:var(--ground);
-  border-bottom:1px solid var(--hairline);scrollbar-width:none}
-.minimap::-webkit-scrollbar{display:none}
-.minimap a{display:inline-flex;align-items:baseline;gap:.32rem;flex:none;
-  text-decoration:none;color:var(--ink-soft);font-size:.77rem;white-space:nowrap;
-  padding:.12rem .42rem;border-radius:3px}
-.minimap a:hover{background:var(--surface-2);color:var(--ink)}
-.minimap .mn{font-family:var(--mono);font-size:.71rem;color:var(--ink-faint);
-  font-variant-numeric:tabular-nums}
-.minimap a:hover .mn{color:var(--ink-soft)}
-/* Anchored rows land below the pinned bar rather than under it. */
-html{scroll-padding-top:3.2rem}
-[id]{scroll-margin-top:3.2rem}
+.cockpit .dl{font-size:.78rem;color:var(--ink-faint);line-height:1.35;min-width:0;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-top:.1rem}
+/* Anchored rows land clear of the top of the viewport, and clear of the collapsed nav
+   strip where there is one. */
+html{scroll-padding-top:1.5rem}
+[id]{scroll-margin-top:1.5rem}
+@media (max-width:60rem){
+  html{scroll-padding-top:3.4rem}
+  [id]{scroll-margin-top:3.4rem}
+}
 
 /* The morning brief: the shortlist, and now shaped like one. It was a single serif
    paragraph at 1.46rem and it was not being read -- five sentences each carrying a claim, a
@@ -249,17 +306,17 @@ html{scroll-padding-top:3.2rem}
    lines reads as a menu, which is the shape this block exists to stop being. The rule
    thickens on hover, so the page still says plainly that every subject here is one click
    from what it is a claim about. */
-.brief{list-style:none;margin:.1rem 0 1.5rem;padding:0;max-width:64em;
-       display:flex;flex-direction:column;gap:.55rem}
+.brief{list-style:none;margin:.1rem 0 2rem;padding:0;max-width:60em;
+       display:flex;flex-direction:column;gap:.7rem}
 /* The label is a fixed rail, so five kickers form a column a reader can run down rather
    than five differently-indented starts. It collapses below the text on a narrow viewport,
    where a 9rem rail would leave the sentence six words wide. */
 .brief li{display:grid;grid-template-columns:8.5rem 1fr;gap:.1rem .9rem;
           align-items:baseline}
-.brief .bk{font-family:var(--mono);font-size:.66rem;text-transform:uppercase;
+.brief .bk{font-family:var(--sans);font-weight:600;font-size:.68rem;
            letter-spacing:.09em;color:var(--ink-faint);text-align:right;
-           padding-top:.28rem}
-.brief .bs{font-family:var(--serif);font-size:clamp(.95rem,1.6vw,1.06rem);line-height:1.5;
+           padding-top:.3rem}
+.brief .bs{font-family:var(--display);font-size:clamp(1rem,1.7vw,1.14rem);line-height:1.5;
            color:var(--ink);text-wrap:pretty}
 .brief a{color:inherit;text-decoration:none;
          box-shadow:inset 0 -1px 0 0 color-mix(in oklab,var(--accent) 45%,transparent)}
@@ -269,10 +326,22 @@ html{scroll-padding-top:3.2rem}
   .brief .bk{text-align:left;padding-top:0}
 }
 
-h2{font-family:var(--serif);font-weight:500;font-size:1.16rem;margin:0 0 .2rem;
-   letter-spacing:-.01em}
-.note{color:var(--ink-soft);font-size:.83rem;max-width:54em;margin:0 0 .95rem}
-section{margin-bottom:2.4rem}
+h2{font-family:var(--display);font-weight:600;font-size:1.5rem;margin:0 0 .1rem;
+   letter-spacing:-.018em;line-height:1.15}
+.note{color:var(--ink-soft);font-size:.85rem;max-width:52em;margin:.35rem 0 1.2rem}
+/* Zones breathe; rows inside them do not. The page used to run at a flat 3rem between
+   everything, which is what made fifteen sections read as one wall -- there was no gap big
+   enough to say "that was a different subject". */
+section{margin-bottom:4.5rem}
+
+/* The structural accent: a short rule above a zone\u2019s heading, so a section announces
+   itself before it is read. Ornament and nothing else -- it invents no copy and makes no
+   claim. Absolutely positioned so it cannot disturb the flex row the heading sits in, and
+   kept off the recency sub-headings inside In play, which are groups rather than zones. */
+section>h2,section>.rung:not([data-bucket])>h2{position:relative}
+section>h2::before,section>.rung:not([data-bucket])>h2::before{content:"";
+  position:absolute;left:0;top:-.85rem;width:1.6rem;height:2px;background:var(--accent);
+  border-radius:1px}
 
 /* One card per arc, leading with what the arc IS. The counts moved to the footer of
    the card because a count is an input to a judgement, not the judgement -- reading
@@ -329,7 +398,8 @@ section{margin-bottom:2.4rem}
 /* Text takes an ink token, never `--hue`. --hue exists to paint the card's top edge, and
    on a neutral card it is the hairline colour -- so borrowing it for the state and the
    blocker rendered both of them invisible against the surface. */
-.arc-state{text-transform:uppercase;letter-spacing:.06em;color:var(--ink-soft)}
+.arc-state{font-family:var(--sans);font-weight:600;letter-spacing:.04em;
+  color:var(--ink-soft)}
 .arc.is-hot .arc-state,.arc.is-warm .arc-state{color:var(--hue)}
 .arc-sum{font-size:.87rem;line-height:1.5;color:var(--ink-soft);margin:0;
          text-wrap:pretty}
@@ -343,9 +413,9 @@ section{margin-bottom:2.4rem}
 .needs{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:.4rem}
 .needs li{display:flex;flex-direction:column;gap:.25rem;font-size:.83rem}
 .needs .row{display:flex;gap:.45rem;align-items:baseline}
-.chip{font-family:var(--mono);font-size:.63rem;text-transform:uppercase;
-      letter-spacing:.07em;padding:.1rem .38rem;border-radius:2px;flex:none;
-      border:1px solid currentColor;line-height:1.4}
+.chip{font-family:var(--sans);font-weight:600;font-size:.66rem;
+      letter-spacing:.06em;padding:.1rem .42rem;border-radius:3px;flex:none;
+      border:1px solid currentColor;line-height:1.45}
 .chip.sev-0,.chip.sev-1,.chip.sev-2{color:var(--hot)}
 .chip.sev-3,.chip.sev-4,.chip.sev-5,.chip.sev-6,.chip.sev-7,.chip.sev-8{color:var(--warm)}
 .needs .what{color:var(--ink)}
@@ -388,7 +458,7 @@ blockquote b{font-weight:600;color:var(--ink)}
    The OPEN mark borrows the demands' warm, because a question left standing in a thread is
    that register even though it is not a demand. */
 .slk{margin:.55rem 0 0;border-top:1px solid var(--hairline);padding-top:.5rem}
-.slk-h{font-family:var(--mono);font-size:.63rem;text-transform:uppercase;
+.slk-h{font-family:var(--sans);font-weight:600;font-size:.68rem;
        letter-spacing:.09em;color:var(--ink-faint);margin-bottom:.4rem}
 .slk-t{display:flex;flex-direction:column;gap:.22rem;margin-bottom:.5rem}
 .slk-t .hd{display:flex;gap:.5rem;align-items:baseline;font-size:.72rem;
@@ -437,7 +507,7 @@ blockquote b{font-weight:600;color:var(--ink)}
 .tree .dot.dup{fill:none;stroke:var(--ink-faint);stroke-width:1.2}
 .tree a{text-decoration:none}
 .tree a:hover .n{text-decoration:underline}
-.legend{font-family:var(--mono);font-size:.66rem;color:var(--ink-faint);
+.legend{font-family:var(--sans);font-size:.72rem;color:var(--ink-faint);
         padding-top:.3rem;display:flex;flex-wrap:wrap;gap:.15rem .8rem}
 
 .metrics{display:flex;flex-wrap:wrap;gap:.15rem .9rem;font-family:var(--mono);
@@ -445,13 +515,12 @@ blockquote b{font-weight:600;color:var(--ink)}
          border-top:1px solid var(--hairline);padding-top:.5rem;margin-top:auto}
 .metrics b{color:var(--ink-soft);font-weight:600}
 
-table{width:100%;border-collapse:collapse;font-size:.82rem}
-.scroll{overflow-x:auto;border:1px solid var(--hairline);border-radius:4px;
-        background:var(--surface)}
-th{text-align:left;font-size:.68rem;text-transform:uppercase;letter-spacing:.06em;
-   color:var(--ink-soft);font-weight:600;padding:.5rem .7rem;
+table{width:100%;border-collapse:collapse;font-size:.84rem}
+.scroll{overflow-x:auto;border-radius:6px;background:var(--surface)}
+th{text-align:left;font-size:.72rem;letter-spacing:.05em;
+   color:var(--ink-soft);font-weight:600;padding:.55rem .8rem;
    border-bottom:1px solid var(--hairline);white-space:nowrap}
-td{padding:.45rem .7rem;border-bottom:1px solid var(--hairline);vertical-align:top}
+td{padding:.5rem .8rem;border-bottom:1px solid var(--hairline);vertical-align:top}
 tr:last-child td{border-bottom:none}
 td.k{font-family:var(--mono);white-space:nowrap;color:var(--ink)}
 td.n{font-family:var(--mono);font-variant-numeric:tabular-nums;text-align:right;
@@ -459,8 +528,8 @@ td.n{font-family:var(--mono);font-variant-numeric:tabular-nums;text-align:right;
 td.d{color:var(--ink-soft)}
 code{font-family:var(--mono);font-size:.75rem;background:var(--surface-2);
      border:1px solid var(--hairline);padding:.1rem .3rem;border-radius:2px}
-footer{margin-top:3rem;padding-top:1.4rem;border-top:1px solid var(--hairline);
-       color:var(--ink-soft);font-size:.85rem}
+footer{margin-top:4rem;padding-top:1.5rem;border-top:1px solid var(--hairline);
+       color:var(--ink-soft);font-size:.84rem;max-width:52em}
 
 /* Links are the whole point of a dashboard you open every morning: every claim on this
    page should be one click from the thing it is a claim about. Underlined on hover only,
@@ -479,11 +548,20 @@ a:hover{text-decoration-color:currentColor}
    used to render hot. The disclosure that wraps this list is defined further down, beside
    the at-risk one it shares a shape with; only the marker colour separates them, and that
    lives in one variable. */
+/* Boxes. There was a hairline rectangle round every list, every tile, every side of the
+   ledger and every collapsed header on this page, and drawn all at once they are what made
+   it read as a printout: fifteen framed panels of equal weight, none of which had said
+   anything yet. A frame is not structure. So the frames are gone and a surface one step off
+   the ground does the grouping, at 6px and with no shadow.
+
+   Rules survive in exactly two places, and both are load-bearing rather than decorative:
+   between the rows of a dense list, where forty rows with nothing between them is a
+   paragraph rather than a table, and down the left of a quote, where the bar is what says
+   the words are somebody else\u2019s. */
 .parked-list{margin:.5rem 0 0;padding:0;list-style:none;display:flex;
-  flex-direction:column;border:1px solid var(--hairline);border-radius:4px;
-  background:var(--surface);overflow:hidden}
+  flex-direction:column;border-radius:6px;background:var(--surface);overflow:hidden}
 .parked-list li{display:grid;grid-template-columns:minmax(0,1fr) auto auto;
-  gap:.3rem .9rem;align-items:baseline;padding:.5rem .7rem;
+  gap:.3rem .9rem;align-items:baseline;padding:.55rem .85rem;
   border-bottom:1px solid var(--hairline)}
 .parked-list li:last-child{border-bottom:none}
 .parked-list .nm{color:var(--ink);font-size:.87rem;min-width:0}
@@ -515,12 +593,12 @@ a:hover{text-decoration-color:currentColor}
    they have been open. Age is the one dimension these rows share, so it is the one thing
    the column sorts by and the one thing allowed a colour: two weeks of silence is a loop
    that has demonstrably failed, not merely an old row. */
-.ledger{display:grid;grid-template-columns:repeat(auto-fit,minmax(23rem,1fr));gap:1rem;
-  align-items:start}
-.ledger .side{background:var(--surface);border:1px solid var(--hairline);
-  border-radius:4px;padding:1rem 1.1rem;display:flex;flex-direction:column;gap:.6rem}
-.ledger h3{margin:0;font-family:var(--serif);font-weight:500;font-size:1.05rem;
-  display:flex;align-items:baseline;gap:.5rem}
+.ledger{display:grid;grid-template-columns:repeat(auto-fit,minmax(21rem,1fr));
+  gap:1.1rem;align-items:start}
+.ledger .side{background:var(--surface);border-radius:6px;padding:1.1rem 1.2rem;
+  display:flex;flex-direction:column;gap:.7rem}
+.ledger h3{margin:0;font-family:var(--display);font-weight:600;font-size:1.15rem;
+  display:flex;align-items:baseline;gap:.5rem;letter-spacing:-.01em}
 .ledger h3 .n{font-family:var(--mono);font-size:.75rem;color:var(--ink-faint);
   font-weight:400}
 .ledger ul{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;
@@ -574,7 +652,7 @@ a:hover{text-decoration-color:currentColor}
 /* Acknowledging is the page's one universal control, and it is an acknowledgement, not
    a deletion: the row stays countable behind a disclosure, and the store is keyed to
    the row's fingerprint so any change to the fact underneath brings it back itself. */
-.dis{flex:none;font-family:var(--mono);font-size:.68rem;
+.dis{flex:none;font-family:var(--sans);font-size:.7rem;
   line-height:1.3;border:1px solid var(--hairline);background:transparent;
   color:var(--ink-faint);border-radius:2px;cursor:pointer;padding:.05rem .32rem}
 .dis:hover{border-color:var(--parked);color:var(--ink-soft)}
@@ -582,7 +660,7 @@ a:hover{text-decoration-color:currentColor}
 [data-fp][data-dismissed="1"]{display:none}
 .ledger .side[data-show="1"] li[data-dismissed="1"]{display:flex;opacity:.55}
 [data-disgroup][data-show="1"] [data-fp][data-dismissed="1"]{display:revert;opacity:.55}
-.showdis{align-self:flex-start;font-family:var(--mono);font-size:.68rem;
+.showdis{align-self:flex-start;font-family:var(--sans);font-size:.72rem;
   padding:.15rem .45rem;border-radius:2px;cursor:pointer;background:transparent;
   border:1px solid var(--hairline);color:var(--ink-faint);margin-top:.3rem}
 .showdis:hover{border-color:var(--parked);color:var(--ink-soft)}
@@ -593,14 +671,14 @@ td .dis{vertical-align:middle}
    no third — a question you cannot answer is answered by leaving it alone, and it comes
    back next build. Sized down deliberately: this is a list of doubts, not of facts, and
    it must not read louder than the work it is doubting. */
-.cur{border:1px solid var(--hairline);border-radius:4px;overflow:hidden}
+.cur{border-radius:6px;background:var(--surface);overflow:hidden}
 .cur .q{display:grid;grid-template-columns:auto 1fr;gap:.6rem;align-items:baseline;
   padding:.55rem .8rem;border-top:1px solid var(--hairline)}
 .cur .q:first-child{border-top:0}
 .cur .q[data-answer="keep"]{background:var(--calm-wash)}
 .cur .q[data-answer="pry"]{background:var(--hot-wash)}
 .cur .yn{display:flex;gap:.3rem;white-space:nowrap}
-.cur .yn button{font:inherit;font-size:.72rem;font-family:var(--mono);cursor:pointer;
+.cur .yn button{font:inherit;font-size:.76rem;font-weight:600;cursor:pointer;
   padding:.1rem .45rem;border-radius:2px;border:1px solid var(--hairline);
   background:transparent;color:var(--ink-faint)}
 .cur .yn button:hover{color:var(--ink)}
@@ -648,8 +726,8 @@ td .dis{vertical-align:middle}
 .ws .tkt.none{color:var(--warm);opacity:.75}
 .ws .nm{color:var(--ink);font-size:.9rem;min-width:0}
 .ws .onbr{font-family:var(--mono);font-size:.68rem;color:var(--ink-faint)}
-.ws .st{font-family:var(--mono);font-size:.7rem;color:var(--ink-soft);white-space:nowrap;
-  font-variant-numeric:tabular-nums}
+.ws .st{font-family:var(--sans);font-size:.78rem;color:var(--ink-soft);
+  white-space:nowrap;font-variant-numeric:tabular-nums}
 .ws .ag{font-family:var(--mono);font-size:.7rem;color:var(--ink-faint);white-space:nowrap}
 
 /* Out for review with nothing outstanding, and somebody actually asked to read it: pushed,
@@ -695,14 +773,13 @@ td .dis{vertical-align:middle}
   .ws .tkt{grid-column:1}.ws .nm{grid-column:1}
   .ws .body{padding-left:.7rem}
 }
-.wslist{border:1px solid var(--hairline);border-radius:4px;background:var(--surface);
-  overflow:hidden}
+.wslist{border-radius:6px;background:var(--surface);overflow:hidden}
 
 /* Parking is a claim about intent, which is the one thing here that cannot be derived. The
    control is a button rather than a checkbox because it is an action with a consequence, and
    it says what it did. */
-.park{font-family:var(--mono);font-size:.63rem;text-transform:uppercase;
-  letter-spacing:.06em;padding:.15rem .4rem;border-radius:2px;cursor:pointer;
+.park{font-family:var(--sans);font-weight:600;font-size:.68rem;
+  letter-spacing:.05em;padding:.18rem .5rem;border-radius:4px;cursor:pointer;
   border:1px solid var(--hairline);background:transparent;color:var(--ink-faint)}
 .park:hover{border-color:var(--parked);color:var(--ink-soft)}
 .ws[data-parked="1"] .park{border-color:var(--parked);color:var(--parked)}
@@ -719,13 +796,15 @@ td .dis{vertical-align:middle}
 
 /* The one thing that came back and has not been looked at yet. Everything else on this page
    is a state; this is news, and it stops being news by being worked on rather than clicked. */
-.news{border:1px solid var(--hot);border-radius:4px;background:var(--hot-wash);
-  padding:.9rem 1rem;display:flex;flex-direction:column;gap:.8rem;margin-bottom:1rem}
-.news h3{margin:0;font-family:var(--serif);font-size:1rem;font-weight:500}
+.news{border-radius:6px;background:var(--hot-wash);padding:.95rem 1.1rem;
+  display:flex;flex-direction:column;gap:.8rem;margin-bottom:.7rem;
+  box-shadow:inset 3px 0 0 var(--hot)}
+.news h3{margin:0;font-family:var(--display);font-size:1.05rem;font-weight:600;
+  letter-spacing:-.01em}
 .news .item{display:flex;flex-direction:column;gap:.3rem;font-size:.85rem}
 .news .when{font-family:var(--mono);font-size:.68rem;color:var(--hot)}
-.quiet{color:var(--ink-soft);font-size:.85rem;padding:.7rem .9rem;
-  border:1px dashed var(--hairline);border-radius:4px}
+.quiet{color:var(--ink-soft);font-size:.85rem;padding:.8rem 1rem;
+  background:var(--surface);border-radius:6px}
 
 /* What moved on its own between the last build of this page and this one. A strip rather
    than cards, because the whole claim being made is that there are only ever a handful --
@@ -734,7 +813,7 @@ td .dis{vertical-align:middle}
    work whose clock is yours, this one is about work that moved while you were elsewhere,
    and most of its rows are background arcs you were right not to be watching. */
 .lb{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;
-  border:1px solid var(--hairline);border-radius:4px;overflow:hidden}
+  border-radius:6px;background:var(--surface);overflow:hidden}
 .lb li{display:grid;grid-template-columns:3.4rem minmax(9rem,15rem) 1fr;gap:.15rem .8rem;
   align-items:baseline;padding:.5rem .8rem;font-size:.85rem;
   border-top:1px solid var(--hairline)}
@@ -762,17 +841,17 @@ td .dis{vertical-align:middle}
    (that would name one of them THE number), no severity hue (that would rank them by
    colour), equal tiles. Each states a condition and how much of it there is. */
 .conditions{display:grid;grid-template-columns:repeat(auto-fit,minmax(11rem,1fr));
-  gap:.55rem;margin:0 0 2rem;list-style:none;padding:0}
-.conditions a{display:flex;flex-direction:column;gap:.1rem;text-decoration:none;
-  background:var(--surface);border:1px solid var(--hairline);border-radius:4px;
-  padding:.7rem .8rem;height:100%}
-.conditions a:hover{border-color:var(--accent)}
+  gap:.7rem;margin:0 0 2rem;list-style:none;padding:0}
+.conditions a{display:flex;flex-direction:column;gap:.15rem;text-decoration:none;
+  background:var(--surface);border-radius:6px;padding:.85rem .95rem;height:100%}
+.conditions a:hover{background:var(--surface-2)}
 /* Proportional figures, deliberately: tabular-nums gives every digit the width of a 0,
    which makes a value like 740 look loose at display size. Tabular is for columns. */
-.conditions .v{font-family:var(--sans);font-size:1.6rem;font-weight:600;line-height:1.1;
-  color:var(--ink);letter-spacing:-.02em}
+.conditions .v{font-family:var(--display);font-size:2rem;font-weight:600;
+  line-height:1;color:var(--ink);letter-spacing:-.03em;
+  font-variant-numeric:tabular-nums}
 .conditions .l{font-size:.78rem;color:var(--ink-soft);line-height:1.35;text-wrap:pretty}
-.conditions .sub{font-family:var(--mono);font-size:.68rem;color:var(--ink-faint)}
+.conditions .sub{font-family:var(--sans);font-size:.74rem;color:var(--ink-faint)}
 
 /* The one tile you can open. Every other condition on the strip points at a section that
    already lists its members; "exists only on this laptop" pointed at nothing, because the
@@ -802,16 +881,16 @@ td .dis{vertical-align:middle}
    this found the sentence that used to be here. */
 details.parked,details.atrisk{margin-top:.4rem}
 details.parked{--disc:var(--parked)}
-details.atrisk{--disc:var(--accent);margin:-1.5rem 0 2rem}
-details.parked>summary,details.atrisk>summary{cursor:pointer;font-size:.85rem;
-  color:var(--ink-soft);padding:.5rem .7rem;border:1px solid var(--hairline);
-  border-radius:4px;background:var(--surface);list-style:none}
+details.atrisk{--disc:var(--accent);margin:-1.4rem 0 2rem}
+details.parked>summary,details.atrisk>summary{cursor:pointer;font-size:.88rem;
+  color:var(--ink-soft);padding:.55rem .8rem;border-radius:6px;
+  background:var(--surface);list-style:none}
 details.parked>summary::-webkit-details-marker,
 details.atrisk>summary::-webkit-details-marker{display:none}
 details.parked>summary::before,details.atrisk>summary::before{content:"▸ ";
   color:var(--disc)}
 details.parked[open]>summary::before,details.atrisk[open]>summary::before{content:"▾ "}
-details.parked>summary:hover,details.atrisk>summary:hover{border-color:var(--disc)}
+details.parked>summary:hover,details.atrisk>summary:hover{background:var(--surface-2)}
 details.parked>summary b,details.atrisk>summary b{color:var(--ink);font-weight:600}
 
 /* A section that is closed when the page opens, with its whole claim on the header line.
@@ -830,22 +909,21 @@ details.parked>summary b,details.atrisk>summary b{color:var(--ink);font-weight:6
    Shares `details.parked`'s marker glyphs and its literal-glyph rule -- a CSS codepoint
    escape in this stylesheet is read by python as octal, see the note above -- and not its
    summary box, because these carry a heading and those carry a sentence. */
-details.fold{margin:0 0 .55rem}
-details.fold[open]{margin-bottom:2rem}
+details.fold{margin:0 0 .35rem}
+details.fold[open]{margin-bottom:3rem}
 details.fold>summary{cursor:pointer;list-style:none;display:flex;flex-wrap:wrap;
-  align-items:baseline;gap:.15rem .7rem;padding:.5rem .7rem;border-radius:4px;
-  border:1px solid var(--hairline);background:var(--surface)}
+  align-items:baseline;gap:.15rem .8rem;padding:.55rem .8rem;border-radius:6px}
 details.fold>summary::-webkit-details-marker{display:none}
 details.fold>summary::before{content:"▸ ";color:var(--ink-faint);flex:none}
 details.fold[open]>summary::before{content:"▾ "}
-details.fold>summary:hover{border-color:var(--accent)}
+details.fold>summary:hover{background:var(--surface-2)}
 details.fold[open]>summary{margin-bottom:1rem}
-details.fold>summary h2{font-size:1rem;margin:0;flex:none}
+details.fold>summary h2{font-size:1.12rem;margin:0;flex:none;font-weight:600}
 details.fold>summary .fn{font-family:var(--mono);font-size:.75rem;
   color:var(--ink-faint);flex:none}
 /* The worst item, on one line. It gives up its tail before the count or the title give up
    anything, because those two are the contract and this is the illustration of it. */
-details.fold>summary .fl{color:var(--ink-soft);font-size:.82rem;min-width:0;flex:1 1 12rem;
+details.fold>summary .fl{color:var(--ink-soft);font-size:.84rem;min-width:0;flex:1 1 12rem;
   overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 @media (max-width:44rem){details.fold>summary .fl{flex-basis:100%}}
 
@@ -863,7 +941,7 @@ details.fold>summary .fl{color:var(--ink-soft);font-size:.82rem;min-width:0;flex
    list. Keeps the .note class, so nothing about the type or the measure changes. */
 .why>summary{cursor:pointer;list-style:none;display:block}
 .why>summary::-webkit-details-marker{display:none}
-.why>summary::after{content:" why ▸";font-family:var(--mono);font-size:.68rem;
+.why>summary::after{content:" why ▸";font-weight:600;font-size:.72rem;
   color:var(--ink-faint);white-space:nowrap}
 .why[open]>summary::after{content:" why ▾"}
 .why>summary:hover::after{color:var(--accent)}
@@ -872,8 +950,8 @@ details.fold>summary .fl{color:var(--ink-soft);font-size:.82rem;min-width:0;flex
 /* One row per workstream that holds work no remote has. Four facts and no more: what it
    is, what it would cost, what it is about, and which branch to push. A fifth would make
    this a second set of cards, and the cards are directly below. */
-.riskrows{margin:.5rem 0 0;padding:0;list-style:none;border:1px solid var(--hairline);
-  border-radius:4px;background:var(--surface);overflow:hidden}
+.riskrows{margin:.5rem 0 0;padding:0;list-style:none;border-radius:6px;
+  background:var(--surface);overflow:hidden}
 .riskrows li{display:grid;grid-template-columns:minmax(0,1fr) auto auto;
   gap:.15rem .9rem;align-items:baseline;padding:.5rem .7rem;
   border-bottom:1px solid var(--hairline)}
@@ -919,18 +997,18 @@ details.fold>summary .fl{color:var(--ink-soft);font-size:.82rem;min-width:0;flex
    list rather than prose. The nesting is one level and stops there. A workstream and what
    happened to it is two facts; a third level would be a tree, and nobody reads a tree out
    loud. */
-.standup{border:1px solid var(--hairline);border-left:3px solid var(--calm);
-  background:var(--surface);border-radius:4px;padding:.7rem .9rem .8rem;margin:0 0 2rem}
+.standup{background:var(--surface);border-radius:6px;padding:.9rem 1.1rem 1rem;
+  margin:0 0 2rem;box-shadow:inset 3px 0 0 var(--calm)}
 .standup .hd{display:flex;flex-wrap:wrap;align-items:baseline;gap:.25rem .6rem;
   margin-bottom:.5rem}
-.standup .tag{font-family:var(--mono);font-size:.68rem;text-transform:uppercase;
-  letter-spacing:.09em;color:var(--calm)}
+.standup .tag{font-family:var(--sans);font-weight:600;font-size:.7rem;
+  letter-spacing:.1em;color:var(--calm)}
 .standup .when{font-family:var(--mono);font-size:.7rem;color:var(--ink-faint)}
 .standup .sunote{font-size:.74rem;color:var(--ink-faint);text-wrap:pretty;
   max-width:54em;margin:-.25rem 0 .55rem}
 /* Pushed to the end of the header rather than floated: it is the one control here and it
    should be findable, not prominent. */
-.standup .cp{margin-left:auto;font:inherit;font-family:var(--mono);font-size:.68rem;
+.standup .cp{margin-left:auto;font:inherit;font-weight:600;font-size:.72rem;
   cursor:pointer;padding:.1rem .45rem;border:1px solid var(--hairline);border-radius:2px;
   background:transparent;color:var(--ink-soft)}
 .standup .cp:hover{border-color:var(--calm);color:var(--ink)}
@@ -938,8 +1016,8 @@ details.fold>summary .fl{color:var(--ink-soft);font-size:.82rem;min-width:0;flex
 .standup .beats{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;
   gap:.55rem}
 .standup .beats>li{display:grid;grid-template-columns:8.5rem 1fr;gap:.1rem .9rem}
-.standup .bk{font-family:var(--mono);font-size:.66rem;text-transform:uppercase;
-  letter-spacing:.09em;color:var(--ink-faint);text-align:right;padding-top:.22rem}
+.standup .bk{font-family:var(--sans);font-weight:600;font-size:.68rem;
+  letter-spacing:.09em;color:var(--ink-faint);text-align:right;padding-top:.24rem}
 .standup .items{list-style:none;margin:0;padding:0}
 .standup .items>li{font-size:.88rem;line-height:1.45;color:var(--ink);
   text-wrap:pretty;margin:0 0 .12rem}
@@ -956,12 +1034,12 @@ details.fold>summary .fl{color:var(--ink-soft);font-size:.82rem;min-width:0;flex
   .standup .beats>li{grid-template-columns:1fr;gap:.05rem}
   .standup .bk{text-align:left;padding-top:0}
 }
-.sprint{border:1px solid var(--hairline);border-left:3px solid var(--accent);
-  background:var(--surface);border-radius:4px;padding:.6rem .85rem;margin:0 0 2rem;
-  display:flex;flex-direction:column;gap:.28rem}
+.sprint{background:var(--surface);border-radius:6px;padding:.8rem 1.05rem;
+  margin:0 0 2rem;display:flex;flex-direction:column;gap:.3rem;
+  box-shadow:inset 3px 0 0 var(--accent)}
 .sprint .hd{display:flex;flex-wrap:wrap;align-items:baseline;gap:.25rem .6rem}
-.sprint .tag{font-family:var(--mono);font-size:.68rem;text-transform:uppercase;
-  letter-spacing:.09em;color:var(--accent)}
+.sprint .tag{font-family:var(--sans);font-weight:600;font-size:.7rem;
+  letter-spacing:.1em;color:var(--accent)}
 .sprint .when{font-family:var(--mono);font-size:.7rem;color:var(--ink-faint)}
 .sprint .ln{font-size:.85rem;color:var(--ink-soft);line-height:1.5;text-wrap:pretty}
 .sprint .ln b{color:var(--ink);font-weight:600}
@@ -976,9 +1054,9 @@ details.fold>summary .fl{color:var(--ink-soft);font-size:.82rem;min-width:0;flex
    6.5rem/1fr/auto/auto/auto and collapses to two columns under 640px; a new column would
    have had to be defined twice and would have squeezed the name on the narrow one. Riding
    inside the name cell, it wraps with the name and needs no breakpoint of its own. */
-.sprintchip{font-family:var(--mono);font-size:.6rem;text-transform:uppercase;
-  letter-spacing:.06em;padding:0 .3rem;border-radius:2px;border:1px solid currentColor;
-  color:var(--accent);opacity:.75;white-space:nowrap;vertical-align:.08em}
+.sprintchip{font-family:var(--sans);font-weight:600;font-size:.63rem;
+  letter-spacing:.05em;padding:0 .34rem;border-radius:3px;border:1px solid currentColor;
+  color:var(--accent);opacity:.75;white-space:nowrap;vertical-align:.06em}
 .ws>summary:hover .sprintchip{opacity:1}
 .sprintchip.idle{color:var(--warm);opacity:1}
 /* The one control on the card for the one judgement no derivation can make. It sits above
@@ -987,7 +1065,7 @@ details.fold>summary .fl{color:var(--ink-soft);font-size:.82rem;min-width:0;flex
    page is waiting for, not something it is asking for. */
 .fileas{display:flex;flex-wrap:wrap;align-items:baseline;gap:.3rem .5rem;
   margin:.6rem 0 .1rem;padding-top:.5rem;border-top:1px solid var(--hairline)}
-.fileas .fa-h{font-family:var(--mono);font-size:.63rem;text-transform:uppercase;
+.fileas .fa-h{font-family:var(--sans);font-weight:600;font-size:.68rem;
   letter-spacing:.09em;color:var(--ink-faint)}
 .fileas .fa-o{font:inherit;font-size:.72rem;font-family:var(--mono);cursor:pointer;
   display:inline-flex;align-items:baseline;gap:.35rem;padding:.1rem .4rem;
@@ -1009,7 +1087,11 @@ details.fold>summary .fl{color:var(--ink-soft);font-size:.82rem;min-width:0;flex
    row happens to fall under -- it is the reason the row says what it says. */
 .sprintchip.filed{opacity:1;letter-spacing:.08em}
 
-.rung{display:flex;flex-wrap:wrap;align-items:baseline;gap:.2rem .6rem;margin:0 0 .2rem}
+.rung{display:flex;flex-wrap:wrap;align-items:baseline;gap:.2rem .7rem;margin:0 0 .35rem}
+/* Air between the recency groups inside In play. They are groups rather than zones -- no
+   accent tick, no 4.5rem -- but a heading flush against the list above it reads as a row of
+   that list rather than as the start of the next one. */
+.wslist+.rung,details.fold+.rung{margin-top:1.7rem}
 .rung h2{margin:0}
 .rung .n{font-family:var(--mono);font-size:.75rem;color:var(--ink-faint);
   font-variant-numeric:tabular-nums}
@@ -1020,10 +1102,9 @@ details.fold>summary .fl{color:var(--ink-soft);font-size:.82rem;min-width:0;flex
    to dread reading it, and this one is only useful read calmly. */
 .cost{display:grid;grid-template-columns:repeat(auto-fit,minmax(10.5rem,1fr));
   gap:.85rem;margin:0 0 1.1rem}
-.cost .fig{background:var(--surface);border:1px solid var(--hairline);border-radius:5px;
-  padding:.65rem .8rem}
-.cost .fig .n{font-family:var(--mono);font-size:1.1rem;color:var(--ink);display:block;
-  font-variant-numeric:tabular-nums}
+.cost .fig{background:var(--surface);border-radius:6px;padding:.75rem .9rem}
+.cost .fig .n{font-family:var(--mono);font-size:1.25rem;font-weight:600;
+  color:var(--ink);display:block;font-variant-numeric:tabular-nums}
 .cost .fig .l{font-size:.73rem;color:var(--ink-soft);display:block;margin-top:.2rem;
   text-wrap:pretty}
 .cost .fig .s{font-family:var(--mono);font-size:.7rem;color:var(--ink-faint);
@@ -1708,9 +1789,15 @@ def headline_block(data, here, fps):
     if not body:
         return ""
     lead = lines[0].get("lead") or ""
+    # The size comes off the sentence's own length. arc-morning writes anything from forty
+    # characters to two hundred and twenty, and a headline is read in one pass or it is not
+    # one: the longest of them at full display size runs six lines and has stopped being a
+    # headline by the third. Derived like everything else here rather than set by hand.
+    n = len(parts_text(lines[0].get("parts")))
+    step = " hl-s" if n > 150 else (" hl-m" if n > 90 else "")
     return ('<div class="headline">'
             + (f'<span class="eyebrow">{esc(lead)}</span>' if lead else "")
-            + f"<p>{body}</p></div>")
+            + f'<p{f" class=\"{step.strip()}\"" if step else ""}>{body}</p></div>')
 
 
 def standup_notes(data):
@@ -1796,14 +1883,15 @@ def cockpit(a, doors):
 def minimap(a, stops):
     """Every section of this page, its own count, and one click to each.
 
-    The compressed form of the strip above it, and the answer to the one cost that made this
-    page a chore: three screenfuls of standing picture is three screenfuls to scroll past to
-    reach the section you opened it for. Sticky in CSS and nothing else -- no observer, no
-    scroll handler, no state -- so it works with scripting off, which is where navigation
-    belongs.
+    It lives in the rail, which is the answer to the one cost that made this page a chore:
+    three screenfuls of standing picture is three screenfuls to scroll past to reach the
+    section you opened it for. Standing still on the left, it answers "where am I" and "what
+    else is there" without a scroll at all -- and under 60rem, where there is no room for a
+    column, the same markup becomes the sticky strip along the top.
 
-    Its figures are mirrors like the doors\u2019, and a stop is emitted only for a section this
-    run actually rendered.
+    CSS and nothing else -- no observer, no scroll handler, no state -- so it works with
+    scripting off, which is where navigation belongs. Its figures are mirrors like the
+    doors\u2019, and a stop is emitted only for a section this run actually rendered.
     """
     if not stops:
         return
@@ -2918,17 +3006,30 @@ def render(data, lede, focus_days, limit, cost=None):
         stamp = data.get("generated", "unknown")
 
     a("<title>Work Arcs</title>")
+    # The one external host this page is allowed. Everything else it needs it carries, and
+    # every face here has a real stack behind it -- a page that reads as a fallback grid the
+    # morning the CDN is slow has been designed once and shipped twice. display=swap for the
+    # same reason: the words are the page, and they are not waiting on a font file.
+    a('<link rel="stylesheet" href="https://fonts.googleapis.com/css2?'
+      "family=Fraunces:opsz,wght@9..144,400..700&"
+      "family=Inter:wght@400;500;600&"
+      'family=JetBrains+Mono:wght@400;600&display=swap">')
     a(f"<style>{CSS}</style>")
-    a('<div class="page">')
-    # --- the masthead, in the corner ---------------------------------------
-    # A title is the one thing on a dashboard that is never news, and this one was the
-    # largest type on a page whose whole claim is that it opens with the most consequential
-    # fact. So it is a line: the name of the thing, and beside it every field the stamp has
-    # always carried -- the build time, the repo, the window and how it splits, the
-    # run-over-run chip. Those are the facts a reader audits everything below against, and
-    # they read perfectly well small. Nothing left the page; one thing stopped shouting.
-    a('<div class="masthead">')
-    a("<h1>Work Arcs</h1>")
+    a('<div class="shell">')
+    # --- the rail -----------------------------------------------------------
+    # What this is, everywhere you can go, and whether to trust this build -- standing still
+    # while the work scrolls past on the right. A title is the one thing on a dashboard that
+    # is never news, so it stopped being the largest type on the page; it is the head of the
+    # rail instead, which is where a name belongs. The stamp keeps every field it has always
+    # carried -- the build time, the repo, the window and how it splits, the run-over-run
+    # chip -- at the foot, because those are facts you go looking for rather than read.
+    a('<aside class="rail">')
+    a('<div class="masthead"><h1>Work Arcs</h1>'
+      '<div class="sub">the standing picture</div></div>')
+    # Where the rail's nav goes once its counts are known. A marker rather than a rewrite of
+    # render()'s order: the stamp is composed from facts available at the top of the page and
+    # the nav from facts that are not, and the rail wants them in the opposite order.
+    RAIL_AT = len(out)
     a('<div class="stamp">')
     a(f"<span>{esc(stamp)}</span>")
     a(f"<span>{link(base, esc(data.get('repo','')))}</span>")
@@ -2950,7 +3051,9 @@ def render(data, lede, focus_days, limit, cost=None):
                            f"since the last build{was}") + "</span>")
     elif sincer.get("why"):
         a(f'<span>no run-over-run diff — {esc(sincer["why"])}</span>')
-    a("</div></div>")
+    a("</div>")
+    a("</aside>")
+    a('<main class="page">')
     # The headline, then the rest of the brief under it -- and never a second opening
     # claim beside either, see headline_block and derive_lede. arc-morning's first line is
     # promoted to display size and its remaining lines render below it, so the promotion
@@ -3059,7 +3162,12 @@ def render(data, lede, focus_days, limit, cost=None):
         if data.get("curation") else None,
         ("cost", "Cost", "") if cost else None,
     ) if x]
-    minimap(a, stops)
+    rail = []
+    minimap(rail.append, stops)
+    # Emitted into the rail rather than here: the nav belongs between the masthead and the
+    # stamp, and both of those were written before the counts it carries were known. One
+    # splice is cheaper than threading every section's count up to the top of render().
+    out[RAIL_AT:RAIL_AT] = rail
 
     # --- the next standup, one block wide -----------------------------------
     # Directly under the brief and above the sprint strip, which is an argument about what
@@ -4448,7 +4556,7 @@ def render(data, lede, focus_days, limit, cost=None):
       "Slack or a repo unless you run the command yourself. Where a branch is called a "
       "superseded copy, its commits were checked against the other branch by "
       "<code>git patch-id</code>, not guessed at from its name.</footer>")
-    a("</div>")
+    a("</main></div>")
     return fold_notes("\n".join(out))
 
 
