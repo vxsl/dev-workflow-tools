@@ -552,18 +552,24 @@ def forgotten_sentence(data):
 def contradiction_sentence(data):
     """(e) The one place the record most undermines the rest of the page.
 
-    Widest by days of work, which is the same choice `derive_lede` made and is
-    deliberately not re-argued here: a status mismatch matters in proportion to how much
-    work the wrong status is hiding, and having two answers to "which is the worst one"
-    on one page would be its own small contradiction. It used to be widest by unpushed
-    commits, which ranked an afternoon of agentic churn above a fortnight of real work.
+    The first row on the wire, which work-arcs ranks on how long each status has gone
+    uncorrected -- not a `max()` taken here, and not the widest by days of work it used to
+    be. Two reasons the clock won, both in `reconcile` at length: a status nobody has
+    corrected in two months is wrong in a way that compounds every time the team reads it,
+    while a fortnight of local work behind a ticket touched this morning is not; and
+    ranking on the pile of unpushed commits made the size of this laptop's disk decide
+    which ticket the brief called out, which is exactly the obsession the page was told to
+    drop. One author for the ranking, so the brief, the page's lede and the table below
+    them cannot name three different worst tickets.
+
+    The staleness travels into the sentence because it decided the order, and a superlative
+    whose figure is missing reads as an assertion. Where Jira never said when the ticket
+    was last touched there is no clock and the sentence simply does not claim one.
     """
     mism = live((data.get("gap") or {}).get("status_mismatch"))
     if not mism:
         return None
-    worst = max(mism, key=lambda m: ((m.get("arc") or {}).get("unpushed_days", 0),
-                                     (m.get("arc") or {}).get("unpushed_live", 0),
-                                     m.get("ref") or ""))
+    worst = mism[0]
     issue, arc = worst.get("issue") or {}, worst.get("arc") or {}
     n = arc.get("unpushed_live", 0)
     key = ref(issue.get("key") or worst.get("ref") or "a ticket",
@@ -576,9 +582,13 @@ def contradiction_sentence(data):
     else:
         body = ["Jira still calls ", key, f" “{issue.get('status','')}”, "
                 + (worst.get("why") or "and the code says otherwise").split(" but ")[-1]]
-    if rest:
-        body.append(f" — the widest of {rest + 1} tickets whose status the code "
-                    "contradicts.")
+    stale = worst.get("stale_days") or 0
+    if stale:
+        body.append(f" — uncorrected for {stale} day{'' if stale == 1 else 's'}")
+        body.append(f", the longest-standing of {rest + 1} tickets whose status the code "
+                    "contradicts." if rest else ".")
+    elif rest:
+        body.append(f" — one of {rest + 1} tickets whose status the code contradicts.")
     else:
         body.append(".")
     return sentence("contradiction", body)

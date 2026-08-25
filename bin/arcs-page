@@ -1460,10 +1460,12 @@ def derive_lede(data, focus_days):
     states it with its numbers, in a fixed order of severity, and never editorialises
     beyond what the counts support.
 
-    The order starts with the work that has come back to him -- a branch that stopped
-    merging, a question nobody answered, an approval nobody acted on. That is a change from
-    opening on the biggest number, which described the page rather than the day: "112
-    unpushed across 15 branches" is true every morning and asks for nothing.
+    The order is contradictions, then work Jira has never heard of, then -- only when those
+    two are empty -- what exists nowhere but this laptop. It is not the biggest number
+    first, which described the page rather than the day: "112 unpushed across 15 branches"
+    is true every morning and asks for nothing. Both leading clauses are facts about what
+    other people are reading; the size of the pile on this disk is the fallback, and it has
+    its own ranked home further down the page either way.
     """
     gap = data.get("gap") or {}
     arcs = [a for a in data.get("arcs", []) if a.get("age_days", 999) <= focus_days]
@@ -1476,22 +1478,45 @@ def derive_lede(data, focus_days):
     # here only by stating the contradictions, which no tile can hold.
     mism = gap.get("status_mismatch") or []
     if mism:
-        # Widest by days of work, not by commit count, and tie-broken all the way down so
-        # two builds of the same data open on the same ticket. A superlative attached to a
-        # figure has to be a superlative OF that figure: ranking on commits while printing
-        # days would let "the widest" name a ticket the page shows as smaller.
-        worst = max(mism, key=lambda m: (m.get("arc", {}).get("unpushed_days", 0),
-                                         m.get("arc", {}).get("unpushed_live", 0),
-                                         m.get("ref") or ""))
+        # First on the wire, not a `max()` taken here. work-arcs ranks this list on how long
+        # each status has gone uncorrected, and that ranking is also what the table below
+        # renders and truncates -- so a superlative computed here could name a row this page
+        # never printed. It used to be the widest by days of work, which made the size of
+        # the pile on this laptop decide which ticket the page called out to the team; see
+        # `reconcile` for why the clock won.
+        worst = mism[0]
         k = worst.get("issue", {})
-        wa = worst.get("arc", {})
-        scale = work_scale(wa.get("unpushed_days", 0), wa.get("unpushed_live", 0))[0]
+        wk = worst.get("arc", {})
+        # The reality clause has to be the reality the row was filed for. Two kinds reach
+        # this list -- a handed-off status with the commits still here, and a status
+        # claiming work is under way on an arc nobody has touched in three weeks -- and the
+        # second has no unpushed figure to print at all. "never reached a remote" was a
+        # sentence those rows did not support, and under a ranking that can put one of them
+        # first it is a sentence the page would open on.
+        n = wk.get("unpushed_live", 0)
+        if n:
+            real = (work_scale(wk.get("unpushed_days", 0), n)[0]
+                    + " on it never reached a remote")
+        else:
+            real = esc(worst.get("why", "").split(" but ")[-1])
+        # The figure that decided the order, in the sentence it ordered -- the same rule the
+        # at-risk list follows about its own two columns. Where Jira never said when it was
+        # last touched there is no clock to print, and the sentence falls back to the count.
+        stale = worst.get("stale_days") or 0
+        rest = len(mism) - 1
+        if stale:
+            tail = f" &mdash; uncorrected for {stale} day{'' if stale == 1 else 's'}"
+            if rest:
+                tail += (f", the longest-standing of {len(mism)} tickets whose status "
+                         "the code contradicts")
+        elif rest:
+            tail = (f", and {rest} other ticket{'' if rest == 1 else 's'} claim"
+                    + ("s" if rest == 1 else "") + " a status the code contradicts")
+        else:
+            tail = ""
         bits.append(
             f'Jira believes <em>{esc(k.get("key",""))}</em> is '
-            f'&ldquo;{esc(k.get("status",""))}&rdquo;, but {scale} on it '
-            f"never reached a remote"
-            + (f", and {len(mism)-1} other tickets claim a status the code contradicts"
-               if len(mism) > 1 else "") + ".")
+            f'&ldquo;{esc(k.get("status",""))}&rdquo;, but {real}{tail}.')
 
     unt = gap.get("unticketed_work") or []
     if unt:
@@ -2152,12 +2177,21 @@ def render(data, lede, focus_days, limit, cost=None):
     buckets = []
     for key, title, test in BUCKETS:
         got = [x for x in live if test(x.get("age_days", 999))]
-        # Within a bucket: what still wants something from him, then the biggest unfinished
-        # thing. Still no ordering between rungs -- the only split applied here is whether the
-        # next move is his, and work that is genuinely out for review sinks below work that is
-        # not. That is a fact about whose clock is running, not a claim that review matters
-        # less; it is the same judgement that stopped "waiting on review" rendering hot.
-        got.sort(key=lambda x: (x.get("stage") == "in-review",
+        # Within a bucket: what is out for review sinks to the foot, then what is waiting
+        # on him worst-first, then the biggest unfinished thing. The middle key is new and
+        # it is the whole correction -- the order used to run straight from the split to
+        # the unpushed count, so a workstream led its group on the size of the pile on this
+        # laptop and a rebase that stopped a branch merging sat under it. `urgency` is
+        # DEMAND_RANK read off the worst demand on the arc, which already puts every
+        # came-back kind above `unpushed`; nothing here re-argues that table, it just stops
+        # overriding it. Volume is what it always should have been: the tiebreak between
+        # two rows that want the same thing.
+        #
+        # The outer split stays as it was. Work genuinely out for review wants nothing from
+        # him and sits at the foot of its group whatever its urgency says -- a fact about
+        # whose clock is running, not a claim that review matters less, and the same
+        # judgement that stopped "waiting on review" rendering hot.
+        got.sort(key=lambda x: (x.get("stage") == "in-review", x.get("urgency", 99),
                                 -x.get("unpushed_live", 0), -x.get("engagement", 0)))
         if got:
             buckets.append((key, title, got))
@@ -2976,7 +3010,8 @@ def render(data, lede, focus_days, limit, cost=None):
     # --- the conditions, as peers ------------------------------------------
     # Still peers, still no hero figure and no severity hue: there is no honest exchange
     # rate between a stalled review and a swathe of unpublished work. These are now an
-    # aggregate rather than the page's spine, since time became the grouping.
+    # aggregate rather than the page's spine, since time became the grouping. What the row
+    # does claim is a reading order -- see `tiles`.
     loc = by_rung.get("local-only", [])
     back = by_rung.get("came-back", [])
     rev = by_rung.get("in-review", [])
@@ -2990,20 +3025,38 @@ def render(data, lede, focus_days, limit, cost=None):
     loc_days = len({d for x in loc for d in x.get("unpushed_dates") or []})
     loc_scale, loc_verb = work_scale(loc_days,
                                      sum(x.get("unpushed_live", 0) for x in loc))
+    # People first, then this laptop. Still no hero figure, still no severity hue, still no
+    # exchange rate claimed between any two of these -- but the order of a row that is read
+    # left to right is an argument about what to read first, and this one used to open on
+    # unpublished commits: "the tool is too obsessed with me having commits on my laptop. i
+    # guess i do want that information somewhere but it's not the main signal of unfinished
+    # work". A loop with somebody else in it compounds while it waits -- the question goes
+    # unanswered another day, the pipeline stays red, the approval ages, the reviewer's
+    # clock runs -- and work sitting on this disk waits exactly as it is. So the two rungs
+    # with a person and a clock on them lead, and the three where the next move is nobody's
+    # but his follow, in DEMAND_RANK's own order: what is on the disk, then a merge request
+    # nobody was asked to read, then no merge request at all.
+    #
+    # Not a demotion of the local-only fact and not a smaller one: the tile keeps its full
+    # scale, keeps its count and keeps the disclosure under it. It is one place to the
+    # right. `unpushed` already ranks below every came-back demand in DEMAND_RANK and this
+    # is the presentation finally agreeing with that table.
+    #
     # Each tile links to where its members are listed. Six of the seven point at the rungs
-    # below, because that is where their work has a row. The seventh cannot: work that
-    # exists only on this laptop has no merge request and no remote to point at, which was
-    # exactly why it had nowhere to send a reader. It points at its own disclosure instead.
+    # below, because that is where their work has a row. The local-only one cannot: work
+    # that exists only on this laptop has no merge request and no remote to point at, which
+    # was exactly why it had nowhere to send a reader. It points at its own disclosure
+    # instead, which is the one place the count can be cashed in for names.
     tiles = [
-        (len(loc), "exist only on this laptop", loc_scale + ", no remote has them",
-         "#only-here"),
         (len(back), "have come back to you",
          "a rebase, a question, a red pipeline, an unmerged approval", "#play"),
-        (len(prop), "are pushed but never proposed", "no merge request exists", "#play"),
-        (len(noask), "have a merge request nobody was asked to read",
-         "open, no reviewer, no comment — it is not moving", "#play"),
         (len(rev), "are out for review",
          "nothing outstanding, somebody has it — a reviewer&rsquo;s clock", "#play"),
+        (len(loc), "exist only on this laptop", loc_scale + ", no remote has them",
+         "#only-here"),
+        (len(noask), "have a merge request nobody was asked to read",
+         "open, no reviewer, no comment — it is not moving", "#play"),
+        (len(prop), "are pushed but never proposed", "no merge request exists", "#play"),
         (len(parked), "are parked", "set aside on purpose, not forgotten", "#play"),
         (len(done), "have landed or been abandoned", "retired from the list below",
          "#play"),
@@ -3082,13 +3135,16 @@ def render(data, lede, focus_days, limit, cost=None):
     a('<div class="rung"><h2 id="play">In play</h2>'
       f'<span class="n">{len(live)} workstreams</span></div>')
     a('<p class="note">Grouped by when you last touched each one, and within a group by '
-      "how much unfinished work it holds. Each row says which rung it has reached — only "
-      "here, pushed, proposed, nobody asked, in review — but no rung is ranked against "
-      "another: unpublished work is a first-class problem, not a milder stalled review. "
-      "The one split the page does make is whether the next move is yours: a row in "
-      "<span style=\"color:var(--calm)\">green</span> is out for review with someone "
-      "named on it and wants nothing from you, so it sits at the foot of its group. "
-      "Open a row for what it is, what it needs, and how its branches relate. "
+      "what is waiting on you — a branch that stopped merging, a question, a red "
+      "pipeline, an approval nobody acted on — before how much unfinished work it holds. "
+      "Each row says which rung it has reached: only here, pushed, proposed, nobody "
+      "asked, in review. Unpublished work is a first-class problem and none of it is "
+      "hidden, but a loop with someone else in it compounds while it waits and a commit "
+      "on this laptop does not, so the loops lead and the size of the pile is the "
+      "tiebreak. The one split above all of that is whether the next move is yours: a "
+      "row in <span style=\"color:var(--calm)\">green</span> is out for review with "
+      "someone named on it and wants nothing from you, so it sits at the foot of its "
+      "group. Open a row for what it is, what it needs, and how its branches relate. "
       "<strong>Park</strong> sets one aside as backlog; it comes back on its own as soon "
       "as a commit lands on it.</p>")
     for key, title, got in buckets:
@@ -3207,24 +3263,54 @@ def render(data, lede, focus_days, limit, cost=None):
         if mism:
             a("<section>")
             a("<h2>Jira says otherwise</h2>")
-            a('<p class="note">Tickets whose status asserts the work left your hands, '
-              "while the commits are still on this laptop.</p>")
+            # Both kinds the list holds, and the order it is in. The note used to describe
+            # only the first kind, and it named no order at all -- which was honest while
+            # there was none: the rows arrived in whatever order Jira listed the issues.
+            # Now that they are ranked, the rank has to be stated and its figure has to be
+            # in the rows, or the column that decides the order reads as a broken sort.
+            a('<p class="note">Tickets the code contradicts — a status saying the work '
+              "left your hands while the commits are still on this laptop, or one saying "
+              "it is under way on a workstream nobody has touched in three weeks. "
+              "<strong>Longest-uncorrected first</strong>: the rank is how long the "
+              "ticket has gone without anyone touching any field on it, which is the "
+              "least time this status can have been standing — not how much unpushed "
+              "work is behind it, which is its own "
+              # Linked only where that disclosure was actually rendered. It is absent on a
+              # page with nothing local-only, and an anchor to a section that was never
+              # emitted is the same lie as a link to a 404.
+              + ('<a href="#only-here">question</a>' if loc else "question")
+              + ". <strong>&#x2715; acknowledges a row</strong> and it returns on its "
+              "own if the status or the scale moves.</p>")
             a('<div class="scroll" data-disgroup><table><thead><tr>'
-              "<th>Ticket</th><th>Claim</th><th>Reality</th><th>Summary</th><th></th>"
+              "<th>Ticket</th><th>Claim</th><th>Uncorrected</th><th>Reality</th>"
+              "<th>Summary</th><th></th>"
               "</tr></thead><tbody>")
             for m in mism:
                 i = m.get("issue", {})
+                # Blank rather than "0d" where Jira never said when the ticket was last
+                # touched. A zero in the column that decides the order is a claim that the
+                # record went wrong today, and an unknown is not that claim.
+                stale = m.get("stale_days") or 0
+                since = f"{stale}d" if stale else ""
                 a(f'<tr data-fp="{esc(m.get("fp",""))}"'
                   + (f' id="gp-{esc(m["fp"])}"' if m.get("fp") else "")
                   + f' data-dismissed="{1 if m.get("dismissed") else 0}"><td class="k">'
                   + link(i.get("url", ""), esc(i.get("key", "")))
                   + f'</td><td class="d">{esc(i.get("status",""))}</td>'
-                  f'<td class="n">{esc(m.get("why","").split(" but ")[-1])}</td>'
+                  + f'<td class="n">{since}</td>'
+                  + f'<td class="n">{esc(m.get("why","").split(" but ")[-1])}</td>'
                   f'<td class="d">{esc(i.get("summary",""))}</td>'
                   '<td><button class="dis" type="button" aria-label="acknowledge — '
                   'returns on its own if the status or the count moves" '
                   'title="acknowledge — returns on its own if the status or the count '
                   'moves">&#x2715;</button></td></tr>')
+            # The one truncation on this table, said out loud. It was silent while the order
+            # was arbitrary and a silent cut on a ranked list is worse: fourteen rows read
+            # as the whole disagreement.
+            cut = len(gap.get("status_mismatch") or []) - len(mism)
+            if cut > 0:
+                a(f'<tr><td class="d" colspan="6">&hellip;and {cut} more, each '
+                  "standing for less time than these.</td></tr>")
             a("</tbody></table></div></section>")
 
         unt = gap.get("unticketed_work") or []

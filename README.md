@@ -523,6 +523,24 @@ correctly sits below a seventeen-day one nobody has opened for a fortnight.
 `unpushed_dates` and `authoritative` already — and the cap belongs to whatever renders it,
 because a list truncated on the wire could never be un-truncated.
 
+**What leads, and what merely persists.** Local-only work has a permanent home — the count,
+the disclosure, the `only_here` ranking — and it does not have the first attention slot:
+*"the tool is too obsessed with me having commits on my laptop. i guess i do want that
+information somewhere but it's not the main signal of unfinished work"*. So the strip reads
+people first — what came back to you, then what is out for review — before what is only
+here, and the rungs where the next move is nobody's but yours follow in `DEMAND_RANK`'s own
+order. Inside a recency group, the same rule: what is waiting on you, worst first, with the
+size of the pile as the tiebreak rather than the sort. Nothing is hidden and no count moves.
+A loop with somebody else in it compounds while it waits; a commit on this disk does not.
+
+**The Jira-mismatch rows are ranked on that same principle** — *longest uncorrected first*,
+which is how long the ticket has gone without anyone touching any field on it, and therefore
+the least time the wrong status can have been standing. Days of work is the tiebreak, not the
+sort. One ranking, made once in `reconcile`: the table renders it in order, the page's
+opening sentence and the morning brief both take its head, and so the three cannot name
+three different worst tickets — nor can a sentence link to a row the table's fourteen-row
+cap removed.
+
 **`--authoritative-ticket` says what an arc’s work IS**, which is the one thing neither
 git nor Jira can settle. `UL-1852` reached review as one merge request; file overlap had
 already gathered eleven other branches into the same arc — experiments, backups, a

@@ -3583,6 +3583,14 @@ def reconcile(arcs, issues):
         a = by_key.get(i["key"])
         if not a:
             continue
+        # How long the record has been wrong, as a lower bound. `updated` moves when anyone
+        # edits any field on the ticket, so a status change would have bumped it: nothing
+        # having touched this ticket for 34 days means this status has stood for at least
+        # 34. Understating is the safe direction for a figure the page prints as
+        # "uncorrected for 34 days", and it needs no field this call does not already ask
+        # for -- `statuscategorychangedate` dates the category move rather than the status
+        # one, so it would read the same across "In Progress" -> "In Review" and overstate.
+        stale = _days_since(i.get("updated")) or 0
         # Days of work over the distinct unlanded commits, not a per-branch sum of commits.
         # "240 commits never pushed" against a ticket that has 114 is the kind of
         # overstatement that costs the whole page its credibility -- and this row exists to
@@ -3591,13 +3599,39 @@ def reconcile(arcs, issues):
         # thirty separate pieces of hidden work.
         if i["handed_off"] and a["unpushed_live"] > 0:
             scale = work_scale(a.get("unpushed_days", 0), a["unpushed_live"])[0]
-            mismatched.append({"issue": i, "arc": a, "ref": i["key"],
+            mismatched.append({"issue": i, "arc": a, "ref": i["key"], "stale_days": stale,
                                "why": f"status '{i['status']}' but {scale} never pushed"})
         elif not i["handed_off"] and a["age_days"] > 21:
-            mismatched.append({"issue": i, "arc": a, "ref": i["key"],
+            mismatched.append({"issue": i, "arc": a, "ref": i["key"], "stale_days": stale,
                                "why": f"status '{i['status']}' but untouched {a['age_days']}d"})
+    # One ranking, made here, because this list had three orders and two authors. The table
+    # rendered it in whatever order Jira happened to return the issues and then cut the
+    # tail at fourteen rows, while the page's lede and the morning brief each ran their own
+    # `max()` over the whole list -- so the ticket both sentences called the worst one could
+    # be a row the truncation had already removed, and the anchor they linked to pointed at
+    # nothing on the page.
+    #
+    # Ranked on how long the record has been wrong, not on how much unpushed work the wrong
+    # status is hiding, and that is a change of subject as much as of key: "the tool is too
+    # obsessed with me having commits on my laptop. i guess i do want that information
+    # somewhere but it's not the main signal of unfinished work". The size of the pile on
+    # this laptop was deciding which ticket the page called out to the team. A status nobody
+    # has corrected in two months is wrong in a way that compounds while it waits -- every
+    # standup, every rollup, every capacity number reads it -- and a fortnight of local work
+    # behind a ticket somebody touched this morning is not. What is on the disk has its own
+    # home in `only_here`, which is where that number is answerable.
+    #
+    # Days of work stays as the tiebreak, then commits, then the key: the order has to be
+    # total, because two builds of the same data that rank differently make the superlative
+    # in the brief move for no reason anybody can see.
+    mismatched.sort(key=lambda m: (-m["stale_days"],
+                                   -m["arc"].get("unpushed_days", 0),
+                                   -m["arc"].get("unpushed_live", 0),
+                                   m["ref"]))
     # The why-text carries the status and the scale, so the fingerprint expires the
-    # moment either moves -- Jira gets corrected, or another day's work piles up.
+    # moment either moves -- Jira gets corrected, or another day's work piles up. The
+    # staleness is deliberately NOT in it: a fingerprint that changed every midnight would
+    # reopen an acknowledged row every morning, which is the one thing a ✕ must not do.
     for m in mismatched:
         m["fp"] = _dfp("gap", m["issue"]["key"], m["why"])
     return {"unticketed_work": unticketed, "tickets_without_work": no_work,

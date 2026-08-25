@@ -63,13 +63,14 @@ def dropped(aid, label, why, cliff=9, **kw):
                      "forgotten": {"verdict": True, "why": why, "fp": "fg-" + aid}}
     return a
 
-def mismatch(key, status, unpushed, days=None, **kw):
+def mismatch(key, status, unpushed, days=None, stale=0, **kw):
+    """One row of the gap report, already ranked -- work-arcs sorts this list, not us."""
     days = unpushed if days is None else days
     scale = am.work_scale(days, unpushed)[0]
     m = {"issue": {"key": key, "status": status, "url": ""},
          "arc": {"unpushed_live": unpushed, "unpushed_days": days}, "ref": key,
          "why": "status '%s' but %s never pushed" % (status, scale),
-         "fp": "gp-" + key}
+         "stale_days": stale, "fp": "gp-" + key}
     m.update(kw)
     return m
 
@@ -185,11 +186,11 @@ print(says(d, "owed")[:4])'
     # A count that includes hidden rows disagrees with the section it points at, and the
     # ledger headings count what is visible.
     run am '
-mism = [mismatch("UL-1", "In Review", 5),
-        mismatch("UL-2", "Releasing", 1, dismissed=True),
-        mismatch("UL-3", "In Review", 2)]
+mism = [mismatch("UL-1", "In Review", 5, stale=40),
+        mismatch("UL-2", "Releasing", 1, stale=30, dismissed=True),
+        mismatch("UL-3", "In Review", 2, stale=20)]
 print(says(payload(gap={"status_mismatch": mism}), "contradiction"))'
-    [[ "$output" == *"the widest of 2 tickets"* ]]
+    [[ "$output" == *"of 2 tickets"* ]]
 }
 
 @test "an acknowledged cliff verdict is not the freshest thing you dropped" {
@@ -378,25 +379,44 @@ print(says(payload(ledger=LEDGER,
 
 # ── the contradiction, and the rankings nobody re-derives ─────────────────────
 
-@test "the widest mismatch wins, on the same rule the lede used" {
+@test "the first row on the wire wins, and it is not re-ranked here" {
+    # work-arcs ranks this list on how long each status has gone uncorrected, and the
+    # brief takes the head of it. It used to run its own max() over days of work, which
+    # meant the size of the pile on this laptop decided which ticket the brief called
+    # out -- and it could name a row the page had already truncated away.
     run am '
-mism = [mismatch("UL-1", "In Review", 6, days=4), mismatch("UL-2", "In Qualification", 202, days=9),
-        mismatch("UL-3", "Releasing", 1, days=1)]
+mism = [mismatch("UL-2", "In Qualification", 202, days=9, stale=61),
+        mismatch("UL-1", "In Review", 6, days=4, stale=12),
+        mismatch("UL-3", "Releasing", 1, days=1, stale=2)]
 print(says(payload(gap={"status_mismatch": mism}), "contradiction"))'
     [[ "$output" == *"UL-2"* ]]
     [[ "$output" == *"9 days of work on it never reached a remote"* ]]
-    [[ "$output" == *"the widest of 3 tickets"* ]]
+    [[ "$output" == *"of 3 tickets"* ]]
 }
 
-@test "widest means the most work, not the most commits" {
-    # 202 commits over one afternoon is one agentic session; 9 days of work is nine days
-    # of work. Ranking on the commit count put the churn first.
+@test "a bigger pile behind a fresher ticket does not take the sentence" {
+    # The verdict, in one comparison: "it is not the main signal of unfinished work". A
+    # ticket wrong for two months leads a ticket wrong since yesterday, whatever is
+    # sitting on the laptop behind either of them -- and the ordering happens upstream,
+    # so all this pins is that nothing here reverses it.
     run am '
-mism = [mismatch("UL-1", "In Review", 12, days=9), mismatch("UL-2", "In Qualification", 202, days=1)]
+mism = [mismatch("UL-2", "In Qualification", 3, days=1, stale=61),
+        mismatch("UL-1", "In Review", 40, days=14, stale=1)]
 print(says(payload(gap={"status_mismatch": mism}), "contradiction"))'
-    [[ "$output" == *"UL-1"* ]]
-    [[ "$output" == *"9 days of work on it never reached a remote"* ]]
-    [[ "$output" != *"202"* ]]
+    [[ "$output" == *"UL-2"* ]]
+    [[ "$output" != *"14 days"* ]]
+}
+
+@test "the sentence carries the clock that ordered the list" {
+    # A superlative whose figure is missing reads as an assertion. Where Jira never said
+    # when the ticket was last touched there is no clock, and none is claimed.
+    run am '
+one = [mismatch("UL-1", "In Review", 6, days=4, stale=61)]
+none = [mismatch("UL-1", "In Review", 6, days=4)]
+print(says(payload(gap={"status_mismatch": one}), "contradiction"))
+print(says(payload(gap={"status_mismatch": none}), "contradiction"))'
+    [[ "${lines[0]}" == *"uncorrected for 61 days"* ]]
+    [[ "${lines[1]}" != *"uncorrected"* ]]
 }
 
 @test "one day and one commit is less than a day, and carries no numeral at all" {
