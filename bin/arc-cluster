@@ -80,6 +80,11 @@ STACK_SIM = float(os.environ.get("ARC_STACK_SIM", "0.9"))
 CONTAIN_AT = float(os.environ.get("ARC_CONTAIN_AT", "0.6"))
 CONTAIN_MIN_SHARED = int(os.environ.get("ARC_CONTAIN_MIN_SHARED", "3"))
 
+# A ticket key in a branch name. Hoisted to a constant because two callers now read it:
+# label(), which names an arc after the ticket its branches carry, and membership(),
+# which never questions a branch whose own name carries that same key.
+TICKET_RE = re.compile(r"\b(UB|UL|DE|SBX)-\d{2,5}\b")
+
 # How much of a child's history must be its parent's before the two count as one stack.
 # Below this the parent is just the base that happened to be checked out.
 STACK_INHERIT = float(os.environ.get("ARC_STACK_INHERIT", "0.5"))
@@ -469,7 +474,11 @@ def cluster(ents, k, min_sim, stacks=()):
     comp = collections.defaultdict(list)
     for kk in keys:
         comp[find(kk)].append(kk)
-    return comp, sim, idf, keys
+    # df and hub_at travel with the result rather than being recomputed by the caller:
+    # they are what decided which files counted as evidence, and a membership explained
+    # in terms of a second, separately-derived ceiling would be explaining a different
+    # graph from the one that was clustered.
+    return comp, sim, idf, keys, df, hub_at
 
 
 def louvain(keys, sim, resolution, passes=12):
@@ -524,6 +533,170 @@ def louvain(keys, sim, resolution, passes=12):
     out = collections.defaultdict(list)
     for n in keys:
         out[comm[n]].append(n)
+    return out, placement_margin(keys, adj, deg, comm, ctot, m2, resolution)
+
+
+def placement_margin(keys, adj, deg, comm, ctot, m2, resolution):
+    """How decisively modularity put each node where it did, in [0, 1].
+
+    Everything else about a membership is evidence the clusterer weighed; this is the
+    clusterer's own verdict on how close the call was, which is the one number nothing
+    downstream can reconstruct. A node whose community beat the runner-up by a hair was
+    placed by a coin-flip over a graph that cannot see intent, and that is exactly the
+    membership worth asking a human about. Reading the objective the partition was
+    chosen by means the confidence is the algorithm's, not a second opinion invented
+    beside it -- a separate heuristic would disagree with the placement it is grading.
+
+    Measured on this corpus (794 entities, 41 multi-branch arcs): the UB-6802 arc holds
+    the metadata-geometry family at margin 1.0 and `UL-1852` -- the geo_filter migration,
+    a different effort on the same files -- near zero. That is the error the plan says no
+    threshold can fix, ranked to the top by the clusterer's own arithmetic.
+
+    Gains are the same expression the local-moving loop maximises. At convergence the
+    home gain is the largest, so the difference is non-negative; normalising by it gives
+    a share rather than a modularity delta, which is comparable across arcs of any size.
+    A runner-up that is not even positive means no alternative community wanted this node
+    at all, which is the strongest placement there is.
+    """
+    out = {}
+    for n in keys:
+        if n not in adj:
+            continue
+        dn = deg.get(n, 0.0)
+        here = comm[n]
+        # Excluding the node from its own community, exactly as the loop does before it
+        # compares -- otherwise a node is scored against a community it is inflating.
+        ctot[here] -= dn
+        wc = collections.defaultdict(float)
+        for nb, w in adj[n].items():
+            wc[comm[nb]] += w
+        gains = {c: w - resolution * ctot[c] * dn / m2 for c, w in wc.items()}
+        gains.setdefault(here, -resolution * ctot[here] * dn / m2)
+        ctot[here] += dn
+        mine = gains.pop(here)
+        alt = max(gains.values(), default=0.0)
+        out[n] = 0.0 if mine <= 0 else max(0.0, min(1.0, 1.0 - max(0.0, alt) / mine))
+    return out
+
+
+# What a membership needs before it stops being worth asking about. Both measured on
+# this repo's own corpus rather than chosen: see membership() for the numbers.
+#
+# CONFIDENCE_AT is the line under which a membership joins the curation queue. At 0.34
+# it holds 156 of 358 memberships on the corpus as measured -- which is not a queue, it
+# is a backlog, and that is the point: the queue is capped at five per build and pinned
+# answers drop out of it, so the line decides what is *eligible* and the cap decides what
+# is asked. Set it lower and the known errors stop being eligible; the UL-1852/UB-6802
+# case sits at 0.25 and `UB-6981` beside it at the same, so anything below 0.25 loses
+# exactly the errors the queue exists for.
+CONFIDENCE_AT = float(os.environ.get("ARC_CONFIDENCE_AT", "0.34"))
+
+# Shared distinctive files at which corroboration stops being the binding constraint.
+# MIN_SHARED (2) is the floor an edge must clear to exist at all, so a membership resting
+# on exactly 2 is resting on the weakest admissible evidence; by 5 the overlap is a
+# module's worth of files and no longer a coincidence.
+CORROBORATED_AT = int(os.environ.get("ARC_CORROBORATED_AT", "5"))
+
+
+def membership(members, ents, idf, df, N, hub_at, sim, margin, stackset, ticket):
+    """Per-branch: how this branch is held into this arc, and how confident that is.
+
+    The clustering's residual error has one shape -- two tickets that edit the same module
+    are structurally identical -- and the plan calls threshold tuning measured-exhausted
+    for it. What is left is a human, and a human is only worth asking where the machine is
+    least sure. So rather than tune the placement, publish the doubt: every membership
+    carries the evidence that put it there and a score for how thin that evidence is, and
+    the thinnest become questions.
+
+    Three terms, and the score is their minimum, because a membership is only as good as
+    its weakest support. Averaging them would let a strong term paper over the fatal one --
+    a branch with a hundred shared files that modularity placed by a coin-flip is exactly
+    the case that must not average its way out of the queue.
+
+      corroboration  distinct non-hub files shared with its strongest in-arc neighbour,
+                     against MIN_SHARED. This is the evidence the edge exists on at all.
+      decisiveness   the clusterer's own placement margin -- see placement_margin.
+      reach          how many members of the arc it links to at all. A branch hanging off
+                     one neighbour is in the arc on one relationship; three is enough to
+                     be embedded. Scaled against the arc's size so a two-branch arc, where
+                     one link IS every link, is not punished for being small.
+
+    Never questioned, and short-circuited to 1.0: ancestry- and alias-backed members,
+    because a branch cut from another is a fact and not an inference, and members whose
+    own name carries the arc's ticket key, because the arc is named after them. work-arcs
+    adds two more classes it alone can see -- the authoritative branch and superseded
+    copies -- since which branch IS the work depends on merge requests this tool never
+    reads.
+
+    Sessions carry no membership question. attach_sessions places them by argmax with no
+    floor at all, so they are genuinely the weakest attachment in the system -- but the
+    answer to a question is a detachment, and detached.json is a per-branch contract with
+    a per-branch expiry. A second store for sessions would be a fork of a contract the
+    plan says to reuse, and a session id is not a thing anybody can be asked about in one
+    keystroke. Recorded here so the omission is a decision rather than an oversight.
+    """
+    br = [m for m in members if m[0] == "branch"]
+    out = {}
+    if len(br) < 2:
+        return out                     # a branch alone in an arc has no membership to doubt
+    peers = len(br) - 1
+    for m in br:
+        here, links = [], 0
+        for o in br:
+            if o == m:
+                continue
+            s = sim.get((m, o) if m < o else (o, m), 0)
+            if not s:
+                continue
+            links += 1
+            # Counted the way cluster() counts it: files at or above the hub ceiling
+            # contribute no weight, so they are not corroboration either.
+            w = [f for f in (ents[m] & ents[o]) if df[f] < hub_at and idf.get(f, 0) > 0]
+            here.append((len(w), s, o, w))
+        here.sort(key=lambda t: (-t[0], -t[1], t[2]))
+        shared, _, best, files = here[0] if here else (0, 0.0, None, [])
+        files = sorted(files, key=lambda f: (-idf.get(f, 0), f))
+
+        anc = any((m, o) in stackset for o in br if o != m)
+        named = bool(ticket) and ticket in m[1].upper()
+        dec = margin.get(m, 0.0)
+        corr = max(0.0, min(1.0, (shared - MIN_SHARED + 1)
+                            / float(max(1, CORROBORATED_AT - MIN_SHARED + 1))))
+        reach = min(1.0, links / float(max(1, min(3, peers))))
+
+        terms = {"corroboration": round(corr, 3), "decisiveness": round(dec, 3),
+                 "reach": round(reach, 3)}
+        if anc or named:
+            score, why = 1.0, ("cut from another branch in this arc" if anc
+                               else "its own name carries this arc's ticket")
+        else:
+            # Ties broken by a fixed order so the reason a membership is questioned is
+            # the same on two runs over the same graph.
+            why_of = {
+                "corroboration": (
+                    "it shares no distinctive file with any branch here" if not shared
+                    else f"held by {shared} shared file"
+                         f"{'' if shared == 1 else 's'}"
+                         + (" — the corroboration floor" if shared <= MIN_SHARED else "")),
+                "decisiveness": "the clustering placed it here by a hair",
+                "reach": ("it links to nothing else here" if not links
+                          else f"it links to {links} of the {peers} other branch"
+                               f"{'' if peers == 1 else 'es'} here"),
+            }
+            key = min(("corroboration", "decisiveness", "reach"), key=lambda k: terms[k])
+            score, why = terms[key], why_of[key]
+        out[m[1]] = {
+            "confidence": round(score, 3),
+            "why": why,
+            "terms": terms,
+            "with": best[1] if best else None,
+            "shared": shared,
+            "files": files[:5],
+            "links": links,
+            "peers": peers,
+            "ancestry": anc,
+            "named": named,
+        }
     return out
 
 
@@ -550,7 +723,7 @@ def label(members, ents, idf, meta):
 
     branches = [n for k, n in members if k == "branch"]
     ticket = next((m.group(0) for n in branches
-                   if (m := re.search(r"\b(UB|UL|DE|SBX)-\d{2,5}\b", n.upper()))), None)
+                   if (m := TICKET_RE.search(n.upper()))), None)
     if ticket:
         return ticket
     if top_words:
@@ -594,6 +767,10 @@ def main():
 
     ents = load_entities(args.repo, args.main, args.max_files)
     meta = load_entities.meta
+    # Only modularity has an objective to read a placement margin off. mknn is kept for
+    # comparison and answers a different question, so it declares no confidence rather
+    # than inventing one.
+    margin = {}
     if not ents:
         sys.exit("arc-cluster: nothing to cluster (run arc-backfill first?)")
     branch_names = {n for kind, n in ents if kind == "branch"}
@@ -618,7 +795,7 @@ def main():
                               f"{parent}...{child}").splitlines() if (b := base(p))}
         if own:
             ents[key] = own
-    comp, sim, idf, keys = cluster(ents, args.k, args.min_sim, stacks)
+    comp, sim, idf, keys, df, hub_at = cluster(ents, args.k, args.min_sim, stacks)
     if args.method == "louvain":
         # Branches decide the arcs; sessions only join one. A session is a thread of
         # thought and thought drifts: session 8a4dc542 opens on roadMonitoring chart
@@ -633,9 +810,17 @@ def main():
         bkeys = [k for k in keys if k[0] == "branch"]
         bsim = {(a, b): s for (a, b), s in sim.items()
                 if a[0] == "branch" and b[0] == "branch"}
-        comp = louvain(bkeys, bsim, args.resolution)
+        comp, margin = louvain(bkeys, bsim, args.resolution)
         comp = attach_sessions(comp, ents, sim)
     comp = enforce_stacks(comp, stacks, set(ents))
+
+    # Ancestry and aliases as an undirected lookup, since "is this membership a fact"
+    # does not care which of the pair was cut from the other.
+    stackset = set()
+    for child, anc in stacks:
+        a, b = ("branch", child), ("branch", anc)
+        stackset.add((a, b))
+        stackset.add((b, a))
 
     arcs = []
     for members in comp.values():
@@ -645,13 +830,21 @@ def main():
         se = sorted({n.rsplit("#", 1)[0] for k, n in members if k == "session"})
         if not br and not se:
             continue
+        lbl = label(members, ents, idf, meta)
         arcs.append({
-            "label": label(members, ents, idf, meta),
+            "label": lbl,
             "branches": br,
             "sessions": se,
             "size": len(members),
+            # Why each branch is here and how thin that reason is. Emitted always rather
+            # than behind a flag: it is derived from the same pass that produced the
+            # arcs, costs one dictionary per branch, and a consumer that had to ask for
+            # it separately would be re-running the clustering to get it.
+            "membership": membership(members, ents, idf, df, len(keys), hub_at, sim,
+                                     margin, stackset,
+                                     lbl if TICKET_RE.fullmatch(lbl) else None),
         })
-    arcs.sort(key=lambda a: (-len(a["branches"]), -len(a["sessions"])))
+    arcs.sort(key=lambda a: (-len(a["branches"]), -len(a["sessions"]), a["label"]))
 
     if args.explain:
         me = ("branch", args.explain)
