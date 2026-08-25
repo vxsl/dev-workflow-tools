@@ -659,6 +659,19 @@ numbers, and the workstream gets its own rung. And it undoes itself: a single co
 branch of it expires the answer, because going back to work proves intent better than any
 answer about it.
 
+Which one gets asked is decided by the ranking it exists to fix: whichever eligible
+workstream sits highest in *what is only here* right now, because that is where an answer
+changes the part of the list a person actually reads. Ranked by how cold it is instead, the
+queue opened on a two-day scratch branch 92 days quiet in sixteenth place, ahead of seven
+days of chart work in fourth.
+
+**Membership still leads, and intent holds one seat of the five.** Strict priority sounded
+right and measured out as silence: 56 memberships sit under the confidence line on this
+repo and five are offered every build, against 29 workstreams eligible for an intent
+question — so the intent half would never have been asked at all until every grouping doubt
+in the repo was answered. Four of five is the priority; nought of five was the priority
+collapsing.
+
 **And every answer is a labelled example.** They append to `curation-labels.jsonl`, both
 verdicts and not only the corrections — scored on corrections alone, a clusterer that split
 everything into singletons would agree with every one of them and be useless. Intent

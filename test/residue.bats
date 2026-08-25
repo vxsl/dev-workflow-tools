@@ -90,8 +90,8 @@ def after(a, **kw):
 # A ledger that answered for everything it holds, and holds no promises.
 LEDGER = {"complete": True, "you_owe": [], "they_owe": []}
 
-def asked(arcs, ledger=LEDGER, jira=True, pinned=()):
-    q, why = wa.residue_queue(arcs, ledger, jira, pinned)
+def asked(arcs, ledger=LEDGER, jira=True, pinned=(), at_risk=()):
+    q, why = wa.residue_queue(arcs, ledger, jira, pinned, at_risk)
     return [x["arc"] for x in q], why
 
 $1
@@ -308,6 +308,36 @@ print([x["arc"] for x in q])
     [[ "$output" == *"['STOPPED', 'STEADY']"* ]]
 }
 
+@test "the queue asks first about whatever is distorting the at-risk ranking most" {
+    # The question exists because a ranked list of at-risk work is wrong when part of the
+    # pile was never meant to land, so the one worth asking first is the one whose answer
+    # moves the top of that list. Ranked by coldness instead, the queue opens on the
+    # oldest scratch branch in the repo, which is the least of what it costs to be wrong
+    # about. The order is passed in rather than recomputed, so there is one author for it.
+    run wa '
+big = arc("BIG-PILE", cliff=20, gap=4)
+old = arc("OLD-SPIKE", cliff=90, gap=1)
+print(asked([big, old])[0])
+print(asked([big, old], at_risk=["BIG-PILE", "OLD-SPIKE"])[0])
+'
+    [ "$status" -eq 0 ]
+    # Coldest-first would lead with the 90-day spike; the ranking that matters leads with
+    # the workstream sitting higher in the at-risk list.
+    [[ "$output" == *"['OLD-SPIKE', 'BIG-PILE']"* ]]
+    [[ "$output" == *"['BIG-PILE', 'OLD-SPIKE']"* ]]
+}
+
+@test "the question says where in the at-risk ranking it sits" {
+    # A queue whose order a reader cannot account for reads as a broken sort.
+    run wa '
+q, _ = wa.residue_queue([arc("A")], LEDGER, True, (), ["other", "A"])
+print(q[0]["at_risk_place"])
+print(wa.residue_preview(q[0]))
+'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"at-risk ranking         #2"* ]]
+}
+
 @test "the residue queue is capped on its own before it is merged" {
     run wa '
 print(len(wa.residue_queue([arc("A%d" % i) for i in range(9)], LEDGER, True)[0]))
@@ -331,6 +361,31 @@ print([q.get("branch") or q["arc"] for q in wa.combined_queue(mem[:1], res)])
     [ "$status" -eq 0 ]
     [[ "$output" == *"['b0', 'b1', 'b2', 'b3', 'R0']"* ]]
     [[ "$output" == *"['b0', 'R0', 'R1', 'R2', 'R3']"* ]]
+}
+
+@test "a full queue of membership questions still leaves intent a seat" {
+    # The case that made the floor necessary rather than tidy. Fifty-six memberships sit
+    # under the confidence line on this corpus and five are offered every build, so under
+    # strict priority the intent question is not merely last -- it is never asked, and a
+    # question that is never asked cannot fix the ranking it exists to fix.
+    run wa '
+mem = [{"kind": "membership", "branch": "b%d" % i} for i in range(9)]
+res = [{"kind": "residue", "arc": "R%d" % i} for i in range(9)]
+print([q.get("branch") or q["arc"] for q in wa.combined_queue(mem, res)])
+'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"['b0', 'b1', 'b2', 'b3', 'R0']"* ]]
+}
+
+@test "a reserved slot never invents a question that does not exist" {
+    run wa '
+mem = [{"kind": "membership", "branch": "b%d" % i} for i in range(9)]
+print([q["branch"] for q in wa.combined_queue(mem, [])])
+print([q["arc"] for q in wa.combined_queue([], [{"kind": "residue", "arc": "R"}])])
+'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"['b0', 'b1', 'b2', 'b3', 'b4']"* ]]
+    [[ "$output" == *"['R']"* ]]
 }
 
 # ── what an answer does ───────────────────────────────────────────────────────

@@ -48,8 +48,9 @@ explanation has been ruled out -- cold against the arc's own rhythm, never propo
 sprint carrying it, no promise naming it. "Residue" leaves every commit where it is and
 stops calling it debt; a commit on the work undoes the answer by itself.
 
-Five questions of both kinds together, and both answers to each append to
-curation-labels.jsonl -- which is what makes the next proposed change to the clustering
+Five questions of both kinds together -- membership leads and intent holds one seat, since
+on this corpus strict priority meant the intent half was never asked at all -- and both
+answers to each append to curation-labels.jsonl -- which is what makes the next proposed change to the clustering
 measurable instead of arguable: `arc-cluster --score-labels` replays a clustering against
 every judgement already made about grouping.
 
@@ -4468,6 +4469,9 @@ def residue_preview(q):
     out.append("  never proposed          no merge request exists and none ever did")
     out.append("  unclaimed               no sprint carries it and no promise names it")
     out.append(f"  rung                    {q['stage']}")
+    if q.get("at_risk_place"):
+        out.append(f"  at-risk ranking         #{q['at_risk_place']} — which is why it "
+                   "is asked here")
     out.append("")
     for n in q["branches"][:8]:
         out.append(f"    {n}")
@@ -4921,8 +4925,9 @@ def _residue_promised(arcs, ledger):
     return out
 
 
-def residue_queue(arcs, ledger, jira_known, pinned=(), cap=CURATION_CAP):
-    """The workstreams worth asking "was this ever meant to land?", coldest first.
+def residue_queue(arcs, ledger, jira_known, pinned=(), at_risk=(),
+                  cap=CURATION_CAP):
+    """The workstreams worth asking "was this ever meant to land?", worst distortion first.
 
     Derived, not asked about wholesale. The whole queue's rule is that asking about a
     fact is worse than asking nothing, and four kinds of work are intended BY
@@ -4955,13 +4960,26 @@ def residue_queue(arcs, ledger, jira_known, pinned=(), cap=CURATION_CAP):
     apply_dismissals makes about pruning on a half-answered ledger. Said out loud by the
     caller, so a quiet queue is never mistaken for a clean one.
 
-    Coldest first, measured as multiples of the arc's own rhythm rather than in days, so
-    two arcs quiet for the same fortnight are ordered by which of them that fortnight is
-    stranger for. Then by the days of work at stake, descending -- if only some of these
-    get answered, the ones whose answer moves the numbers most should be the ones asked.
-    Then the id, so the order is total and two runs over one graph ask in the same
-    sequence.
+    Ranked by where the workstream currently sits in `only_here`, and that ranking is
+    passed in rather than recomputed here for the reason every other ranking in this file
+    has one author: a second copy of days-of-work-times-staleness would differ from the
+    first the day either was improved.
+
+    It is the right key because it is the thing an answer FIXES. This queue exists because
+    a ranked list of at-risk work is wrong when a third of the pile was never meant to
+    land, so the question worth asking first is the one whose answer moves the top of that
+    list -- the part a person actually reads. Measured on this corpus the difference is not
+    academic: ranked by how cold it is, the queue opens on `lint-speedup-v2`, two days of
+    work sitting 92 days quiet at position 16; ranked by what it distorts it opens on seven
+    days of crash-pattern chart work at position 4. Both are worth asking about and only
+    one of them is worth asking about first.
+
+    Coldness is kept as the tiebreak, in multiples of the arc's own rhythm rather than in
+    days, so two arcs distorting the ranking equally are ordered by which of them that
+    silence is stranger for. Then the days of work, then the id, so the order is total and
+    two runs over one graph ask in the same sequence.
     """
+    place = {aid: i for i, aid in enumerate(at_risk or ())}
     if not arcs:
         return [], ""
     if not any(a.get("mrs_known", True) for a in arcs):
@@ -5018,11 +5036,17 @@ def residue_queue(arcs, ledger, jira_known, pinned=(), cap=CURATION_CAP):
             "cliff_days": k,
             "gap_days": gap,
             "beats": round(k / gap, 1),
+            # Where this workstream sits in the at-risk ranking right now, 1-based and
+            # None when it was not ranked. Sent with the question because it is the
+            # reason the question is being asked in this position, and a queue whose
+            # order a reader cannot account for reads as a broken sort.
+            "at_risk_place": (place[arc["id"]] + 1 if arc["id"] in place else None),
             "why": (f"{scale} on no remote, quiet {k} days against a {gap}-day "
                     f"rhythm, never proposed"),
             "stage": arc.get("stage") or "",
         })
-    out.sort(key=lambda q: (-q["beats"], -q["days"], -q["commits"], q["arc_id"]))
+    out.sort(key=lambda q: (place.get(q["arc_id"], len(place)), -q["beats"],
+                            -q["days"], -q["commits"], q["arc_id"]))
     return out[:cap], ""
 
 
@@ -5061,24 +5085,46 @@ def answer_residue(q, intended):
                 "via": q.get("via") or "cli"})
 
 
-def combined_queue(memberships, residues, cap=CURATION_CAP):
-    """One queue of at most `cap` questions, membership first.
+# How many of the queue's slots an intent question is guaranteed, when there is one to
+# ask. One, and it exists because pure priority measured out as silence.
+#
+# Membership outranks residue, and the reason is sound: a branch in the wrong arc poisons
+# everything downstream of the grouping -- the arc's subject, its ticket, its brief, its
+# rung and every count on it -- and it poisons the intent question too, since "is this
+# workstream intended?" is unanswerable about a workstream that is two pieces of work in
+# a trenchcoat. A stale branch counted as debt one more day is a number slightly too
+# large. So membership takes four of the five and leads the list.
+#
+# But strict priority is not a ranking, it is an exclusion, and on this corpus it excludes
+# everything: 56 memberships sit under the confidence line and the queue offers 5 of them
+# every single build, against 29 workstreams eligible for an intent question. Measured on
+# the real graph the day this was written, the combined queue held five membership
+# questions and no intent question, and would have gone on holding none until every
+# grouping doubt in the repo was answered. A question that is never asked cannot fix the
+# ranking it was built to fix -- and the ranking is the whole point: without an intent
+# verdict, five days of dead experiments outrank a meaningful half-day fix forever.
+#
+# So one slot is reserved rather than competed for. Four of five is still the priority the
+# reasoning above asks for; nought of five was the priority collapsing into silence.
+RESIDUE_SLOTS = int(os.environ.get("ARC_RESIDUE_SLOTS", "1"))
+
+
+def combined_queue(memberships, residues, cap=CURATION_CAP, floor=RESIDUE_SLOTS):
+    """One queue of at most `cap` questions, membership first and intent guaranteed a seat.
 
     The cap is shared rather than one each, because it is a budget of attention and not a
     budget of question types: five is what fits on a screen and what a person will answer
     between two other things, and ten questions in two sections is the backlog the whole
     loop was designed not to become.
 
-    Membership outranks residue when they compete, and the ranking is about what a wrong
-    answer costs. A branch in the wrong arc poisons everything downstream of the
-    grouping -- the arc's subject, its ticket, its brief, its rung and every count on it
-    -- and it poisons the residue question too, because "is this workstream intended?" is
-    unanswerable about a workstream that is two pieces of work in a trenchcoat. A stale
-    branch counted as debt for one more day is a number slightly too large. So the
-    questions that fix the foundation are asked first, and intent is asked with whatever
-    room is left.
+    Within it, membership leads and intent holds a floor -- see RESIDUE_SLOTS for the
+    measurement that made the floor necessary. Neither kind is padded: where there is
+    nothing to ask of one kind the other simply fills the queue, so a reserved slot can
+    never show a question that did not exist.
     """
-    return (list(memberships) + list(residues))[:cap]
+    mem, res = list(memberships), list(residues)
+    keep = min(len(res), floor)
+    return (mem[:max(0, cap - keep)] + res)[:cap]
 
 
 def co_members(cluster_assign, branch):
@@ -7721,7 +7767,8 @@ def main():
     # and then announce an abstention about a section it was never going to print.
     residues = []
     if args.curate or args.json:
-        residues, why_not = residue_queue(arcs, ledger, gap is not None, intended)
+        residues, why_not = residue_queue(arcs, ledger, gap is not None, intended,
+                                          only_here_ids)
         if why_not:
             print(f"  {why_not}", file=sys.stderr)
     curation = combined_queue(curation, residues)
