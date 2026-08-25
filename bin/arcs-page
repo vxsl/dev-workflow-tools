@@ -399,6 +399,29 @@ details.parked>summary b{color:var(--ink);font-weight:600}
 .news .item{position:relative;padding-right:2rem}
 .news .item .dis{position:absolute;top:0;right:0}
 td .dis{vertical-align:middle}
+/* Curation: the memberships this build is least sure of, one row each. Two controls and
+   no third — a question you cannot answer is answered by leaving it alone, and it comes
+   back next build. Sized down deliberately: this is a list of doubts, not of facts, and
+   it must not read louder than the work it is doubting. */
+.cur{border:1px solid var(--hairline);border-radius:4px;overflow:hidden}
+.cur .q{display:grid;grid-template-columns:auto 1fr;gap:.6rem;align-items:baseline;
+  padding:.55rem .8rem;border-top:1px solid var(--hairline)}
+.cur .q:first-child{border-top:0}
+.cur .q[data-answer="keep"]{background:var(--calm-wash)}
+.cur .q[data-answer="pry"]{background:var(--hot-wash)}
+.cur .yn{display:flex;gap:.3rem;white-space:nowrap}
+.cur .yn button{font:inherit;font-size:.72rem;font-family:var(--mono);cursor:pointer;
+  padding:.1rem .45rem;border-radius:2px;border:1px solid var(--hairline);
+  background:transparent;color:var(--ink-faint)}
+.cur .yn button:hover{color:var(--ink)}
+.cur .yn button.on[data-a="keep"]{border-color:var(--calm);color:var(--calm);
+  font-weight:700}
+.cur .yn button.on[data-a="pry"]{border-color:var(--hot);color:var(--hot);
+  font-weight:700}
+.cur .q b{font-family:var(--mono);font-size:.8rem;font-weight:600}
+.cur .q .ev{color:var(--ink-soft);font-size:.8rem}
+.cur .q .ev code{font-family:var(--mono);font-size:.74rem;color:var(--ink-faint)}
+
 /* The detach rail: ✕ per branch, an intent recorded now and applied on the next build.
    The struck name says the intent took; the legend says when it takes effect. */
 .tree .det{font-family:var(--mono);font-size:11px;fill:var(--ink-faint);
@@ -792,7 +815,7 @@ PARK_JS = r"""
 """
 
 
-# The page's two human inputs beyond parking, both held to the same contract: they
+# The page's human inputs beyond parking, all held to the same contract: they
 # persist in the artifact frame's own localStorage (per-artifact origin, so they survive
 # republishing), they are keyed to content rather than to names, so any change to the
 # fact underneath expires them, and saving to disk is offered rather than required --
@@ -802,7 +825,10 @@ PARK_JS = r"""
 #
 # Acknowledgement is one store across every ✕ on the page -- a ledger row, a demand on
 # its card, the same demand in the news, a Jira-mismatch row -- so acknowledging a fact
-# anywhere acknowledges it everywhere it is rendered.
+# anywhere acknowledges it everywhere it is rendered. Detachment is one store for the
+# same reason: answering "no, different work" to a curation question and clicking the ✕
+# on that branch's tree are the same act, and a second store would let the page show a
+# branch as both kept and pried.
 INTERACT_JS = r"""
 (function(){
   function read(key){ try{ return JSON.parse(localStorage.getItem(key)||'{}')||{}; }
@@ -822,6 +848,7 @@ INTERACT_JS = r"""
       msg=document.getElementById('intmsg'),
       saveDis=document.getElementById('savedis'),
       saveDet=document.getElementById('savedet'),
+      saveCur=document.getElementById('savecur'),
       saveFil=document.getElementById('savefil');
 
   // --- acknowledgements ----------------------------------------------------
@@ -853,20 +880,67 @@ INTERACT_JS = r"""
       if(d.dataset.branch!==el.dataset.branch) out.push(d.dataset.branch); });
     return out;
   }
+  // --- curation ---------------------------------------------------------------
+  // Two answers to one question, and they are not two stores. "No, different work" IS a
+  // detachment -- the same act as the ✕ on the branch tree, recorded the same way and
+  // saved by the same button -- so answering no here lights up the ✕ there and vice
+  // versa. Only "yes" needed somewhere new, because nothing on this page could say it
+  // before: it is the answer that leaves the grouping alone and stops it being asked
+  // about, and it is half of what makes the answers an eval set rather than a list of
+  // complaints.
+  var CKEY='work-arcs:confirmed:v1', cstore=read(CKEY), cdirty=false;
+  function cwrite(){ try{ localStorage.setItem(CKEY,JSON.stringify(cstore)); }catch(e){} }
+  var qs=[].slice.call(document.querySelectorAll('.cur .q')), qby={};
+  qs.forEach(function(el){ qby[el.dataset.branch]=el; });
+  function qpeers(el){ try{ return JSON.parse(el.dataset.peers||'[]')||[]; }
+                       catch(e){ return []; } }
+  // Same expiry as everything else a human declares here: tested against the company the
+  // branch was recorded keeping, never against the arc's name, so a reworded label leaves
+  // it alone and a regrouping ends it. Checked only where this page rendered the question
+  // -- a confirmation whose row is absent was not examined, and work-arcs expires it on
+  // its own next build.
+  (function(){
+    var dirty=false;
+    Object.keys(cstore).forEach(function(b){
+      var el=qby[b]; if(!el) return;
+      var e=cstore[b]||{}, rec=e['with']||[];
+      if(el.dataset.arc===(e.from||'')) return;
+      var cur={}; qpeers(el).forEach(function(p){ cur[p]=1; });
+      var hit=0; rec.forEach(function(p){ if(cur[p]) hit++; });
+      if(!rec.length||hit/rec.length<0.5){ delete cstore[b]; dirty=true; }
+    });
+    if(dirty) cwrite();
+  })();
+
   // Tested against the co-members rather than the label: the split pass rewords labels
-  // between runs, and a recorded intent must not expire over a rewording. An entry
-  // whose branch no longer shows grouped with mostly the same work has either been
-  // applied by a build or overtaken by the clustering -- not this page's to keep.
+  // between runs, and a recorded intent must not expire over a rewording. An entry whose
+  // branch still shows grouped with mostly the same work is still an answer to the
+  // question that was asked; one grouped with different work has been overtaken by the
+  // clustering and is not this page's to keep.
+  //
+  // Two places can say where a branch currently sits -- the ✕ rail on an arc's tree, and
+  // a curation row -- and both are consulted, because either surface can be the one that
+  // recorded the intent and neither is guaranteed to be on the page. A branch that
+  // appears in NEITHER is left alone rather than dropped: "not rendered" is not "no
+  // longer true", and a focus window sliding past an arc used to silently discard an
+  // unsaved detachment made against it. work-arcs expires those itself, out loud, on the
+  // next build -- which is the only place that has seen the whole clustering.
+  function whereNow(b){
+    var el=detOf[b];
+    if(el) return {arc:el.dataset.arc, peers:peersOf(el)};
+    var row=qby[b];
+    if(row) return {arc:row.dataset.arc, peers:qpeers(row)};
+    return null;
+  }
   Object.keys(tstore).forEach(function(b){
-    var el=detOf[b], e=tstore[b]||{};
+    var at=whereNow(b), e=tstore[b]||{};
+    if(!at) return;
     var keep=false;
-    if(el){
-      if(el.dataset.arc===(e.from||'')) keep=true;
-      else if((e['with']||[]).length){
-        var cur={}; peersOf(el).forEach(function(p){ cur[p]=1; });
-        var hit=0; e['with'].forEach(function(p){ if(cur[p]) hit++; });
-        keep=hit/e['with'].length>=0.5;
-      }
+    if(at.arc===(e.from||'')) keep=true;
+    else if((e['with']||[]).length){
+      var cur={}; at.peers.forEach(function(p){ cur[p]=1; });
+      var hit=0; e['with'].forEach(function(p){ if(cur[p]) hit++; });
+      keep=hit/e['with'].length>=0.5;
     }
     if(!keep){ delete tstore[b]; twrite(); }
   });
@@ -961,13 +1035,15 @@ INTERACT_JS = r"""
 
   function setBar(){
     if(!bar) return;
-    bar.classList.toggle('on', ddirty||tdirty||fdirty);
+    bar.classList.toggle('on', ddirty||tdirty||cdirty||fdirty);
     if(saveDis) saveDis.hidden=!ddirty;
     if(saveDet) saveDet.hidden=!tdirty;
+    if(saveCur) saveCur.hidden=!cdirty;
     if(saveFil) saveFil.hidden=!fdirty;
-    if(msg&&(ddirty||tdirty||fdirty))
+    if(msg&&(ddirty||tdirty||cdirty||fdirty))
       msg.textContent=Object.keys(dstore).length+' acknowledged, '
         +Object.keys(tstore).length+' detached, '
+        +Object.keys(cstore).length+' confirmed, '
         +Object.keys(fstore).length+' filed in this browser';
   }
 
@@ -1007,6 +1083,12 @@ INTERACT_JS = r"""
         '.item[data-dismissed="1"]').length===items.length
         &&n.closest('[data-disgroup]').dataset.show!=='1')?'none':''; });
     fblocks.forEach(fapply);
+    qs.forEach(function(row){
+      var b=row.dataset.branch;
+      row.dataset.answer=(b in cstore)?'keep':((b in tstore)?'pry':'');
+      row.querySelectorAll('.yn button').forEach(function(btn){
+        btn.classList.toggle('on', btn.dataset.a===row.dataset.answer); });
+    });
     dets.forEach(function(el){
       var on=el.dataset.branch in tstore;
       el.classList.toggle('on', on);
@@ -1044,6 +1126,22 @@ INTERACT_JS = r"""
         fdirty=true; fwrite(); apply();
       }
       return; }
+    var yn=t.closest?t.closest('.cur .yn button'):null;
+    if(yn){ ev.preventDefault();
+      var row=yn.closest('.q'), br=row.dataset.branch, want=yn.dataset.a;
+      var entry={from:row.dataset.arc,'with':qpeers(row).slice(0,12),
+                 at:Math.floor(Date.now()/1000)};
+      // A branch cannot be both pinned and pried, so answering one way clears the other.
+      // Clicking the answer already showing takes it back -- the row returns to unasked,
+      // which is the same state as never having touched it.
+      var was=row.dataset.answer;
+      if(br in cstore){ delete cstore[br]; cdirty=true; }
+      if(br in tstore){ delete tstore[br]; tdirty=true; }
+      if(was!==want){
+        if(want==='keep'){ cstore[br]=entry; cdirty=true; }
+        else { tstore[br]=entry; tdirty=true; }
+      }
+      cwrite(); twrite(); apply(); return; }
     var sh=t.closest?t.closest('.ledger .showdis'):null;
     if(sh&&!sh.hidden){ var side=sh.closest('.side');
       if(side){ side.dataset.show=(side.dataset.show==='1')?'0':'1'; apply(); } }
@@ -1070,6 +1168,10 @@ INTERACT_JS = r"""
   if(saveDet) saveDet.addEventListener('click',function(){
     saveFile('detached.json', JSON.stringify(tstore,null,1), msg,
              function(){ tdirty=false; setBar(); });
+  });
+  if(saveCur) saveCur.addEventListener('click',function(){
+    saveFile('confirmed.json', JSON.stringify(cstore,null,1), msg,
+             function(){ cdirty=false; setBar(); });
   });
   if(saveFil) saveFil.addEventListener('click',function(){
     saveFile('authoritative-ticket.json', JSON.stringify(fstore,null,1), msg,
@@ -2993,6 +3095,46 @@ def render(data, lede, focus_days, limit, cost=None):
                   f'<td class="d">{esc(init)}</td></tr>')
             a("</tbody></table></div></section>")
 
+    # --- what the grouping is least sure of ---------------------------------
+    # Silent when there is nothing to ask: work-arcs omits the key rather than sending an
+    # empty list, so this is a test for a section that exists rather than for a length.
+    # Nothing about this block notifies, badges or counts up anywhere else on the page --
+    # the taskmaster shape is exactly what makes a prompt get ignored, and a question that
+    # is ignored is worse than one that was never asked, because it trains the eye past
+    # the place the next one will appear.
+    curation = data.get("curation") or []
+    if curation:
+        a("<section>")
+        a("<h2>Is this the same work?</h2>")
+        a('<p class="note">Where the grouping is least sure of itself. Branches are '
+          "grouped by the files they touch, and two tickets editing the same module look "
+          "identical by files however the weights are set — so the guesses are published "
+          "rather than tuned away. <b>Yes</b> pins the membership and stops it being "
+          "asked while it keeps this company; <b>no</b> pries the branch out, and it "
+          "falls back to what its own name declares. Leaving a row alone records nothing "
+          "and asks again next time. The command line asks the same questions one "
+          "keystroke at a time: <code>work-arcs --curate</code>.</p>")
+        a('<div class="cur">')
+        for q in curation:
+            peers = json.dumps(sorted(q.get("co_members") or []))
+            a(f'<div class="q" data-branch="{esc(q["branch"])}" '
+              f'data-arc="{esc(q["arc"])}" data-fp="{esc(q["fp"])}" '
+              f"data-peers='{esc(peers)}' data-answer=\"\">")
+            a('<span class="yn">'
+              '<button type="button" data-a="keep" title="same work — pin this '
+              'membership">yes</button>'
+              '<button type="button" data-a="pry" title="different work — pry this '
+              'branch out of the arc">no</button></span>')
+            files = ", ".join(q.get("files") or [])
+            a('<span class="ev"><b>' + esc(q["branch"]) + "</b> — same work as "
+              + esc(q["arc"]) + "? <br>" + esc(q.get("why") or "")
+              + (f'.<br>Its strongest tie here is <code>{esc(q["with"])}</code>'
+                 + (f", on {esc(files)}" if files else "") if q.get("with") else "")
+              + "</span>")
+            a("</div>")
+        a("</div>")
+        a("</section>")
+
     # --- what this assistant costs -------------------------------------------
     # Absent unless `arcs` wrote a cost sidecar for this run. A stale figure here would
     # be indistinguishable from a current one, and unlike a stale arc it would never
@@ -3012,10 +3154,11 @@ def render(data, lede, focus_days, limit, cost=None):
     a('<div id="interactbar"><span id="intmsg"></span>'
       '<button type="button" id="savedis" hidden>Save acknowledgements</button>'
       '<button type="button" id="savedet" hidden>Save detachments</button>'
+      '<button type="button" id="savecur" hidden>Save confirmations</button>'
       '<button type="button" id="savefil" hidden>Save filings</button>'
       '<span class="muted">All three apply here and survive reloads. Saving writes '
       '<code>dismissed.json</code> / <code>detached.json</code> / '
-      '<code>authoritative-ticket.json</code> into '
+      '<code>confirmed.json</code> / <code>authoritative-ticket.json</code> into '
       '<code>~/.local/state/work-arcs/</code> — acknowledgements keep the CLI in '
       'agreement, while a detachment or a filing takes full effect when '
       '<code>work-arcs</code> next builds the page.</span></div>')

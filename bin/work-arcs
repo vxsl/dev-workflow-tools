@@ -4448,6 +4448,12 @@ def curation_queue(arcs, membership, cluster_assign, uncertain=(), cap=CURATION_
                 "files": m.get("files") or [],
                 "links": m.get("links", 0),
                 "peers": len(peers),
+                # The referent an answer will be recorded against, sent with the
+                # question so the page writes the same `with` list the CLI would. A page
+                # that rebuilt it from the rows it rendered would record a different
+                # referent whenever the arc's tree was truncated, and the two stores
+                # would then expire at different times over the same event.
+                "co_members": peers[:PEERS_RECORDED],
                 "commits": b.get("commits_ahead", 0),
                 "age_days": b.get("age_days", 999),
                 "flagged_by_model": flagged,
