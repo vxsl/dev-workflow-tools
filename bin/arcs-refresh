@@ -328,9 +328,12 @@ refresh_access_token() {
         return 1
     fi
 
+    # Content-Type and nothing else, which is what the CLI's own refresh sends. The beta
+    # header belongs on /usage and was on this request too until it was checked; an extra
+    # header on a token grant is a way to be rejected for a reason that has nothing to do
+    # with the credential.
     REFRESH_HTTP_CODE="$(curl -sS -m "$HTTP_TIMEOUT" -o "$resp" -w '%{http_code}' \
         -H 'Content-Type: application/json' \
-        -H "anthropic-beta: $OAUTH_BETA" \
         --data @"$req" "$OAUTH_TOKEN_URL" 2>/dev/null || true)"
     REFRESH_HTTP_CODE="$(http_code_or_000 "$REFRESH_HTTP_CODE")"
     rm -f "$req"
