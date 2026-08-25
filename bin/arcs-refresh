@@ -9,13 +9,19 @@
 #                   not stop, it starts spending money. An automation is the one thing
 #                   that must never be what pushes you over, so it reads the utilisation
 #                   before it starts and stands down rather than find out afterwards.
-#   a lock          because a 07:10 cron and a 07:10 `arcs` typed by hand would otherwise
+#   a lock          because a 07:10 timer and a 07:10 `arcs` typed by hand would otherwise
 #                   both move the run-over-run snapshot baseline, and the loser's interval
 #                   of changes disappears.
 #   a log           because a program nobody watches has to be able to say what it did.
 #   silence         on success. A daily "it worked" notification is training to ignore
 #                   notifications; you only hear from this when it did not run.
-#   an environment  built explicitly -- see below, this is where the real bug was.
+#   an environment  built explicitly -- the first bug.
+#   a credential    that survives a night with nobody logged in -- the second.
+#   a clock         that survives a closed lid -- the third.
+#
+# All three are the same bug wearing different clothes: the program was correct and its
+# surroundings were not what it was written in. What follows is the record of each, kept
+# here rather than in a commit message because the next one will be of the same family.
 #
 # THE ENVIRONMENT IS THE WHOLE PROBLEM.
 #
@@ -47,11 +53,51 @@
 # every subprocess. Both are fixed here rather than there, because bin/arcs is correct for
 # the shell it was written for.
 #
-#   arcs-refresh                    run it now, the way cron will
+# AND THEN THE CREDENTIAL, AND THEN THE CLOCK.
+#
+# The paragraphs above were written with some satisfaction, and then the page stopped
+# being rebuilt for eight days anyway. The log is the whole story:
+#
+#     Aug 17 07:10  refreshed in 278s
+#     Aug 19 07:10  stood down: the usage endpoint could not be read
+#     Aug 21 07:10  stood down: the usage endpoint could not be read
+#     Aug 22-25     no line at all
+#
+# THE CREDENTIAL. The quota guard reads claudeAiOauth.accessToken out of
+# ~/.claude/.credentials.json, and that token is good for hours, not for a night. At 07:10
+# nobody has run a Claude session since the evening before, so the token is stale, /usage
+# answers 401, and the guard does precisely the thing it was carefully built to do: it
+# declines to guess, and stands down. Every step of that is correct and the feature does
+# not exist. The tell was that the same check passed by hand at 10:00 the same morning --
+# by then a live session had refreshed the token on its own behalf.
+#
+# So a 401, and a 401 only, now buys one retry with an access token minted from
+# claudeAiOauth.refreshToken against the token endpoint the CLI itself uses. A timeout or
+# a 500 buys nothing: those say something about the network and nothing about the token,
+# and spending a refresh on them would turn "the wifi was down" into "your login is
+# broken" in the log. The new token is held in a variable and never written down --
+# see refresh_access_token for why writing it would be worse than the bug it fixes.
+#
+# THE CLOCK. `10 7 * * *` in a crontab does not fire on a laptop that is asleep at 07:10,
+# and cron has no notion of a run it owes you, so three days of closed lid produced no
+# line in the log at all. Not a failure -- an absence, which is the harder thing to
+# notice, and the reason this went a week. That is now a systemd user timer with
+# Persistent=true, which fires on the next wake for a run it missed. `--install-timer`
+# removes the crontab line on its way past, because two schedulers for one job is a
+# race dressed as a belt and braces.
+#
+# And a timer that fires on wake fires while wifi is still associating, which would have
+# traded the old silence for a new one. A usage read that comes back with no HTTP status
+# at all is therefore retried a few times before it counts as an answer: a run that
+# happens without a network is the same missing page as a run that never happened.
+#
+#   arcs-refresh                    run it now, the way the timer will
 #   arcs-refresh --force            run even if the quota guard says no
 #   arcs-refresh --check-quota      just the guard's verdict, then exit
-#   arcs-refresh --install-cron     add-or-replace the 07:10 daily crontab line
-#   arcs-refresh --install-cron 06:30
+#   arcs-refresh --install-timer    the systemd user timer: 07:10, catches up after sleep
+#   arcs-refresh --install-timer 06:30
+#   arcs-refresh --uninstall-timer  disable it and remove the units
+#   arcs-refresh --install-cron     the crontab line instead -- no catch-up, see above
 #   arcs-refresh --uninstall-cron   remove it, leave every other crontab line alone
 #   arcs-refresh --hook             print the arc-record Stop hook block for settings.json
 #
@@ -61,11 +107,16 @@
 #   WORK_ARCS_REFRESH_ON_UNKNOWN skip|run when the quota cannot be read    (default skip)
 #   WORK_ARCS_REFRESH_CMD        the pipeline to run                       (default arcs)
 #   WORK_ARCS_REFRESH_LOG_LINES  ring-trim the log to this many lines      (default 2000)
+#   WORK_ARCS_REFRESH_NET_TRIES  usage reads before a dead network counts  (default 3)
+#   WORK_ARCS_REFRESH_NET_DELAY  seconds to wait between those             (default 10)
+#   WORK_ARCS_CREDS              the OAuth credential file to read from
+#                                                  (~/.claude/.credentials.json)
 #
 # Exit codes are distinct so the log and a test can tell the outcomes apart: 0 refreshed,
 # 1 the pipeline failed, 3 stood down on quota, 4 another run holds the lock, 5 a required
 # program is missing. cron mails on output rather than on status and this script writes
-# its output to its own log, so a non-zero exit is quiet by construction.
+# its output to its own log, so a non-zero exit is quiet by construction; the systemd unit
+# names 3 and 4 in SuccessExitStatus for the same reason.
 #
 # PUBLISHING IS NOT HERE, and cannot be: the page is a Claude Code artifact and only a
 # Claude Code session can write to that URL. That is a platform constraint rather than a
@@ -116,8 +167,18 @@ STATE="${XDG_STATE_HOME:-$HOME/.local/state}/work-arcs"
 LOG_FILE="$STATE/refresh.log"
 LOCK_FILE="$STATE/refresh.lock"
 STATE_FILE="$STATE/refresh.json"
-CREDS="$HOME/.claude/.credentials.json"
+# Overridable so a test can point it at a fixture -- the 401 path is the whole reason this
+# file has a refresh in it, and it cannot be exercised against the real login.
+CREDS="${WORK_ARCS_CREDS:-$HOME/.claude/.credentials.json}"
 USAGE_URL="${WORK_ARCS_USAGE_URL:-https://api.anthropic.com/api/oauth/usage}"
+
+# The refresh_token half of the flow Claude Code itself uses, read out of the CLI it ships
+# with rather than guessed: TOKEN_URL and CLIENT_ID are its own constants, and the beta
+# header is the one both the token endpoint and /usage are gated behind. Overridable
+# because they are somebody else's constants and will move without asking.
+OAUTH_TOKEN_URL="${WORK_ARCS_OAUTH_TOKEN_URL:-https://platform.claude.com/v1/oauth/token}"
+OAUTH_CLIENT_ID="${WORK_ARCS_OAUTH_CLIENT_ID:-9d1c250a-e61b-44d9-88ed-5944d1962f5e}"
+OAUTH_BETA="${WORK_ARCS_OAUTH_BETA:-oauth-2025-04-20}"
 NOTIFY="$HOME/bin/notification/claude-notify.sh"
 
 MAX_5H="${WORK_ARCS_REFRESH_MAX_5H:-80}"
@@ -126,6 +187,13 @@ ON_UNKNOWN="${WORK_ARCS_REFRESH_ON_UNKNOWN:-skip}"
 PIPELINE="${WORK_ARCS_REFRESH_CMD:-arcs}"
 LOG_LINES="${WORK_ARCS_REFRESH_LOG_LINES:-2000}"
 HTTP_TIMEOUT=10
+
+# A timer that catches up after a wake runs while wifi is still associating, so a
+# usage read that comes back with no HTTP status at all is not yet an answer. Three
+# tries ten seconds apart, which costs half a minute on the one morning a year the
+# machine genuinely has no network and buys back every morning it is merely slow.
+NET_TRIES="${WORK_ARCS_REFRESH_NET_TRIES:-3}"
+NET_DELAY="${WORK_ARCS_REFRESH_NET_DELAY:-10}"
 
 CRON_MARKER="# work-arcs-refresh"
 CRON_DEFAULT_TIME="07:10"
@@ -159,38 +227,159 @@ trim_log() {
 
 # --- the quota guard --------------------------------------------------------------------
 
-# The same endpoint `/usage` and bin/arcs-cost read, with the same etiquette: a 401 is a
-# token caught mid-refresh rather than an error worth reporting, and any failure returns
-# nothing rather than a guess. The caller decides what "nothing" means -- see quota_verdict,
-# where it deliberately does not mean "go ahead".
-fetch_usage() {
-    local tok body code
-    tok="$(jq -r '.claudeAiOauth.accessToken // empty' "$CREDS" 2>/dev/null || true)"
-    [ -n "$tok" ] || return 1
+# Globals rather than a printed tuple, and that is not laziness. The interesting part of
+# the answer is no longer only the number: a read that needed a new access token first is
+# a different outcome from one that did not, and the log has to be able to say which. A
+# command substitution runs its function in a subshell, so anything the function learned
+# on the way to the number would be discarded with it.
+USAGE_JSON=""        # path to a temp file holding the response body, on success
+USAGE_FAILURE=""     # a sentence saying why there is no body, on failure
+USAGE_REFRESHED=0    # 1 when refreshing the access token is what made it work
+USAGE_HTTP_CODE=""   # the last status /usage gave, "000" when curl never got one
+REFRESH_HTTP_CODE="" # ditto for the token endpoint
+FRESH_ACCESS_TOKEN=""
+
+# One GET with one bearer token, and the status kept where the caller can see it. That
+# last part is the change: 401 means this token is stale and 000 means there is no network
+# yet, and the whole fix rests on not treating them the same.
+usage_call() {
+    local tok="$1" body
     body="$(mktemp)"
-    code="$(curl -sS -m "$HTTP_TIMEOUT" -o "$body" -w '%{http_code}' \
+    USAGE_HTTP_CODE="$(curl -sS -m "$HTTP_TIMEOUT" -o "$body" -w '%{http_code}' \
         -H "Authorization: Bearer $tok" \
-        -H "anthropic-beta: oauth-2025-04-20" \
+        -H "anthropic-beta: $OAUTH_BETA" \
         "$USAGE_URL" 2>/dev/null || echo 000)"
-    if [ "$code" = "200" ] && jq -e . "$body" >/dev/null 2>&1; then
-        cat "$body"; rm -f "$body"; return 0
+    if [ "$USAGE_HTTP_CODE" = "200" ] && jq -e . "$body" >/dev/null 2>&1; then
+        USAGE_JSON="$body"
+        return 0
     fi
     rm -f "$body"
     return 1
 }
 
-# Prints "<verdict>|<reason>|<five_hour>|<seven_day>" where verdict is ok, over or unknown.
+# The same call, given up on only after the network has had a chance to arrive. Retries on
+# a "000" -- curl could not complete the request at all -- and on nothing else: a 401 is an
+# answer and gets handled, a 500 is an answer and is not going to change in ten seconds.
+usage_call_patiently() {
+    local tok="$1" try=1
+    while :; do
+        if usage_call "$tok"; then return 0; fi
+        if [ "$USAGE_HTTP_CODE" != "000" ] || [ "$try" -ge "$NET_TRIES" ]; then
+            return 1
+        fi
+        log "the usage endpoint was unreachable (try $try of $NET_TRIES) — waiting ${NET_DELAY}s for the network"
+        sleep "$NET_DELAY"
+        try=$((try + 1))
+    done
+}
+
+# THE 07:10 BUG, and the reason this function exists at all. See the header: the access
+# token in the credentials file is good for hours and not for a night, so at 07:10 it is
+# stale, /usage answers 401, and a guard built to refuse to guess refuses to guess. This
+# mints a new one from the refresh token, which is the flow the CLI uses on its own behalf.
+#
+# THE NEW TOKEN IS NEVER WRITTEN DOWN, and that is the load-bearing decision here.
+# ~/.claude/.credentials.json belongs to whichever Claude Code session is running: it
+# rewrites the whole file when it refreshes, with no lock for anyone else to take. A second
+# writer would turn a lost race into a truncated credential file, which is a broken login
+# rather than a stale page -- strictly worse than the bug being fixed. So the token lives
+# in a shell variable for the length of one retry and is then dropped. The cost is one
+# extra token minted per morning; the benefit is that this file cannot break a session.
+#
+# ~/bin/hud-claude-usage reads the same endpoint with the same 401-means-stale limitation
+# and keeps its stale cache instead. It could borrow this, but it is outside this repo and
+# a shared helper for two callers is a worse trade than a pointer in a comment.
+#
+# The request body is a file and not an argument, because an argument is in `ps` and a
+# refresh token is the durable half of the credential.
+refresh_access_token() {
+    local req resp
+    FRESH_ACCESS_TOKEN=""
+    REFRESH_HTTP_CODE=""
+    req="$(mktemp)"; resp="$(mktemp)"
+    chmod 600 "$req" "$resp"
+
+    jq -n --slurpfile c "$CREDS" --arg cid "$OAUTH_CLIENT_ID" '
+        {grant_type: "refresh_token",
+         refresh_token: $c[0].claudeAiOauth.refreshToken,
+         client_id: $cid,
+         scope: (($c[0].claudeAiOauth.scopes // []) | join(" "))}' >"$req" 2>/dev/null || true
+    # No refresh token to spend is not a network problem and must not look like one.
+    if ! jq -e '.refresh_token | type == "string" and length > 0' "$req" >/dev/null 2>&1; then
+        rm -f "$req" "$resp"
+        REFRESH_HTTP_CODE="none"
+        return 1
+    fi
+
+    REFRESH_HTTP_CODE="$(curl -sS -m "$HTTP_TIMEOUT" -o "$resp" -w '%{http_code}' \
+        -H 'Content-Type: application/json' \
+        -H "anthropic-beta: $OAUTH_BETA" \
+        --data @"$req" "$OAUTH_TOKEN_URL" 2>/dev/null || echo 000)"
+    rm -f "$req"
+
+    if [ "$REFRESH_HTTP_CODE" = "200" ]; then
+        FRESH_ACCESS_TOKEN="$(jq -r '.access_token // empty' "$resp" 2>/dev/null || true)"
+    fi
+    rm -f "$resp"
+    [ -n "$FRESH_ACCESS_TOKEN" ]
+}
+
+# Sets USAGE_JSON on success and USAGE_FAILURE on failure, and the failures are worth
+# telling apart in the log: "there was no network", "your token was old and I fixed it",
+# and "your token was old and I could not" are three different mornings.
+fetch_usage() {
+    USAGE_JSON=""; USAGE_FAILURE=""; USAGE_REFRESHED=0
+    local tok
+    tok="$(jq -r '.claudeAiOauth.accessToken // empty' "$CREDS" 2>/dev/null || true)"
+    if [ -z "$tok" ]; then
+        USAGE_FAILURE="no access token in $CREDS"
+        return 1
+    fi
+
+    if usage_call_patiently "$tok"; then return 0; fi
+
+    # A 401, and only a 401. A timeout or a 500 says something about the network and
+    # nothing about the token, and spending a refresh on one would write "your login is
+    # broken" in the log on a morning the wifi was slow.
+    if [ "$USAGE_HTTP_CODE" != "401" ]; then
+        USAGE_FAILURE="the usage endpoint could not be read (HTTP $USAGE_HTTP_CODE)"
+        return 1
+    fi
+
+    if ! refresh_access_token; then
+        USAGE_FAILURE="the access token is expired and refreshing it was refused (token endpoint HTTP $REFRESH_HTTP_CODE) — run any claude session to refresh it, or re-login"
+        return 1
+    fi
+
+    if usage_call_patiently "$FRESH_ACCESS_TOKEN"; then
+        FRESH_ACCESS_TOKEN=""
+        USAGE_REFRESHED=1
+        return 0
+    fi
+    FRESH_ACCESS_TOKEN=""
+    USAGE_FAILURE="the usage endpoint still answered HTTP $USAGE_HTTP_CODE with a freshly refreshed access token"
+    return 1
+}
+
+QUOTA_VERDICT=""; QUOTA_REASON=""; QUOTA_5H=""; QUOTA_7D=""; QUOTA_REFRESHED=0
+
+# Verdict is ok, over or unknown, in QUOTA_VERDICT, with QUOTA_REFRESHED saying whether
+# reading it took a new token -- see the note on fetch_usage's globals for why this is not
+# a printed tuple any more.
 #
 # `>` and not `>=`: the thresholds name the last utilisation that is still fine, so a
 # default of 80 permits a run at exactly 80% and refuses 81%. The comparison is jq's
 # because the endpoint reports floats and bash cannot compare them.
 quota_verdict() {
-    local raw
-    if ! raw="$(fetch_usage)"; then
-        printf 'unknown|the usage endpoint could not be read||\n'
+    QUOTA_VERDICT=""; QUOTA_REASON=""; QUOTA_5H=""; QUOTA_7D=""; QUOTA_REFRESHED=0
+    if ! fetch_usage; then
+        QUOTA_VERDICT=unknown
+        QUOTA_REASON="$USAGE_FAILURE"
         return 0
     fi
-    printf '%s\n' "$raw" | jq -r --argjson m5 "$MAX_5H" --argjson m7 "$MAX_7D" '
+    QUOTA_REFRESHED="$USAGE_REFRESHED"
+    local line
+    line="$(jq -r --argjson m5 "$MAX_5H" --argjson m7 "$MAX_7D" '
         (.five_hour.utilization // null) as $f |
         (.seven_day.utilization // null) as $s |
         if $f == null or $s == null then
@@ -201,7 +390,9 @@ quota_verdict() {
             "over|7-day quota at \($s)%, over the \($m7)% ceiling|\($f)|\($s)"
         else
             "ok||\($f)|\($s)"
-        end' 2>/dev/null || printf 'unknown|the usage response was not JSON||\n'
+        end' "$USAGE_JSON" 2>/dev/null || printf 'unknown|the usage response was not JSON||')"
+    rm -f "$USAGE_JSON"; USAGE_JSON=""
+    IFS='|' read -r QUOTA_VERDICT QUOTA_REASON QUOTA_5H QUOTA_7D <<<"$line" || true
 }
 
 # --- preflight ---------------------------------------------------------------------------
@@ -249,10 +440,12 @@ current_crontab() {
     crontab -l 2>/dev/null || true
 }
 
-install_cron() {
-    local time="${1:-$CRON_DEFAULT_TIME}"
+# Shared by both installers, because "06:05" must be read as five past six and not as
+# octal 5, and "breakfast" must be refused by whichever flag was typed.
+validate_time() {
+    local time="$1" flag="$2"
     if ! printf '%s' "$time" | grep -Eq '^[0-9]{1,2}:[0-9]{2}$'; then
-        echo "arcs-refresh: --install-cron wants HH:MM, got '$time'" >&2
+        echo "arcs-refresh: $flag wants HH:MM, got '$time'" >&2
         return 2
     fi
     local hh="${time%%:*}" mm="${time##*:}"
@@ -260,6 +453,11 @@ install_cron() {
         echo "arcs-refresh: '$time' is not a time of day" >&2
         return 2
     fi
+}
+
+install_cron() {
+    local time="${1:-$CRON_DEFAULT_TIME}"
+    validate_time "$time" --install-cron || return 2
     # Add-or-replace: every line that is not ours is copied through untouched, and exactly
     # one of ours comes out the far end however many went in.
     #
@@ -283,6 +481,77 @@ uninstall_cron() {
     kept="$(current_crontab | grep -vF "$CRON_MARKER" || true)"
     printf '%s\n' "$kept" | grep -v '^$' | crontab - || true
     echo "removed any $CRON_MARKER line; $(printf '%s\n' "$kept" | grep -c '[^[:space:]]' || true) other line(s) kept"
+}
+
+# --- the systemd user timer --------------------------------------------------------------
+
+# The schedule the crontab line used to hold, and the reason it does not any more:
+# `10 7 * * *` does not fire on a laptop that is asleep at 07:10, and cron keeps no memory
+# of a run it owes you. A closed lid over a weekend produced no line in refresh.log at all
+# -- not a failure, an absence, which is the harder thing to notice. Persistent=true fires
+# on the next wake for a run it missed, and that single property is the whole move.
+#
+# The units are files in systemd/ rather than a here-doc in this script because a unit is
+# configuration and belongs somewhere `systemd-analyze verify` can be pointed at it. Only
+# the two lines that depend on this machine -- ExecStart and OnCalendar -- are rewritten on
+# the way in, so the shipped files stay readable and correct for this checkout as they are.
+UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+SERVICE_UNIT="work-arcs-refresh.service"
+TIMER_UNIT="work-arcs-refresh.timer"
+
+# `systemctl --user` exists on machines with no user manager running for it to talk to, so
+# the question is not whether the binary is there but whether the bus answers.
+have_systemd_user() {
+    command -v systemctl >/dev/null 2>&1 &&
+        systemctl --user show-environment >/dev/null 2>&1
+}
+
+install_timer() {
+    local time="${1:-$CRON_DEFAULT_TIME}"
+    validate_time "$time" --install-timer || return 2
+
+    local tmpl="$REPO_DIR/systemd"
+    if [ ! -f "$tmpl/$SERVICE_UNIT" ] || [ ! -f "$tmpl/$TIMER_UNIT" ]; then
+        echo "arcs-refresh: no unit files in $tmpl" >&2
+        return 2
+    fi
+    if ! have_systemd_user; then
+        echo "arcs-refresh: no systemd user manager answering here." >&2
+        echo "              --install-cron is the fallback, but read the header first:" >&2
+        echo "              a crontab line does not catch up after the machine sleeps." >&2
+        return 2
+    fi
+
+    local self
+    self="$(readlink -f "${BASH_SOURCE[0]}")"
+    mkdir -p "$UNIT_DIR"
+    sed "s|^ExecStart=.*|ExecStart=$self|" "$tmpl/$SERVICE_UNIT" >"$UNIT_DIR/$SERVICE_UNIT"
+    sed "s|^OnCalendar=.*|OnCalendar=$time|"  "$tmpl/$TIMER_UNIT"  >"$UNIT_DIR/$TIMER_UNIT"
+
+    systemctl --user daemon-reload
+    systemctl --user enable --now "$TIMER_UNIT"
+
+    # Two schedulers for one job is a race dressed up as redundancy: the lock would make it
+    # a coin toss over which run's snapshot baseline survives, and the loser's interval of
+    # changes is what the page is for.
+    if current_crontab | grep -qF "$CRON_MARKER"; then
+        uninstall_cron
+        echo "the crontab line is gone; the timer owns the schedule now"
+    fi
+
+    echo "installed: $UNIT_DIR/$TIMER_UNIT (OnCalendar=$time, Persistent=true)"
+    systemctl --user list-timers --all --no-pager "$TIMER_UNIT" 2>/dev/null || true
+}
+
+uninstall_timer() {
+    if have_systemd_user; then
+        systemctl --user disable --now "$TIMER_UNIT" >/dev/null 2>&1 || true
+    fi
+    rm -f "$UNIT_DIR/$TIMER_UNIT" "$UNIT_DIR/$SERVICE_UNIT"
+    if have_systemd_user; then
+        systemctl --user daemon-reload || true
+    fi
+    echo "removed $TIMER_UNIT and $SERVICE_UNIT from $UNIT_DIR"
 }
 
 # The one piece of this workstream that is deliberately not installed for him. arc-record
@@ -346,25 +615,32 @@ do_run() {
         return 5
     fi
 
-    local verdict reason five seven
-    IFS='|' read -r verdict reason five seven <<<"$(quota_verdict)" || true
-    case "$verdict" in
+    # Three outcomes and three sentences, because the log is the only witness. The one
+    # that used to be missing is the middle one: for eight days every morning read
+    # "stood down: the usage endpoint could not be read", which is what a dead network
+    # says too, and so nobody went looking for an expired token.
+    quota_verdict
+    case "$QUOTA_VERDICT" in
         ok)
-            log "quota ok: 5h ${five}% (max ${MAX_5H}), 7d ${seven}% (max ${MAX_7D})" ;;
+            if [ "$QUOTA_REFRESHED" = 1 ]; then
+                log "quota ok after refreshing the access token: 5h ${QUOTA_5H}% (max ${MAX_5H}), 7d ${QUOTA_7D}% (max ${MAX_7D})"
+            else
+                log "quota ok: 5h ${QUOTA_5H}% (max ${MAX_5H}), 7d ${QUOTA_7D}% (max ${MAX_7D})"
+            fi ;;
         over)
             if [ "$force" = 1 ]; then
-                log "quota over: $reason — running anyway (--force)"
+                log "quota over: $QUOTA_REASON — running anyway (--force)"
             else
-                log "stood down: $reason"
-                notify "skipped — $reason"
+                log "stood down: $QUOTA_REASON"
+                notify "skipped — $QUOTA_REASON"
                 return 3
             fi ;;
         *)
             if [ "$force" = 1 ] || [ "$ON_UNKNOWN" = run ]; then
-                log "quota unknown: $reason — running anyway"
+                log "quota unknown: $QUOTA_REASON — running anyway"
             else
-                log "stood down: $reason (WORK_ARCS_REFRESH_ON_UNKNOWN=run to run regardless)"
-                notify "skipped — $reason"
+                log "stood down: $QUOTA_REASON (WORK_ARCS_REFRESH_ON_UNKNOWN=run to run regardless)"
+                notify "skipped — $QUOTA_REASON"
                 return 3
             fi ;;
     esac
@@ -411,7 +687,7 @@ do_run() {
     local page bytes=0
     page="${WORK_ARCS_PAGE:-$STATE/page.html}"
     [ -f "$page" ] && bytes="$(stat -c %s "$page")"
-    write_state "$elapsed" "$bytes" "${five:-}" "${seven:-}" "$page"
+    write_state "$elapsed" "$bytes" "$QUOTA_5H" "$QUOTA_7D" "$page"
 
     log "refreshed in ${elapsed}s — $page ($bytes bytes)"
     if [ -n "${WORK_ARCS_ARTIFACT_URL:-}" ]; then
@@ -430,16 +706,20 @@ do_run() {
 
 force=0
 case "${1:-}" in
-    -h|--help)     sed -n '2,74p' "$0" | sed 's/^# \?//'; exit 0 ;;
+    # Every leading comment line, so the header can grow without this going stale --
+    # which is what the old hard-coded line range did the first time it grew.
+    -h|--help)     awk 'NR > 1 && /^#/ {sub(/^# ?/, ""); print; next} NR > 1 {exit}' "$0"; exit 0 ;;
     --hook)        print_hook; exit 0 ;;
+    --install-timer)   install_timer "${2:-}"; exit $? ;;
+    --uninstall-timer) uninstall_timer; exit $? ;;
     --install-cron)   install_cron "${2:-}"; exit $? ;;
     --uninstall-cron) uninstall_cron; exit $? ;;
     --check-quota)
-        IFS='|' read -r v r f s <<<"$(quota_verdict)" || true
-        case "$v" in
-            ok)   echo "ok — 5h ${f}% (max ${MAX_5H}), 7d ${s}% (max ${MAX_7D})"; exit 0 ;;
-            over) echo "over — $r"; exit 3 ;;
-            *)    echo "unknown — $r"; exit 4 ;;
+        quota_verdict
+        case "$QUOTA_VERDICT" in
+            ok)   echo "ok — 5h ${QUOTA_5H}% (max ${MAX_5H}), 7d ${QUOTA_7D}% (max ${MAX_7D})$([ "$QUOTA_REFRESHED" = 1 ] && echo " (after refreshing the access token)" || true)"; exit 0 ;;
+            over) echo "over — $QUOTA_REASON"; exit 3 ;;
+            *)    echo "unknown — $QUOTA_REASON"; exit 4 ;;
         esac ;;
     --force)       force=1 ;;
     "")            ;;
