@@ -29,16 +29,29 @@ rename.
   work-arcs                        a summary, most recently touched first
   work-arcs --active 14            only arcs touched in the last 14 days
   work-arcs --json --snapshot      the graph, and leave a baseline for the next run
-  work-arcs --curate               answer the memberships it is least sure of
+  work-arcs --curate               answer what it is least sure of
 
-One thing the derivation cannot settle, and it is not a bug to be tuned out: two tickets
-that edit the same module are identical by file overlap however the weights are set. The
-model split pass reads the commits and covers the readable part of that; what survives it
-needs a person. So the doubt is published rather than hidden -- every clustered membership
-carries a confidence, the least confident five become a queue, and answering one either
-pins it or pries the branch out. Both answers append to curation-labels.jsonl, which is
-what makes the next proposed change to the clustering measurable instead of arguable:
-`arc-cluster --score-labels` replays a clustering against every judgement already made.
+Two things the derivation cannot settle, and neither is a bug to be tuned out.
+
+The first is WHICH WORK a branch belongs to: two tickets that edit the same module are
+identical by file overlap however the weights are set. The model split pass reads the
+commits and covers the readable part of that; what survives it needs a person. So the
+doubt is published rather than hidden -- every clustered membership carries a confidence,
+and answering a question either pins the membership or pries the branch out.
+
+The second is WHETHER IT IS WORK AT ALL. Every figure here about unpublished work assumes
+the work was meant to land, and in agentic development much of what accumulates locally
+never was -- experiments, churn, branches a model opened and left. Counting all of it as
+debt is what made the local-only numbers read inflated, and no derivation can fix it:
+intent is not in git. So a second question type asks it, and only where every other
+explanation has been ruled out -- cold against the arc's own rhythm, never proposed, no
+sprint carrying it, no promise naming it. "Residue" leaves every commit where it is and
+stops calling it debt; a commit on the work undoes the answer by itself.
+
+Five questions of both kinds together, and both answers to each append to
+curation-labels.jsonl -- which is what makes the next proposed change to the clustering
+measurable instead of arguable: `arc-cluster --score-labels` replays a clustering against
+every judgement already made about grouping.
 
 Read-only by default. Runs git, glab, Jira and Slack; the two nuances are that an MR with no
 cached mergeability verdict gets a recompute requested (see collect_mrs), which changes no
@@ -7231,9 +7244,13 @@ def main():
     p.add_argument("--undetach", metavar="BRANCH",
                    help="let a detached branch rejoin whatever the clustering says")
     p.add_argument("--curate", action="store_true",
-                   help="answer the memberships this build is least sure about, one "
-                        "keystroke each: keep pins it, pry detaches it, skip asks again "
-                        "next time. Silent when there is nothing worth asking")
+                   help="answer what this build is least sure about, one keystroke each: "
+                        "whether a branch belongs to the arc it was put in, and whether "
+                        "a cold pile of local-only work was ever meant to land. y is "
+                        "always 'the derivation is right', n always 'it is not', skip "
+                        "asks again next time. Silent when there is nothing worth "
+                        "asking. Runs the full pipeline, because the intent question is "
+                        "only askable once the ledger and the sprint have answered")
     p.add_argument("--dismiss", metavar="REF[=NOTE]",
                    help="acknowledge a ledger row (by its !MR / ticket ref or "
                         "fingerprint prefix). Expires itself the moment the fact "

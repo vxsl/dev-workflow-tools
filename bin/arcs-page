@@ -159,6 +159,11 @@ section{margin-bottom:3rem}
 .arc-sub .filed{color:var(--accent);border:1px solid currentColor;border-radius:2px;
   padding:0 .3em;letter-spacing:.02em}
 .metrics .filed-m{color:var(--accent)}
+/* The figure an intent answer stopped counting. Struck rather than removed, in the same
+   faint ink the historical marks use: it is the same kind of statement made by a person
+   rather than derived, and it has to stay legible for the claim to be checkable. */
+.metrics .m-residue{color:var(--ink-faint)}
+.metrics .m-residue s{text-decoration-thickness:1px}
 /* Where a merge request points, when that is not main. Warm rather than faint: an MR aimed
    at another branch is a condition of the work, not a footnote about it. */
 .arc-sub .stack{color:var(--warm)}
@@ -488,6 +493,16 @@ td .dis{vertical-align:middle}
 /* And its opposite, which is what wearing that green undeservedly was hiding: a merge
    request with nobody on it. Left neutral like every other rung — the words say it. */
 .ws[data-stage="no-reviewer"]>summary{box-shadow:inset 3px 0 0 var(--hairline)}
+/* Work you said was never meant to land. Dimmer than in-review and for the opposite
+   reason: that one wants nothing from you because somebody else has it, this one wants
+   nothing from anybody. Same de-emphasis contract as everywhere else on the page — the
+   row keeps its place in its own time bucket, keeps its counts on the card struck
+   through, and hover or open restores it in full. Nothing here is a filter. */
+.ws[data-stage="residue"]>summary{opacity:.55}
+.ws[data-stage="residue"]>summary:hover,
+.ws[data-stage="residue"][open]>summary{opacity:1}
+.ws[data-stage="residue"] .nm{text-decoration:line-through}
+.ws[data-stage="residue"]>summary:hover .nm{text-decoration:none}
 .ws .body{padding:.2rem .7rem 1rem 7.2rem;display:flex;flex-direction:column;gap:.6rem}
 @media (max-width:52rem){
   .ws>summary{grid-template-columns:minmax(0,1fr) auto;row-gap:.1rem}
@@ -918,7 +933,9 @@ INTERACT_JS = r"""
       saveDis=document.getElementById('savedis'),
       saveDet=document.getElementById('savedet'),
       saveCur=document.getElementById('savecur'),
-      saveFil=document.getElementById('savefil');
+      saveFil=document.getElementById('savefil'),
+      saveInt=document.getElementById('saveint'),
+      saveRes=document.getElementById('saveres');
 
   // --- acknowledgements ----------------------------------------------------
   var DKEY='work-arcs:dismissed:v1', dstore=read(DKEY), ddirty=false;
@@ -1014,6 +1031,40 @@ INTERACT_JS = r"""
     if(!keep){ delete tstore[b]; twrite(); }
   });
 
+  // --- intent ------------------------------------------------------------------
+  // The other question the panel asks, and the only pair of stores here keyed on a
+  // workstream rather than on a branch or a fingerprinted fact. Its referent is the arc's
+  // branch tips: "this work, as it stands, was never meant to land" stops being true the
+  // moment a commit lands on any of it, which is the same contract parking is held to and
+  // the same one work-arcs applies to these files. Recording the fingerprint the question
+  // was asked about is what lets the two agree -- a page that recorded only the answer
+  // would hand work-arcs a claim with nothing to expire it.
+  //
+  // Two stores rather than one with a verdict field, mirroring confirmed/detached exactly:
+  // they are one contract pointing in opposite directions, and an answer that can only be
+  // written by overwriting the other one is an answer that cannot be taken back.
+  var IKEY='work-arcs:intended:v1', istore=read(IKEY), idirty=false;
+  var RKEY='work-arcs:residue:v1', rstore=read(RKEY), rdirty=false;
+  function iwrite(){ try{ localStorage.setItem(IKEY,JSON.stringify(istore)); }catch(e){} }
+  function rwrite(){ try{ localStorage.setItem(RKEY,JSON.stringify(rstore)); }catch(e){} }
+  var iqs=[].slice.call(document.querySelectorAll('.cur .q[data-kind="residue"]'));
+  var iby={};
+  iqs.forEach(function(el){ iby[el.dataset.arcid]=el; });
+  // Checked only where this page rendered the question, like the confirmation store above
+  // and for the same reason: an entry whose row is absent was not examined here, and
+  // work-arcs -- the only thing that has seen every workstream -- expires it out loud on
+  // the next build. "Not rendered" is not "no longer true".
+  (function(){
+    [[istore,iwrite],[rstore,rwrite]].forEach(function(pair){
+      var st=pair[0], w=pair[1], dirty=false;
+      Object.keys(st).forEach(function(k){
+        var el=iby[k]; if(!el) return;
+        if((st[k]||{}).fingerprint!==el.dataset.fingerprint){ delete st[k]; dirty=true; }
+      });
+      if(dirty) w();
+    });
+  })();
+
   // --- filings ---------------------------------------------------------------
   // The one judgement on this page that no derivation can make: which ticket a workstream's
   // work IS, and therefore which of its branches are drafts from before it. Every state
@@ -1102,18 +1153,26 @@ INTERACT_JS = r"""
     if(host&&host.parentNode) host.parentNode.insertBefore(fp,host);
   }
 
+  // Six stores now, and the count has to name all six. It said three when there were
+  // four once, which is the small kind of lie that costs a page its credit for every
+  // other figure on it.
   function setBar(){
     if(!bar) return;
-    bar.classList.toggle('on', ddirty||tdirty||cdirty||fdirty);
+    var any=ddirty||tdirty||cdirty||fdirty||idirty||rdirty;
+    bar.classList.toggle('on', any);
     if(saveDis) saveDis.hidden=!ddirty;
     if(saveDet) saveDet.hidden=!tdirty;
     if(saveCur) saveCur.hidden=!cdirty;
     if(saveFil) saveFil.hidden=!fdirty;
-    if(msg&&(ddirty||tdirty||cdirty||fdirty))
+    if(saveInt) saveInt.hidden=!idirty;
+    if(saveRes) saveRes.hidden=!rdirty;
+    if(msg&&any)
       msg.textContent=Object.keys(dstore).length+' acknowledged, '
         +Object.keys(tstore).length+' detached, '
         +Object.keys(cstore).length+' confirmed, '
-        +Object.keys(fstore).length+' filed in this browser';
+        +Object.keys(fstore).length+' filed, '
+        +Object.keys(istore).length+' intended, '
+        +Object.keys(rstore).length+' residue in this browser';
   }
 
   function apply(){
@@ -1158,6 +1217,16 @@ INTERACT_JS = r"""
       row.querySelectorAll('.yn button').forEach(function(btn){
         btn.classList.toggle('on', btn.dataset.a===row.dataset.answer); });
     });
+    // The intent rows record and show the answer, and change no number on this page.
+    // That is the same discipline the detachments keep: work-arcs owns the ladder and
+    // every count on it, so an answer applies on the next build rather than being
+    // simulated here by a second implementation that would eventually disagree.
+    iqs.forEach(function(row){
+      var k=row.dataset.arcid;
+      row.dataset.answer=(k in istore)?'intended':((k in rstore)?'residue':'');
+      row.querySelectorAll('.yn button').forEach(function(btn){
+        btn.classList.toggle('on', btn.dataset.a===row.dataset.answer); });
+    });
     dets.forEach(function(el){
       var on=el.dataset.branch in tstore;
       el.classList.toggle('on', on);
@@ -1195,6 +1264,22 @@ INTERACT_JS = r"""
         fdirty=true; fwrite(); apply();
       }
       return; }
+    var iy=t.closest?t.closest('.cur .q[data-kind="residue"] .yn button'):null;
+    if(iy){ ev.preventDefault();
+      var irow=iy.closest('.q'), ik=irow.dataset.arcid, iwant=iy.dataset.a;
+      var ientry={fingerprint:irow.dataset.fingerprint, label:irow.dataset.arc,
+                  at:Math.floor(Date.now()/1000)};
+      // A workstream cannot be both pinned and written off, so answering one way clears
+      // the other. Clicking the answer already showing takes it back -- the row returns
+      // to unasked, which is the same state as never having touched it.
+      var iwas=irow.dataset.answer;
+      if(ik in istore){ delete istore[ik]; idirty=true; }
+      if(ik in rstore){ delete rstore[ik]; rdirty=true; }
+      if(iwas!==iwant){
+        if(iwant==='intended'){ istore[ik]=ientry; idirty=true; }
+        else { rstore[ik]=ientry; rdirty=true; }
+      }
+      iwrite(); rwrite(); apply(); return; }
     var yn=t.closest?t.closest('.cur .yn button'):null;
     if(yn){ ev.preventDefault();
       var row=yn.closest('.q'), br=row.dataset.branch, want=yn.dataset.a;
@@ -1245,6 +1330,14 @@ INTERACT_JS = r"""
   if(saveFil) saveFil.addEventListener('click',function(){
     saveFile('authoritative-ticket.json', JSON.stringify(fstore,null,1), msg,
              function(){ fdirty=false; setBar(); });
+  });
+  if(saveInt) saveInt.addEventListener('click',function(){
+    saveFile('intended.json', JSON.stringify(istore,null,1), msg,
+             function(){ idirty=false; setBar(); });
+  });
+  if(saveRes) saveRes.addEventListener('click',function(){
+    saveFile('residue.json', JSON.stringify(rstore,null,1), msg,
+             function(){ rdirty=false; setBar(); });
   });
   apply();
 })();
@@ -2683,6 +2776,18 @@ def render(data, lede, focus_days, limit, cost=None):
         shown = bool(lv) and arc.get("stage") != "local-only"
         a('<span class="m-live"' + ("" if shown else " hidden")
           + "><b>" + str(lv) + "</b> unpushed</span>")
+        # The figure the intent answer stopped counting, struck through rather than
+        # dropped. `m-live` above goes to zero under a residue mark and hides itself,
+        # which would leave a card claiming a workstream holds nothing -- and that is the
+        # same conflation the ladder was rebuilt to avoid. De-emphasis is not hiding: a
+        # number that vanished is a number a reader cannot check, and this one is the
+        # whole content of the claim being made.
+        rc, rd = arc.get("residue_commits") or 0, arc.get("residue_days") or 0
+        a('<span class="m-residue"' + ("" if rc else " hidden")
+          + ' title="you said this was never meant to land — the commits are still here '
+            'and a commit on any of these branches brings them back into the count">'
+          + "<s><b>" + str(rc) + "</b> unpushed</s> residue"
+          + (f" · {work_scale(rd, rc)[0]}" if rd else "") + "</span>")
         cp = arc.get("unpushed_only_on_copies") or 0
         # Under a filing the same number means something more specific, and calling it
         # "only on a superseded copy" would credit a person's decision to a derivation.
@@ -3021,6 +3126,7 @@ def render(data, lede, focus_days, limit, cost=None):
     noask = by_rung.get("no-reviewer", [])
     prop = by_rung.get("not-proposed", [])
     parked = by_rung.get("parked", [])
+    resid = by_rung.get("residue", [])
     done = by_rung.get("landed", []) + by_rung.get("abandoned", [])
     # Days of work over the distinct days themselves, so a Tuesday spent on two
     # workstreams is one Tuesday. The tile's own figure is a count of workstreams, which
@@ -3061,6 +3167,12 @@ def render(data, lede, focus_days, limit, cost=None):
          "open, no reviewer, no comment — it is not moving", "#play"),
         (len(prop), "are pushed but never proposed", "no merge request exists", "#play"),
         (len(parked), "are parked", "set aside on purpose, not forgotten", "#play"),
+        # Below every rung that wants something and above the retired ones, because that
+        # is what it is: work nobody is waiting on and nobody has finished. Its own tile
+        # rather than silence, so the count that left the local-only figure is visible
+        # somewhere -- a number that quietly shrank is a number a reader stops trusting.
+        (len(resid), "are residue", "you said they were never meant to land — still on "
+         "the disk, no longer counted", "#play"),
         (len(done), "have landed or been abandoned", "retired from the list below",
          "#play"),
     ]
@@ -3243,6 +3355,18 @@ def render(data, lede, focus_days, limit, cost=None):
         a(f'<p class="note">{esc(s.get("label",""))} is no longer parked: '
           f'{esc(s.get("why",""))}.</p>')
 
+    # Said out loud for the reason every other expiry on this page is: a judgement that
+    # suppressed numbers and has stopped applying must announce that the numbers are
+    # back, or the page silently changes its mind and nothing accounts for it.
+    for s in data.get("stale_residue") or []:
+        a(f'<p class="note">{esc(s.get("label",""))} is no longer residue: '
+          f'{esc(s.get("why",""))} — it is counted again.</p>')
+
+    for s in data.get("stale_intended") or []:
+        a(f'<p class="note">{esc(s.get("label",""))} is no longer pinned as intended: '
+          f'{esc(s.get("why",""))} — it can be asked about again once it next goes '
+          "quiet.</p>")
+
     for s in data.get("stale_detached") or []:
         a(f'<p class="note">{esc(s.get("branch",""))} is no longer detached: '
           f'{esc(s.get("why",""))} — the derivation has been allowed to speak.</p>')
@@ -3378,20 +3502,54 @@ def render(data, lede, focus_days, limit, cost=None):
     # the place the next one will appear.
     curation = data.get("curation") or []
     if curation:
+        # Two question types under one heading, and deliberately not two sections. They
+        # share a budget of five, a keystroke vocabulary and a place on the screen, and
+        # splitting them would turn one short list a person answers into two lists they
+        # scroll past. The heading asks the question both kinds have in common.
         a("<section>")
-        a("<h2>Is this the same work?</h2>")
-        a('<p class="note">Where the grouping is least sure of itself. Branches are '
-          "grouped by the files they touch, and two tickets editing the same module look "
-          "identical by files however the weights are set — so the guesses are published "
-          "rather than tuned away. <b>Yes</b> pins the membership and stops it being "
-          "asked while it keeps this company; <b>no</b> pries the branch out, and it "
-          "falls back to what its own name declares. Leaving a row alone records nothing "
-          "and asks again next time. The command line asks the same questions one "
-          "keystroke at a time: <code>work-arcs --curate</code>.</p>")
+        a("<h2>Did the derivation get this right?</h2>")
+        a('<p class="note">Where the tool is least sure of itself, in the two ways it '
+          "can be. <b>Grouping</b>: branches are grouped by the files they touch, and "
+          "two tickets editing the same module look identical by files however the "
+          "weights are set — <b>yes</b> pins the membership and stops it being asked "
+          "while the branch keeps this company; <b>no</b> pries it out, and it falls "
+          "back to what its own name declares. <b>Intent</b>: a count of unpublished "
+          "work assumes the work was meant to land, and much of what accumulates "
+          "locally never was — <b>yes</b> keeps it counted; <b>no</b> leaves every "
+          "commit exactly where it is and stops calling it debt. Nothing is deleted and "
+          "nothing is hidden either way, and a commit on the work undoes an intent "
+          "answer by itself. Leaving a row alone records nothing and asks again next "
+          "time. The command line asks the same questions one keystroke at a time: "
+          "<code>work-arcs --curate</code>.</p>")
         a('<div class="cur">')
         for q in curation:
+            if q.get("kind") == "residue":
+                # Keyed on the arc and its tips rather than on a branch and its company,
+                # because that is what the answer is about -- and it is what the store
+                # expires against, so the page has to record the same referent the CLI
+                # would or the two would expire at different times over one event.
+                a(f'<div class="q" data-kind="residue" '
+                  f'data-arcid="{esc(q["arc_id"])}" data-arc="{esc(q["arc"])}" '
+                  f'data-fp="{esc(q["fp"])}" '
+                  f'data-fingerprint="{esc(q.get("fingerprint") or "")}" '
+                  f'data-answer="">')
+                a('<span class="yn">'
+                  '<button type="button" data-a="intended" title="real work — keep '
+                  'counting it">yes</button>'
+                  '<button type="button" data-a="residue" title="never meant to land — '
+                  'the commits stay, they stop counting as debt">no</button></span>')
+                a('<span class="ev"><b>' + esc(q["arc"]) + "</b> — still intended "
+                  "work? <br>" + esc(q.get("scale") or "") + " on no remote across "
+                  + str(len(q.get("branches") or [])) + " branch"
+                  + ("" if len(q.get("branches") or []) == 1 else "es")
+                  + f', quiet {q.get("cliff_days", "?")} days against its own '
+                  + f'{q.get("gap_days", "?")}-day rhythm.'
+                  + "<br>No merge request exists and none ever did, no sprint carries "
+                    "it, and no promise names it.</span>")
+                a("</div>")
+                continue
             peers = json.dumps(sorted(q.get("co_members") or []))
-            a(f'<div class="q" data-branch="{esc(q["branch"])}" '
+            a(f'<div class="q" data-kind="membership" data-branch="{esc(q["branch"])}" '
               f'data-arc="{esc(q["arc"])}" data-fp="{esc(q["fp"])}" '
               f"data-peers='{esc(peers)}' data-answer=\"\">")
             a('<span class="yn">'
@@ -3436,12 +3594,16 @@ def render(data, lede, focus_days, limit, cost=None):
       '<button type="button" id="savedet" hidden>Save detachments</button>'
       '<button type="button" id="savecur" hidden>Save confirmations</button>'
       '<button type="button" id="savefil" hidden>Save filings</button>'
+      '<button type="button" id="saveint" hidden>Save intended</button>'
+      '<button type="button" id="saveres" hidden>Save residue</button>'
       '<span class="muted">All of these apply here and survive reloads. Saving writes '
       '<code>dismissed.json</code> / <code>detached.json</code> / '
-      '<code>confirmed.json</code> / <code>authoritative-ticket.json</code> into '
+      '<code>confirmed.json</code> / <code>authoritative-ticket.json</code> / '
+      '<code>intended.json</code> / <code>residue.json</code> into '
       '<code>~/.local/state/work-arcs/</code> — acknowledgements keep the CLI in '
-      'agreement, while a detachment, a confirmation or a filing takes full effect when '
-      '<code>work-arcs</code> next builds the page.</span></div>')
+      'agreement, while a detachment, a confirmation, a filing or an answer about '
+      'intent takes full effect when <code>work-arcs</code> next builds the '
+      'page.</span></div>')
     a(f"<script>{PARK_JS}</script>")
     a(f"<script>{INTERACT_JS}</script>")
     a(f"<script>{STANDUP_JS}</script>")

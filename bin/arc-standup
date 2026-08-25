@@ -873,7 +873,10 @@ def next_beat(data, since, said=None):
     for arc in arcs:
         if room <= 0:
             break
-        if arc.get("settled") or arc.get("stage") == "parked":
+        # `residue` joins parked for the reason parked is here: this beat is "in front of
+        # you", and work you have said was never meant to land is not in front of anybody.
+        # Parked is "not yet" and residue is "never", and neither is a next step.
+        if arc.get("settled") or arc.get("stage") in ("parked", "residue"):
             continue
         if arc.get("id") in (said or ()):
             continue

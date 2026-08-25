@@ -479,7 +479,7 @@ work-arcs                  # every arc, most recently touched first
 work-arcs --focus          # what you are actually working on (8 arcs, derived)
 work-arcs --gap            # where Jira and reality disagree
 work-arcs --jira-ify dove  # file a ticket for an arc, prefilled from what it is
-work-arcs --curate         # answer the memberships it is least sure of
+work-arcs --curate         # answer what it is least sure of
 work-arcs --json           # the whole graph
 ```
 
@@ -606,15 +606,15 @@ call was and by whether the branch's own name is filed under a different ticket 
 five least confident become questions:
 
 ```bash
-work-arcs --curate    # y keep · n pry · s skip · esc done
+work-arcs --curate    # y yes · n no · s skip · esc done
 ```
 
-One keystroke each, a preview pane showing both sides of the tie, and the same five rows
-on the page with **yes** / **no** buttons. The rules are all about the asking, because a
-queue that is unpleasant to open is a queue that stays full: never more than five, one per
-arc (two branches propping each other up is one question, not two), **skip is free and
-leaves no record**, silence when there is nothing to ask, and nothing anywhere that
-notifies, badges or counts up at you.
+One keystroke each, a preview pane showing both sides of the tie, and the same rows on the
+page with **yes** / **no** buttons. The rules are all about the asking, because a queue
+that is unpleasant to open is a queue that stays full: never more than five, one per arc
+(two branches propping each other up is one question, not two), **skip is free and leaves
+no record**, silence when there is nothing to ask, and nothing anywhere that notifies,
+badges or counts up at you.
 
 Four kinds of membership are never asked about, because each is a fact rather than a
 guess: a branch cut from another, the same commit under a second name, a superseded copy
@@ -629,9 +629,41 @@ Both expire the way every declaration here does — against the company the bran
 never the arc's name, so a reworded label leaves them alone and a regrouping ends them out
 loud.
 
+**Intended, or residue?** The same queue asks a second kind of question, and it is about
+a different mistake. Every figure on this page about unpublished work assumes the work was
+meant to land — and in agentic development much of what accumulates locally never was.
+Experiments, churn, a branch a model opened and left. Counting all of it as debt is what
+made the local-only numbers read inflated, and nothing in git can fix it: *intent is not
+derivable*. Without it, five days of dead experiments outrank a meaningful half-day fix in
+the ranking above, forever.
+
+So it is asked — and only where every other explanation has already been ruled out:
+
+| Never asked | Because |
+|---|---|
+| touched within its own rhythm | work in progress is not residue, whatever it looks like |
+| ever proposed | filing a merge request *is* declaring the work meant to land |
+| a sprint carries its ticket | the team has already said the work is wanted |
+| a promise names it | your own words in Slack or in a meeting, and the most direct evidence there is |
+
+Quiet is measured against the arc's own rhythm rather than the calendar — the same
+arithmetic the cliff verdict uses, so there is one place that knows what "quiet for this
+arc" means. And where GitLab, Jira or the ledger did not answer, **no intent question is
+asked at all**, out loud: every test above is an *exclusion*, so missing evidence does not
+shorten the queue, it lets through exactly the work that should have been excluded.
+
+**Yes** keeps it counted. **No** changes nothing about the disk: every commit stays where
+it is, the branches stay on the page, and the card keeps the figure — struck through. What
+stops is calling it debt. It leaves `unpushed_days`, the only-here ranking and the lede's
+numbers, and the workstream gets its own rung. And it undoes itself: a single commit on any
+branch of it expires the answer, because going back to work proves intent better than any
+answer about it.
+
 **And every answer is a labelled example.** They append to `curation-labels.jsonl`, both
 verdicts and not only the corrections — scored on corrections alone, a clusterer that split
-everything into singletons would agree with every one of them and be useless.
+everything into singletons would agree with every one of them and be useless. Intent
+answers are logged as their own kind and counted apart there: they are real judgements
+about real work and simply not judgements about a clustering.
 
 ```bash
 arc-cluster --score-labels    # this clustering against every judgement already made
