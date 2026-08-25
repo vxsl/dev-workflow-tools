@@ -90,7 +90,7 @@ a = arc(sess({14: (900, 8), 13: (700, 7), 12: (500, 4)}))
 print(v(a)["verdict"])
 print(v(a)["why"])'
     [ "${lines[0]}" = "True" ]
-    [ "${lines[1]}" = "19 sessions across 3 days, then nothing for 12 days, never landed." ]
+    [ "${lines[1]}" = "19 sessions across 3 days of work, then nothing for 12 days, never landed." ]
 }
 
 @test "touched steadily but lightly for three weeks is not forgotten" {
@@ -190,13 +190,14 @@ print(v(a)["why"])'
 @test "an arc built by hand qualifies on commits with no session at all" {
     # Sessions reach back only as far as the transcripts do, so commits have to be able
     # to carry a verdict alone -- and the sentence has to read as one body of work rather
-    # than as a missing session count.
+    # than as a missing session count. The commits still decide the verdict; what the
+    # sentence states is the days they were written on.
     run wa '
 a = arc(branches=[br("b", cmts({16: 9, 15: 11, 14: 6}))])
 print(v(a)["verdict"])
 print(v(a)["why"])'
     [ "${lines[0]}" = "True" ]
-    [ "${lines[1]}" = "26 commits across 3 days, then nothing for 14 days, never landed." ]
+    [ "${lines[1]}" = "3 days of work, then nothing for 14 days, never landed." ]
 }
 
 @test "a stack is one body of work, not five copies of it" {
@@ -211,7 +212,7 @@ a = arc(branches=[br("tip", c), br("mid", c[:9]), br("base", c[:4]),
 print(a["activity"]["invested"]["commits"])
 print(v(a)["verdict"], v(a)["why"])'
     [ "${lines[0]}" = "20" ]
-    [[ "${lines[1]}" == "True 20 commits across 2 days"* ]]
+    [[ "${lines[1]}" == "True 2 days of work, then nothing"* ]]
 }
 
 @test "a superseded copy's dates still date the arc, though its volume does not count" {
@@ -269,13 +270,26 @@ print(v(a)["why"])'
     [[ "${lines[2]}" == *"a pause, not a cliff"* ]]
 }
 
+@test "the sentence never states a commit count, however many there were" {
+    # The rule, not one instance of it. Fifty commits in an afternoon is one afternoon,
+    # and a backup branch that doubles them is still one afternoon -- so the number of
+    # commits is the one figure this sentence must not open on.
+    run wa '
+a = arc(sess({14: (900, 40), 13: (700, 35)}), branches=[br("b", cmts({14: 40, 13: 35}))])
+w = v(a)["why"]
+print(w)
+print("COUNTS" if "commit" in w else "NO-COUNTS")'
+    [ "${lines[1]}" = "NO-COUNTS" ]
+    [[ "${lines[0]}" == *"days of work"* ]]
+}
+
 @test "an arc part of which landed does not claim it never landed" {
     # "never landed" beside a row already reading "7 already merged" is a flat
     # contradiction, and that mixture is common enough to have its own line in finalize.
     run wa '
 a = arc(branches=[br("b", cmts({20: 12, 19: 14}))], landed_branches=7)
 print(v(a)["why"])'
-    [ "$output" = "26 commits across 2 days, then nothing for 19 days — 7 branches landed, what is left never did." ]
+    [ "$output" = "2 days of work, then nothing for 19 days — 7 branches landed, what is left never did." ]
 }
 
 @test "an arc with no evidence at all gets no verdict rather than a false one" {

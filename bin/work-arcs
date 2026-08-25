@@ -40,6 +40,12 @@ The Slack side reads only conversations you yourself posted in, on your own user
 only where that token can see a whole thread -- see slack_threads for what it therefore
 cannot read and why that is left alone rather than approximated. `--no-slack-threads` skips
 it entirely.
+
+The ledger's third leg reads Gemini meeting transcripts out of Google Drive for promises
+you made out loud, which nothing else in this pipeline can see -- a room is not a channel.
+It reaches Drive through the claude.ai connector on your Anthropic account rather than
+through a Google credential on this machine, because there is no Google credential on this
+machine; see ledger_meetings. `--no-meetings`, or WORK_ARCS_NO_MEETINGS, skips it.
 """
 
 import argparse
@@ -1780,6 +1786,19 @@ def ledger_meetings():
 
     Returns (rows, complete), the same contract as `ledger_slack`'s last two values.
     """
+    # The one source with no credential to gate itself on. `ledger_slack` returns early
+    # without a token and the Jira rows without a domain, so a caller that has not set up
+    # those universes simply has none of them; this one always runs, and the first thing
+    # that cost was degradation.bats -- a file about what glab does, which from the moment
+    # this leg landed made a real model call through a real Drive connector and then did
+    # not fail but HANG, for as long as the suite was given.
+    #
+    # So the off switch is readable from the environment as well as from the CLI, because
+    # a consumer that imports this module has no argv to put --no-meetings on. Complete
+    # and empty, exactly like the no-token case: turned off means there were never any
+    # meeting rows, so nothing is missing and a dismissal prune stays safe.
+    if os.environ.get("WORK_ARCS_NO_MEETINGS"):
+        return [], True
     # Haiku, and measured rather than assumed. Every call here carries the whole Claude
     # Code session prefix plus the schemas of every connector on the account -- 180-350k
     # cached tokens per call against a transcript of maybe 12k -- so the price is set by
@@ -4800,22 +4819,27 @@ def activity_of(arc, session_days):
 def _forgotten_why(arc, act):
     """The evidence sentence, in the shape the plan asked for it.
 
-    "19 sessions across 3 days, then nothing for 12 days, never landed." One sentence
-    carrying the level, the derivative and the reason it is still open, which is the whole
-    verdict -- so a reader can disagree with it on the facts rather than having to trust it.
+    "19 sessions across 3 days of work, then nothing for 12 days, never landed." One
+    sentence carrying the level, the derivative and the reason it is still open, which is
+    the whole verdict -- so a reader can disagree with it on the facts rather than having
+    to trust it.
+
+    It used to open on a commit count: "83 commits across 19 days, then nothing for 14
+    days". That led with the churn and buried the scale -- in agentic development the
+    number of commits is a fact about how the work was typed, and this sentence is about
+    how much of it there was to lose. The days were already here and already right:
+    distinct active days, a stack counted once, a superseded copy's volume excluded. So
+    the fix is to lead with them and drop the number that stood in front of them. The
+    transcript-entry fallback goes with it, for the same reason and one more: the days
+    cover the case it existed for, since an arc with entries and no commits still has the
+    days it was worked on.
     """
     inv = act["invested"]
-    had = []
-    if inv["sessions"]:
-        had.append(f"{inv['sessions']} session" + ("" if inv["sessions"] == 1 else "s"))
-    if inv["commits"]:
-        had.append(f"{inv['commits']} commit" + ("" if inv["commits"] == 1 else "s"))
-    if not had:                       # entries with no session file and no commit
-        had.append(f"{inv['entries']} transcript entries")
     d, k = inv["days"], act["cliff_days"]
-    sentence = (" and ".join(had)
-                + f" across {d} day" + ("" if d == 1 else "s")
-                + f", then nothing for {k} day" + ("" if k == 1 else "s"))
+    work = f"{d} day" + ("" if d == 1 else "s") + " of work"
+    lead = (f"{inv['sessions']} session" + ("" if inv["sessions"] == 1 else "s")
+            + f" across {work}") if inv["sessions"] else work
+    sentence = lead + f", then nothing for {k} day" + ("" if k == 1 else "s")
     # "never landed" would flatly contradict the row above it on an arc that is part
     # merged and part not, and that mixture is common enough to have its own line in
     # finalize. Say which it is.
@@ -6063,7 +6087,8 @@ def main():
     p.add_argument("--no-meetings", action="store_true",
                    help="skip reading Gemini meeting transcripts for promises you made "
                         "out loud. Two model calls plus one per unseen transcript, and "
-                        "the only source that reaches Google Drive")
+                        "the only source that reaches Google Drive. WORK_ARCS_NO_MEETINGS "
+                        "does the same for a caller that imports the module")
     p.add_argument("--shallow-mr", action="store_true",
                    help="skip the per-MR calls for unresolved review threads and pipeline "
                         "status; the list call alone still gives conflicts and approvals")
