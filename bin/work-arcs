@@ -4486,6 +4486,17 @@ def still_applies(entry, cluster_assign, branch):
     moment the grouping genuinely changes, because then it is an answer to a question
     nobody asked.
 
+    So the co-members are tested first and the label is only the fallback for an answer
+    that recorded none. That order is a correction: the detachment store used to accept a
+    matching label as sufficient and consult the co-members only when the label had
+    changed, which sounds equivalent and is not. An arc labelled from a ticket key keeps
+    that label for as long as any branch carries the key, while every other member of it
+    comes and goes -- `UB-6802` has held the metadata-geometry family and the geo_filter
+    migration under one name. A detachment recorded against the first would have gone on
+    applying to the second, which is precisely the case the contract exists to rule out,
+    and it would have done so silently because a label match never reaches the check that
+    reports expiry.
+
     Extracted so the two stores cannot drift apart. They are the same contract pointing
     in opposite directions -- "not this work" and "yes, this work" -- and a confirmation
     that outlived a detachment under the same circumstances would be a pin that quietly
@@ -4494,13 +4505,17 @@ def still_applies(entry, cluster_assign, branch):
     cur = cluster_assign.get(branch)
     if cur is None:
         return False, "the clustering no longer files it anywhere"
-    if cur == entry.get("from"):
-        return True, ""
     recorded = set(entry.get("with") or [])
-    if not recorded:
-        return False, f"the clustering now groups it with different work ({cur!r})"
-    current = co_members(cluster_assign, branch) or set()
-    if len(recorded & current) / len(recorded) >= 0.5:
+    if recorded:
+        current = co_members(cluster_assign, branch) or set()
+        if len(recorded & current) / len(recorded) >= 0.5:
+            return True, ""
+        return False, ("the work it was grouped with has moved on"
+                       if cur == entry.get("from")
+                       else f"the clustering now groups it with different work ({cur!r})")
+    # No company was recorded, so the arc it names is all there is to test against. Only
+    # an answer about a branch that was alone in its arc can be in this state.
+    if cur == entry.get("from"):
         return True, ""
     return False, f"the clustering now groups it with different work ({cur!r})"
 
