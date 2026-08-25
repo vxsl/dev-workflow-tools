@@ -2592,13 +2592,15 @@ def render(data, lede, focus_days, limit, cost=None):
           "it closes itself the moment either of you moves, and nothing is ever "
           "checked off. A question on your own merge request appears here <em>and</em> "
           "on its workstream: same fact, once by person, once by work. The one "
-          "exception to &ldquo;derived&rdquo; is a commitment read out of your own "
-          "Slack messages — those rows say so, and every Slack row quotes the message "
-          "it is a claim about, one click away. A commitment closes the same way "
-          "everything else here does, on evidence: you delivered it later in the same "
-          "thread, the merge request you named merged, the ticket you named reached "
-          "Done. Where nothing shows that, the row says so and gives the date it "
-          "expires under instead of pretending. <strong>&#x2715; acknowledges a "
+          "exception to &ldquo;derived&rdquo; is a commitment: one read out of your own "
+          "Slack messages, or one read out of your own voice in a meeting transcript. "
+          "Those rows say so, and each quotes the words it is a claim about — a "
+          "permalink for a typed one, the meeting&rsquo;s own document for a spoken "
+          "one, both a click away. A commitment closes the same way everything else "
+          "here does, on evidence: you delivered it later in the same thread, the merge "
+          "request you named merged, the ticket you named reached Done. Where nothing "
+          "shows that, the row says so and gives the date it expires under instead of "
+          "pretending. <strong>&#x2715; acknowledges a "
           "row</strong>: it leaves the list but stays counted, and it comes back on "
           "its own the moment the fact under it changes — a new message, a "
           "re-request, a touched ticket. Nothing here can be deleted, only "
@@ -2669,14 +2671,21 @@ def render(data, lede, focus_days, limit, cost=None):
                        # the next couple days" is his phrase and not the tool's reading of
                        # it. The reading is a separate claim and lives in the brief, where
                        # it can be wrong out loud instead of silently.
+                       # The meeting's name is the row's link label, immediately to the
+                       # left of this sentence, so naming it again here read "FE standup
+                       # ... said out loud at FE standup since 2026-08-12". What the
+                       # sentence owes is the clock he set himself, verbatim and in
+                       # quotes, because "in the next couple days" is his phrase and not
+                       # the tool's reading of it -- the reading is a separate claim and
+                       # lives in the brief, where it can be wrong out loud.
                        "meeting-commitment": "you said you&rsquo;d "
                                      + esc(e.get("promised") or "do this")
                                      + (f" — {who} is relying on it" if e.get("who")
                                         else "")
-                                     + (f" &ldquo;{esc(e['deadline'])}&rdquo;"
+                                     + (f" — &ldquo;{esc(e['deadline'])}&rdquo;"
                                         if e.get("deadline") else "")
-                                     + (f" — said out loud at {esc(e['ref'])}{since}"
-                                        if e.get("ref") else since)
+                                     + (f", said out loud on {esc(e['asked'])}"
+                                        if e.get("asked") else "")
                                      + " (inferred from the transcript, quoted)",
                        }.get(e.get("kind"), who)
                 # How this row will die, said out loud. Every other row on the ledger
