@@ -799,6 +799,7 @@ def score_labels(arcs, path=None):
     """
     path = path or LABELS
     latest = {}
+    other = 0
     try:
         with path.open(errors="replace") as f:
             for line in f:
@@ -809,7 +810,19 @@ def score_labels(arcs, path=None):
                     row = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if not isinstance(row, dict) or not row.get("branch"):
+                if not isinstance(row, dict):
+                    continue
+                # Only the membership answers. The eval set now holds a second kind --
+                # "was this workstream ever meant to land?" -- and its rows carry an arc
+                # and no branch, so the branch test below would drop them silently. A
+                # scoring pass that quietly discards half its inputs reads exactly like
+                # one with fewer answers than were given, so they are counted apart and
+                # reported. `kind` is absent on every label written before the second
+                # question existed, which is why the default is the older meaning.
+                if row.get("kind", "membership") != "membership":
+                    other += 1
+                    continue
+                if not row.get("branch"):
                     continue
                 # Last answer wins. A question can legitimately be asked again after its
                 # pin expires, and a person is allowed to change their mind; scoring both
@@ -839,13 +852,17 @@ def score_labels(arcs, path=None):
         ok = together if want == "keep" else not together
         (agree if ok else disagree).append((row, arc, together))
 
+    # Named rather than left out of the arithmetic silently. An intent answer is a real
+    # judgement about real work and it is simply not a judgement about THIS clustering, so
+    # it cannot score and must not read as a missing answer either.
+    aside = f", {other} about intent rather than grouping" if other else ""
     n = len(agree) + len(disagree)
     if not n:
         print(f"arc-cluster: {len(unscorable)} answer(s) recorded, none scorable "
-              f"against this clustering")
+              f"against this clustering{aside}")
         return
     print(f"{len(agree)}/{n} agree ({100 * len(agree) / n:.0f}%)"
-          + (f", {len(unscorable)} unscorable" if unscorable else ""))
+          + (f", {len(unscorable)} unscorable" if unscorable else "") + aside)
     for row, arc, together in disagree:
         said = ("you said it belongs here" if row.get("answer") == "keep"
                 else "you pried it out")

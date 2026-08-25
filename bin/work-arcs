@@ -3398,8 +3398,8 @@ def join_sprint(sprint, arcs):
         return a.get("age_days", 0) if d is None else d
 
     def in_play(a):
-        return (a.get("stage") not in ("landed", "abandoned", "parked")
-                and not a.get("parked"))
+        return (a.get("stage") not in ("landed", "abandoned", "parked", "residue")
+                and not a.get("parked") and not a.get("residue"))
 
     # Total tiebreak on id, like every other ordering here: two arcs idle the same number
     # of days must not swap places between runs.
@@ -4189,6 +4189,24 @@ DETACHED = (Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
 # and both expire the same way -- see still_applies.
 CONFIRMED = DETACHED.parent / "confirmed.json"
 
+# The other question type's two stores, and they are the same contract as the pair above
+# pointing at a different claim. Membership asks "is this branch this work?"; residue asks
+# "is this still intended work?" -- and the second question exists because the first cannot
+# reach it. Kyle's verdict on the local-only numbers was that they read inflated, and the
+# reason is not a grouping error: in agentic development a great deal of what is on the
+# disk is RESIDUE, experiments and churn that were never meant to land, and the tool was
+# counting every one of them as debt. Without a way to say so, five days of dead
+# experiments outrank a meaningful half-day fix in the `only_here` ranking forever.
+#
+# INTENDED is the ratification, RESIDUE the correction, exactly as CONFIRMED and DETACHED
+# are. Both are keyed on the arc rather than on a branch -- see residue_queue for why the
+# unit is the workstream -- and both expire against `arc_fingerprint`, the tips: working on
+# something proves it was intended better than any answer about it, and a commit on a
+# branch you called residue means you went back to it, so it was not residue. Same
+# self-expiring contract as parking and as a filing, for the same reason.
+INTENDED = DETACHED.parent / "intended.json"
+RESIDUE = DETACHED.parent / "residue.json"
+
 # Every answer, in the order it was given. Not a store and never read back to decide an
 # arc: this is the eval set. "Should we go on massaging the detection algorithm?" is the
 # question the whole curation loop exists to make answerable, and it cannot be answered
@@ -4225,6 +4243,21 @@ CONFIDENCE_AT = float(os.environ.get("ARC_CONFIDENCE_AT", "0.34"))
 # what fits on a screen without scrolling and what a person will actually answer between
 # two other things. Answered ones pin and drop out; skipped ones come back.
 CURATION_CAP = int(os.environ.get("ARC_CURATION_CAP", "5"))
+
+# How cold local-only work has to be before it is worth asking whether it was ever meant
+# to land, as a multiple of the arc's OWN typical gap between active days. The arithmetic
+# is `activity_of`'s and deliberately not a second staleness measure -- the absolute floor
+# and the ratio both come from FORGOTTEN_KNOBS, so there is one place in this file that
+# knows what "quiet for this arc" means and a change to it moves both readers together.
+#
+# The ratio is the one number that differs, 2x here against the cliff's 4x, and the
+# difference is a difference in what the number decides. The cliff's 4x gates an
+# ACCUSATION -- "you were deep in this and then you were not" -- and a false one of those
+# costs trust. This gates a QUESTION whose skip is free and whose wrong answer is one
+# keystroke to reverse, so it can afford to be asked one missed beat earlier. It is still
+# a ratio and not an age: an arc worked every third day and quiet for five days is running
+# normally, and nothing here may call that residue.
+RESIDUE_COLD_RATIO = float(os.environ.get("WORK_ARCS_RESIDUE_RATIO", "2.0"))
 
 
 def question_fp(branch, peers):
@@ -4360,7 +4393,8 @@ def answer_question(q, keep, cluster_assign):
             CONFIRMED.write_text(json.dumps(other, indent=1, sort_keys=True))
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(store, indent=1, sort_keys=True))
-    log_answer({"at": entry["at"], "answer": "keep" if keep else "pry",
+    log_answer({"at": entry["at"], "kind": "membership",
+                "answer": "keep" if keep else "pry",
                 "branch": branch, "arc": label, "fp": q["fp"], "with": peers,
                 "confidence": q.get("confidence"), "why": q.get("why"),
                 "shared": q.get("shared"), "files": q.get("files") or [],
@@ -4386,15 +4420,55 @@ def fzf_bin():
 
 
 def question_line(q):
-    """One row: the branch, its size, and the claim being tested, in that order.
+    """One row: what is being asked about, its size, and the claim being tested.
 
-    The branch first because it is what is being asked about and what the eye is
-    scanning for; the claim last because it is the longest and reads as a sentence.
+    The subject first because it is what the eye is scanning for; the claim last because
+    it is the longest and reads as a sentence. One shape for both question types, and
+    deliberately so -- they share a keystroke vocabulary and a screen, and two row layouts
+    in one list would make the reader work out which kind of question they are on before
+    reading it.
     """
+    if q.get("kind") == "residue":
+        return (f"{q['arc'][:38]:<38}  {q['scale']:>10}  "
+                f"still intended work?  ({q['why']})")
     size = f"+{q['commits']}" if q["commits"] else "no commits"
     mark = " ← the arc's own MR" if q.get("authoritative") else ""
     return (f"{q['branch'][:38]:<38}  {size:>10}  "
             f"same work as {q['arc']}?{mark}  ({q['why']})")
+
+
+def residue_preview(q):
+    """The evidence for an intent question: how much, how cold, and what nobody claimed.
+
+    Every exclusion the queue applied is stated as a fact rather than implied by the
+    question's existence, because the answer a person gives depends on trusting them. "No
+    merge request ever, no sprint, no promise" is the case FOR asking, and a reader who
+    cannot see it has no way to notice the day one of those tests is wrong.
+    """
+    out = [f"{q['arc']}", ""]
+    out.append(f"  {q['scale']} on no remote, across "
+               f"{len(q['branches'])} branch"
+               f"{'' if len(q['branches']) == 1 else 'es'}.")
+    out.append("")
+    out.append(f"  quiet                   {q['cliff_days']} days, "
+               f"{q['beats']}× its own {q['gap_days']}-day rhythm")
+    out.append("  never proposed          no merge request exists and none ever did")
+    out.append("  unclaimed               no sprint carries it and no promise names it")
+    out.append(f"  rung                    {q['stage']}")
+    out.append("")
+    for n in q["branches"][:8]:
+        out.append(f"    {n}")
+    if len(q["branches"]) > 8:
+        out.append(f"    … and {len(q['branches']) - 8} more")
+    out.append("")
+    out.append("  y  yes, still intended — keeps counting; asked again only if it goes")
+    out.append("     cold again after you next touch it")
+    out.append("  n  no, residue — the commits stay exactly where they are and stop")
+    out.append("     counting as debt: struck through on the card, out of the days-of-")
+    out.append("     work figures and out of the only-here ranking. One commit on any")
+    out.append("     branch of it undoes this by itself.")
+    out.append("  s  skip — no record either way; it comes back next build")
+    return "\n".join(out)
 
 
 def question_preview(q):
@@ -4426,14 +4500,20 @@ def question_preview(q):
 
 
 def curate(queue, cluster_assign):
-    """`--curate`: answer the least confident memberships, one keystroke each.
+    """`--curate`: answer what this build is least sure of, one keystroke each.
+
+    Two kinds of question and one keystroke vocabulary. Membership asks "is this branch
+    this work?" and residue asks "is this still intended work?", and in both `y` means the
+    derivation is right and `n` means it is not -- so a person answers a mixed queue
+    without having to hold two mappings in their head. Which question they are on is said
+    by the row and spelled out in full by its preview.
 
     The whole loop exists because the clustering's residual error needs a human and an
     unguided human does not curate. So the rules are about the asking, not the answering:
-    never more than CURATION_CAP questions, skip costs nothing and leaves no record, and
-    an empty queue prints one line and exits rather than opening anything. Nothing here
-    notifies, mails or nags -- a queue nobody opens today is simply a queue that is the
-    same size tomorrow.
+    never more than CURATION_CAP questions of both kinds together, skip costs nothing and
+    leaves no record, and an empty queue prints one line and exits rather than opening
+    anything. Nothing here notifies, mails or nags -- a queue nobody opens today is simply
+    a queue that is the same size tomorrow.
 
     One fzf per question rather than a persistent list with callbacks: the answer has to
     be recorded by a process that holds the current assignment, and a callback shelling
@@ -4443,7 +4523,8 @@ def curate(queue, cluster_assign):
     """
     if not queue:
         print("✓ nothing worth asking about — every membership is either a fact or "
-              "well enough corroborated", file=sys.stderr)
+              "well enough corroborated, and every workstream holding local-only work "
+              "is warm, proposed, claimed or promised", file=sys.stderr)
         return
     fzf = fzf_bin()
     if not fzf:
@@ -4460,7 +4541,9 @@ def curate(queue, cluster_assign):
         # question by parsing the rendered line back would be a parser waiting to meet a
         # branch called `a b`; carrying the key is not.
         for q in queue:
-            (tmp / q["fp"]).write_text(question_preview(q))
+            (tmp / q["fp"]).write_text(residue_preview(q)
+                                       if q.get("kind") == "residue"
+                                       else question_preview(q))
         pending = list(queue)
         answered = 0
         while pending:
@@ -4469,9 +4552,9 @@ def curate(queue, cluster_assign):
                 [fzf, "--ansi", "--reverse", "--height=100%", "--info=inline",
                  "--pointer=▶", "--no-multi", "--no-sort", "--cycle",
                  "--delimiter=\t", "--with-nth=2..", "--expect=y,n,s",
-                 "--header", f"y keep · n pry · s skip · esc done   "
+                 "--header", f"y yes · n no · s skip · esc done   "
                              f"({len(pending)} left, {answered} answered)",
-                 "--prompt", "is this the same work? > ",
+                 "--prompt", "is the derivation right? > ",
                  "--preview", f"cat {shlex.quote(str(tmp))}/{{1}}",
                  "--preview-window", "down,60%,wrap"],
                 input="\n".join(lines), capture_output=True, text=True)
@@ -4481,11 +4564,19 @@ def curate(queue, cluster_assign):
             q = next((x for x in pending if x["fp"] == fp), None)
             if not q or key not in ("y", "n"):
                 break                       # esc, s, or nothing selected: leave it be
-            answer_question(q, key == "y", cluster_assign)
+            if q.get("kind") == "residue":
+                answer_residue(q, key == "y")
+                print(f"  {'✓ intended' if key == 'y' else '✕ residue '}  {q['arc']}"
+                      + ("" if key == "y"
+                         else f" — {q['scale']} stops counting as debt"),
+                      file=sys.stderr)
+            else:
+                answer_question(q, key == "y", cluster_assign)
+                print(f"  {'✓ kept' if key == 'y' else '✕ pried'}  {q['branch']}"
+                      f" {'in' if key == 'y' else 'out of'} {q['arc']!r}",
+                      file=sys.stderr)
             answered += 1
             pending = [x for x in pending if x["fp"] != q["fp"]]
-            print(f"  {'✓ kept' if key == 'y' else '✕ pried'}  {q['branch']}"
-                  f" {'in' if key == 'y' else 'out of'} {q['arc']!r}", file=sys.stderr)
         if answered:
             print(f"✓ {answered} answered — applied on the next build. "
                   f"{CURATION_LABELS}", file=sys.stderr)
@@ -4594,6 +4685,10 @@ def curation_queue(arcs, membership, cluster_assign, uncertain=(), cap=CURATION_
                 continue
             peers = sorted(n for n in members if n != name)
             out.append({
+                # Which question this is. Absent on every label written before residue
+                # questions existed, so every reader of the eval set defaults to
+                # "membership" rather than testing for the key -- see score_labels.
+                "kind": "membership",
                 "branch": name,
                 "arc": arc.get("label") or arc["id"],
                 "arc_id": arc["id"],
@@ -4628,6 +4723,347 @@ def curation_queue(arcs, membership, cluster_assign, uncertain=(), cap=CURATION_
         seen.add(q["arc_id"])
         once.append(q)
     return once[:cap]
+
+
+# ── is this still intended work? ───────────────────────────────────────────────
+#
+# The second question type. Everything above asks whether the derivation put a branch in
+# the right arc; nothing above can ask whether the work is work at all, and that is the
+# question Kyle's verdict on the local-only numbers was actually about: "much local
+# content in agentic development is residue -- experiments and churn that should never
+# land -- and the tool counts all of it as debt." The missing judgement is INTENT, and
+# intent is the one thing this pipeline has never been able to derive.
+#
+# The unit is the workstream, not the branch, and that is a decision with three reasons
+# rather than a convenience:
+#
+#   the tests are arc-level    every exclusion below is a fact about a workstream -- its
+#                              own rhythm, whether a sprint claims it, whose clock is
+#                              running, whether a promise names it. A branch has no
+#                              rhythm and no sprint of its own to be asked about.
+#   the branch-level answer    already exists. `--authoritative-ticket` says "the work of
+#                              this arc is this ticket and the branches outside its
+#                              lineage are history", which IS per-branch residue, with
+#                              its own store and its own expiry. A second per-branch
+#                              mechanism for the same sentence would be two stores that
+#                              can disagree about one branch.
+#   the asked set has no       a workstream is only asked about when it has never been
+#   mixed arcs in it           proposed and holds nothing but local-only work, so there
+#                              is no arc in the queue whose answer would need to be
+#                              "these three branches but not those two".
+#
+# It is not park, either, though it borrows park's expiry. Park says "I am not touching
+# this for a while" and keeps the work in play, counted, on a rung of its own; residue
+# says "this was never going to land" and takes it out of the debt figures while leaving
+# every commit exactly where it is. Two different sentences with two different
+# consequences cannot share one store without one of them being silently mis-stated.
+
+
+def _arc_store_entry(store, arc):
+    """One arc's entry in a fingerprint-keyed store, however it was keyed.
+
+    Three lookups, in the order of how much each proves. The id first, because that is
+    what a write here keys on. The label second, for an entry written before this did.
+    And the fingerprint last, by scanning -- which is the one that earns its keep: an
+    arc's `id` is its cluster label, and the split pass rewords those between runs
+    ("selected state" became "selected-state" within an evening). Keyed on the id alone,
+    a rewording would lose the answer silently, which is precisely the failure
+    `still_applies` exists to rule out for the other pair of stores. The tips are the
+    referent, so they are also the last resort for finding the entry about them.
+    """
+    fp = arc.get("fingerprint")
+    for key in (arc.get("id"), arc.get("label")):
+        if key and isinstance(store.get(key), dict):
+            return key, store[key]
+    if fp:
+        for key, entry in sorted(store.items()):
+            if isinstance(entry, dict) and entry.get("fingerprint") == fp:
+                return key, entry
+    return None, None
+
+
+def _apply_arc_answer(arcs, path, what):
+    """The half of both stores that is the same: which arcs an answer still applies to.
+
+    Returns (the arcs it holds for, the entries it no longer holds for). One expiry test,
+    `arc_fingerprint`, and it expires in the only direction that matters -- a commit on
+    any branch of the arc means you went back to the work, and work you went back to is
+    neither residue nor a question that needed answering. So the answer dies of being
+    disproved by the thing it was a claim about, which is the same contract parking, a
+    filing and the authoritative override are all held to.
+
+    Out loud, not silently: a caller prints the stale ones. An answer that quietly
+    outlived its evidence is worse than no answer, because nothing on the page would say
+    the numbers had been suppressed by a judgement nobody remembers making.
+    """
+    store = load_store(path, what)
+    live, stale, drop = {}, [], []
+    for arc in arcs:
+        if not arc.get("branches"):
+            continue
+        key, entry = _arc_store_entry(store, arc)
+        if entry is None:
+            continue
+        if entry.get("fingerprint") != arc.get("fingerprint"):
+            stale.append({"label": arc.get("label") or arc.get("id"),
+                          "why": "a commit has landed on it since you answered, and "
+                                 "work you went back to is work you meant"})
+            drop.append(key)
+            continue
+        live[arc["id"]] = entry
+    # Only entries this run positively matched to a workstream and found overtaken. An
+    # entry no arc claimed is left alone rather than swept: an arc absent from one run is
+    # usually a --no-cluster run, a branch checked out elsewhere or a repo half-fetched,
+    # and deleting a human judgement on that evidence is the one thing these stores may
+    # never do.
+    if drop:
+        for key in drop:
+            store.pop(key, None)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(store, indent=1, sort_keys=True))
+        except OSError:
+            pass
+    return live, stale
+
+
+def apply_intended(arcs):
+    """Workstreams a human has already said are real work, so they are not asked again.
+
+    A pin, and it changes nothing else -- the arc keeps every commit, every day of work
+    and its place in the `only_here` ranking, because the answer was that all of that is
+    genuinely outstanding. All it removes is the question, and only while it still refers
+    to the work it was an answer about.
+
+    Which is what makes it safe to be permanent, and what makes its expiry the *right*
+    behaviour rather than a limitation: the answer expires the moment a commit lands, and
+    a commit landing is a better proof of intent than the answer ever was. So the arc
+    comes back off the pin having already re-earned it, and is not asked again until it
+    has gone cold a second time.
+    """
+    return _apply_arc_answer(arcs, INTENDED, "the intended store")
+
+
+def apply_residue(arcs, repo=None, main_ref="origin/main"):
+    """Workstreams a human said were never meant to land, and what that stops counting.
+
+    Nothing is hidden and nothing is deleted. Every branch stays on the disk, in the
+    tree, and on the page; what changes is that its commits stop being called debt --
+    excluded from `unpushed_live` and so from `unpushed_days`, from the `only_here`
+    ranking and from the lede's figures, and shown struck through rather than absent, on
+    the same reasoning the historical marks are drawn: de-emphasis is not hiding, and a
+    number that vanished is a number a reader cannot check.
+
+    Mechanically it is `--authoritative-ticket`'s mechanism with the lineage empty: a
+    per-branch mark that `dead` reads, and then finalize recomputes everything that
+    depends on it -- the rung, the live count, the days of work, the demands. Marking the
+    branches rather than patching the totals is the whole of why this cannot drift: there
+    is still exactly one place that knows how to count an arc's outstanding work.
+
+    Reversible without a command, which is the property that matters most. A commit on
+    any branch of the arc expires the declaration, so going back to the work un-residues
+    it on its own -- derived beats declared, and the one thing a person should never have
+    to remember is to withdraw a judgement the evidence has already withdrawn.
+    """
+    live, stale = _apply_arc_answer(arcs, RESIDUE, "the residue store")
+    for arc in arcs:
+        entry = live.get(arc["id"])
+        if not entry:
+            continue
+        for b in arc["branches"]:
+            b["residue"] = True
+        arc["residue"] = {"at": entry.get("at"), "note": entry.get("note", ""),
+                          "branches": sorted(b["name"] for b in arc["branches"])}
+        # Everything the mark changes is finalize's to compute, so it is recomputed rather
+        # than patched -- the same order apply_ticket_authority uses, and for the same
+        # reason: a second implementation of the ladder is a ladder that will disagree.
+        finalize(arc, repo, main_ref)
+    return stale
+
+
+def _residue_promised(arcs, ledger):
+    """Which arcs an open promise names, joined the way a Slack thread is joined.
+
+    `_join_thread` is the one author of the rule that a workstream is named by its ticket
+    keys, its branch names or its merge request iids, and it is reused here rather than
+    re-derived: a promise is a sentence about work, exactly as a thread is, and two
+    implementations of "which work is this sentence about" would disagree the first time
+    one of them was improved.
+
+    Both promise kinds, because `COMMITMENT_KINDS` exists for exactly this -- a meeting
+    promise and a Slack promise differ only in the room they were made in. Closed ones are
+    already off the ledger by the time this runs, so every row here is still open.
+    """
+    if not ledger:
+        return set()
+    index = _thread_join_index(arcs)
+    out = set()
+    for e in ledger.get("you_owe") or ():
+        if e.get("kind") not in COMMITMENT_KINDS:
+            continue
+        text = " ".join(str(e.get(f) or "") for f in ("quote", "promised", "title", "ref"))
+        arc, _, _ = _join_thread(text, index)
+        if arc is not None:
+            out.add(arc["id"])
+    return out
+
+
+def residue_queue(arcs, ledger, jira_known, pinned=(), cap=CURATION_CAP):
+    """The workstreams worth asking "was this ever meant to land?", coldest first.
+
+    Derived, not asked about wholesale. The whole queue's rule is that asking about a
+    fact is worse than asking nothing, and four kinds of work are intended BY
+    CONSTRUCTION -- there is no answer to give but yes, and asking spends the day's one
+    unit of attention on it:
+
+      warm            touched within its own rhythm. Work in progress is not residue,
+                      whatever it looks like; the arithmetic is activity_of's, so
+                      "quiet" means quiet for THIS arc rather than quiet by the calendar.
+      proposed        a merge request exists, or one ever did. Putting work up for review
+                      is the act of declaring it meant to land, and nothing this can ask
+                      overrides it.
+      sprint-claimed  a sprint carries its ticket. That is the team's declaration that
+                      the work is wanted, which outranks a guess about intent.
+      promised        a Slack message or a sentence in a meeting says you would do it.
+                      Your own words, and the most direct evidence of intent there is.
+
+    Then the cliff's own exemptions, which are already the list of reasons silence does
+    not mean neglect: in-review and pre-landing come from FORGOTTEN_EXEMPT rather than
+    being restated, settled work is finished, and parked work is intent already declared
+    the other way. An arc that is already residue is not asked either -- it has answered.
+
+    Two abstentions, and they are refusals to ask rather than reasons to be silent. Every
+    test above is an EXCLUSION, so a source that did not answer does not make the queue
+    shorter -- it makes it wrong, by letting through exactly the work that would have
+    been excluded. Where GitLab was not asked, "never proposed" cannot be established;
+    where the ledger was not built or came back short, "nothing promised it" cannot be.
+    Both then produce no residue questions at all, which is the same judgement
+    mark_forgotten makes about accusing an arc on a --no-mr run and the same one
+    apply_dismissals makes about pruning on a half-answered ledger. Said out loud by the
+    caller, so a quiet queue is never mistaken for a clean one.
+
+    Coldest first, measured as multiples of the arc's own rhythm rather than in days, so
+    two arcs quiet for the same fortnight are ordered by which of them that fortnight is
+    stranger for. Then by the days of work at stake, descending -- if only some of these
+    get answered, the ones whose answer moves the numbers most should be the ones asked.
+    Then the id, so the order is total and two runs over one graph ask in the same
+    sequence.
+    """
+    if not any(a.get("mrs_known", True) for a in arcs):
+        return [], ("GitLab was not asked, so whether this work was ever proposed cannot "
+                    "be known — nothing asked about intent this run")
+    if not (ledger and ledger.get("complete")):
+        return [], ("the waiting-on ledger is incomplete, so whether a promise names "
+                    "this work cannot be known — nothing asked about intent this run")
+    if not jira_known:
+        return [], ("Jira was not asked, so whether a sprint claims this work cannot be "
+                    "known — nothing asked about intent this run")
+
+    promised = _residue_promised(arcs, ledger)
+    out = []
+    for arc in arcs:
+        if arc.get("residue") or arc["id"] in pinned:
+            continue
+        if not arc.get("unpushed_live"):
+            continue                        # nothing on the disk to be residue
+        if arc.get("settled") or arc.get("parked"):
+            continue
+        if arc.get("stage") in FORGOTTEN_EXEMPT:
+            continue
+        if not arc.get("mrs_known", True):
+            continue
+        # Ever proposed, not merely proposed now: a merged or closed merge request is
+        # still the act of having put the work up, and `mr_fate` is the only record of
+        # one that is no longer open.
+        if arc.get("mrs") or any(b.get("mr_fate") for b in arc["branches"]):
+            continue
+        if arc.get("sprint") or arc["id"] in promised:
+            continue
+        act = arc.get("activity") or {}
+        if not act.get("invested"):
+            # No evidence of activity at all, so there is no rhythm to be cold against.
+            # Abstaining is the honest form: a question built on knowing nothing would be
+            # asked about every arc whose commits predate the log window.
+            continue
+        k, gap = act.get("cliff_days") or 0, act.get("typical_gap_days") or 1
+        if k < _knob("cliff_days") or k < RESIDUE_COLD_RATIO * gap:
+            continue
+        days = arc.get("unpushed_days", 0)
+        scale = work_scale(days, arc["unpushed_live"])[0]
+        out.append({
+            "kind": "residue",
+            "arc": arc.get("label") or arc["id"],
+            "arc_id": arc["id"],
+            "fp": _dfp("residue", arc["id"], arc.get("fingerprint")),
+            "fingerprint": arc.get("fingerprint"),
+            "branches": sorted(b["name"] for b in arc["branches"]),
+            "scale": scale,
+            "days": days,
+            "commits": arc["unpushed_live"],
+            "cliff_days": k,
+            "gap_days": gap,
+            "beats": round(k / gap, 1),
+            "why": (f"{scale} on no remote, quiet {k} days against a {gap}-day "
+                    f"rhythm, never proposed"),
+            "stage": arc.get("stage") or "",
+        })
+    out.sort(key=lambda q: (-q["beats"], -q["days"], -q["commits"], q["arc_id"]))
+    return out[:cap], ""
+
+
+def answer_residue(q, intended):
+    """Record one verdict about intent: a pin if the work is meant, a residue mark if not.
+
+    Both answers are written, and for the reason the membership pair is: an eval set of
+    corrections alone would score a detector that called everything residue as perfect.
+    "Yes, this is real work" is the half that makes the other half mean something.
+
+    Keyed on the arc id and stamped with the fingerprint it is a claim about, so it can
+    only ever apply to the work it was an answer to. Answering one way clears the other,
+    so the two stores can never disagree about one workstream.
+    """
+    entry = {"fingerprint": q.get("fingerprint"), "at": int(time.time()),
+             "label": q.get("arc"), "branches": list(q.get("branches") or ())}
+    path = INTENDED if intended else RESIDUE
+    other = RESIDUE if intended else INTENDED
+    store = load_store(path, "the intended store" if intended else "the residue store")
+    store[q["arc_id"]] = entry
+    off = load_store(other, "the residue store" if intended else "the intended store")
+    if off.pop(q["arc_id"], None) is not None or off.pop(q["arc"], None) is not None:
+        try:
+            other.write_text(json.dumps(off, indent=1, sort_keys=True))
+        except OSError:
+            pass
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(store, indent=1, sort_keys=True))
+    log_answer({"at": entry["at"], "kind": "residue",
+                "answer": "intended" if intended else "residue",
+                "arc": q["arc"], "arc_id": q["arc_id"], "fp": q["fp"],
+                "fingerprint": q.get("fingerprint"),
+                "branches": entry["branches"], "days": q.get("days"),
+                "commits": q.get("commits"), "cliff_days": q.get("cliff_days"),
+                "gap_days": q.get("gap_days"), "why": q.get("why"),
+                "via": q.get("via") or "cli"})
+
+
+def combined_queue(memberships, residues, cap=CURATION_CAP):
+    """One queue of at most `cap` questions, membership first.
+
+    The cap is shared rather than one each, because it is a budget of attention and not a
+    budget of question types: five is what fits on a screen and what a person will answer
+    between two other things, and ten questions in two sections is the backlog the whole
+    loop was designed not to become.
+
+    Membership outranks residue when they compete, and the ranking is about what a wrong
+    answer costs. A branch in the wrong arc poisons everything downstream of the
+    grouping -- the arc's subject, its ticket, its brief, its rung and every count on it
+    -- and it poisons the residue question too, because "is this workstream intended?" is
+    unanswerable about a workstream that is two pieces of work in a trenchcoat. A stale
+    branch counted as debt for one more day is a number slightly too large. So the
+    questions that fix the foundation are asked first, and intent is asked with whatever
+    room is left.
+    """
+    return (list(memberships) + list(residues))[:cap]
 
 
 def co_members(cluster_assign, branch):
@@ -5491,6 +5927,14 @@ def mark_forgotten(arc):
                        [arc["settled"]] + " — finished, not forgotten")
     if arc.get("parked"):
         return verdict(False, "parked on purpose — the one thing this cannot derive")
+    if arc.get("residue"):
+        # The other thing this cannot derive, and the stronger of the two. Parking says
+        # "not yet"; residue says "never", and there is nothing in work nobody meant to
+        # finish to have been forgotten. Accusing it would be the feature's own worst
+        # failure mode -- a false accusation, on the one arc a person has already told it
+        # about.
+        return verdict(False, "residue — you said this was never meant to land, so "
+                              "there is nothing here to have dropped")
     if arc.get("stage") in FORGOTTEN_EXEMPT:
         return verdict(False, FORGOTTEN_EXEMPT[arc["stage"]])
 
@@ -5922,10 +6366,22 @@ def finalize(arc, repo=None, main_ref="origin/main"):
         # one a person rather than the repo asserts: the work went out as another branch and
         # this one is a draft from before it. Same consequence as supersession -- its commits
         # are not risk and its absence of an MR is not a demand.
+        # `residue` is the fourth, and the only one that is a claim about intent rather
+        # than about where the content already is. The other three say "these commits are
+        # somewhere safe"; this one says "these commits were never going to land". Same
+        # consequence for every number below -- not risk, not a demand -- because debt you
+        # are not going to pay is not debt either.
         return bool(b.get("superseded_by")) or bool(b.get("historical")) or \
+            bool(b.get("residue")) or \
             b.get("mr_fate", {}).get("state") in ("merged", "closed")
 
-    held = [b["name"] for b in arc["branches"] if b["unpushed"]]
+    # Residue is out of `held` as well as out of `live`, where the other three exclusions
+    # are only out of `live`. The gap between the two is reported as "only on a superseded
+    # copy", which is a claim about the repo, and leaving declared residue inside it would
+    # credit a person's judgement to a derivation -- and inflate the one number on the card
+    # that exists to say what deleting the copies would cost.
+    held = [b["name"] for b in arc["branches"]
+            if b["unpushed"] and not b.get("residue")]
     live = [b["name"] for b in arc["branches"] if b["unpushed"] and not dead(b)]
     if repo is not None:
         # One walk, two facts. `unpushed_live` is the count it always was; the dates it
@@ -5949,11 +6405,34 @@ def finalize(arc, repo=None, main_ref="origin/main"):
         # history.
         arc["unpushed_live"] = sum(b["unpushed"] for b in arc["branches"]
                                    if not dead(b))
-        arc["unpushed_only_on_copies"] = arc["unpushed"] - arc["unpushed_live"]
+        # Over `held` rather than over `unpushed`, so the degraded path draws the same
+        # line the real one does: `unpushed` is the whole arc, declared residue included,
+        # and subtracting the live count from it would report a person's judgement about
+        # intent as a fact about superseded copies.
+        arc["unpushed_only_on_copies"] = (
+            sum(b["unpushed"] for b in arc["branches"]
+                if b["unpushed"] and not b.get("residue")) - arc["unpushed_live"])
         # No repo means no author dates, and there is no second source for them. The scale
         # degrades to naming none rather than to guessing one -- see work_scale.
         arc["unpushed_dates"] = []
     arc["unpushed_days"] = len(arc["unpushed_dates"])
+    # What the residue declaration set aside, counted in the same units as the live work
+    # and on its own walk. Neither number above can stand in for it: `unpushed_live`
+    # excludes it by design and `unpushed_only_on_copies` is now a statement about copies
+    # alone. And de-emphasis needs a figure to de-emphasise -- the card strikes this
+    # through rather than dropping it, because a number that vanished is a number a reader
+    # cannot check, and "these commits stopped counting" is the whole claim being made.
+    res_names = [b["name"] for b in arc["branches"]
+                 if b.get("residue") and b["unpushed"]]
+    if res_names and repo is not None:
+        dated = unpushed_authored(repo, res_names)
+        arc["residue_commits"], arc["residue_days"] = len(dated), len(set(dated))
+    else:
+        # Same degradation as `unpushed_dates`: with no repo the commits can still be
+        # summed per branch, and the days are named as none rather than guessed at.
+        arc["residue_commits"] = sum(b["unpushed"] for b in arc["branches"]
+                                     if b.get("residue"))
+        arc["residue_days"] = 0
     arc["superseded"] = sum(1 for b in arc["branches"] if b.get("superseded_by"))
     arc["landed_branches"] = sum(1 for b in arc["branches"]
                                  if b.get("mr_fate", {}).get("state") == "merged")
@@ -6019,7 +6498,7 @@ def finalize(arc, repo=None, main_ref="origin/main"):
     # that it is a signal, and papering over it was explicitly not wanted.
     live_b = [b for b in arc["branches"]
               if not b.get("mr_fate") and not b.get("superseded_by")
-              and not b.get("historical")]
+              and not b.get("historical") and not b.get("residue")]
     arc["predates_landing"] = sum(1 for b in live_b if b.get("predates_landing"))
     stale_draft = bool(live_b) and all(b.get("predates_landing") for b in live_b)
 
@@ -6027,6 +6506,18 @@ def finalize(arc, repo=None, main_ref="origin/main"):
     if settled:
         arc["stage"] = settled
         arc["state"] = {"landed": "landed", "abandoned": "abandoned"}[settled]
+    elif arc.get("residue"):
+        # Its own rung, and it has to be one. With the marks in place every count on this
+        # arc is zero and the ladder's last branch would call it "nothing outstanding" --
+        # which is true and useless, since it makes a workstream a person wrote off
+        # indistinguishable from one that is pushed and clean. The same conflation `at
+        # risk` / `idle` was rejected for. Named rather than hidden, and it carries the
+        # size it stopped counting, because "de-emphasis is not hiding" is only honest if
+        # the figure is still on the row.
+        arc["stage"] = "residue"
+        n, d = arc.get("residue_commits", 0), arc.get("residue_days", 0)
+        arc["state"] = ("residue — " + (work_scale(d, n)[0] if n else "nothing")
+                        + " not counted")
     elif stale_draft:
         arc["stage"] = "pre-landing"
         ref = next(b["predates_landing"] for b in live_b if b.get("predates_landing"))
@@ -6820,9 +7311,17 @@ def main():
     # underneath the squash index and the session scan instead of after them: measured,
     # that turns 9s of its own wall clock into none. The write-side commands skip it --
     # --park does not need to know who owes whom.
+    # `--curate` is deliberately NOT here any more. It was, on the reasoning that a
+    # write-side command does not need to know who owes whom -- true of every other one,
+    # and false of this one the moment it started asking about intent. "No promise names
+    # this work" is one of the four exclusions that make a residue question askable at
+    # all, and a promise lives in the ledger; a --curate run without it would either ask
+    # about work Kyle had promised out loud or, honestly, ask nothing. It costs no wall
+    # clock either way: the ledger runs in its own thread underneath the git work that
+    # was going to happen regardless.
     writing = (args.park or args.unpark or args.authoritative or args.jira_ify
                or args.detach or args.undetach or args.authoritative_ticket
-               or args.derive_ticket or args.curate)
+               or args.derive_ticket)
     ledger_f = None
     if mrs_known and not args.shallow_mr and not writing:
         ledger_f = futures.ThreadPoolExecutor(max_workers=1).submit(
@@ -6918,12 +7417,15 @@ def main():
     # detachments have already had their say, so a question can only ever be about a
     # membership that survived them -- which is what makes "skip is free" true: a
     # skipped question is simply one nobody pinned, and it comes back next build.
+    #
+    # The residue half of the queue cannot be built here, and the split is not tidiness:
+    # every one of its exclusions -- the sprint, the ledger, `parked`, the rung -- is
+    # settled hundreds of lines below this, so it is assembled where those are known and
+    # merged in there. Membership questions have no such dependency and are built where
+    # their inputs are freshest.
     curation = curation_queue(arcs, {k: v for k, v in membership.items()
                                      if k not in pinned},
                               cluster_assign, unsure)
-
-    if args.curate:
-        return curate(curation, cluster_assign)
 
     if args.detach or args.undetach:
         set_detached(cluster_assign, branches, args.detach or args.undetach,
@@ -6968,7 +7470,9 @@ def main():
 
     gap = None
     sprint = None
-    if args.gap or args.json:
+    # `--curate` joins these two for the same reason it joined the ledger: a residue
+    # question may not be asked about work a sprint claims, and only Jira can say.
+    if args.gap or args.json or args.curate:
         issues, jira_error = collect_jira()
         gap = reconcile(arcs, issues) if not jira_error else None
         # Fetched here, beside the other Jira call, and joined much further down. The
@@ -6978,7 +7482,7 @@ def main():
         # --json only: `--gap` prints and returns before apply_parked, so the join could
         # not be made honestly there, and a network call whose result is thrown away is
         # a network call not worth making.
-        if gap is not None and args.json:
+        if gap is not None and (args.json or args.curate):
             sprint = collect_sprint()
         if gap is not None:
             # Which branch is authoritative can depend on which ticket the arc owns, and
@@ -7039,6 +7543,19 @@ def main():
     filings_live = {k: v for k, v in filing_store.items()
                     if k not in {s["label"] for s in stale_tickets}}
 
+    # Beside the filing and above the park, for the two reasons the comment on the filing
+    # gives. It re-runs finalize, so it must come before anything that asserts a stage
+    # finalize does not derive -- `parked` is exactly that. And conceptually it is the same
+    # order: a filing says what the work IS, residue says whether it is work at all, and
+    # parking is intent layered on top of whatever the answer to both was.
+    stale_residue = apply_residue(arcs, args.repo, args.main)
+    for s in stale_residue:
+        print(f"⚠ {s['label']} is no longer residue: {s['why']}", file=sys.stderr)
+    intended, stale_intended = apply_intended(arcs)
+    for s in stale_intended:
+        print(f"⚠ {s['label']} is no longer pinned as intended: {s['why']}",
+              file=sys.stderr)
+
     # What the page's own filing control would do, per workstream and per key. Computed
     # here because the page must record intent and never derive consequences -- see filing.
     for arc in arcs:
@@ -7073,8 +7590,15 @@ def main():
     # so nothing is missing; a flag means the blocks exist and this run chose not to look,
     # and pruning their acknowledgements would punish a cheap run for being cheap. Same
     # distinction --no-mr already makes for the ledger.
-    slack_lens = {"consulted": False, "complete": False, "why": "--no-slack-threads"}
-    if not args.no_slack_threads:
+    # `--curate` skips it, and that is not a cheap run being cheap: the thread lens is the
+    # one pass that calls a model per thread, it puts words on cards nothing here renders,
+    # and no question in the queue is decided by it. The ledger's own Slack rows -- which
+    # are what a residue question needs -- are a different collector and unaffected, the
+    # same distinction --no-slack-threads has always made.
+    skip_lens = args.no_slack_threads or args.curate
+    slack_lens = {"consulted": False, "complete": False,
+                  "why": "--curate" if args.curate else "--no-slack-threads"}
+    if not skip_lens:
         slack_lens = slack_threads(arcs, ledger)
 
     # Last of the finalize-order corrections, because everything before this point --
@@ -7166,6 +7690,25 @@ def main():
     # make the strip structurally unable to hold the arcs it exists for.
     if sprint is not None:
         join_sprint(sprint, arcs)
+
+    # The second question type, assembled here because here is the first line at which
+    # every one of its exclusions is knowable: the rung and `parked` are settled, the
+    # sprint has been joined, and the ledger has been built and had its kept promises
+    # closed out. Before the window filters, like the two rankings above it and for the
+    # same reason -- work that has gone cold enough to be worth asking about is by
+    # construction the work a recency window hides.
+    # Only where the queue is going to be looked at. A plain summary run renders no
+    # questions, and a run that builds a queue nobody sees would spend a Slack join on it
+    # and then announce an abstention about a section it was never going to print.
+    residues = []
+    if args.curate or args.json:
+        residues, why_not = residue_queue(arcs, ledger, gap is not None, intended)
+        if why_not:
+            print(f"  {why_not}", file=sys.stderr)
+    curation = combined_queue(curation, residues)
+
+    if args.curate:
+        return curate(curation, cluster_assign)
 
     if args.active is not None:
         arcs = [a for a in arcs if a["age_days"] <= args.active]
@@ -7261,6 +7804,12 @@ def main():
             "stale_parks": stale_parks,
             "stale_detached": stale_detached,
             "stale_confirmed": stale_confirmed,
+            # Both halves of the intent contract expiring, said out loud on the page for
+            # the reason every other stale list here is: a judgement that suppressed
+            # numbers and has stopped applying must announce that the numbers are back,
+            # or the page silently changes its mind and nothing accounts for it.
+            "stale_residue": stale_residue,
+            "stale_intended": stale_intended,
             # The questions this build would like answered, least confident first, or
             # absent when it has none. Top-level rather than on the arcs, because the
             # queue is ranked across every arc at once -- the five worth asking are the
