@@ -585,7 +585,20 @@ td .dis{vertical-align:middle}
 
    It borrows `details.parked`'s shape because it is the same gesture, and takes the accent
    for its marker where that one takes the parked grey: this is the list of what you could
-   still lose, and the other is the list of what somebody else is holding. */
+   still lose, and the other is the list of what somebody else is holding.
+
+   `details.parked` has no producer any more -- the parked rung renders as a plain heading
+   and a `.parked-list`, and nothing emits a <details> with that class. Its rules are kept
+   rather than deleted because they are the shape this one is defined in terms of, and
+   sharing one definition is what stops the two drifting if it comes back. Note it here so
+   the next reader does not go looking for the markup.
+
+   The markers are literal glyphs and not CSS codepoint escapes. This stylesheet is a plain
+   triple-quoted python string, so a backslash-25be escape in a content value is read by
+   python as octal 25 followed by the letters "be", and renders as a tofu box with "be"
+   next to it. Written out here rather than shown, because a comment inside this string is
+   inside the same string and would be mangled the same way -- which is how the test for
+   this found the sentence that used to be here. */
 details.parked,details.atrisk{margin-top:.4rem}
 details.parked{--disc:var(--parked)}
 details.atrisk{--disc:var(--accent);margin:-2rem 0 2.5rem}
@@ -594,9 +607,9 @@ details.parked>summary,details.atrisk>summary{cursor:pointer;font-size:.85rem;
   border-radius:4px;background:var(--surface);list-style:none}
 details.parked>summary::-webkit-details-marker,
 details.atrisk>summary::-webkit-details-marker{display:none}
-details.parked>summary::before,details.atrisk>summary::before{content:"\25b8 ";
+details.parked>summary::before,details.atrisk>summary::before{content:"▸ ";
   color:var(--disc)}
-details.parked[open]>summary::before,details.atrisk[open]>summary::before{content:"\25be "}
+details.parked[open]>summary::before,details.atrisk[open]>summary::before{content:"▾ "}
 details.parked>summary:hover,details.atrisk>summary:hover{border-color:var(--disc)}
 details.parked>summary b,details.atrisk>summary b{color:var(--ink);font-weight:600}
 

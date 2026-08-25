@@ -422,6 +422,26 @@ PY
     [ "${lines[0]}" = "4" ]
 }
 
+@test "no CSS content string smuggles a control character out of a python escape" {
+    # CSS is a plain triple-quoted string, not a raw one, so a CSS codepoint escape written
+    # as content:"\25be " is read by python as octal \25 followed by the letters "be" --
+    # and the disclosure marker rendered as a tofu box with "be" beside it. The original
+    # rules used the literal glyphs for exactly this reason. Checked over every content
+    # string in the stylesheet, because the next one will be written the same way.
+    run python3 - "$REPO_ROOT/bin/arcs-page" <<'PY'
+import importlib.machinery, importlib.util, re, sys
+loader = importlib.machinery.SourceFileLoader("pg", sys.argv[1])
+spec = importlib.util.spec_from_loader("pg", loader)
+pg = importlib.util.module_from_spec(spec)
+sys.argv = ["pg"]
+loader.exec_module(pg)
+bad = [c for c in re.findall(r'content:"([^"]*)"', pg.CSS)
+       if any(ord(ch) < 32 for ch in c)]
+print(bad)
+PY
+    [ "${lines[0]}" = "[]" ]
+}
+
 @test "a summary with no sentence break is dropped rather than chopped mid-thought" {
     # A phrase cut at a character count says less than nothing. Where the first sentence
     # is too long for one line the row falls back to a fact it already has.
