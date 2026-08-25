@@ -13,7 +13,7 @@ about to cost you a day. This composes that judgement into prose:
 Three rules hold it honest, and they are the whole design.
 
 **Every claim is a projection of a derived input.** Not "you should look at UL-1692" but
-"Jira calls UL-1692 In Qualification while 202 of its commits have never reached a
+"Jira calls UL-1692 In Qualification while nine days of work on it never reached a
 remote", which is `gap.status_mismatch` said in a sentence. Nothing here counts anything:
 the counts, the clocks and above all the *rankings* come down the wire already computed --
 `ledger.they_owe` is sorted worst-first by work-arcs, `forgotten` is `fell_off_a_cliff`'s
@@ -61,8 +61,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 import headless_claude  # noqa: E402
+from commitments import COMMITMENT_KINDS  # noqa: E402
 from timespan import fmt_interval  # noqa: E402
 from statefile import load_store  # noqa: E402
+from workscale import work_scale  # noqa: E402
 
 STATE = (Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
          / "work-arcs")
@@ -234,7 +236,14 @@ def promised_due(row, restatement=None):
     late only when it is late on every reading. Returns (date, the phrase it was read
     from) or None.
     """
-    said = (restatement if restatement is not None else row.get("promised")) or ""
+    # A meeting row carries the timeframe Kyle stated as its own field, extracted apart
+    # from the restatement, and that is a strictly better input than the restatement is:
+    # `deadline` is the model's isolated answer to "what clock did he name", where
+    # `promised` is a paraphrase of the deliverable that may or may not have kept the
+    # phrase. Both are his words about the promise, which is the property that matters --
+    # never the quote, whose other dates are usually about something else.
+    said = (restatement if restatement is not None
+            else (row.get("deadline") or row.get("promised"))) or ""
     said = said.lower()
     try:
         base = datetime.strptime(row.get("asked", "")[:10], "%Y-%m-%d").date()
@@ -254,6 +263,17 @@ def promised_due(row, restatement=None):
         return base + timedelta(days=2), "the day after tomorrow"
     if re.search(r"\btomorrow\b", said):
         return base + timedelta(days=1), "tomorrow"
+    # "in the next couple days", said at a standup, is a real clock and the commonest
+    # shape a spoken one takes -- Kyle said exactly it of the Dove workspace migration on
+    # 2026-08-24. Both readings resolve late, the way this function resolves every
+    # ambiguity: a couple is two or three, so it is read as three, and a few is three to
+    # five, so it is read as five. A promise is called late only when it is late on every
+    # reading of what was said.
+    m = re.search(r"\b(couple|few)(?: of)? (?:more )?(?:days|weeks)\b", said)
+    if m:
+        weeks = "weeks" in m.group(0)
+        span = (3 if m.group(1) == "couple" else 5) * (7 if weeks else 1)
+        return base + timedelta(days=span), m.group(0)
     if re.search(r"\bnext week\b", said):
         return _friday_of(base, following=True), "next week"
     if re.search(r"\b(?:end of (?:the )?week|this week|eow)\b", said):
@@ -272,7 +292,7 @@ def overdue_commitments(ledger, today):
     """
     out = []
     for e in live((ledger or {}).get("you_owe")):
-        if e.get("kind") != "commitment":
+        if e.get("kind") not in COMMITMENT_KINDS:
             continue
         due = promised_due(e)
         if not due:
@@ -280,8 +300,14 @@ def overdue_commitments(ledger, today):
         late = (today - due[0]).days
         if late > 0:
             out.append((late, e, due[0]))
+    # Down to the fingerprint, not merely to the reference. One standup can hold two
+    # promises whose restatements collide -- the ref is the meeting, shared by all of
+    # them, where a Slack row's ref at least narrows to a channel -- and a tie here hands
+    # the brief whatever order the rows arrived in, which is the arc-brief evidence
+    # fingerprint lesson exactly.
     out.sort(key=lambda r: (-r[0], -(r[1].get("days") or 0),
-                            r[1].get("ref") or "", r[1].get("promised") or ""))
+                            r[1].get("ref") or "", r[1].get("promised") or "",
+                            r[1].get("fp") or ""))
     return out
 
 
@@ -332,6 +358,15 @@ def you_clause(e):
                 f" {days(n)} ago and you have not spoken there since"]
     if kind == "commitment":
         return ["you said you would ",
+                ref(e.get("promised") or "do it", fp=e.get("fp"), of="ledger",
+                    url=e.get("url")), f", {days(n)} ago"]
+    if kind == "meeting-commitment":
+        # Where it was said carries the weight here. A promise typed in Slack has a
+        # permalink the reader can go and check; one said at a standup was heard by the
+        # room and written down nowhere, and naming the meeting is what makes it findable
+        # -- and what makes it credible enough to act on before opening the link.
+        said = f"you said at {e['ref']} you would " if e.get("ref") else "you said you would "
+        return [said,
                 ref(e.get("promised") or "do it", fp=e.get("fp"), of="ledger",
                     url=e.get("url")), f", {days(n)} ago"]
     return [a, f", {days(n)}"]
@@ -456,7 +491,14 @@ def overdue_sentence(data, today):
     late, e, due = over[0]
     where = e.get("ref") or ""
     who = (whoname(e) or [""])[0]
-    told = (f"You told {who} in {where}" if who and where.startswith("#")
+    # Three shapes of `where`: a Slack channel (`#tech-backend`), a meeting Kyle spoke in
+    # (`FE standup`), and nothing at all -- a DM, where naming the room says less than the
+    # counterpart already does. "in #chan" and "at FE standup" are not interchangeable
+    # prepositions, and "You said in FE standup" was the sentence that made this a branch.
+    spoken = e.get("kind") == "meeting-commitment" and where
+    told = (f"You told {who} at {where}" if who and spoken
+            else f"You said at {where}" if spoken
+            else f"You told {who} in {where}" if who and where.startswith("#")
             else f"You told {who}" if who
             else f"You said in {where}" if where.startswith("#")
             else "You said")
@@ -510,15 +552,17 @@ def forgotten_sentence(data):
 def contradiction_sentence(data):
     """(e) The one place the record most undermines the rest of the page.
 
-    Widest by unpushed commits, which is the same choice `derive_lede` made and is
+    Widest by days of work, which is the same choice `derive_lede` made and is
     deliberately not re-argued here: a status mismatch matters in proportion to how much
     work the wrong status is hiding, and having two answers to "which is the worst one"
-    on one page would be its own small contradiction.
+    on one page would be its own small contradiction. It used to be widest by unpushed
+    commits, which ranked an afternoon of agentic churn above a fortnight of real work.
     """
     mism = live((data.get("gap") or {}).get("status_mismatch"))
     if not mism:
         return None
-    worst = max(mism, key=lambda m: ((m.get("arc") or {}).get("unpushed_live", 0),
+    worst = max(mism, key=lambda m: ((m.get("arc") or {}).get("unpushed_days", 0),
+                                     (m.get("arc") or {}).get("unpushed_live", 0),
                                      m.get("ref") or ""))
     issue, arc = worst.get("issue") or {}, worst.get("arc") or {}
     n = arc.get("unpushed_live", 0)
@@ -526,9 +570,9 @@ def contradiction_sentence(data):
               fp=worst.get("fp"), of="gap", url=issue.get("url"))
     rest = len(mism) - 1
     if n:
-        body = ["Jira still calls ", key, f" “{issue.get('status','')}” while "
-                + (f"{n} of its commits have" if n != 1 else "1 of its commits has")
-                + " never reached a remote"]
+        scale = work_scale(arc.get("unpushed_days", 0), n)[0]
+        body = ["Jira still calls ", key, f" “{issue.get('status','')}” while {scale} "
+                "on it never reached a remote"]
     else:
         body = ["Jira still calls ", key, f" “{issue.get('status','')}”, "
                 + (worst.get("why") or "and the code says otherwise").split(" but ")[-1]]

@@ -36,7 +36,9 @@ from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+from commitments import COMMITMENT_KINDS  # noqa: E402
 from timespan import fmt_interval  # noqa: E402
+from workscale import work_scale  # noqa: E402
 
 CSS = """
 :root{
@@ -531,8 +533,8 @@ td .dis{vertical-align:middle}
   .lb .cls{grid-column:1/-1}}
 
 /* The conditions, as peers. There is no defensible exchange rate between "a reviewer asked a
-   question six days ago" and "79 commits exist nowhere but this laptop" -- ranking them
-   against each other invents one, and the swathe of unpublished work is a primary problem
+   question six days ago" and "nine days of work exist nowhere but this laptop" -- ranking
+   them against each other invents one, and the swathe of unpublished work is a primary problem
    in its own right rather than a lesser version of a stalled review. So: no hero figure
    (that would name one of them THE number), no severity hue (that would rank them by
    colour), equal tiles. Each states a condition and how much of it there is. */
@@ -1303,23 +1305,35 @@ def derive_lede(data, focus_days):
     # here only by stating the contradictions, which no tile can hold.
     mism = gap.get("status_mismatch") or []
     if mism:
-        worst = max(mism, key=lambda m: m.get("arc", {}).get("unpushed_live", 0))
+        # Widest by days of work, not by commit count, and tie-broken all the way down so
+        # two builds of the same data open on the same ticket. A superlative attached to a
+        # figure has to be a superlative OF that figure: ranking on commits while printing
+        # days would let "the widest" name a ticket the page shows as smaller.
+        worst = max(mism, key=lambda m: (m.get("arc", {}).get("unpushed_days", 0),
+                                         m.get("arc", {}).get("unpushed_live", 0),
+                                         m.get("ref") or ""))
         k = worst.get("issue", {})
-        n = worst.get("arc", {}).get("unpushed_live", 0)
+        wa = worst.get("arc", {})
+        scale = work_scale(wa.get("unpushed_days", 0), wa.get("unpushed_live", 0))[0]
         bits.append(
             f'Jira believes <em>{esc(k.get("key",""))}</em> is '
-            f'&ldquo;{esc(k.get("status",""))}&rdquo;, but {n} of its commits have '
+            f'&ldquo;{esc(k.get("status",""))}&rdquo;, but {scale} on it '
             f"never reached a remote"
             + (f", and {len(mism)-1} other tickets claim a status the code contradicts"
                if len(mism) > 1 else "") + ".")
 
     unt = gap.get("unticketed_work") or []
     if unt:
-        hidden = sum(a.get("unpushed_live", 0) for a in unt)
+        # Unioned rather than summed. Two arcs worked on the same Tuesday are one Tuesday
+        # of work, and adding their day counts would report a fortnight of hidden work out
+        # of a week of it -- the same double-count in days that per-branch summing was in
+        # commits.
+        hd = len({d for a in unt for d in a.get("unpushed_dates") or []})
+        hidden = work_scale(hd, sum(a.get("unpushed_live", 0) for a in unt))[0]
         bits.append(
             f"{len(unt)} workstream{'s' if len(unt) != 1 else ''} of real work "
             f"{'have' if len(unt) != 1 else 'has'} no ticket at all"
-            + (f", carrying {hidden} unpushed commits" if hidden else "")
+            + (f", carrying {hidden}" if hd else "")
             + " — invisible to Jira, and so absent from Trellis&rsquo;s capacity, "
               "burndown and every initiative rollup.")
 
@@ -1328,9 +1342,10 @@ def derive_lede(data, focus_days):
     # Only when Jira and the code agree, so the tiles are all there is to report.
     loc = [a for a in arcs if a.get("stage") == "local-only"]
     if loc:
-        n = sum(a.get("unpushed_live", 0) for a in loc)
+        n = work_scale(len({d for a in loc for d in a.get("unpushed_dates") or []}),
+                       sum(a.get("unpushed_live", 0) for a in loc))[0]
         return (f"Jira and the code agree on everything they both know about. What Jira "
-                f"does not know about is <em>{n} commits</em> across {len(loc)} "
+                f"does not know about is <em>{n}</em> across {len(loc)} "
                 f"workstreams that no remote has.")
     return "Nothing outstanding — every workstream is pushed, ticketed, and says what it is."
 
@@ -1641,11 +1656,14 @@ def face(who, avatar=""):
             f'style="--av:hsl({hue} 34% 42%)">{esc(letters)}</span>')
 
 
-# Whose message a ledger row quotes. Every other row quotes the other person; these two
-# quote Kyle -- a commitment is read out of his own promise, and "you asked X, no reply"
-# quotes the question he asked. Attributing either to the counterpart would put words in
-# their mouth, which is the one failure a quote cannot survive.
-MINE = ("commitment", "slack-asked")
+# Whose message a ledger row quotes. Every other row quotes the other person; these three
+# quote Kyle -- a commitment is read out of his own promise, whether typed in Slack or
+# spoken at a standup, and "you asked X, no reply" quotes the question he asked.
+# Attributing any of them to the counterpart would put words in their mouth, which is the
+# one failure a quote cannot survive. A meeting transcript makes that sharper rather than
+# softer: the row's `who` is the person Kyle promised, so getting this wrong would print a
+# colleague saying a sentence Kyle said about them.
+MINE = ("commitment", "meeting-commitment", "slack-asked")
 
 
 def ledger_say(e, who):
@@ -2269,7 +2287,7 @@ def render(data, lede, focus_days, limit, cost=None):
         auth = arc.get("authoritative")
         # Everything else on this row is derived; this one thing was declared. It rides
         # here because the row's own state is downstream of it -- "in qualification" where
-        # the derivation said "85 commits exist only here" -- and a reader who cannot see
+        # the derivation said "nine days of work, only here" -- and a reader who cannot see
         # the declaration is in force cannot audit the rung it produced.
         ta = arc.get("ticket_authority") or {}
         hn = arc.get("historical_branches") or 0
@@ -2646,14 +2664,30 @@ def render(data, lede, focus_days, limit, cost=None):
                                      + (f" — {who} is relying on it" if e.get("who")
                                         else "") + since
                                      + " (inferred from your message, quoted)",
+                       # The meeting row says where it was said and, when he named one,
+                       # the clock he set himself -- verbatim and in quotes, because "in
+                       # the next couple days" is his phrase and not the tool's reading of
+                       # it. The reading is a separate claim and lives in the brief, where
+                       # it can be wrong out loud instead of silently.
+                       "meeting-commitment": "you said you&rsquo;d "
+                                     + esc(e.get("promised") or "do this")
+                                     + (f" — {who} is relying on it" if e.get("who")
+                                        else "")
+                                     + (f" &ldquo;{esc(e['deadline'])}&rdquo;"
+                                        if e.get("deadline") else "")
+                                     + (f" — said out loud at {esc(e['ref'])}{since}"
+                                        if e.get("ref") else since)
+                                     + " (inferred from the transcript, quoted)",
                        }.get(e.get("kind"), who)
                 # How this row will die, said out loud. Every other row on the ledger
                 # closes when the other person moves; a commitment whose fulfilment
                 # nothing can show has only the sliding window, and a row that vanishes
                 # one morning unexplained teaches the same distrust as a stale one.
-                if e.get("kind") == "commitment" and e.get("expires_in") is not None:
+                if (e.get("kind") in COMMITMENT_KINDS
+                        and e.get("expires_in") is not None):
+                    where = "Slack" if e["kind"] == "commitment" else "transcript"
                     sub += ('<span class="fade"> — nothing yet shows it landed, so it '
-                            f'expires with the {e.get("window_days", 14)}-day Slack '
+                            f'expires with the {e.get("window_days", 14)}-day {where} '
                             f'window in {esc(e["expires_in"])}d</span>')
                 a(row(e, link(e.get("url", ""), esc(e.get("ref", "")), "ref")
                       + f' {esc(e.get("title",""))}'
@@ -2730,9 +2764,14 @@ def render(data, lede, focus_days, limit, cost=None):
     prop = by_rung.get("not-proposed", [])
     parked = by_rung.get("parked", [])
     done = by_rung.get("landed", []) + by_rung.get("abandoned", [])
+    # Days of work over the distinct days themselves, so a Tuesday spent on two
+    # workstreams is one Tuesday. The tile's own figure is a count of workstreams, which
+    # is what this row counts everywhere; the subtitle is the only place a size belongs.
+    loc_days = len({d for x in loc for d in x.get("unpushed_dates") or []})
     tiles = [
         (len(loc), "exist only on this laptop",
-         f"{sum(x.get('unpushed_live',0) for x in loc)} commits, no remote has them"),
+         work_scale(loc_days, sum(x.get("unpushed_live", 0) for x in loc))[0]
+         + ", no remote has them"),
         (len(back), "have come back to you",
          "a rebase, a question, a red pipeline, an unmerged approval"),
         (len(prop), "are pushed but never proposed", "no merge request exists"),

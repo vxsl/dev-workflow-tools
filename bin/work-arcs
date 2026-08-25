@@ -58,12 +58,14 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 import headless_claude  # noqa: E402
+from commitments import COMMITMENT_KINDS  # noqa: E402
 from statefile import load_store  # noqa: E402
+from workscale import work_scale  # noqa: E402
 
 # Built from JIRA_PROJECTS rather than a generic [A-Z]{2,4}, which matched things
 # like "UTF-8" and "IPV-4" as ticket keys. Falls back to the generic form only if
@@ -314,19 +316,30 @@ def collect_branches(repo, main_ref):
     return branches
 
 
-def distinct_unpushed(repo, names):
-    """How many commits an arc actually has on no remote, counted once each.
+def unpushed_authored(repo, names):
+    """The author date of every commit an arc has on no remote, counted once each.
 
     Summing per branch double-counts every stack: `dove-boot-churn-backup` is an ancestor
     of `dove-boot-churn`, so its 32 unpushed commits ARE 32 of that branch's, and adding
     them made one arc claim 130 where the truth is 98. Union first, then count -- which is
-    what rev-list does natively given every tip at once.
+    what the revision walk does natively given every tip at once.
+
+    Dates rather than a count, because a count of commits is not a measure of work. In an
+    afternoon of agentic development one arc takes 50 commits and a backup branch doubles
+    them; the days those commits were authored on is the same afternoon either way. Every
+    caller that wants the count still gets it as the length of this list, so the walk is
+    the one it always was -- `--format` costs nothing that `--count` did not.
     """
     names = [n for n in names if not n.startswith("-")]
     if not names:
-        return 0
-    out = git(repo, "rev-list", "--count", *names, "--not", "--remotes").strip()
-    return int(out) if out.isdigit() else 0
+        return []
+    out = git(repo, "log", "--format=%ad", "--date=short", *names, "--not", "--remotes")
+    return [ln.strip() for ln in out.splitlines() if ln.strip()]
+
+
+def distinct_unpushed(repo, names):
+    """How many commits an arc actually has on no remote, counted once each."""
+    return len(unpushed_authored(repo, names))
 
 
 def landed_as_squash(repo, branches, main_ref, depth=None):
@@ -1536,6 +1549,339 @@ def ledger_commitments(mine):
     return rows
 
 
+def _doc_url(file_id):
+    """The document, as a person opens it. The transcript lives in a tab whose id the
+    connector does not hand back, so the link lands on the doc and the reader clicks
+    across -- an honest link to the right document beats a fabricated anchor."""
+    return f"https://docs.google.com/document/d/{file_id}/edit"
+
+
+MEETING_CACHE = (Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
+                 / "work-arcs" / "meeting-commitments.json")
+
+# `FE standup - 2026/08/24 10:29 PDT - Notes by Gemini`. The meeting's own name is what
+# the ledger shows as the row's reference, and the timestamp is the promise's instant --
+# which close_commitments needs at better than day resolution, because "did the MR merge
+# after he promised" is unanswerable when both fall on the same afternoon.
+MEETING_TITLE_RE = re.compile(
+    r"^(?P<name>.+?)\s*-\s*(?P<date>\d{4}/\d{2}/\d{2})\s+"
+    r"(?P<time>\d{1,2}:\d{2})\s*(?P<zone>[A-Z]{2,4})?\s*-\s*Notes by Gemini\s*$")
+
+# Zone abbreviations Gemini writes, as UTC offsets in seconds. A zone this does not know
+# falls back to local time, which is the right failure: Kyle's meetings are in his own
+# day, and being an hour out on a promise made at 10:29 cannot reorder it against a merge
+# that happened tomorrow.
+MEETING_ZONES = {"PDT": -7 * 3600, "PST": -8 * 3600, "MDT": -6 * 3600,
+                 "MST": -7 * 3600, "CDT": -5 * 3600, "CST": -6 * 3600,
+                 "EDT": -4 * 3600, "EST": -5 * 3600, "UTC": 0, "GMT": 0}
+
+MEETING_DOCS_PROMPT = """\
+Call the Google Drive tool `search_files` exactly once with this query, verbatim:
+
+  title contains 'Notes by Gemini' and mimeType = 'application/vnd.google-apps.document' \
+and modifiedTime > '{after}'
+
+Then reply with ONLY a JSON array, one object per file the tool returned, copying the
+values EXACTLY as the tool gave them -- do not correct, shorten, re-format or invent any
+field:
+
+[{"id":"<file id>","title":"<title>","modified":"<modifiedTime>"}]
+
+Do not explain, do not summarise the files, do not comment on what you found. Empty array
+if the tool returned no files or failed. No prose, no code fence.
+"""
+
+MEETING_PROMPT = """\
+Call the Google Drive tool `read_file_content` exactly once, with fileId {file_id}.
+
+The document is a Gemini meeting record with two sections: a "Notes" section Gemini
+wrote, and a "Transcript" section of what people actually said, with each line labelled
+by speaker name.
+
+THE TRANSCRIPT IS THE ONLY GROUND TRUTH. The Notes section's attributions are
+demonstrably wrong -- it has assigned one person's ticket to another. You may read the
+Notes "Next steps" list as a hint about where to look, but you must NOT report anything
+from it that you cannot find Kyle saying himself in the transcript. If the Notes claim
+Kyle owns something and the transcript does not show him saying so, it does not exist.
+
+Find the places where KYLE GRIMSRUD-MANZ HIMSELF commits to doing something. Only his own
+lines -- the ones labelled "Kyle Grimsrud-Manz:". Never anyone else's, never something
+someone else says Kyle will do, never something Kyle asks another person to do.
+
+Count ONLY where all three hold:
+- first person future: Kyle himself will do the thing
+- concrete: a nameable action or deliverable, not a vague intention
+- someone else plausibly depends on it happening
+
+Exclude questions, opinions, past-tense reports of work already finished, hypotheticals,
+thinking out loud, offers to be available ("I'm around if you want to chat"), and
+anything you are not sure about. This is a spoken transcript with transcription errors in
+it; where the words are garbled enough that you cannot tell what was promised, say
+nothing. A wrong claim that Kyle owes something costs more trust than ten right ones
+earn: prefer returning nothing over guessing.
+
+Reply with ONLY a JSON array, one object per commitment:
+[{"promised": "<3-8 word restatement of what he said he'd do>",
+  "to": "<the person relying on it, if he named or addressed one, else empty>",
+  "deadline": "<the timeframe HE stated, verbatim and nothing else, e.g. 'today', \
+'in the next couple days', 'next sprint'; empty string if he stated none>",
+  "quote": "<his own words, verbatim from the transcript, at most 180 characters>"}]
+
+Every object MUST carry a `quote` that appears verbatim in the transcript. Empty array if
+none qualify. No prose, no code fence.
+"""
+
+
+def _drive(prompt, model, timeout=300):
+    """A `claude -p` call that may read Google Drive, and nothing else.
+
+    The access path, and the reason this is a model call at all: Kyle has no Google
+    credential on this machine. No rclone remote, no gcalcli, no gcloud, no OAuth token
+    under ~/.config, and no google-api-python-client to use one with. What he does have is
+    the claude.ai Google Drive connector, already authorised against his work account --
+    and its grant lives with the Anthropic account rather than in a file here, so a
+    `claude -p` subprocess inherits it with no setup at all. Measured under `env -i` with
+    only HOME and arcs-refresh's PATH, which is the condition cron actually runs in.
+
+    So the model is the transport, not just the judge, and `--allowedTools` is spelled out
+    per call: this may read a Drive file and it may not write one, edit the tree, or touch
+    the network any other way. `--dangerously-skip-permissions` would grant all three, and
+    a prompt built from a meeting transcript is text Kyle did not write.
+
+    The `=` in `--allowedTools=...` is load-bearing. The flag is variadic, so the space
+    form swallows the prompt as a second tool name and `claude` exits with "Input must be
+    provided either through stdin or as a prompt argument" -- a failure that looks like a
+    broken prompt rather than a broken flag.
+    """
+    return headless_claude.run(
+        ["--model", model,
+         "--allowedTools=mcp__claude_ai_Google_Drive__search_files,"
+         "mcp__claude_ai_Google_Drive__read_file_content",
+         prompt], timeout=timeout)
+
+
+def _json_array(text):
+    """The first JSON array in a model's reply, or None. None means "no answer", never
+    "no commitments" -- the caller must not cache one as the other."""
+    m = re.search(r"\[.*\]", text or "", re.S)
+    if not m:
+        return None
+    try:
+        v = json.loads(m.group(0))
+    except ValueError:
+        return None
+    return v if isinstance(v, list) else None
+
+
+def _meeting_instant(title):
+    """(meeting name, epoch) from a Gemini doc title, or (title, 0).
+
+    0 is load-bearing rather than a sentinel nobody checks, the same way `_iso_epoch`'s
+    is: a promise with no instant orders before every merge and every status move, so an
+    unparseable title closes nothing and expires normally.
+    """
+    m = MEETING_TITLE_RE.match(title or "")
+    if not m:
+        return (title or "").strip(), 0
+    name = m.group("name").strip()
+    stamp = f"{m.group('date')} {m.group('time')}"
+    try:
+        naive = datetime.strptime(stamp, "%Y/%m/%d %H:%M")
+    except ValueError:
+        return name, 0
+    off = MEETING_ZONES.get((m.group("zone") or "").upper())
+    if off is None:
+        return name, int(naive.timestamp())
+    return name, int(naive.replace(tzinfo=timezone.utc).timestamp()) - off
+
+
+# A Drive file id as Drive writes them. The discovery call relays ids through a model, and
+# a relayed id is the one field a model could plausibly "tidy": validating the shape means
+# a garbled id is dropped here rather than spending a read call to find out.
+DRIVE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{20,}$")
+
+
+def _meeting_docs(after_iso, model):
+    """The Gemini meeting docs modified since `after_iso`, newest first.
+
+    One uncached call per run, deliberately: this is the question whose answer must be
+    allowed to change, and a cache on it would make a new morning's standup invisible
+    until something else invalidated it. It is also the cheap call -- a title query and a
+    relay, no document body -- so paying it every run costs almost nothing.
+
+    Returns (docs, complete). `complete` is the same distinction `ledger_slack` draws and
+    for the same reason: a run where Drive would not answer has an unknown meeting
+    universe, not an empty one, and the dismissal prune may not delete an acknowledgement
+    on the grounds that its row is gone.
+    """
+    r = None
+    try:
+        r = _drive(MEETING_DOCS_PROMPT.replace("{after}", after_iso), model, timeout=180)
+        found = _json_array(r.stdout) if r.returncode == 0 else None
+    except (OSError, subprocess.SubprocessError) as e:
+        print(f"  ledger: could not run claude to list meeting docs ({e}) — no meeting "
+              "rows this run, and nothing pruned on their absence", file=sys.stderr)
+        return [], False
+    if found is None:
+        print("  ledger: Drive would not list the meeting docs — no meeting rows this "
+              "run, and nothing pruned on their absence", file=sys.stderr)
+        return [], False
+    docs = []
+    for f in found:
+        if not isinstance(f, dict):
+            continue
+        fid = str(f.get("id") or "").strip()
+        title = str(f.get("title") or "").strip()
+        modified = str(f.get("modified") or "").strip()
+        # All three or none. A doc with no modifiedTime has no revision to key a cache on,
+        # and re-reading it every morning would pay for the same transcript daily.
+        if not (DRIVE_ID_RE.match(fid) and title and modified):
+            continue
+        name, at = _meeting_instant(title)
+        docs.append({"id": fid, "title": title, "modified": modified,
+                     "name": name, "at": at})
+    docs.sort(key=lambda d: (-d["at"], d["title"], d["id"]))
+    return docs[:int(os.environ.get("WORK_ARCS_MEETING_DOCS", "12"))], True
+
+
+def ledger_meetings():
+    """Promises Kyle made out loud, read off the transcripts of his own meetings.
+
+    The third leg. Derived work is in git and declared work is in Jira, and neither holds
+    the sentence "I'll get it in the next couple days" -- said at a standup on a Monday,
+    heard by six people, written down nowhere. The Slack ledger cannot see it either: the
+    room is not a channel. So a promise made in a meeting was the one open loop with a
+    person on the other end that nothing in this pipeline could ever notice, and the only
+    one whose *deadline* Kyle set himself and out loud.
+
+    Two calls, and only the second is cached:
+
+      discovery   which Gemini docs exist in the window. Uncached, once per run, because
+                  this morning's standup must be able to appear.
+      extraction  one call per (doc, revision), reading the transcript for Kyle's own
+                  commitments. Cached, so a fortnight's window costs one call a day.
+
+    The revision is `modifiedTime`, because there is nothing better: the Drive connector
+    exposes no revision id, only that stamp. It behaves the way a revision needs to --
+    Gemini writes the doc once when the meeting ends and never touches it again, so the
+    key is stable, and a doc somebody edits by hand is re-read, which is correct. The
+    prompt's own hash is in the key too, for the reason item 1c cost a release: rewording
+    the question must not reuse yesterday's answers.
+
+    THE TRANSCRIPT TAB IS GROUND TRUTH, and this is the whole reason the feature reads a
+    document instead of a to-do list. Gemini's Notes tab already writes a "Next steps"
+    list with names against it, and it is wrong: it assigned UL-1640 to the wrong person,
+    and it has since been caught twice more. It is also lossy in exactly the direction
+    that matters here -- on 2026-08-24 Kyle said of the Dove workspace migration "it's
+    kind of non-trivial, but I think I'll get it in the next couple days", and the Notes
+    tab rendered that as "Migrate Workspaces: Transition all Dove workspaces to utilize
+    case inputs". The clock, which is the only thing a commitment has, is not in the
+    summary. It is in the transcript, in his own voice, and that is what gets quoted.
+
+    Returns (rows, complete), the same contract as `ledger_slack`'s last two values.
+    """
+    # Haiku, and measured rather than assumed. Every call here carries the whole Claude
+    # Code session prefix plus the schemas of every connector on the account -- 180-350k
+    # cached tokens per call against a transcript of maybe 12k -- so the price is set by
+    # the harness, not by the document, and the model tier is the only lever that moves
+    # it. Sonnet cost $0.32 a call and haiku $0.09, which turns a cold 14-day sweep from
+    # about $4 into about $1.20.
+    #
+    # The quality difference lands on the cheap side of the ledger's asymmetry, which is
+    # why this is affordable. On the 2026-08-24 standup sonnet found two promises and
+    # haiku one, and the one haiku left out was "today I'm probably just going to be doing
+    # a lot of code review" -- an intention hedged with "probably", which the prompt
+    # already tells it to leave alone. A missed promise costs a reminder that never
+    # appears; a wrong one costs trust in every row. And the expensive direction is not
+    # this model's to get wrong at all: close_commitments removes rows on merges and
+    # status moves, with no model in it anywhere.
+    model = os.environ.get("WORK_ARCS_MEETING_MODEL", "haiku")
+    lookback = int(os.environ.get("WORK_ARCS_MEETING_LOOKBACK", "14"))
+    settle = 3600 * int(os.environ.get("WORK_ARCS_MEETING_SETTLE_HOURS", "3"))
+    now = time.time()
+    after = datetime.fromtimestamp(now - lookback * 86400, timezone.utc)
+    docs, whole = _meeting_docs(after.strftime("%Y-%m-%dT%H:%M:%SZ"), model)
+    if not docs:
+        return [], whole
+
+    prompt_sha = hashlib.sha256(MEETING_PROMPT.encode()).hexdigest()[:16]
+    cache = load_store(MEETING_CACHE, "the meeting-commitment cache")
+    if cache.get("prompt") != prompt_sha:
+        cache = {"prompt": prompt_sha, "found": {}}
+    found = cache.setdefault("found", {})
+
+    def key(d):
+        return hashlib.sha256(f"{d['id']}\x00{d['modified']}".encode()).hexdigest()[:16]
+
+    # A meeting still in progress, or one whose doc Gemini is still writing, is not a
+    # settled record. The Slack side waits a day for the same reason; three hours is
+    # enough here because the doc is written once at the end rather than accumulating.
+    ready = [d for d in docs if d["at"] and now - d["at"] >= settle]
+    fresh = [d for d in ready if key(d) not in found]
+    if fresh:
+        print(f"  ledger: reading {len(fresh)} meeting transcript(s) for promises you "
+              f"made out loud ({model})", file=sys.stderr)
+    for d in fresh:
+        try:
+            r = _drive(MEETING_PROMPT.replace("{file_id}", d["id"]), model, timeout=420)
+            got = _json_array(r.stdout) if r.returncode == 0 else None
+        except (OSError, subprocess.SubprocessError):
+            got = None
+        # Nothing is cached on a failed or unparseable call, so the next run asks again
+        # rather than remembering an accident as "this meeting held no promises".
+        if got is None:
+            whole = False
+            print(f"  ledger: could not read “{d['name']}” — its promises are unknown "
+                  "this run, not absent", file=sys.stderr)
+            continue
+        keep = []
+        for c in got:
+            if not isinstance(c, dict):
+                continue
+            quote = _clean_note(str(c.get("quote") or ""))
+            promised = str(c.get("promised") or "").strip()[:80]
+            # No quote, no row. The plan's rule is that every inferred claim shows the
+            # words it is about, and it is held here by construction rather than trusted:
+            # a commitment the model cannot quote is one it cannot show Kyle saying, which
+            # is the failure mode the Notes tab already demonstrates.
+            if not (quote and promised):
+                continue
+            keep.append({"promised": promised,
+                         "to": str(c.get("to") or "").strip()[:40],
+                         "deadline": str(c.get("deadline") or "").strip()[:60],
+                         "quote": quote})
+        found[key(d)] = keep
+        try:
+            MEETING_CACHE.parent.mkdir(parents=True, exist_ok=True)
+            MEETING_CACHE.write_text(json.dumps(cache))
+        except OSError:
+            pass
+
+    rows = []
+    for d in ready:
+        for c in found.get(key(d)) or []:
+            day = datetime.fromtimestamp(d["at"]).strftime("%Y-%m-%d")
+            days = _days_since(day)
+            rows.append({
+                "kind": "meeting-commitment", "ref": d["name"][:24], "title": "",
+                "who": c.get("to", ""), "promised": c.get("promised", ""),
+                # The timeframe he set for himself, kept apart from the restatement so
+                # `promised_due` reads a phrase that is *only* about the promise. It is
+                # the cleanest input that function has ever had: the Slack side has to
+                # mine a three-to-eight word paraphrase for a date, where this is the
+                # model's isolated answer to "what clock did he name".
+                "deadline": c.get("deadline", ""),
+                "asked": day, "days": days, "asked_ts": float(d["at"]),
+                "expires_in": max(0, lookback - (days or 0)),
+                "window_days": lookback,
+                "quote": c.get("quote", ""), "url": _doc_url(d["id"]),
+                # Worn on its sleeve, like the Slack commitment it sits beside. Nothing
+                # here is a fact an API asserted; it is a sentence a model heard.
+                "inferred": True,
+            })
+    return rows, whole
+
+
 def ledger_slack():
     """Slack's side of the ledger, from search alone -- the token has no history scope,
     and it turns out none is needed for whose-turn-is-it.
@@ -2325,7 +2671,7 @@ def set_dismissed(ledger, spec, undo=False):
     DISMISSED.write_text(json.dumps(store, indent=1, sort_keys=True))
 
 
-def build_ledger(repo, mrs):
+def build_ledger(repo, mrs, meetings=True):
     """The waiting-on ledger, both directions, every row a counterparty and a clock.
 
     This is what todo.md was actually for. The load-bearing entries there were `blocked
@@ -2359,6 +2705,13 @@ def build_ledger(repo, mrs):
         f_you = pool.submit(ledger_you_owe, repo, me) if me else None
         f_jira = pool.submit(ledger_jira_stalled)
         f_slack = pool.submit(ledger_slack)
+        # The one source that reaches outside GitLab, Jira and Slack. It is submitted here
+        # rather than run as its own stage for the sake of `complete` below: pruning a
+        # dismissal deletes an acknowledgement on the grounds that its row is gone, and a
+        # meeting sweep that half-answered cannot support that claim about anything. A
+        # collector outside this pool could not contribute to that conjunction, and a
+        # meeting row's acknowledgement would then be pruned on a run that never looked.
+        f_meet = pool.submit(ledger_meetings) if meetings else None
         they, they_whole = f_they.result() if f_they else ([], False)
         you, covered, you_whole = f_you.result() if f_you else ([], 0, False)
         jira_rows, jira_whole = f_jira.result()
@@ -2366,6 +2719,10 @@ def build_ledger(repo, mrs):
         slack_they, slack_you, slack_seen, slack_whole = f_slack.result()
         they += slack_they
         you += slack_you
+        # --no-meetings is (True) for the same reason no Slack token is: there are no
+        # meeting rows and there never were, so nothing is missing and a prune is safe.
+        meet_rows, meet_whole = f_meet.result() if f_meet else ([], True)
+        you += meet_rows
     # Questions on your own MRs that the reviewer is still waiting on. Already fetched
     # and already judged by unresolved_threads -- whoever spoke last says whose turn it
     # is -- so this costs nothing and cannot disagree with the card.
@@ -2399,7 +2756,8 @@ def build_ledger(repo, mrs):
             # anything. Four independent doors were open to it -- glab refusing `user`,
             # glab refusing one MR's notes, Jira timing out, Slack losing a page -- and all
             # four looked from here exactly like a quiet week.
-            "complete": bool(they_whole and you_whole and jira_whole and slack_whole)}
+            "complete": bool(they_whole and you_whole and jira_whole
+                                and slack_whole and meet_whole)}
 
 
 # `!10481` as it is written in prose, and the merge request URL that carries the same
@@ -2494,7 +2852,7 @@ def close_commitments(ledger, fates):
     if not ledger:
         return
     rows = ledger.get("you_owe") or []
-    commits = [e for e in rows if e.get("kind") == "commitment"]
+    commits = [e for e in rows if e.get("kind") in COMMITMENT_KINDS]
     ledger.setdefault("you_owe_closed", [])
     if not commits:
         return
@@ -2554,7 +2912,8 @@ def close_commitments(ledger, fates):
     if not closed:
         return
     ledger["you_owe"] = [e for e in rows
-                        if not (e.get("kind") == "commitment" and e.get("closed_by"))]
+                        if not (e.get("kind") in COMMITMENT_KINDS
+                                and e.get("closed_by"))]
     ledger["you_owe_closed"] = closed
     for e in closed:
         print(f"  commitment closed on evidence: “{(e.get('promised') or '')[:40]}” — "
@@ -3157,19 +3516,21 @@ def reconcile(arcs, issues):
         a = by_key.get(i["key"])
         if not a:
             continue
-        # The distinct count, not the per-branch sum. "240 commits never pushed" against a
-        # ticket that has 114 is the kind of overstatement that costs the whole page its
-        # credibility -- and this row exists to tell someone their ticket is lying.
+        # Days of work over the distinct unlanded commits, not a per-branch sum of commits.
+        # "240 commits never pushed" against a ticket that has 114 is the kind of
+        # overstatement that costs the whole page its credibility -- and this row exists to
+        # tell someone their ticket is lying. The distinct count fixed the overstatement;
+        # saying it in days fixes the unit, which double-counted an afternoon's rewrite as
+        # thirty separate pieces of hidden work.
         if i["handed_off"] and a["unpushed_live"] > 0:
-            n = a["unpushed_live"]
+            scale = work_scale(a.get("unpushed_days", 0), a["unpushed_live"])[0]
             mismatched.append({"issue": i, "arc": a, "ref": i["key"],
-                               "why": f"status '{i['status']}' but {n} "
-                                      f"commit{'' if n == 1 else 's'} never pushed"})
+                               "why": f"status '{i['status']}' but {scale} never pushed"})
         elif not i["handed_off"] and a["age_days"] > 21:
             mismatched.append({"issue": i, "arc": a, "ref": i["key"],
                                "why": f"status '{i['status']}' but untouched {a['age_days']}d"})
-    # The why-text carries the status and the count, so the fingerprint expires the
-    # moment either moves -- Jira gets corrected, or more commits pile up.
+    # The why-text carries the status and the scale, so the fingerprint expires the
+    # moment either moves -- Jira gets corrected, or another day's work piles up.
     for m in mismatched:
         m["fp"] = _dfp("gap", m["issue"]["key"], m["why"])
     return {"unticketed_work": unticketed, "tickets_without_work": no_work,
@@ -4761,10 +5122,9 @@ def demands(arc):
     # unpushed commit on `lint-metric-instance-stability` is a cherry-pick of a commit
     # that is pushed, reviewed and in an MR.
     if arc.get("unpushed_live"):
-        n = arc["unpushed_live"]
+        scale, verb = work_scale(arc.get("unpushed_days", 0), arc["unpushed_live"])
         out.append({"kind": "unpushed",
-                    "what": (f"{n} commit exists" if n == 1 else f"{n} commits exist")
-                            + " nowhere but this laptop"})
+                    "what": f"{scale} {verb} nowhere but this laptop"})
 
     auth = arc.get("authoritative")
     # Only when GitLab was actually asked. With --no-mr, or when glab is missing or the API
@@ -4778,14 +5138,16 @@ def demands(arc):
         # so UL-1835 was told to open the merge request it had already merged as !10449.
         if (b and b.get("pushed") and b.get("commits_ahead", 0) > 0
                 and not b.get("mr_fate")):
-            n = b["commits_ahead"]
+            # No number at all, where the two above carry a scale. Nothing is at risk here
+            # -- the branch is pushed -- so the size of it changes nothing about what to do,
+            # and the only number available was a commit count, which is the unit this page
+            # no longer speaks in. The branch name is the fact worth carrying.
             out.append({"kind": "unreviewed",
-                        "what": f"{auth} is pushed with {n} "
-                                f"commit{'' if n == 1 else 's'} and has no merge request"})
+                        "what": f"{auth} is pushed and has no merge request"})
 
     out.sort(key=lambda d: DEMAND_RANK.get(d["kind"], 9))
-    # The arc's label disambiguates: "3 commits exist nowhere but this laptop" is the
-    # same sentence on many arcs, and without the label one ✕ would acknowledge all of
+    # The arc's label disambiguates: "3 days of work exist nowhere but this laptop" is
+    # the same sentence on many arcs, and without the label one ✕ would acknowledge all of
     # them at once.
     #
     # `rfp` is the same fact fingerprinted for a different question -- did this move
@@ -4905,7 +5267,13 @@ def finalize(arc, repo=None, main_ref="origin/main"):
     held = [b["name"] for b in arc["branches"] if b["unpushed"]]
     live = [b["name"] for b in arc["branches"] if b["unpushed"] and not dead(b)]
     if repo is not None:
-        arc["unpushed_live"] = distinct_unpushed(repo, live)
+        # One walk, two facts. `unpushed_live` is the count it always was; the dates it
+        # rides on are what the page says out loud, since days of work is a scale a person
+        # can feel and a commit count is not. No extra subprocess: the same walk that used
+        # to answer --count now prints one author date per commit.
+        authored = unpushed_authored(repo, live)
+        arc["unpushed_live"] = len(authored)
+        arc["unpushed_dates"] = sorted(set(authored))
         # What deleting only the copies would cost: distinct commits that exist on a
         # superseded branch and nowhere else. Reporting `unpushed - unpushed_live` as
         # "on superseded copies" conflated two different corrections and overstated this
@@ -4921,6 +5289,10 @@ def finalize(arc, repo=None, main_ref="origin/main"):
         arc["unpushed_live"] = sum(b["unpushed"] for b in arc["branches"]
                                    if not dead(b))
         arc["unpushed_only_on_copies"] = arc["unpushed"] - arc["unpushed_live"]
+        # No repo means no author dates, and there is no second source for them. The scale
+        # degrades to naming none rather than to guessing one -- see work_scale.
+        arc["unpushed_dates"] = []
+    arc["unpushed_days"] = len(arc["unpushed_dates"])
     arc["superseded"] = sum(1 for b in arc["branches"] if b.get("superseded_by"))
     arc["landed_branches"] = sum(1 for b in arc["branches"]
                                  if b.get("mr_fate", {}).get("state") == "merged")
@@ -4973,8 +5345,8 @@ def finalize(arc, repo=None, main_ref="origin/main"):
     arc["notify"] = [d for d in arc["demands"]
                      if d.get("at", 0) > mine and STAGE_OF.get(d["kind"]) == "came-back"]
     # Ranks WITHIN a rung only. There is no defensible exchange rate between "a reviewer asked
-    # question six days ago" and "79 commits exist nowhere but this laptop", so the page
-    # never sorts one against the other -- see `stage`.
+    # question six days ago" and "nine days of work exist nowhere but this laptop", so the
+    # page never sorts one against the other -- see `stage`.
     arc["urgency"] = (DEMAND_RANK.get(arc["demands"][0]["kind"], 9)
                       if arc["demands"] else 99)
 
@@ -5012,11 +5384,13 @@ def finalize(arc, repo=None, main_ref="origin/main"):
         }[worst]
     elif worst == "unpushed":
         # The rung follows the worst thing outstanding, MR or no MR: an arc holding an open
-        # merge request AND 181 commits that no remote has is not simply "in review".
+        # merge request AND a fortnight of work that no remote has is not simply
+        # "in review". Said in days rather than commits, so this fragment measures the same
+        # kind of thing every other state on the ladder does -- a condition and its human
+        # size, not a tally of how the work happened to be typed.
         arc["stage"] = "local-only"
-        n = arc["unpushed_live"]
-        arc["state"] = (f"{n} commit exists" if n == 1 else f"{n} commits exist") + \
-                       " only here"
+        arc["state"] = work_scale(arc.get("unpushed_days", 0),
+                                  arc["unpushed_live"])[0] + ", only here"
     elif worst == "unrequested":
         # Its own rung, between "no merge request" and "out for review", because it is
         # neither. The merge request is filed, so the work is not unproposed; no reviewer
@@ -5040,9 +5414,8 @@ def finalize(arc, repo=None, main_ref="origin/main"):
         arc["state"] = qa.lower() if qa else "in review"
     elif arc["unpushed_live"]:
         arc["stage"] = "local-only"
-        n = arc["unpushed_live"]
-        arc["state"] = (f"{n} commit exists" if n == 1 else f"{n} commits exist") + \
-                       " only here"
+        arc["state"] = work_scale(arc.get("unpushed_days", 0),
+                                  arc["unpushed_live"])[0] + ", only here"
     else:
         auth_b = next((b for b in arc["branches"]
                        if b["name"] == arc["authoritative"]), None)
@@ -5687,6 +6060,10 @@ def main():
                    help="skip the Slack thread lens: one conversations.replies per channel "
                         "thread you posted in, plus a cached model pass per thread that "
                         "joined a workstream. The ledger's own Slack rows are unaffected")
+    p.add_argument("--no-meetings", action="store_true",
+                   help="skip reading Gemini meeting transcripts for promises you made "
+                        "out loud. Two model calls plus one per unseen transcript, and "
+                        "the only source that reaches Google Drive")
     p.add_argument("--shallow-mr", action="store_true",
                    help="skip the per-MR calls for unresolved review threads and pipeline "
                         "status; the list call alone still gives conflicts and approvals")
@@ -5782,7 +6159,7 @@ def main():
     ledger_f = None
     if mrs_known and not args.shallow_mr and not writing:
         ledger_f = futures.ThreadPoolExecutor(max_workers=1).submit(
-            build_ledger, args.repo, mrs)
+            build_ledger, args.repo, mrs, not args.no_meetings)
     # Kept rather than consumed into the branches: close_commitments asks whether an MR
     # a promise named has merged since, and this sweep is the only place that knows the
     # fate of a merge request that is no longer open. Refetching it for the ledger would
@@ -6209,6 +6586,11 @@ def main():
                     "slack-dm": f"{e['who']} has the last word in your DM",
                     "commitment": "you said you'd " + (e.get("promised") or "do this")
                                   + (f" ({e['who']})" if e.get("who") else ""),
+                    "meeting-commitment":
+                        "you said you'd " + (e.get("promised") or "do this")
+                        + (f" ({e['who']})" if e.get("who") else "")
+                        + (f" — “{e['deadline']}”" if e.get("deadline") else "")
+                        + " (said out loud, quoted)",
                     }.get(e["kind"], e["who"])
             print(f"  you owe them  {e['ref']:<9} {e.get('days','?'):>4}d  {what}")
             if e.get("quote"):
@@ -6217,9 +6599,10 @@ def main():
                 print(f"                          └ {e['title'][:58]}")
             # A commitment nothing can be shown about says how it will die, because the
             # alternative is a row that disappears one morning for no visible reason.
-            if e["kind"] == "commitment" and e.get("expires_in") is not None:
+            if e["kind"] in COMMITMENT_KINDS and e.get("expires_in") is not None:
+                where = "Slack" if e["kind"] == "commitment" else "transcript"
                 print(f"                          nothing shows it landed; expires with "
-                      f"the {e.get('window_days', 14)}-day Slack window in "
+                      f"the {e.get('window_days', 14)}-day {where} window in "
                       f"{e['expires_in']}d")
         if ledger["you_owe_covered"]:
             print(f"  (+{ledger['you_owe_covered']} review requests already handled — "
