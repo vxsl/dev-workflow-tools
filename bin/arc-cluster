@@ -687,7 +687,13 @@ def membership(members, ents, idf, df, N, hub_at, sim, margin, stackset, ticket)
         mine = TICKET_RE.search(m[1].upper())
         named = bool(ticket) and bool(mine) and mine.group(0) == ticket
         foreign = bool(ticket) and bool(mine) and mine.group(0) != ticket
-        dec = margin.get(m, 0.0)
+        # No recorded margin means nothing measured the placement, which is not the same
+        # as measuring it and finding it close. --method mknn has no objective to read
+        # one off, and a node with no edges at all never reaches the local-moving loop;
+        # in both cases the absence is silence, so it contributes no doubt. Reading it as
+        # maximum doubt halved every membership in the mknn comparison, which would have
+        # made the two methods look different for a reason that was not about either.
+        dec = margin.get(m, 1.0)
         corr = max(0.0, min(1.0, (shared - MIN_SHARED + 1)
                             / float(max(1, CORROBORATED_AT - MIN_SHARED + 1))))
         reach = min(1.0, links / float(max(1, min(3, peers))))
@@ -892,8 +898,9 @@ def main():
     ents = load_entities(args.repo, args.main, args.max_files)
     meta = load_entities.meta
     # Only modularity has an objective to read a placement margin off. mknn is kept for
-    # comparison and answers a different question, so it declares no confidence rather
-    # than inventing one.
+    # comparison and answers a different question, so it contributes no near-tie doubt
+    # rather than inventing one -- see membership() on why an unmeasured placement is
+    # silence and not suspicion.
     margin = {}
     if not ents:
         sys.exit("arc-cluster: nothing to cluster (run arc-backfill first?)")
