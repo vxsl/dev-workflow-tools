@@ -135,8 +135,16 @@ notified() {
     grep -q "DE-2585 is in review !10412" "$NOTIFY_LOG"
 }
 
-@test "an ampersand reaches the notifier escaped, because dunst parses the body as markup" {
+@test "a plain-text surface is handed the ampersand unescaped" {
     write_sidecar
+    run "$NOTIFY_CMD" --at "$WED_BEFORE"
+    [ "$status" -eq 0 ]
+    grep -q "10406 & the geo_filter" "$NOTIFY_LOG"
+}
+
+@test "a markup surface is handed it escaped, or dunst renders none of the block" {
+    write_sidecar
+    export WORK_ARCS_NOTIFY_MARKUP=1
     run "$NOTIFY_CMD" --at "$WED_BEFORE"
     [ "$status" -eq 0 ]
     grep -q "10406 &amp; the geo_filter" "$NOTIFY_LOG"
@@ -253,6 +261,17 @@ notified() {
     grep -q "force past the clock" "$LOG"
 }
 
+@test "force does not spend the morning's one automatic delivery" {
+    # Looking at the thing must not be the reason it never arrives.
+    write_sidecar
+    run "$NOTIFY_CMD" --force --at "$TUE_BEFORE"
+    [ "$status" -eq 0 ]
+    [ ! -f "$MARKER" ]
+    run "$NOTIFY_CMD" --at "$WED_BEFORE"
+    [ "$status" -eq 0 ]
+    [ "$(grep -c '^===' "$NOTIFY_LOG")" -eq 2 ]
+}
+
 # --- when the delivery itself fails ----------------------------------------------------
 #
 # Told apart from a refusal by the exit code, and that separation is the unit's whole
@@ -301,6 +320,12 @@ EOF
     ! grep -qE "^SuccessExitStatus=.*\b1\b" "$REPO_ROOT/systemd/work-arcs-standup.service"
 }
 
+@test "the unit does not tear the popup down the moment the run returns" {
+    # The notification is a process here, not a message handed to a daemon: the default
+    # control-group kill would deliver the prep and take it away in the same second.
+    grep -q "^KillMode=process$" "$REPO_ROOT/systemd/work-arcs-standup.service"
+}
+
 # --- the cadence is the authority ------------------------------------------------------
 
 @test "moving the cadence moves the gate without touching a schedule" {
@@ -327,6 +352,92 @@ EOF
     [ "$status" -eq 0 ]
     notified
     grep -q "could not read STANDUP_NOTIFY_LEAD" "$LOG"
+}
+
+# --- which surface gets it -------------------------------------------------------------
+#
+# The block is twenty-one lines and dunst caps a notification at about thirteen of them, so
+# what a notification drops is the two beats a person on the call can act on. The popup
+# sizes itself to its content; the notification path is the fallback for a machine with no
+# GTK. These drive the real default rather than the single stub the rest of the file uses.
+
+setup_default_surfaces() {
+    mkdir -p "$HOME/bin/notification"
+    unset WORK_ARCS_NOTIFY
+    export POPUP_LOG="$TEST_TMPDIR/popup.log"
+    cat >"$HOME/bin/notification/claude-notify.sh" <<'EOF'
+#!/bin/sh
+printf '=== %s\n%s\n' "$1" "$2" >>"$NOTIFY_LOG"
+EOF
+    chmod +x "$HOME/bin/notification/claude-notify.sh"
+}
+
+popup_stub() {
+    cat >"$HOME/bin/notification/claude-notify-popup.py"
+    chmod +x "$HOME/bin/notification/claude-notify-popup.py"
+}
+
+@test "the block goes to the surface that can show all of it" {
+    write_sidecar
+    setup_default_surfaces
+    popup_stub <<'EOF'
+#!/bin/sh
+printf '=== %s\n%s\n' "$1" "$2" >>"$POPUP_LOG"
+EOF
+    run "$NOTIFY_CMD" --at "$WED_BEFORE"
+    [ "$status" -eq 0 ]
+    grep -q "UL-1852 landed" "$POPUP_LOG"
+    [ ! -s "$NOTIFY_LOG" ]
+}
+
+@test "a popup that cannot open a display falls back, and the log says it did" {
+    write_sidecar
+    setup_default_surfaces
+    popup_stub <<'EOF'
+#!/bin/sh
+echo "cannot open display" >&2
+exit 1
+EOF
+    run "$NOTIFY_CMD" --at "$WED_BEFORE"
+    [ "$status" -eq 0 ]
+    grep -q "UL-1852 landed" "$NOTIFY_LOG"
+    grep -q "fell back to a second notifier" "$LOG"
+    grep -q "cannot open display" "$LOG"
+}
+
+@test "the fallback escapes what the first surface did not" {
+    write_sidecar
+    setup_default_surfaces
+    popup_stub <<'EOF'
+#!/bin/sh
+exit 1
+EOF
+    run "$NOTIFY_CMD" --at "$WED_BEFORE"
+    [ "$status" -eq 0 ]
+    grep -q "10406 &amp; the geo_filter" "$NOTIFY_LOG"
+}
+
+@test "a delivery that worked first time says nothing about a fallback" {
+    write_sidecar
+    setup_default_surfaces
+    popup_stub <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+    run "$NOTIFY_CMD" --at "$WED_BEFORE"
+    [ "$status" -eq 0 ]
+    ! grep -q "fell back" "$LOG"
+}
+
+@test "both surfaces refusing is a failure carrying both reasons" {
+    write_sidecar
+    setup_default_surfaces
+    rm -f "$HOME/bin/notification/claude-notify.sh"
+    run "$NOTIFY_CMD" --at "$WED_BEFORE"
+    [ "$status" -eq 1 ]
+    grep -q "could not be delivered" "$LOG"
+    grep -q "claude-notify-popup.py" "$LOG"
+    grep -q "claude-notify.sh" "$LOG"
 }
 
 # --- the unit --------------------------------------------------------------------------

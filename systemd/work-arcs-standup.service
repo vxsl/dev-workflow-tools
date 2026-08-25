@@ -22,6 +22,14 @@ Description=Deliver the standup prep
 [Service]
 Type=oneshot
 
+# The notification IS a process here: claude-notify-popup.py holds its own GTK window for
+# the fifteen seconds it is on the screen. With the default control-group kill, systemd
+# would tear the popup down the instant this oneshot's ExecStart returned -- the prep would
+# be delivered and then immediately taken away, which is a bug you can only see by looking
+# at the screen at 10:15. Waiting for the window instead would keep the unit activating for
+# fifteen seconds to no purpose.
+KillMode=process
+
 ExecStart=%h/bin/dev-workflow-tools/bin/arc-standup-notify
 
 # 3 is "decided not to speak, and the log says which gate closed" -- no prep on disk, prep

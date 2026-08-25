@@ -56,6 +56,13 @@ next run whether or not anybody remembered to reinstall the unit. The gate is th
 the program: it speaks only in the window that closes when the standup opens, and a unit
 that fires at the wrong time produces a logged refusal rather than a late interruption.
 
+**A popup rather than a notification, because of how tall the block is.** dunst caps a
+notification's height -- 300px here, about thirteen lines -- and the composed block runs
+to twenty-one, so what a notification drops is its tail: BLOCKED / ASKS and IN FRONT OF
+YOU, the two beats a person on the call can act on. claude-notify-popup.py sizes its
+window to its content, which is what it was written for, so it gets the block and
+claude-notify.sh sits behind it for a machine with no GTK or no display. See `surfaces`.
+
 **It gives, and never asks.** No question, no queue, no "did you update the board" -- the
 shape being avoided here is a status bot, and a prompt that arrives uninvited is one the
 eye learns to skip. At most one notification per standup, recorded in a marker beside the
@@ -67,7 +74,8 @@ relearning.
     arc-standup-notify                  gate on the clock, then notify -- what the timer runs
     arc-standup-notify --check          say what it would do and why, and do nothing
     arc-standup-notify --print          print the prep it holds, to stdout
-    arc-standup-notify --force          notify now, whatever the clock and the marker say
+    arc-standup-notify --force          notify now, whatever the clock says -- and without
+                                        spending the morning's one automatic delivery
     arc-standup-notify --at 2026-08-26T10:16   pretend it is that instant
     arc-standup-notify --install-timer  the systemd user timer, derived from the cadence
     arc-standup-notify --uninstall-timer
@@ -76,8 +84,9 @@ Tuning, read from .env or the environment:
     STANDUP_NOTIFY_LEAD    minutes before the standup this speaks in       (default 15)
     STANDUP_DAYS/TIME/TZ   arc-standup's cadence, shared and not duplicated
     WORK_ARCS_ARTIFACT_URL the published page, named in the last line of the notification
-    WORK_ARCS_NOTIFY       the notifier to hand the text to
-                                        (~/bin/notification/claude-notify.sh)
+    WORK_ARCS_NOTIFY       one notifier instead of the two below, taking summary and body
+    WORK_ARCS_NOTIFY_MARKUP  set to 1 when that one parses its body as Pango markup
+    STANDUP_NOTIFY_ACCENT  the popup's border colour                      (#a8d8a8)
 
 Exit codes are distinct because a unit reads them: 0 delivered, 3 decided not to
 speak and said why in the log, 1 it should have spoken and the delivery failed, 2 a
@@ -293,11 +302,10 @@ def summary_line(cad, now):
 def body_text(st):
     """The block, plus the one line that makes the page reachable from the popup.
 
-    The URL is a line of the body rather than a notification action: claude-notify.sh
-    fires and forgets, so there is no process left alive for an action to call back into,
-    and dunst offers a URL in a notification body to the middle click and the context menu
-    on its own. Inventing a second notifier to gain a button would be a worse trade than
-    the one line costs.
+    The URL is a line of the body rather than a notification action: both surfaces below
+    fire and forget, so there is no process left alive for an action to call back into.
+    Inventing a third notifier to gain a button would be a worse trade than the one line
+    costs, and dunst offers a URL in a body to the middle click on its own.
     """
     text = (st.get("text") or "").rstrip("\n")
     url = os.environ.get("WORK_ARCS_ARTIFACT_URL", "").strip()
@@ -307,36 +315,81 @@ def body_text(st):
 
 
 def pango_escape(s):
-    """dunst is configured with markup=full, so the body is parsed as Pango markup.
+    """Escaped only for a surface that parses its body as Pango markup, which is dunst.
 
-    An ampersand in a ticket subject would make the whole block fail to parse, and what
-    dunst shows for that is not the block. Three characters, escaped where the notifier
-    cannot do it for us -- it takes a body and passes it straight through.
+    An ampersand in a ticket subject makes the whole block fail to parse there, and what
+    dunst then shows is not the block. The GTK popup takes plain text, and escaping for it
+    would put a literal ampersand-a-m-p on the screen -- so this is done per surface on the
+    way out rather than once to the body.
     """
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def notifier():
-    return Path(os.environ.get(
-        "WORK_ARCS_NOTIFY", str(Path.home() / "bin/notification/claude-notify.sh")))
+# --------------------------------------------------------------------------- the surface
+#
+# The popup is not the obvious choice and is the right one, for a reason that is a property
+# of this block rather than a preference. dunst's notification height is capped -- 300px on
+# this machine, about thirteen lines of its Monospace 16 -- and the composed block runs to
+# twenty-one with its beat headers, its blank lines and the URL. What gets cut is the tail,
+# which is BLOCKED / ASKS and IN FRONT OF YOU: the two beats holding what a person on the
+# call can act on. A notification that reliably drops the actionable half of the prep is
+# not a smaller version of this feature.
+#
+# claude-notify-popup.py sizes its window to its content and has no such cap, which is what
+# it was written for. What it gives up is dunst's history and the chime, so the block is
+# gone when it times out -- which is why --print exists and hands over the same string.
+# claude-notify.sh is kept behind it rather than dropped: on a machine with no GTK or no
+# display, a clipped block beats no block, and the fallback says so in the log.
+NOTIFY_POPUP = Path.home() / "bin/notification/claude-notify-popup.py"
+NOTIFY_SEND = Path.home() / "bin/notification/claude-notify.sh"
+
+# A fixed colour rather than claude-notify.sh's per-session hash: this is the same card
+# three mornings a week, and being recognisable before it is read is most of its job.
+ACCENT = os.environ.get("STANDUP_NOTIFY_ACCENT", "#a8d8a8")
+
+# How long a surface is given to fail before it counts as delivered. Waiting for the popup
+# to *exit* would be waiting for the notification to be over -- it holds its own window for
+# fifteen seconds. The only failure either of these has is immediate: no display, no GTK,
+# no session bus.
+EARLY_FAILURE_SECONDS = 2.5
+
+
+def surfaces():
+    """Where the block is offered, in order, each with whether it parses markup."""
+    override = os.environ.get("WORK_ARCS_NOTIFY", "").strip()
+    if override:
+        return [(Path(override), os.environ.get("WORK_ARCS_NOTIFY_MARKUP", "") == "1")]
+    return [(NOTIFY_POPUP, False), (NOTIFY_SEND, True)]
+
+
+def hand_over(exe, markup, summary, body):
+    if not os.access(exe, os.X_OK):
+        return False, f"no notifier at {exe}"
+    text = pango_escape(body) if markup else body
+    try:
+        proc = subprocess.Popen([str(exe), summary, text, ACCENT],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    except OSError as e:
+        return False, f"could not run {exe} ({e})"
+    try:
+        rc = proc.wait(timeout=EARLY_FAILURE_SECONDS)
+    except subprocess.TimeoutExpired:
+        return True, ""                      # still up, so it is on the screen
+    if rc != 0:
+        err = (proc.stderr.read() or b"").decode(errors="replace").strip().splitlines()
+        return False, f"{exe.name} exited {rc}" + (f": {err[-1]}" if err else "")
+    return True, ""
 
 
 def deliver(summary, body):
-    exe = notifier()
-    if not os.access(exe, os.X_OK):
-        return False, f"no notifier at {exe}"
-    try:
-        r = subprocess.run([str(exe), summary, pango_escape(body)],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-                           timeout=30)
-    except OSError as e:
-        return False, f"could not run {exe} ({e})"
-    except subprocess.TimeoutExpired:
-        return False, f"{exe} did not return within 30s"
-    if r.returncode != 0:
-        err = (r.stderr or b"").decode(errors="replace").strip().splitlines()
-        return False, f"{exe.name} exited {r.returncode}" + (f": {err[-1]}" if err else "")
-    return True, ""
+    """The first surface that takes it, and what the ones before it said if any refused."""
+    tried = []
+    for exe, markup in surfaces():
+        ok, why = hand_over(exe, markup, summary, body)
+        if ok:
+            return True, "; ".join(tried)
+        tried.append(why)
+    return False, "; ".join(tried)
 
 
 # --------------------------------------------------------------------------- the timer
@@ -488,8 +541,16 @@ def main(argv=None):
     if not ok:
         log(f"prep was ready and could not be delivered — {err}")
         return 1
+    # Only when the first surface refused. A fallback that happens silently is a feature
+    # quietly running in its degraded mode for a month.
+    if err:
+        log(f"fell back to a second notifier — {err}")
 
-    write_marker((cad.get("for") or {}).get("iso"), now)
+    # Not on --force, and this is not a detail: --force is a person asking to see it now,
+    # and burning the morning's one automatic delivery to answer that would make looking at
+    # the thing the reason it never arrived.
+    if not args.force:
+        write_marker((cad.get("for") or {}).get("iso"), now)
     said = sum(len(b.get("items") or []) for b in st.get("beats") or [])
     log(f"delivered {said} line" + ("" if said == 1 else "s") + f" — {why}")
     return 0
