@@ -156,18 +156,18 @@ h1{font-family:var(--sans);font-weight:600;font-size:.9rem;letter-spacing:.02em;
    The eyebrow is mono and tiny against it on purpose. It says what KIND of fact is coming
    -- "jira disagrees", "open loop", "dropped" -- which is the one thing a display sentence
    cannot say about itself, and it costs a line of nothing to say it. */
-.headline{margin:0 0 1.1rem;max-width:33em}
+.headline{margin:0 0 1.1rem}
 .headline .eyebrow{display:block;font-family:var(--mono);font-size:.66rem;
   text-transform:uppercase;letter-spacing:.11em;color:var(--ink-faint);
   margin-bottom:.32rem}
-.headline p{font-family:var(--serif);font-weight:500;margin:0;
+.headline p{font-family:var(--serif);font-weight:500;margin:0;max-width:23em;
   font-size:clamp(1.5rem,3.5vw,2.25rem);line-height:1.16;letter-spacing:-.022em;
   color:var(--ink);text-wrap:balance}
 /* The degradation is several facts rather than one, so it is set a step down. derive_lede
    composes up to two sentences, and two sentences at full display size read as a paragraph
    that has been shouted rather than as a headline. */
 .headline p.lede{font-size:clamp(1.22rem,2.5vw,1.66rem);line-height:1.26;
-  letter-spacing:-.014em;max-width:34em;text-wrap:pretty}
+  letter-spacing:-.014em;max-width:29em;text-wrap:pretty}
 .headline em{color:var(--accent);font-style:normal;font-weight:600}
 .headline a{color:inherit;text-decoration:none;
   box-shadow:inset 0 -2px 0 0 color-mix(in oklab,var(--accent) 38%,transparent)}
@@ -1950,7 +1950,8 @@ def standup_block(data, here, fps):
     head, since = st.get("for") or {}, st.get("since") or {}
     when = " &middot; ".join(x for x in (
         f'for {esc(head.get("when"))}' if head.get("when") else "",
-        f'since {esc(since.get("when"))}' if since.get("when") else "") if x)
+        f'since {esc(since.get("when"))}' if since.get("when") else "",
+        f'<span id="su-n">{notes}</span> note' + ("" if notes == 1 else "s")) if x)
 
     # The block's own size, on its own header, and the one figure the door above it
     # mirrors. It was the one companion block on the page that never stated how much it was
@@ -1959,8 +1960,6 @@ def standup_block(data, here, fps):
     out = ['<section class="standup" id="standup">', '<div class="hd">',
            '<span class="tag">Next standup</span>',
            f'<span class="when">{when}</span>',
-           f'<span class="when"><span id="su-n">{notes}</span> note'
-           + ("" if notes == 1 else "s") + "</span>",
            f'<button class="cp" id="sucopy" type="button" '
            f'data-text="{esc(st.get("text") or "")}">copy</button>']
     out.append("</div>")
