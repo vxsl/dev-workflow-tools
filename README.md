@@ -479,6 +479,7 @@ work-arcs                  # every arc, most recently touched first
 work-arcs --focus          # what you are actually working on (8 arcs, derived)
 work-arcs --gap            # where Jira and reality disagree
 work-arcs --jira-ify dove  # file a ticket for an arc, prefilled from what it is
+work-arcs --curate         # answer the memberships it is least sure of
 work-arcs --json           # the whole graph
 ```
 
@@ -551,6 +552,56 @@ commit landing on any of them means you went back to that branch, and a branch y
 back to is not history — the page then says it has stopped filing the arc that way, and
 everything is counted again. Two things it deliberately does not touch: unpushed commits on
 the declared branch itself, and anything the merge request is asking for.
+
+**Where the grouping is unsure, it asks.** File overlap has a resolution limit and this
+repo has been to the end of it: two tickets that edit the same module are structurally
+identical however the weights are set, and the model split pass — which reads the commits,
+the one thing overlap cannot — still leaves errors. Measured, live: `UL-1852` is two commits
+of geo\_filter migration sitting in a fifteen-branch arc about deriving route geometry from
+metadata, held there by two shared files. Nothing in the derivation can tell those apart,
+because by every signal it has, they are the same.
+
+So the doubt is published instead of tuned away. Every clustered membership carries a
+confidence — how much evidence holds this branch in this arc, discounted by how close the
+call was and by whether the branch's own name is filed under a different ticket — and the
+five least confident become questions:
+
+```bash
+work-arcs --curate    # y keep · n pry · s skip · esc done
+```
+
+One keystroke each, a preview pane showing both sides of the tie, and the same five rows
+on the page with **yes** / **no** buttons. The rules are all about the asking, because a
+queue that is unpleasant to open is a queue that stays full: never more than five, one per
+arc (two branches propping each other up is one question, not two), **skip is free and
+leaves no record**, silence when there is nothing to ask, and nothing anywhere that
+notifies, badges or counts up at you.
+
+Four kinds of membership are never asked about, because each is a fact rather than a
+guess: a branch cut from another, the same commit under a second name, a superseded copy
+verified by `git patch-id`, and a branch whose own name carries the arc's ticket. The
+branch carrying the arc's merge request is *not* on that list, and that is the correction
+that made the queue useful — authority follows the newest MR rather than the weight of the
+work, so an arc's subject can be decided by a stranger, which is worse than a stranger
+merely standing in it. The question says what prying it costs before you answer.
+
+**Yes** pins the membership; **no** writes the same detachment the `✕` on the tree writes.
+Both expire the way every declaration here does — against the company the branch keeps,
+never the arc's name, so a reworded label leaves them alone and a regrouping ends them out
+loud.
+
+**And every answer is a labelled example.** They append to `curation-labels.jsonl`, both
+verdicts and not only the corrections — scored on corrections alone, a clusterer that split
+everything into singletons would agree with every one of them and be useless.
+
+```bash
+arc-cluster --score-labels    # this clustering against every judgement already made
+```
+
+Which is the point. *Is it worth going on massaging the detection algorithm?* has been
+argued about for three revisions of the plan and cannot be settled by argument. Now the
+next change to the resolution, the hub ceiling or the corroboration floor either scores
+better against judgements a person actually made, or it does not.
 
 **The Slack lens: what was decided, on the card for the work it decided about.** The
 graph knows what the code says and what the tickets say, and both are records of
