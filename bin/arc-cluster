@@ -27,9 +27,10 @@ Read-only, and deliberately so: this tool and its siblings never write to Jira, 
 or a repo. Anything outward-facing happens only when you run it yourself.
 
   arc-cluster                 the arcs, largest first
-  arc-cluster --json          the full graph
+  arc-cluster --json          the full graph, with per-branch membership confidence
   arc-cluster --explain NAME  why a branch landed where it did
   arc-cluster --why A B       the chain of evidence joining two branches
+  arc-cluster --score-labels  this clustering against the memberships a human ruled on
 
 Reads $XDG_STATE_HOME/work-arcs/turns.jsonl (see arc-backfill) and git. Read-only.
 """
@@ -756,6 +757,92 @@ def label(members, ents, idf, meta):
     return top_files[0] if top_files else (branches[0] if branches else "?")
 
 
+LABELS = STATE / "curation-labels.jsonl"
+
+
+def score_labels(arcs, path=None):
+    """This clustering against every membership a human has already ruled on.
+
+    The point of recording the answers, and the answer to the question that started all
+    of this: is it worth going on massaging the detection algorithm? That cannot be
+    settled by argument, and it has been argued about for three revisions of the plan.
+    It can be settled by a number. Every keep and every pry is a labelled example, and a
+    proposed change to the weights, the resolution, the hub ceiling or the corroboration
+    floor either scores better against them or it does not.
+
+    Both halves are scored, and that is deliberate. Scoring only the prys would reward a
+    clusterer that split everything into singletons -- it would agree with every
+    correction and be useless. The keeps are what stop that, which is why answering "yes,
+    same work" writes a record at all rather than merely silencing a question.
+
+    Agreement is tested against the co-members the answer named, never the label: the
+    same referent the stores expire on, for the same reason -- a reworded arc is not a
+    regrouped one. A `keep` agrees while most of the company it was recorded with is
+    still there; a `pry` agrees while most of it is not. Labels whose branch has since
+    left the corpus entirely are unscorable rather than wrong, and are counted apart so a
+    deleted branch never reads as a regression.
+    """
+    path = path or LABELS
+    latest = {}
+    try:
+        with path.open(errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(row, dict) or not row.get("branch"):
+                    continue
+                # Last answer wins. A question can legitimately be asked again after its
+                # pin expires, and a person is allowed to change their mind; scoring both
+                # verdicts would score the clusterer against a contradiction.
+                latest[row.get("fp") or row["branch"]] = row
+    except OSError:
+        print(f"arc-cluster: no answers recorded yet ({path})", file=sys.stderr)
+        return
+
+    home = {}
+    for a in arcs:
+        for b in a["branches"]:
+            home[b] = a
+    agree, disagree, unscorable = [], [], []
+    for row in sorted(latest.values(), key=lambda r: (r.get("at") or 0, r["branch"])):
+        branch, want = row["branch"], row.get("answer")
+        arc = home.get(branch)
+        if arc is None:
+            unscorable.append((branch, "no longer in the corpus"))
+            continue
+        recorded = set(row.get("with") or ())
+        if not recorded:
+            unscorable.append((branch, "the answer recorded no co-members"))
+            continue
+        current = set(arc["branches"]) - {branch}
+        together = len(recorded & current) / len(recorded) >= 0.5
+        ok = together if want == "keep" else not together
+        (agree if ok else disagree).append((row, arc, together))
+
+    n = len(agree) + len(disagree)
+    if not n:
+        print(f"arc-cluster: {len(unscorable)} answer(s) recorded, none scorable "
+              f"against this clustering")
+        return
+    print(f"{len(agree)}/{n} agree ({100 * len(agree) / n:.0f}%)"
+          + (f", {len(unscorable)} unscorable" if unscorable else ""))
+    for row, arc, together in disagree:
+        said = ("you said it belongs here" if row.get("answer") == "keep"
+                else "you pried it out")
+        now = ("still grouped with that work" if together
+               else "no longer grouped with that work")
+        print(f"  ✗ {row['branch']}  {said}, and it is {now}")
+        print(f"      recorded against {row.get('arc', '?')!r}; "
+              f"now in {arc.get('label', '?')!r}")
+    for branch, why in unscorable:
+        print(f"  · {branch} — {why}")
+
+
 def main():
     env_file()
     p = argparse.ArgumentParser(description="Derive work arcs from files touched.")
@@ -788,6 +875,9 @@ def main():
     p.add_argument("--explain", metavar="NAME", help="why this branch landed where it did")
     p.add_argument("--why", nargs=2, metavar=("A", "B"),
                    help="the chain of evidence putting A and B in one arc")
+    p.add_argument("--score-labels", action="store_true",
+                   help="replay this clustering against every membership a human has "
+                        "answered, and print where the two disagree")
     args = p.parse_args()
 
     ents = load_entities(args.repo, args.main, args.max_files)
@@ -939,6 +1029,9 @@ def main():
                   f"{len(shared)} shared{mark}")
             print(f"         {', '.join(shared[:5])}")
         return
+
+    if args.score_labels:
+        return score_labels(arcs)
 
     if args.json:
         json.dump({"arcs": arcs, "entities": len(ents)}, sys.stdout, indent=1)
