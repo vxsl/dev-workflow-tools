@@ -4962,6 +4962,8 @@ def residue_queue(arcs, ledger, jira_known, pinned=(), cap=CURATION_CAP):
     Then the id, so the order is total and two runs over one graph ask in the same
     sequence.
     """
+    if not arcs:
+        return [], ""
     if not any(a.get("mrs_known", True) for a in arcs):
         return [], ("GitLab was not asked, so whether this work was ever proposed cannot "
                     "be known — nothing asked about intent this run")

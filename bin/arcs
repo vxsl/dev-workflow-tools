@@ -156,9 +156,23 @@ echo "  page:  $OUT"
 # is where they get answered and a queue nobody knows about is a queue nobody opens. It
 # is deliberately not a notification: the DE team's taskmaster bot is the shape to avoid,
 # and a prompt that arrives uninvited is one the eye learns to skip.
-q=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(len(d.get("curation") or []))' "$graph" 2>/dev/null || echo 0)
-if [ "${q:-0}" != "0" ]; then
-    echo "  ask:   $q membership$([ "$q" = 1 ] || echo s) the grouping is unsure of — work-arcs --curate"
+# Both kinds, counted apart, because they are two different doubts and the line is the
+# only place a person learns the queue exists. "3 the grouping is unsure of" said about a
+# queue holding two questions about intent would send them looking for the wrong thing.
+q=$(python3 -c 'import json,sys
+d=json.load(open(sys.argv[1]))
+qs=d.get("curation") or []
+r=sum(1 for x in qs if x.get("kind")=="residue")
+print(len(qs), len(qs)-r, r)' "$graph" 2>/dev/null || echo "0 0 0")
+set -- $q
+if [ "${1:-0}" != "0" ]; then
+    bits=""
+    [ "${2:-0}" = "0" ] || bits="$2 grouping"
+    if [ "${3:-0}" != "0" ]; then
+        [ -z "$bits" ] || bits="$bits, "
+        bits="$bits$3 intent"
+    fi
+    echo "  ask:   $1 question$([ "$1" = 1 ] || echo s) — $bits — work-arcs --curate"
 fi
 if [ -n "$URL" ]; then
     echo "  live:  $URL"
