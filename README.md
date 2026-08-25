@@ -730,15 +730,52 @@ arc-standup --at 2026-08-24T09:00  # any standup's window, without waiting for i
 ### `arcs-refresh`
 `arcs` rebuilds the work-arcs page; this runs it at 07:10 so the page is already fresh
 when you sit down, which was the point of the thing and was still a command you had to
-remember to type.
+remember to type. Scheduled as a **systemd user timer** rather than a crontab line, and
+that is not a preference — see *It catches up after a closed lid* below.
 
 ```bash
-arcs-refresh --install-cron         # daily at 07:10
-arcs-refresh --install-cron 06:30   # or whenever
-arcs-refresh --uninstall-cron       # removes only its own line
+arcs-refresh --install-timer        # daily at 07:10, catches up after the laptop sleeps
+arcs-refresh --install-timer 06:30  # or whenever
+arcs-refresh --uninstall-timer      # disable it and remove the units
 arcs-refresh --check-quota          # what the guard currently thinks
 arcs-refresh --hook                 # the arc-record Stop hook block, not installed for you
 ```
+
+**Install it on this machine** — one line, and it removes the crontab line if one is
+still there:
+
+```bash
+~/bin/dev-workflow-tools/bin/arcs-refresh --install-timer
+```
+
+That copies `systemd/work-arcs-refresh.{service,timer}` into
+`~/.config/systemd/user/`, rewrites `ExecStart` to this checkout and `OnCalendar` to the
+time asked for, and runs `systemctl --user daemon-reload && systemctl --user enable --now
+work-arcs-refresh.timer`. `--install-cron` still exists for machines with no systemd user
+manager, but read the next paragraph before choosing it.
+
+**It catches up after a closed lid.** `10 7 * * *` does not fire on a laptop that is
+asleep at 07:10, and cron keeps no memory of a run it owes you, so a weekend of closed
+lid produced no line in the log at all — an absence rather than a failure, which is the
+harder thing to notice and the reason it went a week unspotted. The systemd timer sets
+`Persistent=true`: systemd stamps every run and, on its next start, fires immediately for
+one it missed. It deliberately does *not* set `WakeSystem` — waking a laptop in a bag at
+07:10 to rebuild a page nobody is looking at yet is worse than rebuilding it at 08:04 when
+the lid opens. A run that stands down on quota (exit 3) or finds the lock held (exit 4) is
+named in `SuccessExitStatus`, so `systemctl --user status` stays meaningful.
+
+**It refreshes its own access token.** The quota guard reads
+`claudeAiOauth.accessToken` from `~/.claude/.credentials.json`, and that token is good for
+hours rather than for a night: at 07:10 no Claude session has run since the evening
+before, `/usage` answers 401, and the fail-closed guard below stands the run down. Every
+step of that is correct and the feature does not exist. A 401 — and only a 401 — now buys
+one retry with an access token minted from `claudeAiOauth.refreshToken` against the token
+endpoint the CLI itself uses. A timeout or a 500 buys nothing, because those say something
+about the network and nothing about the token. **The refreshed token is never written
+back**: that file belongs to whichever Claude Code session is running, which rewrites it
+whole and unlocked, and a lost race there is a broken login rather than a stale page.
+`~/bin/hud-claude-usage` has the same 401-means-stale limitation and keeps its stale cache
+instead; it could borrow this, but it lives outside this repo.
 
 **It stands down rather than spend.** `extra_usage` is enabled on this account, so 100%
 of the weekly quota is where charging starts, not where anything stops. The run reads
@@ -746,6 +783,16 @@ the utilisation first and skips above 80% of the 5-hour window or 90% of the 7-d
 (`WORK_ARCS_REFRESH_MAX_5H`, `WORK_ARCS_REFRESH_MAX_7D`), and skips when it cannot read
 them at all — a stale page costs one `/arcs`, a blind run can cost money. Set
 `WORK_ARCS_REFRESH_ON_UNKNOWN=run` if you would rather it guessed.
+
+The log distinguishes the ways that can go, because "could not be read" covering all of
+them is what hid the expired token for eight days: `quota ok after refreshing the access
+token` (it worked), `stood down: 5-hour quota at 83%…` (there was no room),
+`the access token is expired and refreshing it was refused (token endpoint HTTP 429,
+rate_limit_error: …)` (the credential needs a person), and `the usage endpoint could not
+be read (HTTP 000)` (there is no network). A timer that catches up on wake fires while
+wifi is still associating, so a read with no HTTP status at all is retried
+`WORK_ARCS_REFRESH_NET_TRIES` times, `WORK_ARCS_REFRESH_NET_DELAY` seconds apart, before
+it counts as an answer.
 
 **You only hear from it when it didn't run.** A daily "it worked" is training to ignore
 notifications. Everything goes to `~/.local/state/work-arcs/refresh.log` (ring-trimmed);

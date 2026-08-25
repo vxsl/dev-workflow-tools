@@ -237,6 +237,7 @@ USAGE_FAILURE=""     # a sentence saying why there is no body, on failure
 USAGE_REFRESHED=0    # 1 when refreshing the access token is what made it work
 USAGE_HTTP_CODE=""   # the last status /usage gave, "000" when curl never got one
 REFRESH_HTTP_CODE="" # ditto for the token endpoint
+REFRESH_ERROR=""     # what the token endpoint said when it said no
 FRESH_ACCESS_TOKEN=""
 
 # One GET with one bearer token, and the status kept where the caller can see it. That
@@ -296,6 +297,7 @@ refresh_access_token() {
     local req resp
     FRESH_ACCESS_TOKEN=""
     REFRESH_HTTP_CODE=""
+    REFRESH_ERROR=""
     req="$(mktemp)"; resp="$(mktemp)"
     chmod 600 "$req" "$resp"
 
@@ -319,6 +321,22 @@ refresh_access_token() {
 
     if [ "$REFRESH_HTTP_CODE" = "200" ]; then
         FRESH_ACCESS_TOKEN="$(jq -r '.access_token // empty' "$resp" 2>/dev/null || true)"
+    else
+        # What the endpoint said, not just that it said no. An OAuth error body is an
+        # `error` and an `error_description` and no credential material, and the whole
+        # lesson of this file is that "it did not work" is not a diagnosis: 429 means
+        # throttled and try later, invalid_grant means the login is actually gone, and a
+        # log that cannot tell them apart sends the next reader to the wrong place.
+        # Two shapes, because this endpoint answers in both: the flat OAuth
+        # {error, error_description} for a refused grant, and Anthropic's nested
+        # {error: {type, message}} for a rate limit. Reading only the first one is how the
+        # 429 that turned up during testing arrived in the log as a bare status code.
+        REFRESH_ERROR="$(jq -r '
+            (if (.error | type) == "object"
+             then [.error.type, .error.message]
+             else [(.error // .type), (.error_description // .message)] end)
+            | map(select(type == "string" and . != "")) | join(": ")' "$resp" 2>/dev/null || true)"
+        REFRESH_ERROR="${REFRESH_ERROR:0:200}"
     fi
     rm -f "$resp"
     [ -n "$FRESH_ACCESS_TOKEN" ]
@@ -347,7 +365,7 @@ fetch_usage() {
     fi
 
     if ! refresh_access_token; then
-        USAGE_FAILURE="the access token is expired and refreshing it was refused (token endpoint HTTP $REFRESH_HTTP_CODE) — run any claude session to refresh it, or re-login"
+        USAGE_FAILURE="the access token is expired and refreshing it was refused (token endpoint HTTP $REFRESH_HTTP_CODE${REFRESH_ERROR:+, $REFRESH_ERROR}) — run any claude session to refresh it, or re-login"
         return 1
     fi
 

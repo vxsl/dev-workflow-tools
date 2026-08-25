@@ -519,6 +519,36 @@ exit 0'
 }
 
 # Nothing to refresh with is not a network round trip, and must not be reported as one.
+# The token endpoint answers in two shapes and the log has to read both. The flat OAuth
+# one is a refused grant; the nested Anthropic one is what a 429 looks like, which turned
+# up while this was being tested and arrived in the log as a bare status code until the
+# reader handled it. 429 means try later and invalid_grant means re-login: a log that
+# cannot tell them apart sends the next reader to the wrong place, which is the whole bug.
+@test "a nested rate-limit error is named in the log, not just its status" {
+    cat >"$STUB_TOKEN_RESP" <<'EOF'
+{"error": {"type": "rate_limit_error", "message": "Rate limited. Please try again later."}}
+EOF
+    STUB_USAGE_CODES=401 STUB_TOKEN_CODE=429 run "$REFRESH"
+    [ "$status" -eq 3 ]
+    grep -q "token endpoint HTTP 429, rate_limit_error: Rate limited" "$LOG"
+}
+
+@test "a flat OAuth error is named in the log too" {
+    cat >"$STUB_TOKEN_RESP" <<'EOF'
+{"error": "invalid_grant", "error_description": "Refresh token not found"}
+EOF
+    STUB_USAGE_CODES=401 STUB_TOKEN_CODE=400 run "$REFRESH"
+    [ "$status" -eq 3 ]
+    grep -q "token endpoint HTTP 400, invalid_grant: Refresh token not found" "$LOG"
+}
+
+@test "a token endpoint that answers with no body at all still logs its status" {
+    : >"$STUB_TOKEN_RESP"
+    STUB_USAGE_CODES=401 STUB_TOKEN_CODE=503 run "$REFRESH"
+    [ "$status" -eq 3 ]
+    grep -q "token endpoint HTTP 503)" "$LOG"
+}
+
 @test "a credentials file with no refresh token does not reach the token endpoint" {
     write_creds --no-refresh
     STUB_USAGE_CODES=401 run "$REFRESH"
