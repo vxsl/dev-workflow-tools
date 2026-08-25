@@ -4799,6 +4799,25 @@ def _arc_store_entry(store, arc):
     return None, None
 
 
+def _arc_store_drop(store, arc_id, label, fingerprint):
+    """Every key in a store that refers to one workstream, removed. Returns whether any did.
+
+    Three ways in, so three ways out. `_arc_store_entry` will find an answer under an old
+    id, an old label or a matching fingerprint, so a write that only ever deleted the
+    current id would leave an answer behind under whichever of the three it was written
+    with -- and the two stores would then both claim the arc, which is the one state the
+    "cannot be both" rule exists to make impossible.
+    """
+    gone = False
+    for key in list(store):
+        e = store[key]
+        if key in (arc_id, label) or (isinstance(e, dict) and fingerprint
+                                      and e.get("fingerprint") == fingerprint):
+            del store[key]
+            gone = True
+    return gone
+
+
 def _apply_arc_answer(arcs, path, what):
     """The half of both stores that is the same: which arcs an answer still applies to.
 
@@ -4861,7 +4880,7 @@ def apply_intended(arcs):
     return _apply_arc_answer(arcs, INTENDED, "the intended store")
 
 
-def apply_residue(arcs, repo=None, main_ref="origin/main"):
+def apply_residue(arcs, repo=None, main_ref="origin/main", pinned=()):
     """Workstreams a human said were never meant to land, and what that stops counting.
 
     Nothing is hidden and nothing is deleted. Every branch stays on the disk, in the
@@ -4885,7 +4904,13 @@ def apply_residue(arcs, repo=None, main_ref="origin/main"):
     live, stale = _apply_arc_answer(arcs, RESIDUE, "the residue store")
     for arc in arcs:
         entry = live.get(arc["id"])
-        if not entry:
+        # A pin wins a contradiction, and only a store edited by hand or saved from two
+        # browsers can produce one -- answer_residue clears the other side. It is settled
+        # here anyway, and settled that way round, because the two answers are not
+        # symmetrical in what being wrong costs: a pin that should have been residue
+        # leaves a number slightly too large, and a residue mark that should have been a
+        # pin silently stops counting work somebody said was real.
+        if not entry or arc["id"] in pinned:
             continue
         for b in arc["branches"]:
             b["residue"] = True
@@ -5066,10 +5091,12 @@ def answer_residue(q, intended):
     path = INTENDED if intended else RESIDUE
     other = RESIDUE if intended else INTENDED
     store = load_store(path, "the intended store" if intended else "the residue store")
+    _arc_store_drop(store, q["arc_id"], q.get("arc"), q.get("fingerprint"))
     store[q["arc_id"]] = entry
     off = load_store(other, "the residue store" if intended else "the intended store")
-    if off.pop(q["arc_id"], None) is not None or off.pop(q["arc"], None) is not None:
+    if _arc_store_drop(off, q["arc_id"], q.get("arc"), q.get("fingerprint")):
         try:
+            other.parent.mkdir(parents=True, exist_ok=True)
             other.write_text(json.dumps(off, indent=1, sort_keys=True))
         except OSError:
             pass
@@ -7613,13 +7640,13 @@ def main():
     # finalize does not derive -- `parked` is exactly that. And conceptually it is the same
     # order: a filing says what the work IS, residue says whether it is work at all, and
     # parking is intent layered on top of whatever the answer to both was.
-    stale_residue = apply_residue(arcs, args.repo, args.main)
-    for s in stale_residue:
-        print(f"⚠ {s['label']} is no longer residue: {s['why']}", file=sys.stderr)
     intended, stale_intended = apply_intended(arcs)
     for s in stale_intended:
         print(f"⚠ {s['label']} is no longer pinned as intended: {s['why']}",
               file=sys.stderr)
+    stale_residue = apply_residue(arcs, args.repo, args.main, intended)
+    for s in stale_residue:
+        print(f"⚠ {s['label']} is no longer residue: {s['why']}", file=sys.stderr)
 
     # What the page's own filing control would do, per workstream and per key. Computed
     # here because the page must record intent and never derive consequences -- see filing.

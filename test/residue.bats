@@ -645,6 +645,45 @@ print(sorted(json.loads(wa.RESIDUE.read_text())))
     [[ "$output" == *"[]"* ]]
 }
 
+@test "an answer under an old key is replaced rather than left beside the new one" {
+    # A store can be reached three ways -- the id, the label, or a matching fingerprint --
+    # so a write that only deleted the current id would leave the old entry behind, and
+    # both stores would then claim the arc, which is the one state the rule below exists
+    # to make impossible.
+    run wa '
+a = arc("selected state")
+q = {"arc_id": "selected state", "arc": "selected state", "fp": "q",
+     "fingerprint": a["fingerprint"], "branches": ["selected state-branch"], "days": 0,
+     "commits": 3, "cliff_days": 20, "gap_days": 2, "why": "w"}
+wa.answer_residue(q, False)
+# The split pass rewords the arc, and the next answer arrives under the new id.
+q2 = dict(q, arc_id="selected-state", arc="selected-state")
+wa.answer_residue(q2, True)
+print(sorted(json.loads(wa.INTENDED.read_text())),
+      sorted(json.loads(wa.RESIDUE.read_text())))
+'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"['selected-state'] []"* ]]
+}
+
+@test "a pin wins a contradiction the stores should never have been able to hold" {
+    # Only a hand-edited store or two browsers saving at once can produce one, and it is
+    # settled this way round because the two answers are not symmetrical: a pin that
+    # should have been residue leaves a number slightly too large, and a residue mark
+    # that should have been a pin silently stops counting work somebody said was real.
+    run wa '
+a = arc("A")
+wa.RESIDUE.write_text(json.dumps({"A": {"fingerprint": a["fingerprint"], "at": 1}}))
+wa.INTENDED.write_text(json.dumps({"A": {"fingerprint": a["fingerprint"], "at": 1}}))
+b = arc("A")
+pinned, _ = wa.apply_intended([b])
+wa.apply_residue([b], None, "origin/main", pinned)
+print(b["stage"], b["unpushed_live"], b.get("residue"))
+'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"local-only 3 None"* ]]
+}
+
 @test "a pinned and a residue answer cannot both stand for one workstream" {
     run wa '
 q = {"arc_id": "A", "arc": "A", "fp": "q", "fingerprint": "fp", "branches": ["A-branch"],
