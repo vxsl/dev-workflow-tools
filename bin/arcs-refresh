@@ -87,12 +87,24 @@
 #   exactly once per window; a retry loop re-arms the throttle and can never succeed. That
 #   is what --check-refresh is for: it asks about the token endpoint alone.
 #
-#   The token endpoint itself answered 429 to every attempt over half an hour, on an
-#   account whose 5-hour window was at 84% and whose live session had been refreshing all
-#   evening. So minting a token was never observed to succeed here, only to be throttled --
-#   which is a different thing from being refused, and the log now says which. If 07:10
-#   turns out to be throttled too, the line to look for is "refreshing it was refused",
-#   and the fallback is the one this file already has: say so plainly and stand down.
+#   The token endpoint itself answered 429 to every attempt over half an hour. That is not
+#   the account being out of room: the credentials file shows Claude Code refreshing its
+#   own token successfully at 01:03, three minutes after one of those 429s, from this
+#   machine. So the endpoint is throttling THIS client, and the difference is client
+#   identity -- which is not something to route around by claiming to be the CLI.
+#
+# Which is why minting a token is the first route and not the only one. What has been
+# observed working is a live session refreshing the credential -- it is why the 10:00 check
+# passed on a morning 07:10 had failed, the observation this whole diagnosis started from.
+# So a refused mint falls through to the cheapest session there is, and the retry re-reads
+# the file that session rewrote rather than reusing the token that already 401'd. See
+# refresh_via_session, and note that it goes through lib/headless_claude for a reason that
+# has nothing to do with tidiness: a bare `claude -p` would put this morning's token
+# refresh on the page as a piece of work you did.
+#
+# Four outcomes, four sentences in the log: minted, session-refreshed, refused outright,
+# and a session that ran without refreshing anything. Nothing reaches a model on a morning
+# the token was fine, on a network failure, or when the mint worked.
 #
 # THE CLOCK. `10 7 * * *` in a crontab does not fire on a laptop that is asleep at 07:10,
 # and cron has no notion of a run it owes you, so three days of closed lid produced no
