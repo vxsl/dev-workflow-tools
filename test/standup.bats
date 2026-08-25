@@ -572,6 +572,152 @@ print(beat(d, "2026-08-24T09:00:00", "next"))'
     [ "$output" = "[]" ]
 }
 
+# ── claimed ───────────────────────────────────────────────────────────────────
+#
+# The leading beat: what he said he would do at the last standup, each claim against what
+# happened. Membership is the `asked` day equalling the window's opening day, and the
+# outcomes are all somebody else's judgement -- work-arcs' closure evidence, the rung of
+# the workstream the claim's own words name, or "not yet".
+
+@test "a claim made on the last standup's day leads the block" {
+    run su 'd = payload(ledger={"they_owe": [], "you_owe_closed": [], "you_owe": [
+    owed("meeting-commitment", "FE Standup", 3, promised="migrate Dove workspaces",
+         asked="2026-08-21", quote="I think I will get it in the next couple days")]})
+st = build(d, "2026-08-24T09:00:00")
+print(st["beats"][0]["kind"], "|", beat(d, "2026-08-24T09:00:00", "claimed"))'
+    [ "$status" -eq 0 ]
+    [[ "$output" == "claimed |"*"migrate Dove workspaces — not yet"* ]]
+}
+
+@test "a claim from an older standup is not replayed as last time's" {
+    # Wednesday's claim was answered for at Friday's standup. The window opening Friday
+    # covers only Friday's claims.
+    run su 'd = payload(ledger={"they_owe": [], "you_owe_closed": [], "you_owe": [
+    owed("meeting-commitment", "FE Standup", 5, promised="an old promise",
+         asked="2026-08-19", quote="old words")]})
+print(beat(d, "2026-08-24T09:00:00", "claimed"))'
+    [ "$status" -eq 0 ]
+    [ "$output" = "[]" ]
+}
+
+@test "a Slack promise is not something he claimed at the standup" {
+    run su 'd = payload(ledger={"they_owe": [], "you_owe_closed": [], "you_owe": [
+    owed("commitment", "#tech-drive", 3, promised="typed in a channel",
+         asked="2026-08-21", quote="will do")]})
+print(beat(d, "2026-08-24T09:00:00", "claimed"))'
+    [ "$status" -eq 0 ]
+    [ "$output" = "[]" ]
+}
+
+@test "a claim kept on evidence is said with the evidence that closed it" {
+    run su 'closed = owed("meeting-commitment", "FE Standup", 3,
+             promised="review the crash patterns MR", asked="2026-08-21",
+             quote="I will review !10600", closed_by="!10600 merged the same day",
+             closed_ts=at("2026-08-21T16:00:00").timestamp(), closed_url="u")
+d = payload(ledger={"they_owe": [], "you_owe": [], "you_owe_closed": [closed]})
+print(beat(d, "2026-08-24T09:00:00", "claimed"))'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"review the crash patterns MR — !10600 merged the same day"* ]]
+}
+
+@test "a kept claim is not read out again by discussed as a fresh closure" {
+    run su 'closed = owed("meeting-commitment", "FE Standup", 3,
+             promised="review the crash patterns MR", asked="2026-08-21",
+             quote="I will review !10600", closed_by="!10600 merged the same day",
+             closed_ts=at("2026-08-21T16:00:00").timestamp(), closed_url="u")
+d = payload(ledger={"they_owe": [], "you_owe": [], "you_owe_closed": [closed]})
+print(beat(d, "2026-08-24T09:00:00", "discussed"))'
+    [ "$status" -eq 0 ]
+    [ "$output" = "[]" ]
+}
+
+@test "a closure claimed at an older standup still reaches discussed" {
+    # The dedup is per-claim, not a blanket: a promise made two standups ago and kept on
+    # Tuesday is Tuesday's news and the claimed beat never mentioned it.
+    run su 'closed = owed("meeting-commitment", "FE Standup", 5,
+             promised="an older promise", asked="2026-08-19", quote="will do",
+             closed_by="UB-1 moved to Done 2d after",
+             closed_ts=at("2026-08-22T16:00:00").timestamp())
+d = payload(ledger={"they_owe": [], "you_owe": [], "you_owe_closed": [closed]})
+print(beat(d, "2026-08-24T09:00:00", "claimed"), beat(d, "2026-08-24T09:00:00", "discussed"))'
+    [ "$status" -eq 0 ]
+    [[ "$output" == "[] ["*"an older promise"* ]]
+}
+
+@test "a claim naming a ticket is answered with that workstream's rung" {
+    run su 'sat = int(at("2026-08-22T14:00:00").timestamp())
+a = arc("a1", "Dove case inputs", own_activity=sat, stage="in-review",
+        state="in review", ticket="UB-7001",
+        mrs=[{"iid": 10554, "url": "u", "threads": []}])
+d = payload(arcs=[a], ledger={"they_owe": [], "you_owe_closed": [], "you_owe": [
+    owed("meeting-commitment", "FE Standup", 3, promised="finish UB-7001",
+         asked="2026-08-21", quote="I will finish UB-7001 this week")]})
+print(beat(d, "2026-08-24T09:00:00", "claimed"))'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"finish UB-7001 — !10554 in review"* ]]
+}
+
+@test "a workstream a claim answered for is not restated by moved or next" {
+    run su 'sat = int(at("2026-08-22T14:00:00").timestamp())
+a = arc("a1", "Dove case inputs", own_activity=sat, stage="in-review",
+        state="in review", ticket="UB-7001",
+        mrs=[{"iid": 10554, "url": "u", "threads": []}])
+d = payload(arcs=[a], ledger={"they_owe": [], "you_owe_closed": [], "you_owe": [
+    owed("meeting-commitment", "FE Standup", 3, promised="finish UB-7001",
+         asked="2026-08-21", quote="I will finish UB-7001 this week")]})
+print(beat(d, "2026-08-24T09:00:00", "moved"), beat(d, "2026-08-24T09:00:00", "next"))'
+    [ "$status" -eq 0 ]
+    [ "$output" = "[] []" ]
+}
+
+@test "a bare ticket number he said out loud joins nothing" {
+    # "682" could be half the board. A wrong join puts the wrong rung on a claim, so the
+    # honest answer is "not yet" and one glance at the page.
+    run su 'sat = int(at("2026-08-22T14:00:00").timestamp())
+a = arc("a1", "the 682 work", own_activity=sat, state="in review", ticket="UB-682")
+d = payload(arcs=[a], ledger={"they_owe": [], "you_owe_closed": [], "you_owe": [
+    owed("meeting-commitment", "FE Standup", 3, promised="code review for 682",
+         asked="2026-08-21", quote="doing a lot of code review for 682")]})
+print(beat(d, "2026-08-24T09:00:00", "claimed"))'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"code review for 682 — not yet"* ]]
+    [[ "$output" != *"in review"* ]]
+}
+
+@test "an unjoined claim carries the clock he set himself, in his words" {
+    run su 'd = payload(ledger={"they_owe": [], "you_owe_closed": [], "you_owe": [
+    owed("meeting-commitment", "FE Standup", 3, promised="migrate Dove workspaces",
+         asked="2026-08-21", quote="non-trivial but soon",
+         deadline="in the next couple days")]})
+print(beat(d, "2026-08-24T09:00:00", "claimed"))'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"not yet (you said in the next couple days)"* ]]
+}
+
+@test "a claim answered not-yet is not also counted as a debt he owes" {
+    run su 'd = payload(ledger={"they_owe": [], "you_owe_closed": [], "you_owe": [
+    owed("meeting-commitment", "FE Standup", 3, promised="migrate Dove workspaces",
+         asked="2026-08-21", quote="soon"),
+    owed("review-owed", "!10408", 17, who="vadym")]})
+print(beat(d, "2026-08-24T09:00:00", "blocked"))'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"!10408"* ]]
+    [[ "$output" != *"more waiting on me"* ]]
+    [[ "$output" != *"FE Standup"* ]]
+}
+
+@test "kept claims lead the beat, in the ledger's own order inside each half" {
+    run su 'mk = lambda i, **kw: owed("meeting-commitment", "FE Standup", 3, fp="f%d" % i,
+                                      asked="2026-08-21", quote="q", **kw)
+d = payload(ledger={"they_owe": [],
+    "you_owe": [mk(1, promised="still open one"), mk(2, promised="still open two")],
+    "you_owe_closed": [mk(3, promised="kept one", closed_by="!1 merged the same day",
+                          closed_ts=at("2026-08-22T09:00:00").timestamp())]})
+print(beat(d, "2026-08-24T09:00:00", "claimed"))'
+    [ "$status" -eq 0 ]
+    [[ "$output" == "['kept one — !1 merged the same day', 'still open one — not yet', 'still open two — not yet']" ]]
+}
+
 # ── the whole block ───────────────────────────────────────────────────────────
 
 @test "a truncated beat says how many it left out" {
@@ -589,7 +735,7 @@ print(len(beat(d, "2026-08-24T09:00:00", "moved")),
     run su 'st = build(payload(), "2026-08-24T09:00:00")
 print(st["empty"], [len(b["items"]) for b in st["beats"]])'
     [ "$status" -eq 0 ]
-    [ "$output" = "True [0, 0, 0, 0]" ]
+    [ "$output" = "True [0, 0, 0, 0, 0]" ]
 }
 
 @test "the text projection is one composition, so page and clipboard cannot disagree" {
@@ -598,7 +744,8 @@ print(st["empty"], [len(b["items"]) for b in st["beats"]])'
     run su 'sat = int(at("2026-08-22T14:00:00").timestamp())
 d = payload(arcs=[arc("a", "the only thing", own_activity=sat, state="s")])
 st = build(d, "2026-08-24T09:00:00")
-print("the only thing" in st["text"], st["beats"][0]["items"][0]["text"])'
+mv = next(b for b in st["beats"] if b["kind"] == "moved")
+print("the only thing" in st["text"], mv["items"][0]["text"])'
     [ "$status" -eq 0 ]
     [ "$output" = "True the only thing — s" ]
 }

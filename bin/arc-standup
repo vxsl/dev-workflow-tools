@@ -37,8 +37,16 @@ categories. Every cap sits well under what the ledger could fill it with, and a 
 debt is said on the day it changes rather than on the forty days it does not. A block that
 has to be skimmed to be given is one that gets skimmed instead of given.
 
-Four beats, in the order a standup is actually given, each dropped when it holds nothing:
+**The block opens by answering for the last one.** A standup is the one meeting where the
+room remembers what you said three days ago, and the previous update's claims are the
+first thing the new one is measured against. So the leading beat replays what Kyle said he
+would do at the last standup -- the promises the meeting leg heard him make that day --
+each against what actually happened: the evidence that closed it, the rung the work it
+names is on now, or "not yet", in his own deadline's words. See `claimed_beat`.
 
+Five beats, in the order a standup is actually given, each dropped when it holds nothing:
+
+    claimed     what you said you would do at the last one, against what happened
     moved       what happened to the code -- the rung each workstream reached
     discussed   what was worked out in Slack and in review threads
     blocked     the asks the room can act on, and one clause for what you owe
@@ -103,6 +111,11 @@ DEFAULT_TZ = "America/Los_Angeles"
 # was the reason this file changed: "the goal is to keep track of the broad strokes of my
 # work, not every singular commit everywhere". A cap that never bites is a cap in name.
 CAPS = {
+    # Roomier than the rest because its size is bounded by Kyle's own mouth rather than
+    # by the ledger: it can only hold what he claimed out loud at one standup, which the
+    # meeting leg has never heard exceed a handful. A fifth claim would be the one
+    # standup where announced truncation is exactly right.
+    "claimed": int(os.environ.get("STANDUP_CLAIMED_MAX", "4")),
     "moved": int(os.environ.get("STANDUP_MOVED_MAX", "3")),
     "discussed": int(os.environ.get("STANDUP_DISCUSSED_MAX", "3")),
     # Caps the *asks* half of the blocked beat only -- the debts other people owe, which
@@ -415,6 +428,23 @@ def rung_clause(arc, landed=()):
     return [ref, f" {words}"] if ref and stage in MR_RUNGS else [words]
 
 
+def landed_in(arc, since):
+    """The branches of this workstream whose merge request reached a fate in the window.
+
+    Sorted freshest-first so the landing a clause names is the most recent one. This is
+    the one event that needs no activity of Kyle's to be standup-worthy -- a reviewer
+    merging his week-old branch on Tuesday is Tuesday's news -- which is why both the
+    beat that lists movement and the beat that answers for his claims ask it.
+    """
+    landed = [(b, (b.get("mr_fate") or {})) for b in arc.get("branches") or []]
+    landed = [(b, f) for b, f in landed
+              if f.get("state") in ("merged", "closed")
+              and date_in_window(f.get("at"), since)]
+    landed.sort(key=lambda x: (x[1].get("at") or "", x[1].get("iid") or 0),
+                reverse=True)
+    return landed
+
+
 def moved_beat(data, since, said=None):
     """What happened to the code: one workstream, one line, the rung it reached.
 
@@ -435,20 +465,20 @@ def moved_beat(data, since, said=None):
     only finished thing in the beat, and the freshest thing leads the rest because it is
     the one whose details you can still answer a question about.
 
-    Ids of the workstreams this named are added to `said`, so `next_beat` can leave them
-    out rather than restating them as today's plan.
+    A workstream already in `said` is left out: `claimed_beat` stated its rung two lines
+    up as the outcome of a promise, and this beat repeating the same rung under the
+    workstream's own name would be the block answering one question twice. Ids of the
+    workstreams this beat does name are added to `said` in turn, so `next_beat` can leave
+    them out rather than restating them as today's plan.
     """
     out = []
     for arc in data.get("arcs") or []:
+        if arc.get("id") in (said or ()):
+            continue
         own = arc.get("own_activity") or 0
-        landed = [(b, (b.get("mr_fate") or {})) for b in arc.get("branches") or []]
-        landed = [(b, f) for b, f in landed
-                  if f.get("state") in ("merged", "closed")
-                  and date_in_window(f.get("at"), since)]
+        landed = landed_in(arc, since)
         if not in_window(own, since) and not landed:
             continue
-        landed.sort(key=lambda x: (x[1].get("at") or "", x[1].get("iid") or 0),
-                    reverse=True)
         out.append((bool(landed), own, arc.get("id"),
                     line(arc_head(arc) + [" — "] + rung_clause(arc, landed))))
 
@@ -458,6 +488,125 @@ def moved_beat(data, since, said=None):
     if said is not None:
         said.update(aid for _, _, aid, _ in out[:CAPS.get("moved", 3)])
     return capped([ln for _, _, _, ln in out], "moved")
+
+
+# --------------------------------------------------------------------------- claimed
+#
+# The beat that leads the block, written after `moved` in this file because every outcome
+# it states is in `moved`'s vocabulary: the rung, the landing, the same one author for
+# each. BEATS' order, not source order, is the standup's order.
+
+
+# How a claim's own words are joined back to a workstream. These are the two shapes
+# work-arcs itself reads out of a commitment when it closes one on evidence (its
+# `close_commitments`), matched here so "this sentence names that MR" means the same
+# thing on both ends of the pipeline. The bare ticket number Kyle actually says out loud
+# ("682") deliberately matches neither: a join guessed from three digits would put the
+# wrong workstream's rung on a claim, and a claim honestly answered "not yet" costs one
+# glance at the page below it.
+CLAIM_MR_RE = re.compile(r"(?<![\w!])!(\d{3,6})\b|/merge_requests/(\d{3,6})\b")
+CLAIM_TICKET_RE = re.compile(r"\b[A-Z]{2,4}-\d{2,5}\b")
+
+
+def claim_arc(row, arcs):
+    """The workstream a claim is about, found by the references in its own words.
+
+    Quote and restatement are both read, because the model's restatement sometimes keeps
+    the ticket key the rambling original buried and sometimes loses it. First match wins
+    in the arcs' own order; no fuzzy anything -- a claim that names nothing joins nothing.
+    """
+    text = f"{row.get('quote') or ''} {row.get('promised') or ''}"
+    iids = {int(a or b) for a, b in CLAIM_MR_RE.findall(text)}
+    keys = {m.group(0) for m in CLAIM_TICKET_RE.finditer(text.upper())}
+    for arc in arcs or []:
+        if (arc.get("ticket") or "").upper() in keys:
+            return arc
+        if any((m.get("iid") or 0) in iids for m in arc.get("mrs") or []):
+            return arc
+    return None
+
+
+def claimed_beat(data, since, said=None):
+    """What you said you would do at the last standup, each claim against what happened.
+
+    This is the beat Kyle asked for in as many words -- "i think i need more emphasis on
+    what the main arcs are that i claimed i was going to do in the last standup" -- and it
+    leads the block because a standup is the one meeting where the room remembers what you
+    said three days ago. The other four beats describe the window; this one answers for
+    the previous update, which is the first thing any listener measures the new one
+    against.
+
+    Membership is every promise the meeting leg heard Kyle make on the day of the last
+    standup: ledger rows of kind `meeting-commitment` whose `asked` date is the window's
+    opening date, whether the row is still open or already closed on evidence. The day is
+    the join, and it is a compromise worth stating: the extractor stamps a claim with the
+    transcript's date and not with which meeting it was, so a promise made in Wednesday's
+    one-on-one an hour after Wednesday's standup is counted as claimed "last time". It
+    was said out loud to a colleague that day, which is the accountability this beat is
+    about; a resolution finer than the day would be invented, not derived. Slack-sourced
+    commitments are excluded on the same charter -- this beat is what he told the room,
+    not what he typed.
+
+    Each claim gets the restatement it arrived with and one of three outcomes, every one
+    of them somebody else's judgement said verbatim:
+
+      kept     -- `closed_by`, work-arcs' own evidence sentence ("!10682 merged the same
+                  day"), from the closed row this run produced
+      located  -- the rung of the workstream the claim's own words name, via `claim_arc`,
+                  in `rung_clause`'s words -- which answers "did you do it" better than
+                  any yes/no here could: "get it in review" against "in review" is kept,
+                  against "still unpushed" is not, and the room can hear which
+      not yet  -- nothing closed it and nothing it names is on the page, plus the clock
+                  he set himself, if he set one, in his own words
+
+    Kept claims lead. Like every split in this file it is a partition on a fact the row
+    carries (`closed_by`), the ledger's order preserved inside each half.
+
+    Any workstream a claim's words name -- kept or not -- is added to `said` so `moved`
+    and `next` do not restate it, and every claim's own fingerprint is added so a kept one
+    is not read out again by `discussed` as a fresh closure and a still-open one is not
+    counted against him again in `blocked`'s self-debt clause. All of it only for lines
+    that survive the cap, since a line the cap cut was not actually said.
+    """
+    led = data.get("ledger") or {}
+    day = since.get("date") or ""
+    if not day:
+        return []
+    rows = [(True, r) for r in led.get("you_owe_closed") or []
+            if r.get("kind") == "meeting-commitment" and (r.get("asked") or "") == day]
+    rows += [(False, r) for r in led.get("you_owe") or []
+             if r.get("kind") == "meeting-commitment" and (r.get("asked") or "") == day]
+
+    out = []
+    for kept, r in rows:
+        promised = clip(r.get("promised") or "")
+        if not promised:
+            continue
+        lead = [span(promised, of="ledger", fp=r.get("fp"), url=r.get("url")), " — "]
+        marks, arc = {r.get("fp")}, claim_arc(r, data.get("arcs"))
+        if arc is not None:
+            # Even for a kept claim: the landing its evidence names is the same landing
+            # `moved` would read out under the workstream's own name two lines later.
+            marks.add(arc.get("id"))
+        if kept:
+            tail = [span(r.get("closed_by") or "done", url=r.get("closed_url"))]
+        else:
+            if arc is not None:
+                tail = rung_clause(arc, landed_in(arc, since))
+                # One anchor to the workstream's card where the rung brought no link of
+                # its own -- "still unpushed" with nowhere to click is an outcome you
+                # cannot check.
+                if not any(isinstance(p, dict) for p in tail):
+                    tail = [span(text_of(tail), arc=arc.get("id"))]
+            else:
+                due = (r.get("deadline") or "").strip()
+                tail = ["not yet" + (f" (you said {due})" if due else "")]
+        out.append((marks, line(lead + tail)))
+
+    if said is not None:
+        for marks, _ in out[:CAPS.get("claimed", 4)]:
+            said.update(m for m in marks if m)
+    return capped([ln for _, ln in out], "claimed")
 
 
 # --------------------------------------------------------------------------- discussed
@@ -500,6 +649,9 @@ def discussed_beat(data, since, said=None):
     work-arcs, which resolved it against GitLab; there is nothing here to guess with.
     """
     me = (data.get("me") or "").lower()
+    # Captured before the review-thread loop below shadows the name. A closure already
+    # read out by `claimed_beat` as a promise kept is not read again here as news.
+    already = set(said or ())
     out = []
 
     for arc in data.get("arcs") or []:
@@ -551,6 +703,8 @@ def discussed_beat(data, since, said=None):
         # which is how a beat stops being about an interval.
         at = int(float(c.get("closed_ts") or 0))
         if not in_window(at, since):
+            continue
+        if c.get("fp") and c["fp"] in already:
             continue
         promised = clip(c.get("promised") or c.get("title") or "")
         if not promised:
@@ -797,7 +951,10 @@ def blocked_beat(data, since, said=None):
     """
     led = data.get("ledger") or {}
     they = list(led.get("they_owe") or [])
-    mine = list(led.get("you_owe") or [])
+    # Minus what `claimed_beat` already said out loud: a promise answered "not yet" two
+    # beats up is not also a unit of "waiting on me", or the block confesses it twice.
+    mine = [r for r in led.get("you_owe") or []
+            if not (r.get("fp") and r["fp"] in (said or ()))]
 
     def live(rows):
         return [r for r in rows
@@ -887,7 +1044,8 @@ def next_beat(data, since, said=None):
 
 # --------------------------------------------------------------------------- assembly
 
-BEATS = [("moved", "moved", moved_beat),
+BEATS = [("claimed", "last time you said", claimed_beat),
+         ("moved", "moved", moved_beat),
          ("discussed", "discussed", discussed_beat),
          ("blocked", "blocked / asks", blocked_beat),
          ("next", "in front of you", next_beat)]
@@ -923,10 +1081,12 @@ def build(data, now=None):
     cad = cadence(now)
     since = cad.get("since") or {}
     # What a beat has already said, so a later one does not say it again. Passed rather
-    # than returned because only one pair of beats cares -- `moved` fills it, `next` reads
-    # it -- and a return value threaded through all four would put the coupling everywhere
-    # instead of in the two docstrings that explain it. BEATS' order is the standup's
-    # order, so a beat can only ever be told about beats that come before it.
+    # than returned because only the beats that care touch it -- `claimed` fills it with
+    # the workstreams and closures its reconciliation named; `moved` skips those and
+    # fills it with the workstreams it spoke; `discussed` and `next` skip what is in it
+    # by then -- and a return value threaded through all five would put the coupling
+    # everywhere instead of in the docstrings that explain it. BEATS' order is the
+    # standup's order, so a beat can only ever be told about beats that come before it.
     said = set()
     beats = []
     for kind, lead, fn in BEATS:
