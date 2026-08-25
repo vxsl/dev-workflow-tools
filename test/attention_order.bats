@@ -287,7 +287,7 @@ doc = json.loads(sys.argv[1])
 doc["gap"]["status_mismatch"] = list(reversed(doc["gap"]["status_mismatch"]))
 r = subprocess.run([sys.executable, "bin/arcs-page", "--focus", "30"],
                    input=json.dumps(doc), capture_output=True, text=True)
-table = re.search(r'<h2>Jira says otherwise</h2>.*?</table>', r.stdout, re.S)
+table = re.search(r'<h2[^>]*>Jira says otherwise</h2>.*?</table>', r.stdout, re.S)
 print(re.findall(r'browse/(UL-\d+)', table.group(0)))
 PY
     [ "${lines[0]}" = "['UL-102', 'UL-101', 'UL-100']" ]
@@ -304,7 +304,7 @@ r = subprocess.run([sys.executable, "bin/arcs-page", "--focus", "30"],
                    input=json.dumps(doc), capture_output=True, text=True)
 lede = re.search(r'<p class="lede">.*?</p>', r.stdout, re.S).group(0)
 named = re.search(r"<em>(UL-\d+)</em>", lede).group(1)
-table = re.search(r'<h2>Jira says otherwise</h2>.*?</table>', r.stdout, re.S).group(0)
+table = re.search(r'<h2[^>]*>Jira says otherwise</h2>.*?</table>', r.stdout, re.S).group(0)
 print(named, 'id="gp-gp-%s"' % named in table)
 PY
     [ "${lines[0]}" = "UL-100 True" ]

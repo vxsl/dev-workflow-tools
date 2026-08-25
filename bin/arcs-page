@@ -23,6 +23,32 @@ Renders without arc-brief in the pipeline too -- the cards fall back to the clus
 label and lose their descriptions, which is the honest degradation. Without arc-morning
 the opening paragraph falls back to `derive_lede`, which is the same trade: one derived
 sentence instead of the composed several.
+
+What opens, and what is a line
+------------------------------
+Every section on this page used to render fully expanded, all fifteen of them, and the
+verdict on that was "it feels a bit all over the place ... just another bucket of slop to
+wrangle". The facts were not the problem. The arrangement was: a morning brief and a
+twenty-row table of last week's landed branches were structurally equal, so the page had
+no opinion about what it was for.
+
+It has one now. On open it is the companion -- the stamp, the brief, the standup notes, the
+sprint strip, what came back, the worst few loops in either direction, the rung strip, and
+the rows for what you touched today and this week. Everything else is a line: last week
+and earlier, the cliff, the parked, the retired, the three Jira tables, the questions and
+the cost, each a closed disclosure carrying its real count and its single worst item.
+
+De-emphasis is not hiding, and that is the law the whole arrangement rests on rather than a
+nicety -- fold() will not render a header without a count, and every truncation under one
+states its own remainder. Nothing was removed, nothing moved section, and one click reaches
+all of it. The long derivation notes are folded the same way, behind their own first
+sentence, by fold_notes().
+
+None of it persists. A fold is a default and not a preference: the one durable fact about
+how this page is used is that no manual control on it has been touched in a fortnight, so
+the defaults have to be the selection and the controls the override. A remembered fold
+would walk the page back to fifteen expanded sections one morning at a time, and unlike a
+dismissal or a filing there is no fingerprint under it for anything to expire against.
 """
 
 import argparse
@@ -385,6 +411,33 @@ a:hover{text-decoration-color:currentColor}
 .ledger .cev li{display:list-item;font-size:.74rem;color:var(--ink-faint);
   margin-top:.2rem}
 .ledger .fade{opacity:.85}
+
+/* The rest of a side, and the silent review requests as one row.
+
+   Both are the same argument in two places: the ledger's job is to name the open loops,
+   and eleven rows reading "no response from brian, vadym, ajit, Matt, ella" name one loop
+   eleven times. The worst few stand where they always did; the tail is one line away.
+
+   The aggregate row carries no fingerprint and no ✕ of its own, and that is deliberate
+   rather than an omission: a fingerprint over a set expires the moment the set changes, so
+   an acknowledgement of "the silent reviews" would evaporate the next time one of them
+   answered. The individual rows inside it keep theirs, which is where the acknowledgement
+   belongs -- the fact being acknowledged is a request, not a tally. */
+.ledger details.more{margin-top:.6rem;padding-top:.6rem;
+  border-top:1px solid var(--hairline)}
+.ledger details.more>summary,.ledger .agg summary{cursor:pointer;list-style:none;
+  font-size:.82rem;color:var(--ink-soft)}
+.ledger details.more>summary::-webkit-details-marker,
+.ledger .agg summary::-webkit-details-marker{display:none}
+.ledger details.more>summary::before,.ledger .agg summary::before{content:"▸ ";
+  color:var(--ink-faint)}
+.ledger details.more[open]>summary::before,
+.ledger .agg details[open]>summary::before{content:"▾ "}
+.ledger details.more>summary:hover,.ledger .agg summary:hover{color:var(--ink)}
+.ledger details.more>summary b,.ledger .agg summary b{color:var(--ink);font-weight:600}
+.ledger details.more>ul,.ledger .agg details>ul{margin-top:.6rem;padding-left:.7rem;
+  border-left:1px solid var(--hairline)}
+.ledger .agg>.what{min-width:0;flex:1 1 auto}
 /* Acknowledging is the page's one universal control, and it is an acknowledgement, not
    a deletion: the row stays countable behind a disclosure, and the store is keyed to
    the row's fingerprint so any change to the fact underneath brings it back itself. */
@@ -628,6 +681,61 @@ details.parked[open]>summary::before,details.atrisk[open]>summary::before{conten
 details.parked>summary:hover,details.atrisk>summary:hover{border-color:var(--disc)}
 details.parked>summary b,details.atrisk>summary b{color:var(--ink);font-weight:600}
 
+/* A section that is closed when the page opens, with its whole claim on the header line.
+
+   The page had fifteen sections and every one of them was fully expanded, which made the
+   morning brief structurally equal to a table of last week's landed branches. This is the
+   shape the archive half of the page takes instead: one line, still in reading order,
+   still in the same place it always was.
+
+   De-emphasis is not hiding, and this rule is where that is enforced rather than hoped
+   for -- see fold(), which will not render a header without a count. A header that says
+   only "Landed or abandoned" has hidden its own size, and a size a reader cannot see is
+   one they have to open the section to find out, which is the whole cost the collapse was
+   supposed to save.
+
+   Shares `details.parked`'s marker glyphs and its literal-glyph rule -- a CSS codepoint
+   escape in this stylesheet is read by python as octal, see the note above -- and not its
+   summary box, because these carry a heading and those carry a sentence. */
+details.fold{margin:0 0 .55rem}
+details.fold[open]{margin-bottom:2.5rem}
+details.fold>summary{cursor:pointer;list-style:none;display:flex;flex-wrap:wrap;
+  align-items:baseline;gap:.15rem .7rem;padding:.5rem .7rem;border-radius:4px;
+  border:1px solid var(--hairline);background:var(--surface)}
+details.fold>summary::-webkit-details-marker{display:none}
+details.fold>summary::before{content:"▸ ";color:var(--ink-faint);flex:none}
+details.fold[open]>summary::before{content:"▾ "}
+details.fold>summary:hover{border-color:var(--accent)}
+details.fold[open]>summary{margin-bottom:1rem}
+details.fold>summary h2{font-size:1rem;margin:0;flex:none}
+details.fold>summary .fn{font-family:var(--mono);font-size:.75rem;
+  color:var(--ink-faint);flex:none}
+/* The worst item, on one line. It gives up its tail before the count or the title give up
+   anything, because those two are the contract and this is the illustration of it. */
+details.fold>summary .fl{color:var(--ink-soft);font-size:.82rem;min-width:0;flex:1 1 12rem;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+@media (max-width:44rem){details.fold>summary .fl{flex-basis:100%}}
+
+/* A section's method behind that section's first sentence. See fold_notes().
+
+   These notes are the page saying out loud how every row under them was derived, and
+   removing one would be removing the only place that is said -- but the ledger's ran to
+   226 words above nine rows, which is a paragraph you read once and skip for a fortnight,
+   and skipping it is how "the page feels like another bucket of slop to wrangle" starts.
+   The first sentence carries the claim and the order; the rest is the method, and the
+   method is a thing you go looking for on the morning you doubt a row.
+
+   Deliberately not a bare truncation with a chevron: the affordance says "why", because
+   what is behind it is the reason the section is trustworthy and not more of the same
+   list. Keeps the .note class, so nothing about the type or the measure changes. */
+.why>summary{cursor:pointer;list-style:none;display:block}
+.why>summary::-webkit-details-marker{display:none}
+.why>summary::after{content:" why ▸";font-family:var(--mono);font-size:.68rem;
+  color:var(--ink-faint);white-space:nowrap}
+.why[open]>summary::after{content:" why ▾"}
+.why>summary:hover::after{color:var(--accent)}
+.why[open]>summary{margin-bottom:.4rem}
+
 /* One row per workstream that holds work no remote has. Four facts and no more: what it
    is, what it would cost, what it is about, and which branch to push. A fifth would make
    this a second set of cards, and the cards are directly below. */
@@ -870,6 +978,11 @@ PARK_JS = r"""
       if(on) store[el.dataset.key]=el.dataset.fp; else delete store[el.dataset.key];
       if(!write()) warned=true;
       dirty=true;
+      // The parked block is folded, so a click that moved a row into it moved the row
+      // somewhere invisible: park read as delete. Only on a real click -- re-applying the
+      // store on load must not open it, or the fold would be pointless on every page that
+      // has anything parked at all.
+      if(on&&sec&&sec.tagName==='DETAILS') sec.open=true;
     }
     recount(); setBar();
   }
@@ -1187,6 +1300,18 @@ INTERACT_JS = r"""
       if(t){ t.hidden=(hid===0);
         t.textContent=hid+' acknowledged — '+(side.dataset.show==='1'?'hide':'show'); }
     });
+    // The one row on the ledger that stands for several. Its figure is rewritten from
+    // what is actually inside it, because a header reading 12 above a list of two is the
+    // small kind of lie that costs a page its credit for every other number on it -- and
+    // when every request inside has been acknowledged the row itself has nothing left to
+    // say, so it goes the same way a fully-acknowledged news block does.
+    document.querySelectorAll('.ledger .agg').forEach(function(g){
+      var vis=g.querySelectorAll('li[data-fp]:not([data-dismissed="1"])').length,
+          n=g.querySelector('[data-aggcount]'),
+          side=g.closest('.side');
+      if(n) n.textContent=vis;
+      g.hidden=(vis===0 && !(side&&side.dataset.show==='1'));
+    });
     // Everywhere else gets an auto-appended disclosure so nothing is concealed.
     document.querySelectorAll('[data-disgroup]').forEach(function(g){
       var hid=g.querySelectorAll(
@@ -1301,13 +1426,21 @@ INTERACT_JS = r"""
       if(side){ side.dataset.show=(side.dataset.show==='1')?'0':'1'; apply(); } }
   });
 
-  // A row linked from the run-over-run strip is a collapsed <details>, so jumping to it
-  // lands you on a summary line that says nothing you did not just read. Open it.
+  // A row linked from the brief, the standup or the run-over-run strip is a collapsed
+  // <details>, so jumping to it lands you on a summary line that says nothing you did not
+  // just read. Open it -- and open everything it is inside of, which is the part that used
+  // to be missing. Half the sections on this page are folded now, so a workstream row is
+  // routinely a disclosure nested in a disclosure, and opening only the innermost one left
+  // the anchor inside a closed parent: the jump did nothing at all and read as a dead link
+  // in the one block on the page whose whole claim is that its sentences are checkable.
   function openTarget(){
     var el=location.hash&&document.querySelector(location.hash);
     if(!el) return;
     var d=el.tagName==='DETAILS'?el:el.closest('details');
-    if(d){ d.open=true; d.scrollIntoView({block:'center'}); }
+    var deepest=d;
+    while(d){ d.open=true; d=d.parentNode&&d.parentNode.closest
+              ?d.parentNode.closest('details'):null; }
+    (deepest||el).scrollIntoView({block:'center'});
   }
   window.addEventListener('hashchange', openTarget);
   openTarget();
@@ -1350,6 +1483,14 @@ EVIDENCE_ID = {"ledger": "lg-", "forgotten": "fg-", "gap": "gp-"}
 # named rather than inlined because the morning brief has to know where the list stops in
 # order not to link into the part of it that was cut.
 MISMATCH_ROWS = 14
+
+# The same cap on the other two tables Jira feeds. Both are read once a week at most and
+# neither is ranked, so the number is a limit on the reading rather than on the risk -- but
+# it is named here for the reason MISMATCH_ROWS is: a collapsed section states its own size
+# on its header, and a cap written inline next to a slice is a cap the remainder row will
+# eventually disagree with.
+UNTICKETED_ROWS = 12
+NOWORK_ROWS = 14
 
 
 def brief_block(data, here, fps):
@@ -2142,6 +2283,116 @@ def money(x):
     return f"${x:,.0f}" if x >= 10 else f"${x:.2f}"
 
 
+# The two recency groups whose rows are on screen when the page opens. Everything the
+# window holds is still on the page and still in the same order -- these are the two whose
+# rows are already unfolded, because "what am I in the middle of" is answered by this week
+# and last week is a question you go looking for. Named rather than inlined so the test
+# suite and the bucket loop cannot disagree about which two they are.
+OPEN_BUCKETS = ("today", "week")
+
+# How many rows of one ledger side stand before the rest go behind a disclosure. The list
+# is longest-open-first, so the five are the five oldest loops -- and 29 rows of them is
+# how "who is waiting on me" became something to scroll rather than something to read.
+LEDGER_ROWS = 5
+
+# How many silent review requests it takes before they render as one row instead of many.
+# Two near-identical rows are two facts; eleven are a single fact about a reviewer pool,
+# and reading them one at a time is what made this section feel like a list of complaints.
+# Below this they stay individual, because wrapping two rows in a disclosure to save one
+# line is a control for its own sake.
+AGG_MIN = 3
+
+
+def one_line(arc):
+    """What a one-line header calls a workstream: its ticket and its derived name.
+
+    The same pair the card's own heading leads with -- `UL-1692 · SMP Neighborhoods
+    per-map selected state` -- because a collapsed header naming its worst item by a
+    different string than the row inside it makes the reader check whether they are the
+    same thing.
+    """
+    b = arc.get("brief") or {}
+    nm = str(b.get("name") or arc.get("label", "?"))
+    t = arc.get("ticket")
+    return f"{t} {nm}" if t and nm != t else nm
+
+
+# How much prose a section's note has to be carrying before its method goes behind its
+# first sentence. Short notes stay whole: a one-line "no longer parked, it is counted
+# again" is the whole announcement, and putting a toggle on it would be a control that
+# hides nothing.
+NOTE_MIN = 260
+
+
+def fold_notes(page):
+    """Put each long note's method behind that note's own first sentence.
+
+    Applied to the assembled page rather than at each of the fifteen places a note is
+    written, and that is the argument for doing it here: "the first sentence stands, the
+    method is one toggle away" is a rule about a *class* of content on this page, and a
+    rule enforced by fifteen call sites is a rule that holds at fourteen of them by the end
+    of the month. A note added next year gets it for free.
+
+    Splits at a sentence boundary and nowhere else, at tag depth zero so a full stop inside
+    an attribute cannot be mistaken for one -- the same discipline first_clause() keeps, for
+    the same reason: what survives has to be a whole statement. A note with no boundary to
+    split on, or nothing worth putting behind one, is left exactly as it was.
+    """
+    def split(inner):
+        depth = 0
+        for i, ch in enumerate(inner):
+            if ch == "<":
+                depth += 1
+            elif ch == ">":
+                depth -= 1
+            elif ch in ".!?" and depth == 0:
+                # A boundary is a stop followed by space and then more sentence. The stop
+                # closing the last sentence of the note has nothing after it, and a note
+                # whose remainder is a handful of characters has nothing to hide.
+                if inner[i + 1:i + 2] == " " and len(inner[i + 2:].strip()) > 40:
+                    return inner[:i + 1], inner[i + 2:]
+        return None
+
+    def one(m):
+        inner = m.group(1)
+        if len(re.sub(r"<[^>]+>", "", inner)) < NOTE_MIN:
+            return m.group(0)
+        cut = split(inner)
+        if not cut:
+            return m.group(0)
+        return ('<details class="note why"><summary>' + cut[0] + "</summary>"
+                + cut[1] + "</details>")
+
+    return re.sub(r'<p class="note">(.*?)</p>', one, page, flags=re.S)
+
+
+def fold(a, title, count, lead="", sid="", attrs=""):
+    """Open a section collapsed by default, and refuse to do it without a count.
+
+    De-emphasis is not hiding. A collapsed section that names itself and nothing else has
+    hidden its own size, and a size you can only learn by opening the section is the whole
+    cost the collapse was meant to save -- so `count` is required and the assertion is the
+    design law, not a guard against a typo. `lead` is the single worst item in there,
+    which is the other half: a count says how much was set aside and one item says what
+    kind of thing it is.
+
+    `title`, `count` and `lead` arrive escaped, because two of the three carry markup --
+    a count wraps the figure in the span the client's recount writes into, and a lead is
+    composed from a name and a clause that were escaped where they were read.
+
+    The caller closes it with `</details>`. Deliberately not a context manager: every
+    section here appends into one flat list and a `with` block would be the only indented
+    scope in a 1300-line function.
+    """
+    assert count, f"a collapsed section must state its size: {title}"
+    a(f'<details class="fold"{attrs}>')
+    a("<summary>"
+      + (f'<h2 id="{sid}">{title}</h2>' if sid else f"<h2>{title}</h2>")
+      + f'<span class="fn">{count}</span>'
+      + (f'<span class="fl">{lead}</span>' if lead else "")
+      + "</summary>")
+
+
 def render_cost(a, cost):
     """What the pipeline that builds this page spent to build it.
 
@@ -2157,8 +2408,16 @@ def render_cost(a, cost):
     wp, tp = week["pipeline"], today["pipeline"]
     runs, q = cost["runs"], cost["quota"]
 
-    a("<section>")
-    a("<h2>What this assistant costs</h2>")
+    # Collapsed, and the header carries the two figures the section exists to report:
+    # what the week cost and how many calls bought it. This is the one section on the page
+    # about the tool rather than about the work, and a person who wants it knows they want
+    # it -- which is exactly the reader a disclosure serves.
+    fold(a, "What this assistant costs",
+         f'{wp["calls"]:,} calls',
+         esc(money(wp["list_cost"]) + " this week"
+             + (f", {week['share_pct']:.0f}% of your Claude spend"
+                if week.get("share_pct") is not None else "")),
+         sid="cost")
     a('<p class="note">Every model call this pipeline makes — naming an arc, splitting '
       "one, reading a commitment out of Slack, judging whether a DM wants a reply — runs "
       "with its own working directory, so its transcript lands in a Claude Code project "
@@ -2249,7 +2508,7 @@ def render_cost(a, cost):
         a(f'<p class="note">{wp["unpriced"]:,} call(s) ran on a model with no listed '
           "price. They are counted above and left out of the weighting rather than "
           "priced at a guess.</p>")
-    a("</section>")
+    a("</details>")
 
 
 def render(data, lede, focus_days, limit, cost=None):
@@ -2878,8 +3137,20 @@ def render(data, lede, focus_days, limit, cost=None):
         shown = {x.get("id") for x in arcs}
         bg = sum(1 for c in diffs if c.get("id") not in shown)
         ago = fmt_interval(since.get("interval_seconds"))
-        a("<section>")
-        a("<h2>Since the last build</h2>")
+        # Collapsed, and the stamp at the top of the page already carries the count -- so
+        # this section is the one place on the page where the header line was written twice
+        # before the fold existed. What the header adds is which workstream moved and what
+        # moved on it; the interval and the ratio stay in the stamp, where facts about the
+        # build live.
+        lead = by_id.get((diffs[0].get("id"))) or {}
+        what = next((e.get("what") for e in diffs[0].get("evidence") or []
+                     if e.get("what")), "")
+        fold(a, "Since the last build",
+             f"{len(diffs)} moved",
+             esc("including " + (one_line(lead) if lead
+                                 else str(diffs[0].get("label") or "?"))
+                 + (f" — {what}" if what else "")),
+             sid="sincebuild")
         note = ["What moved on its own in the "
                 + (f"{esc(ago)} " if ago else "") + "since this page was last built — "
                 "a different clock from the section above, which is measured against "
@@ -2926,7 +3197,7 @@ def render(data, lede, focus_days, limit, cost=None):
                     # itself -- at full length four of them make the section a transcript.
                     a(say(q, e.get("url", ""), clip=140))
             a("</span></li>")
-        a("</ul></section>")
+        a("</ul></details>")
 
     # --- the waiting-on ledger ----------------------------------------------
     # Both directions of "who is waiting on whom", which is what todo.md was for and
@@ -3000,62 +3271,98 @@ def render(data, lede, focus_days, limit, cost=None):
         def visible(entries):
             return sum(1 for e in entries if not e.get("dismissed"))
 
+        def lead_of(e):
+            """The one row a disclosure names on its own header line.
+
+            Its clock and its subject, and nothing else. Not a link: a header is a toggle,
+            and an anchor inside a <summary> is a click that does one thing on the words
+            and another half a millimetre to their left.
+            """
+            d = e.get("days")
+            what = " ".join(x for x in (e.get("ref") or "",
+                                        e.get("title") or e.get("promised") or "") if x)
+            return esc((f"{d}d — " if d is not None else "")
+                       + (what.strip() or str(e.get("who") or "?")))
+
+        def you_row(e):
+            """One row of what you owe, wherever on the side it ends up rendered.
+
+            A function rather than a loop body, because the side is two lists now -- the
+            five oldest and everything under them -- and a row composed twice is two rows
+            that will eventually disagree about what a commitment sentence says.
+            """
+            who = esc(e.get("who", "?"))
+            since = f' since {esc(e["asked"])}' if e.get("asked") else ""
+            sub = {"review-owed": f"{who} asked for your review{since}",
+                   "reply-owed": f"{who} answered your comment{since} — your turn",
+                   "thread-reply": f"{who} awaits your reply on your own merge "
+                                   f"request{since}",
+                   "slack-mention": f"{who} mentioned you{since} — nothing from "
+                                    "you in that thread or channel after it",
+                   "slack-dm": f"{who} has the last word in your DM{since}",
+                   "commitment": "you said you&rsquo;d "
+                                 + esc(e.get("promised") or "do this")
+                                 + (f" — {who} is relying on it" if e.get("who")
+                                    else "") + since
+                                 + " (inferred from your message, quoted)",
+                   # The meeting row says where it was said and, when he named one,
+                   # the clock he set himself -- verbatim and in quotes, because "in
+                   # the next couple days" is his phrase and not the tool's reading of
+                   # it. The reading is a separate claim and lives in the brief, where
+                   # it can be wrong out loud instead of silently.
+                   # The meeting's name is the row's link label, immediately to the
+                   # left of this sentence, so naming it again here read "FE standup
+                   # ... said out loud at FE standup since 2026-08-12". What the
+                   # sentence owes is the clock he set himself, verbatim and in
+                   # quotes, because "in the next couple days" is his phrase and not
+                   # the tool's reading of it -- the reading is a separate claim and
+                   # lives in the brief, where it can be wrong out loud.
+                   "meeting-commitment": "you said you&rsquo;d "
+                                 + esc(e.get("promised") or "do this")
+                                 + (f" — {who} is relying on it" if e.get("who")
+                                    else "")
+                                 + (f" — &ldquo;{esc(e['deadline'])}&rdquo;"
+                                    if e.get("deadline") else "")
+                                 + (f", said out loud on {esc(e['asked'])}"
+                                    if e.get("asked") else "")
+                                 + " (inferred from the transcript, quoted)",
+                   }.get(e.get("kind"), who)
+            # How this row will die, said out loud. Every other row on the ledger
+            # closes when the other person moves; a commitment whose fulfilment
+            # nothing can show has only the sliding window, and a row that vanishes
+            # one morning unexplained teaches the same distrust as a stale one.
+            if (e.get("kind") in COMMITMENT_KINDS
+                    and e.get("expires_in") is not None):
+                where = "Slack" if e["kind"] == "commitment" else "transcript"
+                sub += ('<span class="fade"> — nothing yet shows it landed, so it '
+                        f'expires with the {e.get("window_days", 14)}-day {where} '
+                        f'window in {esc(e["expires_in"])}d</span>')
+            return row(e, link(e.get("url", ""), esc(e.get("ref", "")), "ref")
+                       + f' {esc(e.get("title",""))}'
+                       + f'<span class="who">{sub}</span>'
+                       + ledger_say(e, who))
+
         a('<div class="side">')
         a(f'<h3>You owe them <span class="n" data-count>{visible(you)}</span></h3>')
         if you:
+            # The five oldest loops stand; the rest are one line away. Twenty-nine rows of
+            # "who is waiting on me" is a thing to scroll past, and the sixth-oldest of
+            # them was never what this side was opened to find out. The heading above still
+            # counts every one, and the disclosure states its own size and its own oldest
+            # row, so nothing here is a silent cut -- the same rule the at-risk list and
+            # the Jira table are already held to.
             a("<ul>")
-            for e in you:
-                who = esc(e.get("who", "?"))
-                since = f' since {esc(e["asked"])}' if e.get("asked") else ""
-                sub = {"review-owed": f"{who} asked for your review{since}",
-                       "reply-owed": f"{who} answered your comment{since} — your turn",
-                       "thread-reply": f"{who} awaits your reply on your own merge "
-                                       f"request{since}",
-                       "slack-mention": f"{who} mentioned you{since} — nothing from "
-                                        "you in that thread or channel after it",
-                       "slack-dm": f"{who} has the last word in your DM{since}",
-                       "commitment": "you said you&rsquo;d "
-                                     + esc(e.get("promised") or "do this")
-                                     + (f" — {who} is relying on it" if e.get("who")
-                                        else "") + since
-                                     + " (inferred from your message, quoted)",
-                       # The meeting row says where it was said and, when he named one,
-                       # the clock he set himself -- verbatim and in quotes, because "in
-                       # the next couple days" is his phrase and not the tool's reading of
-                       # it. The reading is a separate claim and lives in the brief, where
-                       # it can be wrong out loud instead of silently.
-                       # The meeting's name is the row's link label, immediately to the
-                       # left of this sentence, so naming it again here read "FE standup
-                       # ... said out loud at FE standup since 2026-08-12". What the
-                       # sentence owes is the clock he set himself, verbatim and in
-                       # quotes, because "in the next couple days" is his phrase and not
-                       # the tool's reading of it -- the reading is a separate claim and
-                       # lives in the brief, where it can be wrong out loud.
-                       "meeting-commitment": "you said you&rsquo;d "
-                                     + esc(e.get("promised") or "do this")
-                                     + (f" — {who} is relying on it" if e.get("who")
-                                        else "")
-                                     + (f" — &ldquo;{esc(e['deadline'])}&rdquo;"
-                                        if e.get("deadline") else "")
-                                     + (f", said out loud on {esc(e['asked'])}"
-                                        if e.get("asked") else "")
-                                     + " (inferred from the transcript, quoted)",
-                       }.get(e.get("kind"), who)
-                # How this row will die, said out loud. Every other row on the ledger
-                # closes when the other person moves; a commitment whose fulfilment
-                # nothing can show has only the sliding window, and a row that vanishes
-                # one morning unexplained teaches the same distrust as a stale one.
-                if (e.get("kind") in COMMITMENT_KINDS
-                        and e.get("expires_in") is not None):
-                    where = "Slack" if e["kind"] == "commitment" else "transcript"
-                    sub += ('<span class="fade"> — nothing yet shows it landed, so it '
-                            f'expires with the {e.get("window_days", 14)}-day {where} '
-                            f'window in {esc(e["expires_in"])}d</span>')
-                a(row(e, link(e.get("url", ""), esc(e.get("ref", "")), "ref")
-                      + f' {esc(e.get("title",""))}'
-                      + f'<span class="who">{sub}</span>'
-                      + ledger_say(e, who)))
+            for e in you[:LEDGER_ROWS]:
+                a(you_row(e))
             a("</ul>")
+            rest = you[LEDGER_ROWS:]
+            if rest:
+                a('<details class="more"><summary>'
+                  f'<b>{len(rest)}</b> more, none standing as long as these &mdash; '
+                  f"the oldest of them {lead_of(rest[0])}</summary><ul>")
+                for e in rest:
+                    a(you_row(e))
+                a("</ul></details>")
             a('<button class="showdis" type="button" hidden></button>')
         else:
             a('<div class="quiet">Nobody is waiting on a review or a reply from '
@@ -3083,29 +3390,68 @@ def render(data, lede, focus_days, limit, cost=None):
             a("</ul></div>")
         a("</div>")
 
+        def they_row(e):
+            """One row of what is owed to you, individual wherever it renders."""
+            who = e.get("who")
+            who = ", ".join(who) if isinstance(who, list) else (who or "?")
+            kind = e.get("kind")
+            if kind == "review-silence":
+                sub = esc(f"no response from {who} since {e.get('asked','?')}")
+                if e.get("asked_is_proxy"):
+                    sub += (" (clock from the merge request&rsquo;s last update "
+                            "&mdash; no request note exists)")
+            elif kind == "slack-asked":
+                sub = esc(f"you asked {who} on {e.get('asked','?')} — no reply")
+            else:
+                sub = esc(f"with {who}"
+                          + (f" · {e['status']}" if e.get("status") else "")
+                          + f", untouched since {e.get('asked','?')}")
+            return row(e, link(e.get("url", ""), esc(e.get("ref", "")), "ref")
+                       + f' {esc(e.get("title",""))}'
+                       + f'<span class="who">{sub}</span>'
+                       + ledger_say(e, who))
+
         a('<div class="side">')
         a(f'<h3>They owe you <span class="n" data-count>{visible(they)}</span></h3>')
         if they:
+            # Eleven rows reading "no response from brian, vadym, ajit, Matt, ella" are
+            # eleven copies of one fact: a reviewer pool that is not answering. They render
+            # as one row, standing exactly where the oldest of them stood so the side is
+            # still longest-open-first, and each of them is there the moment it is opened.
+            #
+            # The aggregate carries no fingerprint and no ✕, and that is the point rather
+            # than an omission. A fingerprint over a set expires the moment the set
+            # changes, so an acknowledgement of "the silent reviews" would evaporate the
+            # next morning one of them answered -- and what there is to acknowledge is a
+            # request, not a tally. Its figure is live for the reason every figure on this
+            # page is: the client rewrites it as rows inside are acknowledged, so the
+            # header can never read 12 above a list of two.
+            sil = [e for e in they if e.get("kind") == "review-silence"]
+            agg, done_agg = len(sil) >= AGG_MIN, False
             a("<ul>")
             for e in they:
-                who = e.get("who")
-                who = ", ".join(who) if isinstance(who, list) else (who or "?")
-                kind = e.get("kind")
-                if kind == "review-silence":
-                    sub = esc(f"no response from {who} since {e.get('asked','?')}")
-                    if e.get("asked_is_proxy"):
-                        sub += (" (clock from the merge request&rsquo;s last update "
-                                "&mdash; no request note exists)")
-                elif kind == "slack-asked":
-                    sub = esc(f"you asked {who} on {e.get('asked','?')} — no reply")
-                else:
-                    sub = esc(f"with {who}"
-                              + (f" · {e['status']}" if e.get("status") else "")
-                              + f", untouched since {e.get('asked','?')}")
-                a(row(e, link(e.get("url", ""), esc(e.get("ref", "")), "ref")
-                      + f' {esc(e.get("title",""))}'
-                      + f'<span class="who">{sub}</span>'
-                      + ledger_say(e, who)))
+                if agg and e.get("kind") == "review-silence":
+                    if done_agg:
+                        continue
+                    done_agg = True
+                    people = []
+                    for x in sil:
+                        w = x.get("who")
+                        for p in (w if isinstance(w, list) else [w]):
+                            if p and p not in people:
+                                people.append(p)
+                    a('<li class="agg">' + clock(sil[0])
+                      + '<div class="what"><details><summary>'
+                      + f'<b data-aggcount>{len(sil)}</b> review requests nobody has '
+                      + "answered"
+                      + (" &mdash; asked of " + esc(", ".join(people[:5]))
+                         + ("&hellip;" if len(people) > 5 else "") if people else "")
+                      + "</summary><ul>")
+                    for x in sil:
+                        a(they_row(x))
+                    a("</ul></details></div></li>")
+                    continue
+                a(they_row(e))
             a("</ul>")
             a('<button class="showdis" type="button" hidden></button>')
         else:
@@ -3151,11 +3497,14 @@ def render(data, lede, focus_days, limit, cost=None):
     # right. `unpushed` already ranks below every came-back demand in DEMAND_RANK and this
     # is the presentation finally agreeing with that table.
     #
-    # Each tile links to where its members are listed. Six of the seven point at the rungs
-    # below, because that is where their work has a row. The local-only one cannot: work
-    # that exists only on this laptop has no merge request and no remote to point at, which
-    # was exactly why it had nowhere to send a reader. It points at its own disclosure
-    # instead, which is the one place the count can be cashed in for names.
+    # Each tile links to where its members are listed, and to the section that actually
+    # lists them rather than to the nearest heading: the parked and the retired tiles both
+    # used to point at #play, which is the one rung neither of their members is on, and now
+    # that those two sections are folded a tile aiming at the wrong anchor would leave the
+    # right one shut. The local-only tile cannot point at a rung at all -- work that exists
+    # only on this laptop has no merge request and no remote to point at, which was exactly
+    # why it had nowhere to send a reader. It points at its own disclosure instead, which is
+    # the one place the count can be cashed in for names.
     tiles = [
         (len(back), "have come back to you",
          "a rebase, a question, a red pipeline, an unmerged approval", "#play"),
@@ -3166,7 +3515,7 @@ def render(data, lede, focus_days, limit, cost=None):
         (len(noask), "have a merge request nobody was asked to read",
          "open, no reviewer, no comment — it is not moving", "#play"),
         (len(prop), "are pushed but never proposed", "no merge request exists", "#play"),
-        (len(parked), "are parked", "set aside on purpose, not forgotten", "#play"),
+        (len(parked), "are parked", "set aside on purpose, not forgotten", "#parked"),
         # Below every rung that wants something and above the retired ones, because that
         # is what it is: work nobody is waiting on and nobody has finished. Its own tile
         # rather than silence, so the count that left the local-only figure is visible
@@ -3174,7 +3523,7 @@ def render(data, lede, focus_days, limit, cost=None):
         (len(resid), "are residue", "you said they were never meant to land — still on "
          "the disk, no longer counted", "#play"),
         (len(done), "have landed or been abandoned", "retired from the list below",
-         "#play"),
+         "#settled"),
     ]
     a('<ul class="conditions">')
     for n, label, sub, href in tiles:
@@ -3262,14 +3611,33 @@ def render(data, lede, focus_days, limit, cost=None):
       "group. Open a row for what it is, what it needs, and how its branches relate. "
       "<strong>Park</strong> sets one aside as backlog; it comes back on its own as soon "
       "as a commit lands on it.</p>")
+    # Today and this week are open; last week and earlier are folded. The window still
+    # holds all four and the order is untouched -- what changed is which of them you have
+    # to walk past to reach the ledger. "What am I in the middle of" is answered by the
+    # first two, and the second two are a question you go looking for.
+    #
+    # The fold takes `data-bucket` because that is the hook the client's recount already
+    # hides an emptied group by, and the figure sits in its own span inside the header so
+    # `[data-count]` can be rewritten without taking the word "workstreams" with it.
     for key, title, got in buckets:
-        a(f'<div class="rung" data-bucket="{key}">'
-          f'<h2 id="{key}" style="font-size:1rem">{title}</h2>'
-          f'<span class="n" data-count="{key}">{len(got)}</span></div>')
+        shut = key not in OPEN_BUCKETS
+        if shut:
+            fold(a, esc(title),
+                 f'<span data-count="{key}">{len(got)}</span> workstream'
+                 + ("" if len(got) == 1 else "s"),
+                 esc("worst: " + one_line(got[0])
+                     + (f" — {got[0].get('state')}" if got[0].get("state") else "")),
+                 sid=key, attrs=f' data-bucket="{key}"')
+        else:
+            a(f'<div class="rung" data-bucket="{key}">'
+              f'<h2 id="{key}" style="font-size:1rem">{title}</h2>'
+              f'<span class="n" data-count="{key}">{len(got)}</span></div>')
         a(f'<div class="wslist" data-list="{key}">')
         for arc in got:
             workstream_row(arc)
         a("</div>")
+        if shut:
+            a("</details>")
     a("</section>")
 
     # --- work that fell off a cliff -----------------------------------------
@@ -3294,9 +3662,14 @@ def render(data, lede, focus_days, limit, cost=None):
         # One axis for every row: the longest history in the section, so the pictures can
         # be read against each other rather than only against themselves.
         cliff_span = max((d for x in fell for d, _ in x["activity"]["series"]), default=0)
-        a("<section>")
-        a('<div class="rung"><h2 id="cliff">Fell off a cliff</h2>'
-          f'<span class="n" data-count="cliff">{len(fell)}</span></div>')
+        # Folded, and the header carries the freshest of them: work-arcs ranks these
+        # freshest-cliff-first because the one you can still resume is the one you fell off
+        # most recently, so the first row is the one worth naming on a closed header.
+        fold(a, "Fell off a cliff",
+             f'<span class="n" data-count="cliff">{len(fell)}</span> dropped',
+             esc("most recent: " + one_line(fell[0]) + " — "
+                 + str((fell[0]["activity"].get("cliff_days")) or "?") + "d quiet"),
+             sid="cliff")
         a('<p class="note">Not the old work — <em>the dropped</em> work. Each of these '
           "took real investment and then stopped dead, and nothing closed it: no merge, "
           "no abandonment, no park, and nobody else holding it. The distinction is the "
@@ -3335,13 +3708,20 @@ def render(data, lede, focus_days, limit, cost=None):
               "&#x2715;</button>")
             a(f'<span class="why">{esc(f.get("why",""))}</span>')
             a("</li>")
-        a("</ul></section>")
+        a("</ul></details>")
 
     # Always emitted, even empty: parking happens in the page, so the client needs somewhere
     # to move a row to without inventing structure.
-    a(f'<section id="parkedsec"{"" if parked else " hidden"}>')
-    a('<div class="rung"><h2 id="parked">Parked</h2>'
-      f'<span class="n" data-count="parked">{len(parked)}</span></div>')
+    # Folded, and it keeps `parkedsec` on the disclosure itself rather than on a section
+    # inside it: the client hides this whole block when nothing is parked and inserts the
+    # came-back-on-its-own note directly before it, and both want the outermost element.
+    # Parking from the page opens it -- see PARK_JS -- because a row that vanishes on a
+    # click and reappears nowhere visible reads as a deletion.
+    fold(a, "Parked",
+         f'<span class="n" data-count="parked">{len(parked)}</span> set aside',
+         esc("including " + one_line(parked[0])) if parked else "",
+         sid="parked",
+         attrs=f' id="parkedsec"{"" if parked else " hidden"}')
     a('<p class="note">Set aside on purpose. Still counted, still here — the difference '
       "between parked and forgotten is the whole point of saying so. Each returns to "
       "<em>In play</em> by itself as soon as a commit lands on it, because the park is "
@@ -3349,7 +3729,7 @@ def render(data, lede, focus_days, limit, cost=None):
     a('<div class="wslist" id="parkedlist">')
     for arc in parked:
         workstream_row(arc)
-    a("</div></section>")
+    a("</div></details>")
 
     for s in data.get("stale_parks") or []:
         a(f'<p class="note">{esc(s.get("label",""))} is no longer parked: '
@@ -3372,24 +3752,36 @@ def render(data, lede, focus_days, limit, cost=None):
           f'{esc(s.get("why",""))} — the derivation has been allowed to speak.</p>')
 
     if done:
-        a("<section>")
-        a(f'<div class="rung"><h2 id="settled">Landed or abandoned</h2>'
-          f'<span class="n">{len(done)}</span></div>')
+        # The archive, and the clearest case on the page for a fold: twenty rows of
+        # finished work were rendering at the same weight as the morning brief. Shown once
+        # so it is clear they were retired rather than lost -- which a one-line header
+        # carrying the count does exactly as well as twenty rows did.
+        fold(a, "Landed or abandoned", f"{len(done)} retired",
+             esc("including " + one_line(done[0])), sid="settled")
         a('<p class="note">Finished, and shown once so it is clear they were retired '
           "rather than lost. These stayed on the page for as long as this tool existed: "
           "every merge request here squash-merges, and a squash leaves the branch "
           "unmerged by ancestry, which was the only test <code>git</code> was being "
           "asked.</p>")
         rows(done)
-        a("</section>")
+        a("</details>")
 
     # --- where Jira disagrees with the code --------------------------------
     if gap:
         # `mism` is the truncated list, resolved at the top of render(): the brief links
         # into this table and must not point at a row the truncation removed.
         if mism:
-            a("<section>")
-            a("<h2>Jira says otherwise</h2>")
+            # Folded, with the worst row on the header. The table is ranked
+            # longest-uncorrected-first, so the first row IS the worst one and the header
+            # can name it without a second ranking being written here.
+            worst = mism[0].get("issue", {})
+            fold(a, "Jira says otherwise",
+                 f"{len(gap.get('status_mismatch') or [])} contradicted",
+                 esc("worst: " + str(worst.get("key", "?")) + " "
+                     + str(worst.get("status", ""))
+                     + (f", {mism[0]['stale_days']}d uncorrected"
+                        if mism[0].get("stale_days") else "")),
+                 sid="jira")
             # Both kinds the list holds, and the order it is in. The note used to describe
             # only the first kind, and it named no order at all -- which was honest while
             # there was none: the rows arrived in whatever order Jira listed the issues.
@@ -3438,19 +3830,22 @@ def render(data, lede, focus_days, limit, cost=None):
             if cut > 0:
                 a(f'<tr><td class="d" colspan="6">&hellip;and {cut} more, each '
                   "standing for less time than these.</td></tr>")
-            a("</tbody></table></div></section>")
+            a("</tbody></table></div></details>")
 
         unt = gap.get("unticketed_work") or []
         if unt:
-            a("<section>")
-            a("<h2>Real work with no ticket</h2>")
+            # Folded. The count is the whole claim -- work Jira cannot see is invisible to
+            # Trellis, capacity and every rollup whether it is one workstream or eight --
+            # and the header carries it along with one of them by name.
+            fold(a, "Real work with no ticket", f"{len(unt)} unfiled",
+                 esc("including " + one_line(unt[0])), sid="unticketed")
             a('<p class="note">Invisible to Jira, and therefore to Trellis — absent '
               "from capacity, burndown and every initiative rollup. Each has a one-step "
               "command to file it.</p>")
             a('<div class="scroll"><table><thead><tr>'
               "<th>What it is</th><th>Branches</th><th>Sessions</th><th>Unpushed</th>"
               "<th>File it</th></tr></thead><tbody>")
-            for x in unt[:12]:
+            for x in unt[:UNTICKETED_ROWS]:
                 cc = x.get("counts", {})
                 nm = (x.get("brief") or {}).get("name") or x.get("label", "?")
                 a(f'<tr><td class="d">{esc(nm)}</td>'
@@ -3472,26 +3867,45 @@ def render(data, lede, focus_days, limit, cost=None):
                   f"<td><code>work-arcs --jira-ify "
                   f"'{esc(x.get('label','?'))}'</code></td>"
                   "</tr>")
-            a("</tbody></table></div></section>")
+            # Said out loud, because the header above now states how many there are and a
+            # table quietly holding fewer than its own heading claims is the one thing a
+            # collapsed section must never do -- the count is the whole contract the fold
+            # is trusted on.
+            if len(unt) > UNTICKETED_ROWS:
+                a(f'<tr><td class="d" colspan="5">&hellip;and '
+                  f"{len(unt) - UNTICKETED_ROWS} more, in the order work-arcs found "
+                  "them. Each has a row of its own above.</td></tr>")
+            a("</tbody></table></div></details>")
 
         empty = gap.get("tickets_without_work") or []
         if empty:
-            a("<section>")
-            a("<h2>Tickets with nothing behind them</h2>")
+            # Folded. The one section here nobody has ever had to act on in a hurry: a
+            # ticket with no work behind it is either not started or already done, and
+            # neither is news at 10:15.
+            fold(a, "Tickets with nothing behind them", f"{len(empty)} empty",
+                 esc("including " + str(empty[0].get("key", "?")) + " "
+                     + str(empty[0].get("status", ""))), sid="noworkfor")
             a('<p class="note">Assigned and open, with no branch or session against '
               "them. Either they have not started, or they are done and nobody closed "
               "them.</p>")
             a('<div class="scroll"><table><thead><tr>'
               "<th>Ticket</th><th>Status</th><th>Summary</th><th>Initiative</th>"
               "</tr></thead><tbody>")
-            for i in empty[:14]:
+            for i in empty[:NOWORK_ROWS]:
                 init = ", ".join(i.get("initiatives") or []) or "—"
                 a('<tr><td class="k">'
                   + link(i.get("url", ""), esc(i.get("key", "")))
                   + f'</td><td class="d">{esc(i.get("status",""))}</td>'
                   f'<td class="d">{esc(i.get("summary",""))}</td>'
                   f'<td class="d">{esc(init)}</td></tr>')
-            a("</tbody></table></div></section>")
+            # The cut this table has always made, said out loud now that the header states
+            # the full figure. It was silent while nothing above it made a claim about the
+            # size; a header reading 18 over fourteen rows is a lie about the one number a
+            # closed section is trusted for.
+            if len(empty) > NOWORK_ROWS:
+                a(f'<tr><td class="d" colspan="4">&hellip;and '
+                  f"{len(empty) - NOWORK_ROWS} more, as Jira listed them.</td></tr>")
+            a("</tbody></table></div></details>")
 
     # --- what the grouping is least sure of ---------------------------------
     # Silent when there is nothing to ask: work-arcs omits the key rather than sending an
@@ -3506,8 +3920,17 @@ def render(data, lede, focus_days, limit, cost=None):
         # share a budget of five, a keystroke vocabulary and a place on the screen, and
         # splitting them would turn one short list a person answers into two lists they
         # scroll past. The heading asks the question both kinds have in common.
-        a("<section>")
-        a("<h2>Did the derivation get this right?</h2>")
+        # Folded like every other question queue on the page, and for the reason that is
+        # load-bearing rather than aesthetic: nothing here notifies, badges or counts up
+        # anywhere else, because the taskmaster shape is what makes a prompt get skipped.
+        # A closed header stating how many questions are waiting is the quietest form that
+        # still says the queue exists -- and the command line asks the same ones.
+        first = curation[0]
+        fold(a, "Did the derivation get this right?",
+             f"{len(curation)} unsure",
+             esc("first: " + str(first.get("arc") if first.get("kind") == "residue"
+                                 else first.get("branch") or first.get("arc") or "?")),
+             sid="curation")
         a('<p class="note">Where the tool is least sure of itself, in the two ways it '
           "can be. <b>Grouping</b>: branches are grouped by the files they touch, and "
           "two tickets editing the same module look identical by files however the "
@@ -3571,7 +3994,7 @@ def render(data, lede, focus_days, limit, cost=None):
               + "</span>")
             a("</div>")
         a("</div>")
-        a("</section>")
+        a("</details>")
 
     # --- what this assistant costs -------------------------------------------
     # Absent unless `arcs` wrote a cost sidecar for this run. A stale figure here would
@@ -3615,7 +4038,7 @@ def render(data, lede, focus_days, limit, cost=None):
       "superseded copy, its commits were checked against the other branch by "
       "<code>git patch-id</code>, not guessed at from its name.</footer>")
     a("</div>")
-    return "\n".join(out)
+    return fold_notes("\n".join(out))
 
 
 def main():
