@@ -15,18 +15,20 @@ Any arguments after the command pass straight through to `arcs` (e.g. `/arcs --f
    about a minute — most of that is GitLab and the model passes, and both are cached, so a
    second run in the same hour is fast.
 
-2. Publish the file it printed with the **Artifact** tool, passing:
-   - `file_path`: the path `arcs` printed
-   - `url`: the URL `arcs` printed (from `WORK_ARCS_ARTIFACT_URL` in the repo's `.env`).
-     **This is not optional.** Publishing without it creates a second artifact with a new
-     link rather than updating the one Kyle has open.
-   - `favicon`: 🧭 — keep it stable, he finds the tab by its icon
-   - `label`: a two-or-three-word note on what moved since last time
+2. Run `arcs-refresh --publish`. It uploads the file `arcs` just wrote to the artifact URL
+   in `.env`, over the same HTTP API the CLI's own Artifact tool uses, and prints the new
+   version. It reads the artifact's current title and favicon and sends them back
+   unchanged, so the tab Kyle finds by its icon keeps its name and its icon.
 
-   If the publish is refused because this session has not seen the current version, WebFetch
-   the URL once and publish again. Do **not** pass `force` — the page is fully regenerated
-   from the repo each run, so there is nothing of anyone else's to preserve, but the refusal
-   is also a signal that another session is publishing and worth a moment's thought.
+   Do **not** publish with the Artifact tool instead. It works, but it has to read the
+   whole 370KB page into context first, and this does the same job for nothing.
+
+   If it fails, it says why in one line. The two worth knowing:
+   - **the publish cap for this plan has been reached** — nothing to do but wait; the
+     page on disk is current and the next morning's run will send it.
+   - **the artifact moved since this run read it** — another session published in
+     between. It supersedes it automatically and says so; the page is regenerated whole
+     from local state every run, so nothing of that version was worth keeping.
 
 3. Report what actually changed, not that it succeeded. Compare against the previous run
    where you can: which workstreams moved rung, what came back, what landed, what is newly
@@ -39,7 +41,7 @@ Any arguments after the command pass straight through to `arcs` (e.g. `/arcs --f
 
 ## Notes
 
-- Publishing is a Claude Code step by necessity: the page is an artifact, and only a session
-  can write to that URL. `arcs` on its own does every part that a shell can do.
+- The morning timer (`work-arcs-refresh.timer`, 07:10) now publishes on its own — this
+  command is for a rebuild on demand, not for finishing a job the timer left half done.
 - If `arcs` fails, say which stage. It runs the programs separately so the failing one is
   named rather than surfacing as "stdin is not work-arcs --json".

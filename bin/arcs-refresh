@@ -13,6 +13,11 @@
 #                   both move the run-over-run snapshot baseline, and the loser's interval
 #                   of changes disappears.
 #   a log           because a program nobody watches has to be able to say what it did.
+#   a publish       because a rebuilt page that never leaves this machine is not a fresh
+#                   page. This ended by printing an instruction for a person to follow
+#                   for longer than it should have, on the belief that only a Claude Code
+#                   session could write to an artifact URL. That was a fact about the
+#                   Artifact tool, not about artifacts; the API is ordinary HTTP.
 #   silence         on success. A daily "it worked" notification is training to ignore
 #                   notifications; you only hear from this when it did not run.
 #   an environment  built explicitly -- the first bug.
@@ -130,6 +135,7 @@
 #   arcs-refresh --install-cron     the crontab line instead -- no catch-up, see above
 #   arcs-refresh --uninstall-cron   remove it, leave every other crontab line alone
 #   arcs-refresh --hook             print the arc-record Stop hook block for settings.json
+#   arcs-refresh --publish          upload the page already on disk, without rebuilding it
 #
 # Tuning, all read from .env or the environment:
 #   WORK_ARCS_REFRESH_MAX_5H     stand down above this 5-hour utilisation  (default 80)
@@ -144,6 +150,10 @@
 #   WORK_ARCS_REFRESH_NET_DELAY  seconds to wait between those             (default 10)
 #   WORK_ARCS_CREDS              the OAuth credential file to read from
 #                                                  (~/.claude/.credentials.json)
+#   WORK_ARCS_PUBLISH            upload the page after building it          (default 1)
+#   WORK_ARCS_PUBLISH_SUPERSEDE  overwrite an artifact that moved under us  (default 1)
+#   WORK_ARCS_PUBLISH_TRIES      attempts while the render service is busy  (default 3)
+#   WORK_ARCS_FRAME_BASE         the artifact API host        (https://claude.ai)
 #
 # Exit codes are distinct so the log and a test can tell the outcomes apart: 0 refreshed,
 # 1 the pipeline failed, 3 stood down on quota, 4 another run holds the lock, 5 a required
