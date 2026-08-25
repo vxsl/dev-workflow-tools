@@ -422,7 +422,9 @@ spec.loader.exec_module(mod)
 # The cheapest call that still authenticates, which is the only part that matters: the
 # answer is thrown away, the refreshed credential is the point.
 r = mod.run(["--model", "haiku", "Reply with the single word: ok"], timeout=120)
-sys.exit(0 if r.returncode == 0 else 1)
+# claude's own status, clamped into a shell exit, so the log can say 127 (not on PATH,
+# though preflight should have caught that) rather than only "it did not work".
+sys.exit(min(r.returncode, 125) if r.returncode else 0)
 PYEOF
 }
 
@@ -466,8 +468,10 @@ fetch_usage() {
     fi
 
     log "minting a token directly was refused ($minted) — running the cheapest claude session to refresh it instead"
-    if ! refresh_via_session; then
-        USAGE_FAILURE="the access token is expired, minting one was refused ($minted) and a claude session could not refresh it either — re-login"
+    local src=0
+    refresh_via_session || src=$?
+    if [ "$src" -ne 0 ]; then
+        USAGE_FAILURE="the access token is expired, minting one was refused ($minted) and a claude session could not run either (claude exited $src) — re-login"
         return 1
     fi
 

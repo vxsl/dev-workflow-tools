@@ -597,7 +597,7 @@ exit 0'
     STUB_USAGE_CODES=401 STUB_TOKEN_CODE=429 run "$REFRESH"
     [ "$status" -eq 3 ]
     ! ran_pipeline
-    grep -q "a claude session could not refresh it either" "$LOG"
+    grep -q "a claude session could not run either (claude exited 1)" "$LOG"
 }
 
 # A session can exit 0 without having refreshed anything, and that is a fourth outcome
