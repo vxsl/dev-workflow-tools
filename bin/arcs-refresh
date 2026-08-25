@@ -792,6 +792,12 @@ frame_call() {
         -H "X-Frame-Surface: code"
         -H "X-Frame-Platform: cli"
         -H "X-Frame-Client-Version: $FRAME_CLIENT_VERSION"
+        # Not decoration. With curl's own User-Agent the endpoint answers 403 -- not 401,
+        # so it is not the credential, and not 404, so the route matched. Something in
+        # front of the service refuses a client it does not recognise, and this is the
+        # string the CLI sends: `claude-cli/<version> (external, <entrypoint>)`.
+        -H "User-Agent: claude-cli/$FRAME_CLIENT_VERSION (external, cli)"
+        -H "anthropic-version: 2023-06-01"
     )
     # --data-binary and not --data: `--data @file` strips newlines out of the file, which
     # a compact JSON body survives by luck rather than design. Sending the bytes that were
@@ -846,6 +852,11 @@ frame_record() {
     fi
     if [ "$FRAME_HTTP_CODE" != "200" ]; then
         FRAME_ERROR="the artifact list answered HTTP $FRAME_HTTP_CODE"
+        # A 403 is neither a bad token nor a wrong path, and both of those are what a
+        # reader will check first. It is what this endpoint answers a client it does not
+        # recognise -- which in practice means the User-Agent or the X-Frame headers went
+        # missing, so say so rather than sending the next reader to re-check the login.
+        [ "$FRAME_HTTP_CODE" = "403" ] && FRAME_ERROR="$FRAME_ERROR — the credential is fine and the route matched, so suspect the client headers (User-Agent, X-Frame-*) before the login"
         return 1
     fi
     local rec

@@ -1107,6 +1107,24 @@ EOF
     grep -q "^X-Frame-Surface: code$" "$STUB_DIR/deploy-headers"
 }
 
+# The first live run 403'd on curl's own User-Agent -- not a 401, so the credential was
+# fine, and not a 404, so the route matched. Both calls need it, and the read is the one
+# that failed, so both are checked.
+@test "every frame call claims to be the CLI" {
+    publishing_on
+    run "$REFRESH"
+    grep -q "^User-Agent: claude-cli/.* (external, cli)$" "$STUB_DIR/frames-headers"
+    grep -q "^User-Agent: claude-cli/.* (external, cli)$" "$STUB_DIR/deploy-headers"
+}
+
+@test "a 403 on the read points at the headers rather than the login" {
+    publishing_on
+    STUB_FRAMES_CODE=403 run "$REFRESH"
+    grep -q "HTTP 403" "$LOG"
+    grep -q "suspect the client headers" "$LOG"
+    [ "$(deploy_calls)" = 0 ]
+}
+
 @test "the publish uses the token the quota check already proved" {
     publishing_on
     run "$REFRESH"
