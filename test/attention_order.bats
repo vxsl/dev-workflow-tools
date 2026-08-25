@@ -326,6 +326,22 @@ PY
     [[ "$output" == *"longest-standing of 3 tickets"* ]]
 }
 
+@test "an acknowledged row is out of the opening sentence and out of its count" {
+    # The rule the morning brief already follows. A count that includes hidden rows
+    # disagrees with the table it points at, and an acknowledgement that still opens the
+    # page with the same ticket does nothing at all.
+    run python3 - "$(doc "$(gap 3)")" <<'PY'
+import json, re, subprocess, sys
+doc = json.loads(sys.argv[1])
+doc["gap"]["status_mismatch"][0]["dismissed"] = True
+r = subprocess.run([sys.executable, "bin/arcs-page", "--focus", "30"],
+                   input=json.dumps(doc), capture_output=True, text=True)
+lede = re.search(r'<p class="lede">.*?</p>', r.stdout, re.S).group(0)
+print(re.search(r"<em>(UL-\d+)</em>", lede).group(1), "of 2" in lede)
+PY
+    [ "${lines[0]}" = "UL-101 True" ]
+}
+
 @test "a mismatch with no unpushed work is not said to have unpushed work" {
     # The second kind of row: a status claiming work is under way on a workstream nobody
     # has touched in three weeks. It has no scale to print, and under a ranking that can

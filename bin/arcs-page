@@ -1476,7 +1476,10 @@ def derive_lede(data, focus_days):
     # the row directly above -- and it quoted a different no-ticket number than the gap
     # section further down, because the two count different things. Prose earns its place
     # here only by stating the contradictions, which no tile can hold.
-    mism = gap.get("status_mismatch") or []
+    # Acknowledged rows are out of the count as well as out of the choice, which is the
+    # rule the morning brief already follows: a count that includes hidden rows disagrees
+    # with the table it points at, and a ✕ that still opens the page does nothing.
+    mism = [m for m in gap.get("status_mismatch") or [] if not m.get("dismissed")]
     if mism:
         # First on the wire, not a `max()` taken here. work-arcs ranks this list on how long
         # each status has gone uncorrected, and that ranking is also what the table below
