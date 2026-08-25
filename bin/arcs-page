@@ -605,23 +605,30 @@ details.parked>summary b,details.atrisk>summary b{color:var(--ink);font-weight:6
    this a second set of cards, and the cards are directly below. */
 .riskrows{margin:.5rem 0 0;padding:0;list-style:none;border:1px solid var(--hairline);
   border-radius:4px;background:var(--surface);overflow:hidden}
-.riskrows li{display:grid;grid-template-columns:minmax(0,1fr) auto;
+.riskrows li{display:grid;grid-template-columns:minmax(0,1fr) auto auto;
   gap:.15rem .9rem;align-items:baseline;padding:.5rem .7rem;
   border-bottom:1px solid var(--hairline)}
 .riskrows li:last-child{border-bottom:none}
 .riskrows .nm{grid-column:1;color:var(--ink);font-size:.87rem;font-weight:600;
   text-decoration:none;min-width:0}
 .riskrows .nm:hover{text-decoration:underline}
-/* The cost, and the only figure on the row. Tabular here because it IS a column. */
+/* Both figures the rank is made of. Tabular here because they ARE columns -- and the
+   staleness is set faint beside the cost rather than level with it, because it explains
+   the order and the cost is the thing the order is about. */
 .riskrows .dy{grid-column:2;font-family:var(--mono);font-size:.72rem;color:var(--ink);
   white-space:nowrap;font-variant-numeric:tabular-nums}
+.riskrows .ag{grid-column:3;font-family:var(--mono);font-size:.72rem;
+  color:var(--ink-faint);white-space:nowrap;font-variant-numeric:tabular-nums}
 .riskrows .wy{grid-column:1;font-size:.79rem;color:var(--ink-soft);text-wrap:pretty}
-.riskrows .br{grid-column:2;font-family:var(--mono);font-size:.68rem;
+.riskrows .br{grid-column:2/-1;font-family:var(--mono);font-size:.68rem;
   color:var(--ink-faint);overflow-wrap:anywhere;max-width:15rem;text-align:right}
 /* Said out loud rather than left as a silent cut: a list that stops at eight and does not
    say so reads as a complete list of eight. */
 .riskrows .more{display:block;padding:.45rem .7rem;font-size:.75rem;
   color:var(--ink-faint)}
+@media(max-width:640px){.riskrows li{grid-template-columns:minmax(0,1fr) auto}
+  .riskrows .ag{grid-column:2}
+  .riskrows .wy,.riskrows .br{grid-column:1/-1;text-align:left;max-width:none}}
 
 /* The sprint strip: a lens, and sized like one. Time is still the spine of this page --
    that decision is recorded three comments down, and it holds -- so what the sprint gets
@@ -3020,19 +3027,34 @@ def render(data, lede, focus_days, limit, cost=None):
         order = {aid: i for i, aid in enumerate(data.get("only_here") or [])}
         ranked = sorted(loc, key=lambda x: (order.get(x.get("id"), len(order)),
                                             str(x.get("id") or "")))
+        # The summary names the order as well as the figure. A reader who is not told the
+        # order is days-of-work times staleness reads the days column as a broken sort.
         a(f'<details class="atrisk" id="only-here"><summary><b>{esc(loc_scale)}</b> '
-          f"{loc_verb} nowhere but this laptop — which workstreams, and what each "
-          "would cost</summary>")
+          f"{loc_verb} nowhere but this laptop — which workstreams, biggest and "
+          "longest-quiet first</summary>")
         a('<ul class="riskrows">')
         for x in ranked[:AT_RISK_ROWS]:
             brief = x.get("brief") or {}
             nm = brief.get("name") or x.get("label", "?")
             scale = work_scale(x.get("unpushed_days", 0), x.get("unpushed_live", 0))[0]
-            why = (first_clause(brief.get("summary")) or brief.get("blocker")
-                   or x.get("state") or "")
+            # BOTH halves of the rank, because the order is made of both and a column of
+            # figures that does not descend reads as a broken sort. This list is ranked on
+            # days of work times how long the arc has been quiet, so a 13-day workstream
+            # touched yesterday sits below a 17-day one nobody has opened for a fortnight
+            # -- correctly, and unaccountably if the row only prints the 13. Same rule the
+            # morning brief already follows about its superlative: a figure that decides an
+            # order has to appear in the row it ordered.
+            quiet = x.get("age_days")
+            # Deliberately no `state` fallback. For every arc in this list `state` IS the
+            # days-of-work sentence -- that is what puts them on the local-only rung -- so
+            # falling back to it printed "6 days of work, only here" beside a cell already
+            # reading "6 days of work". A blank second line says less than a duplicate does.
+            why = first_clause(brief.get("summary")) or brief.get("blocker") or ""
             branch = x.get("authoritative") or ""
             a(f'<li><a class="nm" href="#{anchor(x.get("id"))}">{esc(nm)}</a>'
               f'<span class="dy">{esc(scale)}</span>'
+              + (f'<span class="ag">{quiet}d quiet</span>' if quiet is not None
+                 else '<span class="ag"></span>')
               + (f'<span class="wy">{esc(why)}</span>' if why else "")
               + (f'<span class="br">{esc(branch)}</span>' if branch else "")
               + "</li>")

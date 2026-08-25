@@ -494,13 +494,34 @@ a different action:
 
 | Gap | Meaning |
 |---|---|
-| real work with no ticket | `dove` — 17 branches, 182 unpushed commits, no Jira presence |
-| status claims handed off | `UL-1692` says *In Review* with 136 commits never pushed |
+| real work with no ticket | `dove` — 17 branches, days of work no remote has, no Jira presence |
+| status claims handed off | `UL-1692` says *In Review* with a fortnight never pushed |
 | ticket with no work | assigned and open, but no branch or session exists |
+
+**Only work that is still outstanding.** The first row asks whether anything is left to
+file a ticket *about* — unpushed commits, an open merge request, or any demand — and not
+merely whether the arc has a ticket and looks busy. Without that it offered a one-step
+`--jira-ify` command for work that had already merged, on a page that listed the same
+workstream under *Landed*. The test is `settled`, which is the one place that decides
+whether every branch of an arc has landed or been abandoned, plus the `pre-landing` rung
+where the work shipped as a reshape and the survivors are drafts from before it.
 
 `--jira-ify` files the ticket using what the arc already knows — branches, unpushed
 count, session count, recent commit subjects — then drops into `create-jira-ticket`'s
 board picker, because UL vs UB is a judgment call. Add `--dry-run` to see it first.
+
+**Which work exists only here.** The aggregate strip at the top of the page counts the
+workstreams no remote has a copy of, and that count opens: one row per workstream, biggest
+and longest-quiet first, capped at eight with the remainder stated. Each row carries the
+workstream's name, what it would cost to lose, how long it has been quiet, the branch that
+IS the work, and a link to its card. Both figures are on the row because the order is made
+of both — days of work times staleness — so a thirteen-day workstream touched yesterday
+correctly sits below a seventeen-day one nobody has opened for a fortnight.
+
+`work-arcs --json` emits that order as `only_here`: arc ids, ranked, complete. Like
+`forgotten` it is the ranking and not the data — the arcs carry `unpushed_days`,
+`unpushed_dates` and `authoritative` already — and the cap belongs to whatever renders it,
+because a list truncated on the wire could never be un-truncated.
 
 **`--authoritative-ticket` says what an arc’s work IS**, which is the one thing neither
 git nor Jira can settle. `UL-1852` reached review as one merge request; file overlap had

@@ -315,6 +315,57 @@ PY
     [[ "$output" == *'class="nm" href="#ws-workstream-2-'* ]]
 }
 
+@test "a row prints both figures its rank is made of, not only the cost" {
+    # The order is days of work times staleness, so the days column does not descend. A
+    # column of figures that does not descend reads as a broken sort unless the row also
+    # carries the figure that broke it -- the same rule the morning brief follows about
+    # its superlative.
+    run page "$(doc 3)"
+    [[ "$output" == *'<span class="dy">3 days of work</span><span class="ag">3d quiet</span>'* ]]
+}
+
+@test "the order named in the summary is the order the rows are in" {
+    # Sixteen days of work touched yesterday sits below three days nobody has opened for a
+    # month, and the row has to be able to say why.
+    run python3 - "$(doc 2)" <<'PY'
+import json, re, subprocess, sys
+doc = json.loads(sys.argv[1])
+live = [x for x in doc["arcs"] if x["unpushed_live"]]
+live[0].update(unpushed_days=16, unpushed_live=48, age_days=1,
+               unpushed_dates=["2026-08-%02d" % (d + 1) for d in range(16)])
+live[1].update(unpushed_days=3, unpushed_live=9, age_days=30,
+               unpushed_dates=["2026-08-%02d" % (d + 1) for d in range(3)])
+live.sort(key=lambda x: (-(x["unpushed_days"] * max(x["age_days"], 1)), x["id"]))
+doc["only_here"] = [x["id"] for x in live]
+r = subprocess.run([sys.executable, "bin/arcs-page", "--focus", "40"],
+                   input=json.dumps(doc), capture_output=True, text=True)
+m = re.search(r'<details class="atrisk".*?</details>', r.stdout, re.S)
+print(re.findall(r'<span class="dy">([^<]*)</span><span class="ag">([^<]*)</span>',
+                 m.group(0)))
+PY
+    [ "${lines[0]}" = "[('3 days of work', '30d quiet'), ('16 days of work', '1d quiet')]" ]
+}
+
+@test "a row whose brief says nothing leaves the line blank rather than repeating the cost" {
+    # For every arc in this list `state` IS the days-of-work sentence -- that is what puts
+    # them on the local-only rung -- so falling back to it printed "3 days of work, only
+    # here" beside a cell already reading "3 days of work".
+    run python3 - "$(doc 1)" <<'PY'
+import json, re, subprocess, sys
+doc = json.loads(sys.argv[1])
+for x in doc["arcs"]:
+    if x["unpushed_live"]:
+        x["brief"] = {"name": "no summary here"}
+r = subprocess.run([sys.executable, "bin/arcs-page", "--focus", "30"],
+                   input=json.dumps(doc), capture_output=True, text=True)
+m = re.search(r'<details class="atrisk".*?</details>', r.stdout, re.S)
+print("WY" if 'class="wy"' in m.group(0) else "NO-WY")
+print("DUPE" if "only here" in m.group(0) else "NO-DUPE")
+PY
+    [ "${lines[0]}" = "NO-WY" ]
+    [ "${lines[1]}" = "NO-DUPE" ]
+}
+
 @test "the rows come down the wire in the order work-arcs ranked them" {
     # Four workstreams, and the page must not re-derive their order. Reversing only the
     # ranking -- the arcs list untouched -- must reverse the rows.
