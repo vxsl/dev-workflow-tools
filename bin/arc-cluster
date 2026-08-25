@@ -579,17 +579,11 @@ def placement_margin(keys, adj, deg, comm, ctot, m2, resolution):
     return out
 
 
-# What a membership needs before it stops being worth asking about. Both measured on
-# this repo's own corpus rather than chosen: see membership() for the numbers.
-#
-# CONFIDENCE_AT is the line under which a membership joins the curation queue. At 0.34
-# it holds 156 of 358 memberships on the corpus as measured -- which is not a queue, it
-# is a backlog, and that is the point: the queue is capped at five per build and pinned
-# answers drop out of it, so the line decides what is *eligible* and the cap decides what
-# is asked. Set it lower and the known errors stop being eligible; the UL-1852/UB-6802
-# case sits at 0.25 and `UB-6981` beside it at the same, so anything below 0.25 loses
-# exactly the errors the queue exists for.
-CONFIDENCE_AT = float(os.environ.get("ARC_CONFIDENCE_AT", "0.34"))
+# The most a doubt signal may discount a membership's confidence. Half, so doubt can
+# reorder the queue and never fill it: what a membership is worth is decided by its
+# evidence, and a signal that could sink solid evidence on its own would be a threshold
+# by another name -- which is the tuning the plan calls exhausted.
+DOUBT_MAX = float(os.environ.get("ARC_DOUBT_MAX", "0.5"))
 
 # Shared distinctive files at which corroboration stops being the binding constraint.
 # MIN_SHARED (2) is the floor an edge must clear to exist at all, so a membership resting
@@ -608,18 +602,40 @@ def membership(members, ents, idf, df, N, hub_at, sim, margin, stackset, ticket)
     carries the evidence that put it there and a score for how thin that evidence is, and
     the thinnest become questions.
 
-    Three terms, and the score is their minimum, because a membership is only as good as
-    its weakest support. Averaging them would let a strong term paper over the fatal one --
-    a branch with a hundred shared files that modularity placed by a coin-flip is exactly
-    the case that must not average its way out of the queue.
+    Evidence first, doubt second, and they are not the same kind of thing. Two terms say
+    how much there is to stand on, and the membership is worth only the weaker of them:
 
       corroboration  distinct non-hub files shared with its strongest in-arc neighbour,
                      against MIN_SHARED. This is the evidence the edge exists on at all.
-      decisiveness   the clusterer's own placement margin -- see placement_margin.
       reach          how many members of the arc it links to at all. A branch hanging off
                      one neighbour is in the arc on one relationship; three is enough to
                      be embedded. Scaled against the arc's size so a two-branch arc, where
                      one link IS every link, is not punished for being small.
+
+    Two more argue against, and they discount rather than floor:
+
+      near-tie       the clusterer's own placement margin -- see placement_margin. A
+                     branch modularity placed by a hair was placed by a coin-flip.
+      foreign ticket the branch's name carries a ticket key, and it is not the arc's.
+                     The split prompt calls this the single most reliable signal for
+                     telling two bodies of work apart, and it is precisely the residual
+                     error: two tickets editing the same module.
+
+    They discount because both are routinely true of correct memberships. Modularity
+    margins are small for every well-connected node at the boundary of two dense arcs,
+    and a stack legitimately carries one ticket's commits across branches named for
+    another; as floors they buried the thin-evidence cases under boundary artefacts.
+    Measured: as a minimum term, near-tie filled the first five questions with branches
+    holding 24 and 45 shared files -- memberships nothing was wrong with -- while
+    `UL-1852` at two shared files in the UB-6802 arc, the live error this exists to
+    catch, sat outside the cap. As a discount, both of those score above the line and
+    UL-1852 comes first.
+
+    The discount is bounded at DOUBT_MAX so doubt can halve a membership's confidence and
+    never sink it: sinking it is what evidence is for. Only the larger of the two applies
+    -- they are two readings of the same worry, and a branch that is both a near-tie and
+    foreign-ticketed is not twice as suspicious, it is suspicious for a reason that has
+    been noticed twice.
 
     Never questioned, and short-circuited to 1.0: ancestry- and alias-backed members,
     because a branch cut from another is a fact and not an inference, and members whose
@@ -658,14 +674,17 @@ def membership(members, ents, idf, df, N, hub_at, sim, margin, stackset, ticket)
         files = sorted(files, key=lambda f: (-idf.get(f, 0), f))
 
         anc = any((m, o) in stackset for o in br if o != m)
-        named = bool(ticket) and ticket in m[1].upper()
+        mine = TICKET_RE.search(m[1].upper())
+        named = bool(ticket) and bool(mine) and mine.group(0) == ticket
+        foreign = bool(ticket) and bool(mine) and mine.group(0) != ticket
         dec = margin.get(m, 0.0)
         corr = max(0.0, min(1.0, (shared - MIN_SHARED + 1)
                             / float(max(1, CORROBORATED_AT - MIN_SHARED + 1))))
         reach = min(1.0, links / float(max(1, min(3, peers))))
+        evidence = {"corroboration": round(corr, 3), "reach": round(reach, 3)}
+        doubt = {"near_tie": round(1.0 - dec, 3),
+                 "foreign_ticket": 1.0 if foreign else 0.0}
 
-        terms = {"corroboration": round(corr, 3), "decisiveness": round(dec, 3),
-                 "reach": round(reach, 3)}
         if anc or named:
             score, why = 1.0, ("cut from another branch in this arc" if anc
                                else "its own name carries this arc's ticket")
@@ -678,17 +697,23 @@ def membership(members, ents, idf, df, N, hub_at, sim, margin, stackset, ticket)
                     else f"held by {shared} shared file"
                          f"{'' if shared == 1 else 's'}"
                          + (" — the corroboration floor" if shared <= MIN_SHARED else "")),
-                "decisiveness": "the clustering placed it here by a hair",
                 "reach": ("it links to nothing else here" if not links
                           else f"it links to {links} of the {peers} other branch"
                                f"{'' if peers == 1 else 'es'} here"),
             }
-            key = min(("corroboration", "decisiveness", "reach"), key=lambda k: terms[k])
-            score, why = terms[key], why_of[key]
+            key = min(("corroboration", "reach"), key=lambda k: evidence[k])
+            base, why = evidence[key], why_of[key]
+            worst = max(doubt, key=lambda k: doubt[k])
+            score = base * (1.0 - DOUBT_MAX * doubt[worst])
+            if doubt[worst] > 0:
+                why += ("; and its name is filed under "
+                        f"{mine.group(0)}, not {ticket}" if worst == "foreign_ticket"
+                        else "; and the clustering placed it here by a hair")
         out[m[1]] = {
             "confidence": round(score, 3),
             "why": why,
-            "terms": terms,
+            "evidence": evidence,
+            "doubt": doubt,
             "with": best[1] if best else None,
             "shared": shared,
             "files": files[:5],

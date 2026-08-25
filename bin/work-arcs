@@ -55,9 +55,11 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import unicodedata
 import urllib.error
@@ -4043,7 +4045,7 @@ def load_clusters(repo, main, resolution):
     """
     tool = Path(__file__).resolve().parent / "arc-cluster"
     if not tool.exists():
-        return {}, {}
+        return {}, {}, {}
     turns = CLUSTER_CACHE.parent / "turns.jsonl"
     try:
         st = turns.stat()
@@ -4061,8 +4063,9 @@ def load_clusters(repo, main, resolution):
     ]).encode()).hexdigest()
     cached = load_store(CLUSTER_CACHE, "the clustering cache")
     if cached.get("key") == key and isinstance(cached.get("assign"), dict) \
-            and isinstance(cached.get("sessions"), dict):
-        return cached["assign"], cached["sessions"]
+            and isinstance(cached.get("sessions"), dict) \
+            and isinstance(cached.get("membership"), dict):
+        return cached["assign"], cached["sessions"], cached["membership"]
     try:
         r = subprocess.run(
             [str(tool), "--repo", str(repo), "--main", main,
@@ -4070,9 +4073,9 @@ def load_clusters(repo, main, resolution):
             capture_output=True, text=True, timeout=180)
         data = json.loads(r.stdout)
     except (OSError, subprocess.SubprocessError, json.JSONDecodeError, ValueError):
-        return {}, {}
+        return {}, {}, {}
 
-    assign, sessions = {}, {}
+    assign, sessions, member = {}, {}, {}
     for arc in data.get("arcs", []):
         label = arc.get("label") or "?"
         # Two clusters can derive the same label; keep them distinct so their members
@@ -4082,18 +4085,418 @@ def load_clusters(repo, main, resolution):
         sessions[label] = arc.get("sessions", [])
         for b in arc.get("branches", []):
             assign[b] = label
+        # Flattened by branch rather than kept per arc: every consumer here holds a
+        # branch and wants to know how it got where it is, and a branch is in exactly
+        # one arc, so the arc key would only ever be a second way to spell `assign`.
+        for b, m in (arc.get("membership") or {}).items():
+            member[b] = m
     if assign:
         try:
             CLUSTER_CACHE.parent.mkdir(parents=True, exist_ok=True)
             CLUSTER_CACHE.write_text(json.dumps(
-                {"key": key, "assign": assign, "sessions": sessions}))
+                {"key": key, "assign": assign, "sessions": sessions,
+                 "membership": member}))
         except OSError:
             pass  # a cache that cannot be written is just a cache miss next time
-    return assign, sessions
+    return assign, sessions, member
 
 
 DETACHED = (Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
             / "work-arcs" / "detached.json")
+
+# The other half of the same contract: branches a human confirmed DO belong where the
+# clustering put them. A detachment corrects the derivation; a confirmation ratifies it,
+# and both expire the same way -- see still_applies.
+CONFIRMED = DETACHED.parent / "confirmed.json"
+
+# Every answer, in the order it was given. Not a store and never read back to decide an
+# arc: this is the eval set. "Should we go on massaging the detection algorithm?" is the
+# question the whole curation loop exists to make answerable, and it cannot be answered
+# by argument -- only by scoring a proposed change against judgements a human already
+# made. Append-only, one JSON object per line, so a run can only ever add to it.
+CURATION_LABELS = DETACHED.parent / "curation-labels.jsonl"
+
+# How many co-members an answer records as its referent. The same cap the detachment
+# store has always used, hoisted so the confirmation store cannot pick a different one --
+# two stores with the same expiry rule and different sample sizes would expire at
+# different times over the same event.
+PEERS_RECORDED = 12
+
+# The line under which a membership is worth asking a human about. Scoring is
+# arc-cluster's job -- it is the only thing that saw the graph -- and where to draw the
+# line is this file's, because this is where the four never-question classes it cannot
+# see are applied and where the queue is actually built.
+#
+# Measured on this repo's corpus (794 entities, 358 memberships in 41 multi-branch arcs,
+# `arc-cluster --json`): 0.34 makes 56 memberships eligible. That is more than a queue
+# and deliberately so -- eligibility is not the same as being asked. The cap decides what
+# is asked, pins remove answered questions, and the ranking decides the order; the line
+# only decides what may ever come up. It sits where it does because the two known live
+# errors sit at 0.25 -- `UL-1852` (the geo_filter migration) and `UB-6981` in the UB-6802
+# metadata-geometry arc, both held by exactly the two-file corroboration floor -- and any
+# line below 0.25 excludes precisely the errors this exists to catch. Above ~0.5 the
+# eligible set doubles with memberships whose only weakness is a close modularity call,
+# which is common and usually right.
+CONFIDENCE_AT = float(os.environ.get("ARC_CONFIDENCE_AT", "0.34"))
+
+# Questions per build. Five is not a tuning parameter, it is the whole design: the
+# corpus has 56 memberships under the confidence line and would have more on a bigger
+# repo, and a queue that showed all of them would be a backlog nobody opens. Five is
+# what fits on a screen without scrolling and what a person will actually answer between
+# two other things. Answered ones pin and drop out; skipped ones come back.
+CURATION_CAP = int(os.environ.get("ARC_CURATION_CAP", "5"))
+
+
+def question_fp(branch, peers):
+    """What makes two builds' questions the same question.
+
+    The claim, not the wording: this branch, kept with this company. A label reword
+    leaves it alone and a changed neighbourhood changes it, which is the same referent
+    the stores expire on. Used to key a pin, to dedupe a label, and to let the page and
+    the CLI recognise each other's answers.
+    """
+    h = hashlib.sha256()
+    h.update(branch.encode())
+    h.update(b"\0")
+    h.update("\n".join(sorted(peers)).encode())
+    return h.hexdigest()[:16]
+
+
+def apply_confirmed(cluster_assign):
+    """Memberships a human has already ratified, so they are not asked about again.
+
+    A pin is not an override. It changes no assignment and moves no branch -- everything
+    it touches is somewhere the clustering already put it, which is the whole content of
+    the answer. All it does is take the question off the queue, and only while the answer
+    still refers to something: the moment the branch's company changes, the ratified
+    claim is about a grouping that no longer exists and the pin expires by itself rather
+    than silently vouching for work it never saw.
+
+    That self-expiry is what makes the pin safe to be permanent. A confirmation with no
+    expiry would be a human answer outliving its evidence, which is exactly the failure
+    the detachment contract was built to avoid.
+    """
+    store = load_store(CONFIRMED, "the confirmation store")
+    pinned, stale = set(), []
+    for branch, entry in list(store.items()):
+        live, why = still_applies(entry, cluster_assign, branch)
+        if live:
+            pinned.add(branch)
+        else:
+            stale.append({"branch": branch, "why": why})
+            del store[branch]
+    if stale:
+        try:
+            CONFIRMED.write_text(json.dumps(store, indent=1, sort_keys=True))
+        except OSError:
+            pass
+    return pinned, stale
+
+
+def log_answer(row):
+    """Append one answer to the eval set. Never fails a build."""
+    try:
+        CURATION_LABELS.parent.mkdir(parents=True, exist_ok=True)
+        with CURATION_LABELS.open("a") as f:
+            f.write(json.dumps(row, sort_keys=True) + "\n")
+    except OSError:
+        pass
+
+
+def answer_question(q, keep, cluster_assign):
+    """Record one verdict: a pin if the membership is right, a detachment if it is not.
+
+    Both answers write to the eval set, and that is the point of asking at all. A `pry`
+    alone would make the loop a correction mechanism, which fixes today's page and
+    teaches nothing -- the disagreements are only half the signal, and a clusterer that
+    scores well on them by splitting everything would look perfect. The agreements are
+    what stop that.
+    """
+    branch, label = q["branch"], q["arc"]
+    peers = sorted(co_members(cluster_assign, branch) or ())[:PEERS_RECORDED]
+    entry = {"from": label, "with": peers, "at": int(time.time())}
+    path = CONFIRMED if keep else DETACHED
+    store = load_store(path, "the confirmation store" if keep
+                       else "the detachment store")
+    store[branch] = entry
+    if keep:
+        # A branch cannot be both pinned and pried. Answering one way clears the other,
+        # so the two stores can never disagree about the same membership.
+        other = load_store(DETACHED, "the detachment store")
+        if other.pop(branch, None) is not None:
+            DETACHED.write_text(json.dumps(other, indent=1, sort_keys=True))
+    else:
+        other = load_store(CONFIRMED, "the confirmation store")
+        if other.pop(branch, None) is not None:
+            CONFIRMED.write_text(json.dumps(other, indent=1, sort_keys=True))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(store, indent=1, sort_keys=True))
+    log_answer({"at": entry["at"], "answer": "keep" if keep else "pry",
+                "branch": branch, "arc": label, "fp": q["fp"], "with": peers,
+                "confidence": q.get("confidence"), "why": q.get("why"),
+                "shared": q.get("shared"), "files": q.get("files") or [],
+                "via": q.get("via") or "cli"})
+
+
+def fzf_bin():
+    """The same fzf lib/fzf-helpers resolves, in the same order."""
+    local = Path.home() / ".zsh/fzf/bin/fzf"
+    if local.is_file() and os.access(local, os.X_OK):
+        return str(local)
+    return shutil.which("fzf")
+
+
+def question_line(q):
+    """One row: the branch, its size, and the claim being tested, in that order.
+
+    The branch first because it is what is being asked about and what the eye is
+    scanning for; the claim last because it is the longest and reads as a sentence.
+    """
+    size = f"+{q['commits']}" if q["commits"] else "no commits"
+    return (f"{q['branch'][:38]:<38}  {size:>10}  "
+            f"same work as {q['arc']}?  ({q['why']})")
+
+
+def question_preview(q):
+    """The evidence, as a person would want to check it: what is shared, and with what.
+
+    Both sides of the tie, because "these two branches share these files" is the entire
+    claim and showing one side of it asks the reader to take the other on faith.
+    """
+    out = [f"{q['branch']}", ""]
+    out.append(f"  the clustering put this in the arc {q['arc']!r},")
+    out.append(f"  alongside {q['peers']} other branch"
+               f"{'' if q['peers'] == 1 else 'es'}.")
+    out.append("")
+    out.append(f"  why it is being asked   {q['why']}")
+    out.append(f"  confidence              {q['confidence']:.2f}")
+    if q.get("with"):
+        out.append(f"  strongest tie           {q['with']}")
+    if q.get("files"):
+        out.append(f"  shared files            {', '.join(q['files'])}")
+    out.append("")
+    out.append("  y  yes, same work — pin it, and stop asking while it keeps this company")
+    out.append("  n  no, different work — pry it out; it falls back to its own name")
+    out.append("  s  skip — no record either way; it comes back next build")
+    return "\n".join(out)
+
+
+def curate(queue, cluster_assign):
+    """`--curate`: answer the least confident memberships, one keystroke each.
+
+    The whole loop exists because the clustering's residual error needs a human and an
+    unguided human does not curate. So the rules are about the asking, not the answering:
+    never more than CURATION_CAP questions, skip costs nothing and leaves no record, and
+    an empty queue prints one line and exits rather than opening anything. Nothing here
+    notifies, mails or nags -- a queue nobody opens today is simply a queue that is the
+    same size tomorrow.
+
+    One fzf per question rather than a persistent list with callbacks: the answer has to
+    be recorded by a process that holds the current assignment, and a callback shelling
+    back into work-arcs would rebuild the arcs -- minutes of git and GitLab -- to write
+    one line. Re-running fzf over the remaining rows costs nothing and keeps every write
+    in the process that already knows what it is writing.
+    """
+    if not queue:
+        print("✓ nothing worth asking about — every membership is either a fact or "
+              "well enough corroborated", file=sys.stderr)
+        return
+    fzf = fzf_bin()
+    if not fzf:
+        print("work-arcs: fzf is not installed; the questions this build would ask:",
+              file=sys.stderr)
+        for q in queue:
+            print(f"  {question_line(q)}", file=sys.stderr)
+        return
+
+    tmp = Path(tempfile.mkdtemp(prefix="work-arcs-curate."))
+    try:
+        # The fingerprint rides in a first tab-separated column that fzf is told not to
+        # display. A branch name can hold anything a ref can hold, so recovering the
+        # question by parsing the rendered line back would be a parser waiting to meet a
+        # branch called `a b`; carrying the key is not.
+        for q in queue:
+            (tmp / q["fp"]).write_text(question_preview(q))
+        pending = list(queue)
+        answered = 0
+        while pending:
+            lines = [f"{q['fp']}\t{question_line(q)}" for q in pending]
+            r = subprocess.run(
+                [fzf, "--ansi", "--reverse", "--height=100%", "--info=inline",
+                 "--pointer=▶", "--no-multi", "--no-sort", "--cycle",
+                 "--delimiter=\t", "--with-nth=2..", "--expect=y,n,s",
+                 "--header", f"y keep · n pry · s skip · esc done   "
+                             f"({len(pending)} left, {answered} answered)",
+                 "--prompt", "is this the same work? > ",
+                 "--preview", f"cat {shlex.quote(str(tmp))}/{{1}}",
+                 "--preview-window", "down,60%,wrap"],
+                input="\n".join(lines), capture_output=True, text=True)
+            parts = r.stdout.split("\n")
+            key = parts[0].strip() if parts else ""
+            fp = parts[1].split("\t", 1)[0] if len(parts) > 1 else ""
+            q = next((x for x in pending if x["fp"] == fp), None)
+            if not q or key not in ("y", "n"):
+                break                       # esc, s, or nothing selected: leave it be
+            answer_question(q, key == "y", cluster_assign)
+            answered += 1
+            pending = [x for x in pending if x["fp"] != q["fp"]]
+            print(f"  {'✓ kept' if key == 'y' else '✕ pried'}  {q['branch']}"
+                  f" {'in' if key == 'y' else 'out of'} {q['arc']!r}", file=sys.stderr)
+        if answered:
+            print(f"✓ {answered} answered — applied on the next build. "
+                  f"{CURATION_LABELS}", file=sys.stderr)
+        else:
+            print("nothing answered.", file=sys.stderr)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def curation_queue(arcs, membership, cluster_assign, uncertain=(), cap=CURATION_CAP):
+    """The memberships worth a human's attention, least confident first.
+
+    Kyle's verdict on the arcs was that they hold a lot of false positives, and the
+    repo's own history says threshold tuning is exhausted for the shape that is left:
+    two tickets editing the same module are structurally identical however the weights
+    are set, and the model split pass already covers the readable part. What remains is
+    curation -- and curation that is not guided is curation that does not happen. So the
+    system publishes where it is least sure and asks exactly there.
+
+    Four classes are never asked about, and each is a fact rather than an inference:
+
+      the authoritative branch  it IS the work; an arc cannot be wrong about its own
+                                subject, only about who else is standing next to it
+      superseded copies         a backup or pre-squash copy belongs wherever the branch
+                                it copies belongs, and asking about it is asking the
+                                same question twice
+      ancestry and aliases      a branch cut from another, or the same commit under a
+                                second name (arc-cluster settles these)
+      the arc's own ticket      a branch whose name carries the key the arc is named for
+
+    Of those, the first two need merge requests and squash detection to see, which is why
+    they are applied here and not in the clusterer.
+
+    Ranked by confidence ascending, then by how recently the branch was touched, then by
+    how much work is on it, then by name so the order is total and two runs over one
+    graph ask in the same sequence.
+
+    Recency is the tiebreak and not arc size, which is what it was first. The corpus has
+    eleven memberships at the identical lowest score -- all the same shape, a branch held
+    by the two-file floor whose name is filed under a different ticket from its arc's --
+    and nothing structural separates them, because there is nothing structural left to
+    separate: that is the shape the plan says no threshold fixes. What separates them is
+    whether the person can answer. A branch touched last week is one you remember; a
+    seventy-day-old stub is one you would have to go and read the diff for, and a
+    question you have to research is a question that gets skipped. Size sorted by how
+    much a wrong answer costs, which is the wrong end -- a question nobody answers costs
+    everything it might have fixed.
+
+    One question per arc per build, and that rule earns its keep on the first corpus it
+    saw: `UL-1810` and `UL-1810-prerebase` are each other's only evidence, and the queue
+    asked about both -- two keystrokes to settle one thing, and the second asked after
+    the first had already changed the answer. More generally the answers within an arc
+    are not independent: prying one branch out changes what is left for the rest to be
+    corroborated against, so the second question in an arc is being asked against
+    evidence the first has already invalidated. Five questions across five arcs cover
+    five times the ground and every one of them is answered against what is currently
+    true. An arc with four strangers in it is asked again next build, one at a time,
+    which is slower and right.
+
+    Capped, and absent entirely when nothing falls below the line.
+    """
+    unsure = set(uncertain or ())
+    out = []
+    for arc in arcs:
+        if arc.get("kind") != "cluster" or len(arc.get("branches") or []) < 2:
+            continue
+        auth = next((b["name"] for b in arc["branches"] if b.get("authoritative")), None)
+        members = [b["name"] for b in arc["branches"]]
+        for b in arc["branches"]:
+            name = b["name"]
+            if name == auth or b.get("superseded_by"):
+                continue
+            m = membership.get(name)
+            if not m:
+                continue
+            # The model kept this branch and said it could not justify keeping it. That
+            # is a verdict about content, which is the one thing file overlap cannot see,
+            # so it makes the membership *eligible* whatever the structure says. It does
+            # not make it first: the ranking stays the measured one, so a flagged branch
+            # with solid structural evidence is asked only if there is room after the
+            # ones the clusterer is genuinely unsure about. A model that turned talkative
+            # can therefore lengthen the tail but never take over the queue.
+            flagged = name in unsure
+            conf = m.get("confidence", 1.0)
+            if not flagged and conf >= CONFIDENCE_AT:
+                continue
+            # The evidence a question shows is the tie it is really asking about, so a
+            # question whose named neighbour has since left the arc is a question about
+            # a claim nobody is making. The split pass separating the two IS the answer.
+            with_b = m.get("with")
+            if with_b and with_b not in members:
+                continue
+            peers = sorted(n for n in members if n != name)
+            out.append({
+                "branch": name,
+                "arc": arc.get("label") or arc["id"],
+                "arc_id": arc["id"],
+                "fp": question_fp(name, peers[:PEERS_RECORDED]),
+                "confidence": round(conf, 3),
+                "why": ("the split pass kept it but could not say why" if flagged
+                        else m.get("why") or ""),
+                "with": with_b,
+                "shared": m.get("shared", 0),
+                "files": m.get("files") or [],
+                "links": m.get("links", 0),
+                "peers": len(peers),
+                "commits": b.get("commits_ahead", 0),
+                "age_days": b.get("age_days", 999),
+                "flagged_by_model": flagged,
+            })
+    out.sort(key=lambda q: (q["confidence"], q["age_days"], -q["commits"], q["branch"]))
+    seen, once = set(), []
+    for q in out:
+        if q["arc_id"] in seen:
+            continue
+        seen.add(q["arc_id"])
+        once.append(q)
+    return once[:cap]
+
+
+def co_members(cluster_assign, branch):
+    """Everything the clustering currently groups this branch with."""
+    label = cluster_assign.get(branch)
+    if label is None:
+        return None
+    return {n for n, lbl in cluster_assign.items() if lbl == label and n != branch}
+
+
+def still_applies(entry, cluster_assign, branch):
+    """Whether a recorded judgement about a branch's arc still refers to that arc.
+
+    The referent of every human answer in this pipeline -- a detachment, and now a
+    confirmation -- is the *company a branch is keeping*, never the arc's name. The split
+    pass rewords labels between runs ("selected state" became "selected-state" within an
+    evening) and an answer must not expire over a rewording; equally it must expire the
+    moment the grouping genuinely changes, because then it is an answer to a question
+    nobody asked.
+
+    Extracted so the two stores cannot drift apart. They are the same contract pointing
+    in opposite directions -- "not this work" and "yes, this work" -- and a confirmation
+    that outlived a detachment under the same circumstances would be a pin that quietly
+    outvotes the evidence it was checked against.
+    """
+    cur = cluster_assign.get(branch)
+    if cur is None:
+        return False, "the clustering no longer files it anywhere"
+    if cur == entry.get("from"):
+        return True, ""
+    recorded = set(entry.get("with") or [])
+    if not recorded:
+        return False, f"the clustering now groups it with different work ({cur!r})"
+    current = co_members(cluster_assign, branch) or set()
+    if len(recorded & current) / len(recorded) >= 0.5:
+        return True, ""
+    return False, f"the clustering now groups it with different work ({cur!r})"
 
 
 def apply_detached(cluster_assign):
@@ -4112,26 +4515,15 @@ def apply_detached(cluster_assign):
     store = load_store(DETACHED, "the detachment store")
     removed, stale = [], []
     for branch, entry in list(store.items()):
-        cur = cluster_assign.get(branch)
         # The claim is "not the same work as THESE", so it is tested against the
-        # co-members, not the label -- the split pass rewords labels between runs
-        # ("selected state" became "selected-state" within an evening), and a
-        # detachment must not expire over a rewording. It applies while most of the
-        # recorded co-members are still what the branch is grouped with, and expires
-        # when the grouping genuinely changes.
-        recorded = set(entry.get("with") or [])
-        current = {n for n, lbl in cluster_assign.items()
-                   if lbl == cur and n != branch} if cur else set()
-        same_label = cur is not None and cur == entry.get("from")
-        overlap = (len(recorded & current) / len(recorded)) if recorded else 0
-        if cur is not None and (same_label or overlap >= 0.5):
+        # co-members and not the label -- see still_applies, which both human stores
+        # share so neither can outlive the other's circumstances.
+        live, why = still_applies(entry, cluster_assign, branch)
+        if live:
             del cluster_assign[branch]
             removed.append(branch)
         else:
-            stale.append({"branch": branch,
-                          "why": (f"the clustering now groups it with different work "
-                                  f"({cur!r})" if cur else "the clustering no longer "
-                                  "files it anywhere")})
+            stale.append({"branch": branch, "why": why})
             del store[branch]
     if stale:
         try:
@@ -4162,10 +4554,9 @@ def set_detached(cluster_assign, branches, spec, undo=False):
             sys.exit(f"work-arcs: {branch!r} is not grouped by file overlap — its arc "
                      "comes from its own name (ticket or prefix), and the only way to "
                      "detach a branch from its own name is to rename it")
-        # The co-members are the real referent -- see apply_detached. Capped, sorted,
+        # The co-members are the real referent -- see still_applies. Capped, sorted,
         # so the entry stays small and stable.
-        peers = sorted(n for n, lbl in cluster_assign.items()
-                       if lbl == label and n != branch)[:12]
+        peers = sorted(co_members(cluster_assign, branch) or ())[:PEERS_RECORDED]
         store[branch] = {"from": label, "with": peers, "at": int(time.time())}
         print(f"✓ {branch} detached from {label!r}", file=sys.stderr)
         print("  it falls back to what its name declares; expires itself if the "
@@ -4177,12 +4568,20 @@ def set_detached(cluster_assign, branches, spec, undo=False):
 def split_assignment(arcs, args):
     """arc-brief's verdict on which arcs hold more than one body of work.
 
+    Returns (assignment, uncertain) -- the refined branch -> arc-label map, and the
+    branches the model kept in a body while saying it could not justify keeping them.
+    The second is what the model knows that no structural signal does: it read the
+    commits, decided not to cut, and is not sure. Those go to the front of the curation
+    queue whatever their structural confidence says, because "the evidence I have does
+    not settle this" is a stronger reason to ask a human than any number derived from
+    file overlap.
+
     Degrades the same way every other step does: no arc-brief, no model, or a reply that
     fails to account for every branch leaves the clustering exactly as it was.
     """
     tool = Path(__file__).resolve().parent / "arc-brief"
     if not tool.exists():
-        return {}
+        return {}, []
     payload = json.dumps({"repo": str(args.repo), "main": args.main, "arcs": arcs})
     cmd = [str(tool), "--split", "--jobs", str(args.split_jobs)]
     if args.split_model:
@@ -4191,16 +4590,25 @@ def split_assignment(arcs, args):
         r = subprocess.run(cmd, input=payload, capture_output=True, text=True,
                            timeout=args.split_timeout)
     except (OSError, subprocess.SubprocessError):
-        return {}
+        return {}, []
     if r.stderr:
         print(r.stderr.rstrip(), file=sys.stderr)
     if r.returncode != 0:
-        return {}
+        return {}, []
     try:
         out = json.loads(r.stdout)
     except json.JSONDecodeError:
-        return {}
-    return out if isinstance(out, dict) else {}
+        return {}, []
+    if not isinstance(out, dict):
+        return {}, []
+    # Two shapes, told apart by a key no branch can be named: the flat branch -> label
+    # map this returned before the uncertainty list existed, and the envelope that
+    # carries both. Tolerated rather than versioned because the only cost of reading an
+    # old reply is a run with no model-flagged questions in it.
+    if isinstance(out.get("assign"), dict):
+        unsure = out.get("uncertain")
+        return out["assign"], (unsure if isinstance(unsure, list) else [])
+    return out, []
 
 
 def ticket_of(name, known_projects):
@@ -6102,6 +6510,10 @@ def main():
                         "clustering ever reassigns the branch")
     p.add_argument("--undetach", metavar="BRANCH",
                    help="let a detached branch rejoin whatever the clustering says")
+    p.add_argument("--curate", action="store_true",
+                   help="answer the memberships this build is least sure about, one "
+                        "keystroke each: keep pins it, pry detaches it, skip asks again "
+                        "next time. Silent when there is nothing worth asking")
     p.add_argument("--dismiss", metavar="REF[=NOTE]",
                    help="acknowledge a ledger row (by its !MR / ticket ref or "
                         "fingerprint prefix). Expires itself the moment the fact "
@@ -6157,9 +6569,10 @@ def main():
         sys.exit(f"work-arcs: not a git repo: {args.repo}")
     git(args.repo, "rev-parse", "--verify", args.main, check=True)
 
-    cluster_assign = {}
+    cluster_assign, membership = {}, {}
     if not args.no_cluster:
-        cluster_assign, _ = load_clusters(args.repo, args.main, args.resolution)
+        cluster_assign, _, membership = load_clusters(
+            args.repo, args.main, args.resolution)
 
     branches = collect_branches(args.repo, args.main)
     stashes = collect_stashes(args.repo)
@@ -6180,7 +6593,7 @@ def main():
     # --park does not need to know who owes whom.
     writing = (args.park or args.unpark or args.authoritative or args.jira_ify
                or args.detach or args.undetach or args.authoritative_ticket
-               or args.derive_ticket)
+               or args.derive_ticket or args.curate)
     ledger_f = None
     if mrs_known and not args.shallow_mr and not writing:
         ledger_f = futures.ThreadPoolExecutor(max_workers=1).submit(
@@ -6249,15 +6662,32 @@ def main():
     # arcs, so every count stays computed in one place. Human detachments come last,
     # after the split, because they correct the assignment the page actually showed --
     # which is the post-split one.
-    refined = {} if args.no_split else split_assignment(arcs, args)
+    refined, unsure = ({}, []) if args.no_split else split_assignment(arcs, args)
     if refined:
         cluster_assign = {**cluster_assign, **refined}
     detached, stale_detached = apply_detached(cluster_assign)
     for s in stale_detached:
         print(f"⚠ {s['branch']} is no longer detached: {s['why']}", file=sys.stderr)
+    # After the split and after the detachments, because a pin is a judgement about the
+    # grouping the page showed -- which is the one those two have finished with.
+    pinned, stale_confirmed = apply_confirmed(cluster_assign)
+    for s in stale_confirmed:
+        print(f"⚠ {s['branch']} is no longer confirmed in its arc: {s['why']}",
+              file=sys.stderr)
     if refined or detached:
         arcs, unattached = build_arcs(branches, stashes, mrs, sessions, args.main,
                                       cluster_assign, args.repo, mrs_known, own_tokens)
+
+    # Built here, once, from the arcs the page and the CLI both show. Pins and
+    # detachments have already had their say, so a question can only ever be about a
+    # membership that survived them -- which is what makes "skip is free" true: a
+    # skipped question is simply one nobody pinned, and it comes back next build.
+    curation = curation_queue(arcs, {k: v for k, v in membership.items()
+                                     if k not in pinned},
+                              cluster_assign, unsure)
+
+    if args.curate:
+        return curate(curation, cluster_assign)
 
     if args.detach or args.undetach:
         set_detached(cluster_assign, branches, args.detach or args.undetach,
@@ -6576,6 +7006,14 @@ def main():
             "filings": filings_live,
             "stale_parks": stale_parks,
             "stale_detached": stale_detached,
+            "stale_confirmed": stale_confirmed,
+            # The questions this build would like answered, least confident first, or
+            # absent when it has none. Top-level rather than on the arcs, because the
+            # queue is ranked across every arc at once -- the five worth asking are the
+            # five worst anywhere, and a per-arc list could not express that. Absent and
+            # not empty when there is nothing to ask, so a renderer can test for the key
+            # rather than for a length and a silent build stays silent.
+            **({"curation": curation} if curation else {}),
             "gap": gap,
         }, sys.stdout, indent=1)
         print()
