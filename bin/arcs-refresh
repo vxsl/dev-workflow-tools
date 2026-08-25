@@ -78,6 +78,22 @@
 # broken" in the log. The new token is held in a variable and never written down --
 # see refresh_access_token for why writing it would be worse than the bug it fixes.
 #
+# Two things learned trying to watch that work, both of them about how hard these endpoints
+# are to probe rather than about the flow itself, and both worth writing down because the
+# next person to test this will otherwise spend the same half hour:
+#
+#   /usage answers 429 rather than a second 401 when it is handed the same invalid bearer
+#   token more than once. So "corrupt a copy of the credentials and watch it refresh" works
+#   exactly once per window; a retry loop re-arms the throttle and can never succeed. That
+#   is what --check-refresh is for: it asks about the token endpoint alone.
+#
+#   The token endpoint itself answered 429 to every attempt over half an hour, on an
+#   account whose 5-hour window was at 84% and whose live session had been refreshing all
+#   evening. So minting a token was never observed to succeed here, only to be throttled --
+#   which is a different thing from being refused, and the log now says which. If 07:10
+#   turns out to be throttled too, the line to look for is "refreshing it was refused",
+#   and the fallback is the one this file already has: say so plainly and stand down.
+#
 # THE CLOCK. `10 7 * * *` in a crontab does not fire on a laptop that is asleep at 07:10,
 # and cron has no notion of a run it owes you, so three days of closed lid produced no
 # line in the log at all. Not a failure -- an absence, which is the harder thing to
