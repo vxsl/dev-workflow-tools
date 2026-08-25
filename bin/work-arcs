@@ -4298,7 +4298,17 @@ def answer_question(q, keep, cluster_assign):
 
 
 def fzf_bin():
-    """The same fzf lib/fzf-helpers resolves, in the same order."""
+    """The same fzf lib/fzf-helpers resolves, in the same order.
+
+    $FZP_FZF first, because that is the override the shell library already documents and
+    two resolvers that disagree about which fzf is in use are worse than either. It is
+    also the only way to drive this flow from a test: without it the resolution is
+    whatever is installed, and a keystroke interface that cannot be scripted is a
+    keystroke interface nobody can regression-test.
+    """
+    override = os.environ.get("FZP_FZF")
+    if override:
+        return override
     local = Path.home() / ".zsh/fzf/bin/fzf"
     if local.is_file() and os.access(local, os.X_OK):
         return str(local)

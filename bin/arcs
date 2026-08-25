@@ -131,6 +131,15 @@ arcs-page --focus "$FOCUS" --out "$OUT" ${cost_arg+"${cost_arg[@]}"} \
 finished=1
 echo
 echo "  page:  $OUT"
+# One line, only when there is something to say, and only at the end of a run somebody
+# asked for. The questions are already on the page; this exists because the command line
+# is where they get answered and a queue nobody knows about is a queue nobody opens. It
+# is deliberately not a notification: the DE team's taskmaster bot is the shape to avoid,
+# and a prompt that arrives uninvited is one the eye learns to skip.
+q=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(len(d.get("curation") or []))' "$graph" 2>/dev/null || echo 0)
+if [ "${q:-0}" != "0" ]; then
+    echo "  ask:   $q membership$([ "$q" = 1 ] || echo s) the grouping is unsure of — work-arcs --curate"
+fi
 if [ -n "$URL" ]; then
     echo "  live:  $URL"
     echo

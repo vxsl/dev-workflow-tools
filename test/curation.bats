@@ -80,6 +80,21 @@ $1
 PY
 }
 
+# A stand-in for fzf that answers with $FAKE_KEY on the first row and exits, so the
+# keystroke flow can be driven from a test. Built with printf rather than a heredoc:
+# every helper in this repo that writes a shell script from a bats file is one edit away
+# from a backtick or a $( ) that the outer heredoc eats, and the failure lands on every
+# test in the file at once rather than on the one that introduced it.
+fake_fzf() {
+    {
+        echo '#!/usr/bin/env bash'
+        echo 'first=$(head -1)'
+        printf '%s\n' 'printf "%s\n%s\n" "$FAKE_KEY" "$first"'
+    } > "$TEST_TMPDIR/fzf"
+    chmod +x "$TEST_TMPDIR/fzf"
+    export FZP_FZF="$TEST_TMPDIR/fzf"
+}
+
 # Runs a python snippet with arc-cluster imported as ac.
 ac() {
     python3 - "$REPO_ROOT/bin/arc-cluster" <<PY
@@ -458,6 +473,93 @@ print(same, moved)
 '
     [ "$status" -eq 0 ]
     [[ "$output" == "True False" ]]
+}
+
+# ── answering, one keystroke at a time ────────────────────────────────────────
+
+@test "n records a detachment, y a confirmation, and both reach the eval set" {
+    # The keystroke flow end to end, driven through the same $FZP_FZF override
+    # lib/fzf-helpers documents -- an interface nobody can script is an interface nobody
+    # can regression-test.
+    fake_fzf
+
+    FAKE_KEY=n run wa '
+q = [{"branch": "stray", "arc": "A", "arc_id": "A", "fp": "f1", "confidence": 0.1,
+      "why": "held by 2 shared files", "with": "p1", "shared": 2, "files": ["x.ts"],
+      "links": 1, "peers": 2, "commits": 3, "age_days": 4, "flagged_by_model": False,
+      "authoritative": False}]
+wa.curate(q, {"stray": "A", "p1": "A", "p2": "A"})
+print(sorted(json.loads(wa.DETACHED.read_text())))
+print([json.loads(x)["answer"] for x in wa.CURATION_LABELS.read_text().splitlines()])
+'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"['stray']"* ]]
+    [[ "$output" == *"['pry']"* ]]
+
+    FAKE_KEY=y run wa '
+q = [{"branch": "stray", "arc": "A", "arc_id": "A", "fp": "f1", "confidence": 0.1,
+      "why": "held by 2 shared files", "with": "p1", "shared": 2, "files": ["x.ts"],
+      "links": 1, "peers": 2, "commits": 3, "age_days": 4, "flagged_by_model": False,
+      "authoritative": False}]
+wa.curate(q, {"stray": "A", "p1": "A", "p2": "A"})
+print(sorted(json.loads(wa.CONFIRMED.read_text())),
+      sorted(json.loads(wa.DETACHED.read_text())))
+print([json.loads(x)["answer"] for x in wa.CURATION_LABELS.read_text().splitlines()])
+'
+    [ "$status" -eq 0 ]
+    # The pin lands, the detachment the first half of this test wrote is cleared, and the
+    # log keeps both answers -- the two verdicts on one question are the record.
+    [[ "$output" == *"['stray'] []"* ]]
+    [[ "$output" == *"['pry', 'keep']"* ]]
+}
+
+@test "skip and escape leave no record at all" {
+    # Painlessness is the feature. A skipped question must cost nothing -- no store
+    # entry, no label, no nag -- or the queue becomes something to get through rather
+    # than something to answer.
+    fake_fzf
+
+    FAKE_KEY=s run wa '
+q = [{"branch": "stray", "arc": "A", "arc_id": "A", "fp": "f1", "confidence": 0.1,
+      "why": "w", "with": "p1", "shared": 2, "files": [], "links": 1, "peers": 2,
+      "commits": 1, "age_days": 4, "flagged_by_model": False, "authoritative": False}]
+wa.curate(q, {"stray": "A", "p1": "A"})
+print(wa.DETACHED.exists(), wa.CONFIRMED.exists(), wa.CURATION_LABELS.exists())
+'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"False False False"* ]]
+}
+
+@test "no fzf prints the questions rather than failing the build" {
+    run wa '
+wa.fzf_bin = lambda: None
+q = [{"branch": "stray", "arc": "A", "arc_id": "A", "fp": "f1", "confidence": 0.1,
+      "why": "held by 2 shared files", "with": "p1", "shared": 2, "files": [],
+      "links": 1, "peers": 2, "commits": 3, "age_days": 4, "flagged_by_model": False,
+      "authoritative": False}]
+wa.curate(q, {})
+'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"fzf is not installed"* ]]
+    [[ "$output" == *"stray"* ]]
+}
+
+@test "an answer given on the page is caught up into the eval set" {
+    # The page saves confirmed.json and detached.json through the browser download, which
+    # cannot append to a log; --detach predates the eval set entirely. An eval set that
+    # only saw one command would under-count exactly the surface a person used.
+    run wa '
+wa.CONFIRMED.write_text(json.dumps(
+    {"kept": {"from": "A", "with": ["p1", "p2"], "at": 111}}))
+wa.DETACHED.write_text(json.dumps(
+    {"pried": {"from": "A", "with": ["p1", "p2"], "at": 222}}))
+print(wa.log_from_stores(), wa.log_from_stores())
+rows = [json.loads(x) for x in wa.CURATION_LABELS.read_text().splitlines()]
+print(sorted((r["branch"], r["answer"], r["via"]) for r in rows))
+'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"2 0"* ]]
+    [[ "$output" == *"[('kept', 'keep', 'store'), ('pried', 'pry', 'store')]"* ]]
 }
 
 # ── scoring a clustering against the answers ─────────────────────────────────
