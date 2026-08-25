@@ -64,10 +64,12 @@ truncation. derive_lede is still the degradation for a pipeline that never ran a
 
 Under the headline is a fixed strip of doors -- the standup, the ledger, what is in play --
 each with its section's own count, its section's own next item, and one click into the zone
-it names. Under that is a mini-map of every section on the page, sticky, that pins itself to
-the top the moment you scroll past the briefing. Both exist for the same reason: three
-screenfuls of standing picture is three screenfuls to scroll past to reach the section you
-opened the page for, and that scroll is most of what made this page feel like a chore.
+it names. Down the left is the rail: the same nav as a mini-map of every section on the
+page, standing still while the work scrolls past, with the build stamp at its foot. Both
+exist for the same reason: three screenfuls of standing picture is three screenfuls to
+scroll past to reach the section you opened the page for, and that scroll is most of what
+made this page feel like a chore. Under 60rem there is no room for a column, so the same
+markup becomes a sticky strip along the top -- one media query, same anchors, same counts.
 
 The strip does not move. The same doors in the same order, every time, and the data is the
 only thing that differs between two opens -- which is a correction rather than a default.
@@ -86,7 +88,38 @@ fold()'s law about a collapsed header applied to a link that points at one -- a 
 claiming eight above a list showing two is the small kind of lie that costs a page its
 credit for every other number on it. And a door or a stop is absent whenever its section
 is, because an anchor to a section that was never emitted is the same lie as a link to a
-404. The mini-map itself needs no script at all: position:sticky and nothing else.
+404. The rail needs no script at all: position:sticky and nothing else.
+
+What it looks like, and why
+---------------------------
+The skin was the last thing anybody had an opinion about, and the opinion was "the styling
+is kind of bad. something about it just doesn\u2019t grab me when i look at it". Three things
+were doing it, and all three were one mistake made in different places.
+
+Mono was the voice of the whole page -- every kicker, every tag, every table head, every
+button -- and a caps-mono label over a serif sentence is the register of a report you have
+been handed rather than a thing you are glad exists. Mono is data now and only data: a sha,
+a branch, an iid, a ticket key, a clock, a count. Labels are Inter 600, letterspaced,
+sentence case. The display voice is Fraunces, whose optical-size axis is the whole reason
+one family can carry a 3rem headline and a 1.15rem heading without either looking borrowed
+from the other.
+
+There was a hairline rectangle round every list, every tile, every side of the ledger and
+every collapsed header, and drawn all at once they were fifteen framed panels of equal
+weight, none of which had said anything yet. A frame is not structure. Surfaces one step
+off the ground do the grouping instead, at 6px and without a shadow; rules survive in
+exactly two places, both load-bearing -- between the rows of a dense list, where forty rows
+with nothing between them is a paragraph rather than a table, and down the left of a quote,
+where the bar is what says the words are somebody else\u2019s.
+
+And the palette was blue-black on blue-white, which is the temperature of a terminal.
+Paper is warm and ink is warm. The severity vocabulary did not move -- hot is what has
+failed, warm what wants an answer, calm what somebody else is holding -- it simply has the
+chroma now to register before it is read.
+
+fonts.googleapis.com is the one external host this page is allowed, and every face has a
+real stack behind it with display=swap in front: a page that reads as a fallback grid the
+morning the CDN is slow has been designed once and shipped twice.
 """
 
 import argparse

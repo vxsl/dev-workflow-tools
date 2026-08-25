@@ -762,13 +762,23 @@ PY
     [[ "$output" == *"migrate the Dove workspaces"* ]]
     [[ "$output" == *"in the next couple days"* ]]
     [[ "$output" == *"said out loud on 2026-08-12"* ]]
-    # The meeting's name is the link label; saying it twice read badly enough to be a bug.
-    [[ "$(grep -o "FE standup" <<<"$output" | wc -l)" -eq 1 ]]
     [[ "$output" == *"inferred from the transcript, quoted"* ]]
     # How it dies, and named as the transcript window rather than Slack's.
     [[ "$output" == *"14-day transcript window in 12d"* ]]
     # And the quote is Kyle's, never Ella's -- she is who he promised.
     [[ "$output" != *"Ella:"* ]]
+    # The meeting's name is the link label; the row saying it twice read badly enough to be
+    # a bug. Counted inside the row rather than across the page: the cockpit door above the
+    # ledger names that section's own oldest loop, which on this document is this row, and
+    # a door naming what it points at is the whole of what a door is for. Last in the test,
+    # because `run` rebinds $output and every assertion above it reads the page.
+    run python3 - "$TEST_TMPDIR/page.html" <<'ZZONCE'
+import re, sys
+html = open(sys.argv[1]).read()
+row = re.search(r'<li data-fp="fp-m".*?</li>', html, re.S).group(0)
+print(row.count("FE standup"))
+ZZONCE
+    [ "${lines[0]}" = "1" ]
 }
 
 @test "a spoken promise closed on evidence is shown as closed, with the evidence" {
