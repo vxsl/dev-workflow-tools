@@ -472,7 +472,10 @@ fetch_usage() {
     fi
 
     # Re-read rather than reuse: the session refreshed the credential by rewriting the
-    # file, which is the one writer entitled to.
+    # file, which it is the one writer entitled to do. Note that it writes the real
+    # ~/.claude/.credentials.json wherever WORK_ARCS_CREDS points, so this route only
+    # recovers the default path -- which is the only one production uses, the override
+    # existing so a test can hand the guard a fixture.
     tok="$(jq -r '.claudeAiOauth.accessToken // empty' "$CREDS" 2>/dev/null || true)"
     if [ -n "$tok" ] && usage_call_patiently "$tok"; then
         USAGE_REFRESHED=session
