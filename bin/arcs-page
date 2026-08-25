@@ -312,16 +312,9 @@ a:hover{text-decoration-color:currentColor}
 
 /* Work whose only state is "up for review" -- his end of the deal done, the clock now
    someone else's. Present, countable, linked, and out of the way. This is the tier that
-   used to render hot. */
-details.parked{margin-top:.4rem}
-details.parked>summary{cursor:pointer;font-size:.85rem;color:var(--ink-soft);
-  padding:.5rem .7rem;border:1px solid var(--hairline);border-radius:4px;
-  background:var(--surface);list-style:none}
-details.parked>summary::-webkit-details-marker{display:none}
-details.parked>summary::before{content:"▸ ";color:var(--parked)}
-details.parked[open]>summary::before{content:"▾ "}
-details.parked>summary:hover{border-color:var(--parked)}
-details.parked>summary b{color:var(--ink);font-weight:600}
+   used to render hot. The disclosure that wraps this list is defined further down, beside
+   the at-risk one it shares a shape with; only the marker colour separates them, and that
+   lives in one variable. */
 .parked-list{margin:.5rem 0 0;padding:0;list-style:none;display:flex;
   flex-direction:column;border:1px solid var(--hairline);border-radius:4px;
   background:var(--surface);overflow:hidden}
@@ -334,6 +327,12 @@ details.parked>summary b{color:var(--ink);font-weight:600}
   color:var(--ink-faint);white-space:nowrap;font-variant-numeric:tabular-nums}
 .parked-list .sub{grid-column:1/-1;font-family:var(--mono);font-size:.7rem;
   color:var(--ink-faint)}
+/* A landing with no merge request to name -- squash-detected, cherry-equivalent, or an
+   ancestor of a merged tip -- names its branch instead. Branch names run long where an
+   iid runs to five characters, so this one cell is allowed to wrap rather than push the
+   workstream's own name out of the row. */
+.parked-list .viaref{white-space:normal;overflow-wrap:anywhere;display:inline-block;
+  max-width:15rem;text-align:right}
 /* Work that fell off a cliff. Same compact row as the lists above, one column wider for
    the sparkline and the ✕ — and the why-sentence is set as prose rather than as the faint
    mono `.sub`, because on these rows it is not metadata about the row, it IS the row. */
@@ -573,6 +572,56 @@ td .dis{vertical-align:middle}
   color:var(--ink);letter-spacing:-.02em}
 .conditions .l{font-size:.78rem;color:var(--ink-soft);line-height:1.35;text-wrap:pretty}
 .conditions .sub{font-family:var(--mono);font-size:.68rem;color:var(--ink-faint)}
+
+/* The one tile you can open. Every other condition on the strip points at a section that
+   already lists its members; "exists only on this laptop" pointed at nothing, because the
+   work it counts is by definition work no remote and no merge request has a page for. So
+   the count gets a disclosure underneath it and the tile links here.
+
+   Underneath the strip rather than inside the tile, and that is the whole reason the
+   markup is shaped this way: the tiles are peers by construction -- no hero figure, no
+   severity hue -- and a tile that grew a body would be the hero the rule above forbids.
+   An appendix to the strip promotes nothing.
+
+   It borrows `details.parked`'s shape because it is the same gesture, and takes the accent
+   for its marker where that one takes the parked grey: this is the list of what you could
+   still lose, and the other is the list of what somebody else is holding. */
+details.parked,details.atrisk{margin-top:.4rem}
+details.parked{--disc:var(--parked)}
+details.atrisk{--disc:var(--accent);margin:-2rem 0 2.5rem}
+details.parked>summary,details.atrisk>summary{cursor:pointer;font-size:.85rem;
+  color:var(--ink-soft);padding:.5rem .7rem;border:1px solid var(--hairline);
+  border-radius:4px;background:var(--surface);list-style:none}
+details.parked>summary::-webkit-details-marker,
+details.atrisk>summary::-webkit-details-marker{display:none}
+details.parked>summary::before,details.atrisk>summary::before{content:"\25b8 ";
+  color:var(--disc)}
+details.parked[open]>summary::before,details.atrisk[open]>summary::before{content:"\25be "}
+details.parked>summary:hover,details.atrisk>summary:hover{border-color:var(--disc)}
+details.parked>summary b,details.atrisk>summary b{color:var(--ink);font-weight:600}
+
+/* One row per workstream that holds work no remote has. Four facts and no more: what it
+   is, what it would cost, what it is about, and which branch to push. A fifth would make
+   this a second set of cards, and the cards are directly below. */
+.riskrows{margin:.5rem 0 0;padding:0;list-style:none;border:1px solid var(--hairline);
+  border-radius:4px;background:var(--surface);overflow:hidden}
+.riskrows li{display:grid;grid-template-columns:minmax(0,1fr) auto;
+  gap:.15rem .9rem;align-items:baseline;padding:.5rem .7rem;
+  border-bottom:1px solid var(--hairline)}
+.riskrows li:last-child{border-bottom:none}
+.riskrows .nm{grid-column:1;color:var(--ink);font-size:.87rem;font-weight:600;
+  text-decoration:none;min-width:0}
+.riskrows .nm:hover{text-decoration:underline}
+/* The cost, and the only figure on the row. Tabular here because it IS a column. */
+.riskrows .dy{grid-column:2;font-family:var(--mono);font-size:.72rem;color:var(--ink);
+  white-space:nowrap;font-variant-numeric:tabular-nums}
+.riskrows .wy{grid-column:1;font-size:.79rem;color:var(--ink-soft);text-wrap:pretty}
+.riskrows .br{grid-column:2;font-family:var(--mono);font-size:.68rem;
+  color:var(--ink-faint);overflow-wrap:anywhere;max-width:15rem;text-align:right}
+/* Said out loud rather than left as a silent cut: a list that stops at eight and does not
+   say so reads as a complete list of eight. */
+.riskrows .more{display:block;padding:.45rem .7rem;font-size:.75rem;
+  color:var(--ink-faint)}
 
 /* The sprint strip: a lens, and sized like one. Time is still the spine of this page --
    that decision is recorded three comments down, and it holds -- so what the sprint gets
@@ -1686,6 +1735,37 @@ def anchor(arc_id):
     return f"ws-{slug}-{h}" if slug else f"ws-{h}"
 
 
+# How many workstreams the at-risk disclosure lists before it says how many it left out.
+# Eight is what a person will actually read in one glance before the list becomes a second
+# copy of the page; past that the rows below carry the same facts in full. The remainder is
+# always stated -- see the `.more` row -- because a list that stops silently reads as a
+# complete list.
+AT_RISK_ROWS = 8
+
+# The longest first sentence worth putting on a one-line row. Past this the sentence is
+# doing something other than introducing the work, and the row falls back to the blocker or
+# the rung instead of chopping it -- a phrase cut mid-thought says less than nothing.
+CLAUSE_MAX = 140
+
+
+def first_clause(text):
+    """The opening sentence of a brief's summary, for a row with one line to spend.
+
+    A summary is two or three sentences written for a card. A ranked row has room for the
+    first of them. Cut at a sentence boundary and nowhere else: what survives is a whole
+    statement, and a sentence chopped at a character count is the kind of post-processing
+    this page does not do to derived text. Where the first sentence is too long to be one
+    line, this returns nothing at all rather than a fragment, and the caller falls back to
+    a fact it already has.
+    """
+    t = " ".join((text or "").split())
+    if not t:
+        return ""
+    m = re.search(r"(?<=[.!?])\s", t)
+    head = t[:m.start()] if m else t
+    return head if len(head) <= CLAUSE_MAX else ""
+
+
 def link(url, text, cls=""):
     """A hyperlink where there is somewhere to go, and plain text where there is not.
 
@@ -2342,9 +2422,18 @@ def render(data, lede, focus_days, limit, cost=None):
             ref = " ".join(link(m.get("url", ""), "!" + str(m.get("iid")))
                            for m in mrs[:3])
             if not ref and arc.get("settled"):
-                f = next((b.get("mr_fate") for b in arc.get("branches", [])
-                          if b.get("mr_fate")), None) or {}
-                ref = link(f.get("url", ""), "!" + str(f.get("iid", "?")))
+                # The branch as well as its fate, because the fate alone may not have a
+                # merge request to name. Three of the four ways work-arcs concludes a
+                # branch landed -- the squash index, per-commit equivalence, and ancestry
+                # under a merged tip -- see no MR at all and record `iid: None`, so
+                # `.get("iid", "?")` never reached its default and the row rendered the
+                # literal `!None`. The branch name is what that fate is a fact about, and
+                # unlike a question mark it is something a reader can go and look at.
+                b = next((x for x in arc.get("branches", [])
+                          if x.get("mr_fate")), None) or {}
+                f = b.get("mr_fate") or {}
+                ref = (link(f.get("url", ""), "!" + str(f["iid"])) if f.get("iid")
+                       else f'<span class="viaref">{esc(b.get("name", ""))}</span>')
             tkt = arc.get("ticket")
             i = next((x for x in arc.get("issues", []) if x.get("key") == tkt), {})
             a(f'<li id="{anchor(arc.get("id"))}"><span class="nm">'
@@ -2879,27 +2968,79 @@ def render(data, lede, focus_days, limit, cost=None):
     # workstreams is one Tuesday. The tile's own figure is a count of workstreams, which
     # is what this row counts everywhere; the subtitle is the only place a size belongs.
     loc_days = len({d for x in loc for d in x.get("unpushed_dates") or []})
+    loc_scale, loc_verb = work_scale(loc_days,
+                                     sum(x.get("unpushed_live", 0) for x in loc))
+    # Each tile links to where its members are listed. Six of the seven point at the rungs
+    # below, because that is where their work has a row. The seventh cannot: work that
+    # exists only on this laptop has no merge request and no remote to point at, which was
+    # exactly why it had nowhere to send a reader. It points at its own disclosure instead.
     tiles = [
-        (len(loc), "exist only on this laptop",
-         work_scale(loc_days, sum(x.get("unpushed_live", 0) for x in loc))[0]
-         + ", no remote has them"),
+        (len(loc), "exist only on this laptop", loc_scale + ", no remote has them",
+         "#only-here"),
         (len(back), "have come back to you",
-         "a rebase, a question, a red pipeline, an unmerged approval"),
-        (len(prop), "are pushed but never proposed", "no merge request exists"),
+         "a rebase, a question, a red pipeline, an unmerged approval", "#play"),
+        (len(prop), "are pushed but never proposed", "no merge request exists", "#play"),
         (len(noask), "have a merge request nobody was asked to read",
-         "open, no reviewer, no comment — it is not moving"),
+         "open, no reviewer, no comment — it is not moving", "#play"),
         (len(rev), "are out for review",
-         "nothing outstanding, somebody has it — a reviewer&rsquo;s clock"),
-        (len(parked), "are parked", "set aside on purpose, not forgotten"),
-        (len(done), "have landed or been abandoned", "retired from the list below"),
+         "nothing outstanding, somebody has it — a reviewer&rsquo;s clock", "#play"),
+        (len(parked), "are parked", "set aside on purpose, not forgotten", "#play"),
+        (len(done), "have landed or been abandoned", "retired from the list below",
+         "#play"),
     ]
     a('<ul class="conditions">')
-    for n, label, sub in tiles:
+    for n, label, sub, href in tiles:
         if not n:
             continue
-        a(f'<li><a href="#play"><span class="v">{n}</span>'
+        a(f'<li><a href="{href}"><span class="v">{n}</span>'
           f'<span class="l">{label}</span><span class="sub">{sub}</span></a></li>')
     a("</ul>")
+
+    # --- which work is only here -------------------------------------------
+    # The one question the strip above could not answer. "24 exist only on this laptop --
+    # 558 commits, no remote has them" states a risk and then stops, and a number you
+    # cannot cash in is a number you stop reading. This is where it gets cashed in.
+    #
+    # One list, ranked and capped, rather than an alarm on every card. That arrangement is
+    # the point: the commit count under each workstream was rejected outright -- "the goal
+    # is to keep track of the broad strokes of my work, not every singular commit
+    # everywhere" -- while the concern underneath it was not: "i do often have a dangling
+    # commit that _is_ meaningful and i dont want to lose track of". A ranked eight answers
+    # the second without reinstating the first.
+    #
+    # Informational, and deliberately with no ✕ of its own. Every row here is a workstream
+    # whose card carries the demands, and those already have acknowledgement; a second
+    # place to dismiss the same fact is a second state to keep in sync.
+    #
+    # The order arrives on the wire from work-arcs -- days of work times staleness, see
+    # `only_here` -- and is applied to the arcs this page kept rather than re-derived over
+    # them. Anything the ranking does not name sorts to the end by id rather than being
+    # dropped, so the disclosure can never hold fewer workstreams than the tile counted.
+    if loc:
+        order = {aid: i for i, aid in enumerate(data.get("only_here") or [])}
+        ranked = sorted(loc, key=lambda x: (order.get(x.get("id"), len(order)),
+                                            str(x.get("id") or "")))
+        a(f'<details class="atrisk" id="only-here"><summary><b>{esc(loc_scale)}</b> '
+          f"{loc_verb} nowhere but this laptop — which workstreams, and what each "
+          "would cost</summary>")
+        a('<ul class="riskrows">')
+        for x in ranked[:AT_RISK_ROWS]:
+            brief = x.get("brief") or {}
+            nm = brief.get("name") or x.get("label", "?")
+            scale = work_scale(x.get("unpushed_days", 0), x.get("unpushed_live", 0))[0]
+            why = (first_clause(brief.get("summary")) or brief.get("blocker")
+                   or x.get("state") or "")
+            branch = x.get("authoritative") or ""
+            a(f'<li><a class="nm" href="#{anchor(x.get("id"))}">{esc(nm)}</a>'
+              f'<span class="dy">{esc(scale)}</span>'
+              + (f'<span class="wy">{esc(why)}</span>' if why else "")
+              + (f'<span class="br">{esc(branch)}</span>' if branch else "")
+              + "</li>")
+        if len(ranked) > AT_RISK_ROWS:
+            rest = len(ranked) - AT_RISK_ROWS
+            a(f'<li class="more">&hellip;and {rest} more, each smaller or more recently '
+              "touched than these. Every one of them has a row below.</li>")
+        a("</ul></details>")
 
     # --- in play, by when you last touched it ------------------------------
     a("<section>")
@@ -3071,6 +3212,15 @@ def render(data, lede, focus_days, limit, cost=None):
                   # Quoted: since arc-brief started deriving labels they are phrases, so
                   # the command as printed was `--jira-ify SMP Neighborhoods ODX journeys`
                   # and the shell would hand --jira-ify only the first word.
+                  #
+                  # The label and not the display name above it, because the label is the
+                  # lookup key. Where the split pass has named a workstream after a file
+                  # -- `classify_bug_corpus.py` -- the command reads as slop and there is
+                  # nothing here to swap it for: `--jira-ify` accepts the arc id as well,
+                  # and the id IS this string. `split_assignment` returns branch -> label
+                  # and work-arcs builds the arc with `id` and `label` both set to it, so
+                  # an id-based command would print the same characters. The only place
+                  # that name can be improved is the prompt that derives it.
                   f"<td><code>work-arcs --jira-ify "
                   f"'{esc(x.get('label','?'))}'</code></td>"
                   "</tr>")

@@ -3509,9 +3509,17 @@ def tickets_to_arcs(arcs):
 def reconcile(arcs, issues):
     """Where the derived picture and the declared one disagree.
 
-    Three gaps, and they want different actions: work with no ticket needs one
-    filing, a ticket with no work needs closing or starting, and a ticket claiming
-    to be handed off while its commits sit on this laptop needs a push.
+    Three gaps, and they want different actions: work with no ticket AND SOMETHING STILL
+    OUTSTANDING needs one filing, a ticket with no work needs closing or starting, and a
+    ticket claiming to be handed off while its commits sit on this laptop needs a push.
+
+    The capitalised clause is the one that had to be added. `unticketed_work` used to ask
+    only whether an arc had a ticket, was busy enough and was recent enough -- never
+    whether anything was left to file a ticket *about* -- so on the 24th it offered a
+    one-step `--jira-ify` command for "App framework brief next beats backend message",
+    which the same page listed under Landed, having merged as !10348. A ticket opened for
+    work that already shipped is paperwork nobody will ever close, and one nonsense row
+    costs the other two their credibility.
     """
     by_key = tickets_to_arcs(arcs)
     issue_keys = {i["key"] for i in issues}
@@ -3534,11 +3542,39 @@ def reconcile(arcs, issues):
             return True
         return any(TICKET_RE.search(b["name"].upper()) for b in a["branches"])
 
+    def outstanding(a):
+        """Whether there is still work here for a ticket to be about.
+
+        Resolved through `settled` rather than by asking the branches again, because
+        `settled` is finalize's single author for "every branch of this arc has landed or
+        been abandoned" -- and it is already the thing that empties an arc's demands and
+        exempts it from the forgotten verdict. A second derivation of the same question is
+        a second answer waiting to disagree with the first, on the same page, about the
+        same workstream.
+
+        `pre-landing` is the third settled shape and needs naming separately: the work
+        shipped as a reshape, and what survives are drafts from before it. `settled` is
+        None there because those drafts have no merge request of their own, but they are
+        residue rather than an open loop -- the same exemption `mark_forgotten` makes, for
+        the same reason.
+
+        Then the positive test, so an arc with nothing pushed, nothing proposed and
+        nothing asked of it does not get a command either: unpushed commits no remote has,
+        an open merge request (`collect_mrs` asks for `state=opened`, so every entry here
+        is live), or any demand at all.
+        """
+        if a.get("settled") or a.get("stage") == "pre-landing":
+            return False
+        return bool(a["unpushed_live"] or a["mrs"] or a.get("demands"))
+
     unticketed = [
         a for a in arcs
-        if not has_ticket(a) and a["engagement"] >= 200 and a["age_days"] <= 30
+        if not has_ticket(a) and outstanding(a)
+        and a["engagement"] >= 200 and a["age_days"] <= 30
     ]
-    unticketed.sort(key=lambda a: -a["engagement"])
+    # Total tiebreak on id, as everywhere else: engagement is a coarse integer, ties are
+    # ordinary, and two builds of the same data must not shuffle the table.
+    unticketed.sort(key=lambda a: (-a["engagement"], a["id"]))
 
     no_work = [i for i in issues if i["key"] not in by_key]
 
@@ -5492,6 +5528,51 @@ def fell_off_a_cliff(arcs, include_dismissed=True):
     return out
 
 
+def only_here(arcs):
+    """Work that exists nowhere but this laptop, most at stake first.
+
+    The page could say how much unpublished work there was -- "24 exist only on this
+    laptop, 31 days of work" -- and then had nowhere to say WHICH. That is the one
+    question a count of at-risk work has to be able to answer, because a number you cannot
+    cash in is a number you stop reading. The alarm used to be diffused instead, as a
+    commit count under every card, which is the shape Kyle rejected outright: "the goal is
+    to keep track of the broad strokes of my work, not every singular commit everywhere".
+    One ranked list, capped where it is rendered, is the opposite arrangement of the same
+    concern -- and it is the arrangement that survives "i do often have a dangling commit
+    that _is_ meaningful and i dont want to lose track of".
+
+    Ranked on expected loss: DAYS OF WORK times how long nothing has touched the arc. Both
+    halves are load-bearing and neither is sufficient. Days of work alone ranks by what
+    would be lost and says nothing about whether you are about to lose it -- a fortnight
+    you committed this morning is not at risk, it is in progress. Staleness alone ranks a
+    forgotten one-line scratch branch above a month of unpushed work. The product is the
+    only combination of the two that says "how much would this cost, and how likely am I
+    to have forgotten it".
+
+    `max(age_days, 1)` rather than `age_days`, because an arc touched today has age 0 and
+    a score of zero would sort the biggest live body of work to the bottom of a list about
+    risk. A day is the floor of the unit either way.
+
+    Ids only, in order, exactly as `forgotten` is emitted -- the ranking, not the data. The
+    arcs themselves already carry `unpushed_days`, `unpushed_dates` and `authoritative`, so
+    a renderer that got rows here would be reading two copies of the same workstream. And
+    total tiebreak down to the id, because a ranking that reaches output has to be the same
+    ranking twice.
+
+    Over every arc with local-only content rather than over the `local-only` rung alone: an
+    arc out for review with a fortnight of unpushed work on top of its merge request is
+    holding exactly as much unrecoverable work as one that never pushed. The rung says
+    whose move it is; this says what is on the disk. A renderer scoped to a window (the
+    page is) intersects with its own set and keeps this order.
+    """
+    at = [a for a in arcs if a.get("unpushed_live")]
+    at.sort(key=lambda a: (-(a.get("unpushed_days", 0) * max(a.get("age_days", 0), 1)),
+                           -a.get("unpushed_days", 0),
+                           -a.get("unpushed_live", 0),
+                           str(a.get("id") or "")))
+    return [a["id"] for a in at]
+
+
 def _day_epoch(text):
     """A YYYY-MM-DD from the API as an epoch. Day resolution is all these carry."""
     try:
@@ -6887,7 +6968,11 @@ def main():
             print(f"  {a['label']:<28} {a['counts']['branches']}b, "
                   f"{a['counts']['sessions']}sess, {a['engagement']}ref, "
                   f"{a['unpushed']} unpushed, {a['age_days']}d")
-            print(f"    └ work-arcs --jira-ify {a['label']}")
+            # Quoted, as the page's copy of this command already is. Since arc-brief
+            # started deriving labels they are phrases, so unquoted this printed
+            # `--jira-ify SMP Neighborhoods ODX journeys` and the shell handed --jira-ify
+            # one word of four.
+            print(f"    └ work-arcs --jira-ify '{a['label']}'")
         print("\n── Jira says handed off, but the work is still here ─────")
         for m in gap["status_mismatch"][:10]:
             print(f"  {m['issue']['key']:<10} {m['why']}")
@@ -7035,6 +7120,11 @@ def main():
     # hold the arcs it exists for.
     fell = fell_off_a_cliff(arcs, include_dismissed=False)
     forgotten_ids = [a["id"] for a in fell_off_a_cliff(arcs)]
+    # Before the window filters too, and for a sharper version of the same reason: work
+    # that exists only here is at its most dangerous precisely when it has been quiet long
+    # enough to fall out of a recency window. Ranked over everything; a renderer scoped to
+    # a window intersects with its own set.
+    only_here_ids = only_here(arcs)
 
     # Here for the same reason as the two lines above it: before the window filters. A
     # sprint arc nobody has touched for a working week is by construction the one most
@@ -7099,6 +7189,15 @@ def main():
             # arc-morning drops them, because a ✕ that still opens the morning brief is a
             # ✕ that does nothing.
             "forgotten": forgotten_ids,
+            # The other ranking, and the answer to the one question the at-risk count on
+            # the page could not answer: which work exists nowhere but this laptop, most at
+            # stake first. Ids in order, like `forgotten` and for the same reasons -- the
+            # arcs carry `unpushed_days`, `unpushed_dates` and `authoritative` already, and
+            # a ranking re-derived by each consumer is a ranking that will differ in one of
+            # them. Ranked on days of work times staleness; see `only_here` for why neither
+            # half alone would do. Complete rather than capped: the cap belongs where the
+            # rendering is, and a list truncated here could never be un-truncated.
+            "only_here": only_here_ids,
             "arcs": arcs,
             "ledger": ledger,
             # What the Slack thread lens saw and what it could not, top-level because it is
