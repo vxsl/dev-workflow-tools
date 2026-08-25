@@ -3162,11 +3162,11 @@ def render(data, lede, focus_days, limit, cost=None):
       '<button type="button" id="savedet" hidden>Save detachments</button>'
       '<button type="button" id="savecur" hidden>Save confirmations</button>'
       '<button type="button" id="savefil" hidden>Save filings</button>'
-      '<span class="muted">All three apply here and survive reloads. Saving writes '
+      '<span class="muted">All of these apply here and survive reloads. Saving writes '
       '<code>dismissed.json</code> / <code>detached.json</code> / '
       '<code>confirmed.json</code> / <code>authoritative-ticket.json</code> into '
       '<code>~/.local/state/work-arcs/</code> — acknowledgements keep the CLI in '
-      'agreement, while a detachment or a filing takes full effect when '
+      'agreement, while a detachment, a confirmation or a filing takes full effect when '
       '<code>work-arcs</code> next builds the page.</span></div>')
     a(f"<script>{PARK_JS}</script>")
     a(f"<script>{INTERACT_JS}</script>")
