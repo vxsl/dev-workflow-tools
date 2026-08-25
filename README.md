@@ -764,6 +764,13 @@ one it missed. It deliberately does *not* set `WakeSystem` — waking a laptop i
 the lid opens. A run that stands down on quota (exit 3) or finds the lock held (exit 4) is
 named in `SuccessExitStatus`, so `systemctl --user status` stays meaningful.
 
+One thing a user timer still cannot survive: a machine that is *logged out* rather than
+asleep, because the user manager the timer lives in goes with the session. Suspend keeps
+the session, which is the failure this fixes, so `Linger=no` is the right default — but if
+this ever misses a morning after a reboot nobody logged in from,
+`loginctl enable-linger $USER` is the answer, and `systemctl --user list-timers` will show
+`LAST`/`PASSED` empty when that is what happened.
+
 **It refreshes its own access token.** The quota guard reads
 `claudeAiOauth.accessToken` from `~/.claude/.credentials.json`, and that token is good for
 hours rather than for a night: at 07:10 no Claude session has run since the evening
