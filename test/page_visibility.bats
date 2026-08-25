@@ -244,7 +244,10 @@ ZZSIDE
     run python3 - "$TEST_TMPDIR/p.html" <<'ZZCOUNT'
 import re, sys
 html = open(sys.argv[1]).read()
-print(re.search(r'You owe them <span class="n" data-count>(\d+)</span>', html).group(1))
+# Selected on the element rather than on its attribute order: the count span carries
+# an id now, so the door and the mini-map above it can mirror the one figure the
+# section itself prints.
+print(re.search(r'You owe them <span class="n"[^>]*>(\d+)</span>', html).group(1))
 ZZCOUNT
     [ "${lines[0]}" = "29" ]
 }

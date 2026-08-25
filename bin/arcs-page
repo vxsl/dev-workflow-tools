@@ -49,6 +49,44 @@ how this page is used is that no manual control on it has been touched in a fort
 the defaults have to be the selection and the controls the override. A remembered fold
 would walk the page back to fifteen expanded sections one morning at a time, and unlike a
 dismissal or a filing there is no fingerprint under it for anything to expire against.
+
+Where it opens, and how you get anywhere from there
+--------------------------------------------------
+It opened on its own title. "Work Arcs" set at 2.4rem was the largest type on a page whose
+entire claim is that it leads with the most consequential fact -- and a title is the one
+thing on a dashboard that is never news. So the title and the build stamp are one quiet
+line in the corner now, carrying every field they always carried, and the biggest thing on
+the page is arc-morning's first sentence, promoted to a headline with that stage's own
+label for it as an eyebrow above. Nothing re-ranks to do that: arc-morning already decided
+which fact leads. Nothing is dropped either -- the remaining lines render in the brief
+directly below, so the count is intact by construction rather than by an announced
+truncation. derive_lede is still the degradation for a pipeline that never ran arc-morning.
+
+Under the headline is a fixed strip of doors -- the standup, the ledger, what is in play --
+each with its section's own count, its section's own next item, and one click into the zone
+it names. Under that is a mini-map of every section on the page, sticky, that pins itself to
+the top the moment you scroll past the briefing. Both exist for the same reason: three
+screenfuls of standing picture is three screenfuls to scroll past to reach the section you
+opened the page for, and that scroll is most of what made this page feel like a chore.
+
+The strip does not move. The same doors in the same order, every time, and the data is the
+only thing that differs between two opens -- which is a correction rather than a default.
+The first arrangement built here chose what to lead with from the viewer's clock: a standup
+panel in the hours before the standup, a triage view in the morning, loose ends in the
+afternoon. The verdict on it was "no, i dont like the idea of it being unpredictable.
+emphasizing different sections depending on the time of day is not a good solution to what
+im asking for". Spatial memory is the feature. Everything has a place; nothing has a time,
+and no script on this page asks the browser what time it is in order to choose what to show
+-- the only clock left in it stamps the second a person's declaration was recorded.
+
+A door never states a figure of its own. Every count on the strip and in the mini-map is a
+copy of the element the section itself prints: rendered server-side from the same variable,
+then kept equal to it by MIRROR_JS, which copies text and never tallies rows. That is
+fold()'s law about a collapsed header applied to a link that points at one -- a door
+claiming eight above a list showing two is the small kind of lie that costs a page its
+credit for every other number on it. And a door or a stop is absent whenever its section
+is, because an anchor to a section that was never emitted is the same lie as a link to a
+404. The mini-map itself needs no script at all: position:sticky and nothing else.
 """
 
 import argparse
@@ -96,14 +134,109 @@ CSS = """
 *,*::before,*::after{box-sizing:border-box}
 body{margin:0;background:var(--ground);color:var(--ink);font-family:var(--sans);
      font-size:15px;line-height:1.55;-webkit-font-smoothing:antialiased}
-.page{max-width:72rem;margin:0 auto;padding:3rem 1.5rem 5rem}
-h1{font-family:var(--serif);font-weight:500;font-size:clamp(1.8rem,4vw,2.4rem);
-   letter-spacing:-.015em;margin:0 0 .3rem;text-wrap:balance}
-.stamp{font-family:var(--mono);font-size:.75rem;color:var(--ink-faint);
-       display:flex;flex-wrap:wrap;gap:.2rem 1rem;margin-bottom:2rem}
-.lede{font-family:var(--serif);font-size:clamp(1.1rem,2.1vw,1.32rem);line-height:1.5;
-      max-width:36em;margin:0 0 2.5rem;text-wrap:pretty}
-.lede em{color:var(--accent);font-style:normal;font-weight:600}
+.page{max-width:72rem;margin:0 auto;padding:2.2rem 1.5rem 5rem}
+/* The masthead: what this page is, and whether to trust this build of it. In the corner,
+   because "Work Arcs" is not news and was never worth 2.4rem on a page whose whole claim is
+   that it opens with the most consequential fact. Every field the stamp ever carried is
+   still here -- the build time, the repo, the window and how it splits, the run-over-run
+   chip -- because those are the facts a reader audits everything below against, and they
+   read perfectly well small. */
+.masthead{display:flex;flex-wrap:wrap;align-items:baseline;gap:.15rem 1rem;
+  margin:0 0 1.4rem;padding-bottom:.5rem;border-bottom:1px solid var(--hairline)}
+h1{font-family:var(--sans);font-weight:600;font-size:.9rem;letter-spacing:.02em;
+   margin:0;flex:none;color:var(--ink-soft)}
+.stamp{font-family:var(--mono);font-size:.72rem;color:var(--ink-faint);
+       display:flex;flex-wrap:wrap;gap:.15rem 1rem;margin:0}
+
+/* The headline. One sentence, set as the biggest thing on the page, stating the single most
+   consequential fact -- arc-morning's first line, promoted, with that stage's own label for
+   it as an eyebrow above. Display serif and a 33em measure: a headline is read in one pass
+   or it is not a headline, and at the brief's 64em it would be read in three.
+
+   The eyebrow is mono and tiny against it on purpose. It says what KIND of fact is coming
+   -- "jira disagrees", "open loop", "dropped" -- which is the one thing a display sentence
+   cannot say about itself, and it costs a line of nothing to say it. */
+.headline{margin:0 0 1.1rem;max-width:33em}
+.headline .eyebrow{display:block;font-family:var(--mono);font-size:.66rem;
+  text-transform:uppercase;letter-spacing:.11em;color:var(--ink-faint);
+  margin-bottom:.32rem}
+.headline p{font-family:var(--serif);font-weight:500;margin:0;
+  font-size:clamp(1.5rem,3.5vw,2.25rem);line-height:1.16;letter-spacing:-.022em;
+  color:var(--ink);text-wrap:balance}
+/* The degradation is several facts rather than one, so it is set a step down. derive_lede
+   composes up to two sentences, and two sentences at full display size read as a paragraph
+   that has been shouted rather than as a headline. */
+.headline p.lede{font-size:clamp(1.22rem,2.5vw,1.66rem);line-height:1.26;
+  letter-spacing:-.014em;max-width:34em;text-wrap:pretty}
+.headline em{color:var(--accent);font-style:normal;font-weight:600}
+.headline a{color:inherit;text-decoration:none;
+  box-shadow:inset 0 -2px 0 0 color-mix(in oklab,var(--accent) 38%,transparent)}
+.headline a:hover,.headline a:focus-visible{box-shadow:inset 0 -3px 0 0 var(--accent)}
+
+/* The doors. The same three, in the same order, every time this page is opened: the
+   standup, the ledger, what is in play. The first arrangement tried here chose what to
+   lead with from the viewer's clock, and the verdict on that was "i dont like the idea of
+   it being unpredictable. emphasizing different sections depending on the time of day is
+   not a good solution to what im asking for" -- so nothing on this strip moves, ever.
+   Spatial memory is the feature. Everything has a place; nothing has a time.
+
+   Each door carries three lines: what it is, its section's own figure, and its section's
+   own next item. Not tiles and deliberately not shaped like .conditions: those are peers
+   with no exchange rate between them and no order worth claiming, and these are three
+   destinations with one door each. The left edge takes the colour its own section's left
+   edge already takes -- calm for the standup, accent for what is in play -- so the door and
+   the place it lands you are the same object seen twice. That is wayfinding and not
+   severity: nothing here is ranked against anything else here. */
+.cockpit{display:grid;grid-template-columns:repeat(auto-fit,minmax(14rem,1fr));
+  gap:.55rem;margin:0 0 1.4rem;padding:0;list-style:none}
+.cockpit .door{display:flex;flex-direction:column;gap:.15rem;text-decoration:none;
+  background:var(--surface);border:1px solid var(--hairline);border-radius:5px;
+  border-left:3px solid var(--edge,var(--hairline));padding:.6rem .8rem;min-width:0}
+.cockpit .door:hover{border-color:var(--accent);
+  border-left-color:var(--edge,var(--accent))}
+.cockpit .door[data-door="standup"]{--edge:var(--calm)}
+.cockpit .door[data-door="ledger"]{--edge:var(--warm)}
+.cockpit .door[data-door="play"]{--edge:var(--accent)}
+.cockpit .dk{font-family:var(--mono);font-size:.63rem;text-transform:uppercase;
+  letter-spacing:.09em;color:var(--ink-faint)}
+.cockpit .dv{font-size:.86rem;color:var(--ink-soft);line-height:1.35;
+  display:flex;flex-wrap:wrap;align-items:baseline;gap:.05rem .35rem}
+/* Proportional, like the .conditions figures and for the same reason: tabular-nums gives
+   every digit the width of a zero, which reads loose at display size. Tabular is for
+   columns, and a door is not one. */
+.cockpit .dn{font-family:var(--sans);font-size:1.3rem;font-weight:600;color:var(--ink);
+  letter-spacing:-.02em;line-height:1.05}
+/* One line, and it gives up its tail rather than the door's shape -- the same trade the
+   fold headers make with .fl, for the same reason: the figure is the contract and this is
+   the illustration of it. */
+.cockpit .dl{font-size:.75rem;color:var(--ink-faint);line-height:1.35;min-width:0;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+/* The mini-map: every section of this page, its own count, one click away, pinned to the
+   top the moment you scroll past the briefing. Three screenfuls of standing picture is
+   three screenfuls you have to scroll through to reach the one section you opened the page
+   for, and scrolling is the cost that made this page a chore.
+
+   position:sticky and nothing else -- no observer, no scroll listener, no state. It works
+   with scripting off, which is the whole argument for doing it in CSS: navigation is the
+   last thing on a page that should need a script. The negative side margins let its
+   background cover .page's own padding, so rows do not slide out from under it at the
+   edges, and it stays one line and scrolls sideways rather than wrapping into two. */
+.minimap{position:sticky;top:0;z-index:5;display:flex;flex-wrap:nowrap;
+  align-items:baseline;gap:0 .1rem;overflow-x:auto;overscroll-behavior-x:contain;
+  margin:0 -1.5rem 1.6rem;padding:.35rem 1.5rem;background:var(--ground);
+  border-bottom:1px solid var(--hairline);scrollbar-width:none}
+.minimap::-webkit-scrollbar{display:none}
+.minimap a{display:inline-flex;align-items:baseline;gap:.32rem;flex:none;
+  text-decoration:none;color:var(--ink-soft);font-size:.77rem;white-space:nowrap;
+  padding:.12rem .42rem;border-radius:3px}
+.minimap a:hover{background:var(--surface-2);color:var(--ink)}
+.minimap .mn{font-family:var(--mono);font-size:.71rem;color:var(--ink-faint);
+  font-variant-numeric:tabular-nums}
+.minimap a:hover .mn{color:var(--ink-soft)}
+/* Anchored rows land below the pinned bar rather than under it. */
+html{scroll-padding-top:3.2rem}
+[id]{scroll-margin-top:3.2rem}
 
 /* The morning brief: the shortlist, and now shaped like one. It was a single serif
    paragraph at 1.46rem and it was not being read -- five sentences each carrying a claim, a
@@ -116,8 +249,8 @@ h1{font-family:var(--serif);font-weight:500;font-size:clamp(1.8rem,4vw,2.4rem);
    lines reads as a menu, which is the shape this block exists to stop being. The rule
    thickens on hover, so the page still says plainly that every subject here is one click
    from what it is a claim about. */
-.brief{list-style:none;margin:.2rem 0 2.5rem;padding:0;max-width:64em;
-       display:flex;flex-direction:column;gap:.7rem}
+.brief{list-style:none;margin:.1rem 0 1.5rem;padding:0;max-width:64em;
+       display:flex;flex-direction:column;gap:.55rem}
 /* The label is a fixed rail, so five kickers form a column a reader can run down rather
    than five differently-indented starts. It collapses below the text on a narrow viewport,
    where a 9rem rail would leave the sentence six words wide. */
@@ -126,7 +259,7 @@ h1{font-family:var(--serif);font-weight:500;font-size:clamp(1.8rem,4vw,2.4rem);
 .brief .bk{font-family:var(--mono);font-size:.66rem;text-transform:uppercase;
            letter-spacing:.09em;color:var(--ink-faint);text-align:right;
            padding-top:.28rem}
-.brief .bs{font-family:var(--serif);font-size:clamp(1rem,1.9vw,1.14rem);line-height:1.5;
+.brief .bs{font-family:var(--serif);font-size:clamp(.95rem,1.6vw,1.06rem);line-height:1.5;
            color:var(--ink);text-wrap:pretty}
 .brief a{color:inherit;text-decoration:none;
          box-shadow:inset 0 -1px 0 0 color-mix(in oklab,var(--accent) 45%,transparent)}
@@ -136,10 +269,10 @@ h1{font-family:var(--serif);font-weight:500;font-size:clamp(1.8rem,4vw,2.4rem);
   .brief .bk{text-align:left;padding-top:0}
 }
 
-h2{font-family:var(--serif);font-weight:500;font-size:1.25rem;margin:0 0 .2rem;
+h2{font-family:var(--serif);font-weight:500;font-size:1.16rem;margin:0 0 .2rem;
    letter-spacing:-.01em}
-.note{color:var(--ink-soft);font-size:.85rem;max-width:54em;margin:0 0 1.1rem}
-section{margin-bottom:3rem}
+.note{color:var(--ink-soft);font-size:.83rem;max-width:54em;margin:0 0 .95rem}
+section{margin-bottom:2.4rem}
 
 /* One card per arc, leading with what the arc IS. The counts moved to the footer of
    the card because a count is an input to a judgement, not the judgement -- reading
@@ -629,7 +762,7 @@ td .dis{vertical-align:middle}
    (that would name one of them THE number), no severity hue (that would rank them by
    colour), equal tiles. Each states a condition and how much of it there is. */
 .conditions{display:grid;grid-template-columns:repeat(auto-fit,minmax(11rem,1fr));
-  gap:.55rem;margin:0 0 2.5rem;list-style:none;padding:0}
+  gap:.55rem;margin:0 0 2rem;list-style:none;padding:0}
 .conditions a{display:flex;flex-direction:column;gap:.1rem;text-decoration:none;
   background:var(--surface);border:1px solid var(--hairline);border-radius:4px;
   padding:.7rem .8rem;height:100%}
@@ -669,7 +802,7 @@ td .dis{vertical-align:middle}
    this found the sentence that used to be here. */
 details.parked,details.atrisk{margin-top:.4rem}
 details.parked{--disc:var(--parked)}
-details.atrisk{--disc:var(--accent);margin:-2rem 0 2.5rem}
+details.atrisk{--disc:var(--accent);margin:-1.5rem 0 2rem}
 details.parked>summary,details.atrisk>summary{cursor:pointer;font-size:.85rem;
   color:var(--ink-soft);padding:.5rem .7rem;border:1px solid var(--hairline);
   border-radius:4px;background:var(--surface);list-style:none}
@@ -698,7 +831,7 @@ details.parked>summary b,details.atrisk>summary b{color:var(--ink);font-weight:6
    escape in this stylesheet is read by python as octal, see the note above -- and not its
    summary box, because these carry a heading and those carry a sentence. */
 details.fold{margin:0 0 .55rem}
-details.fold[open]{margin-bottom:2.5rem}
+details.fold[open]{margin-bottom:2rem}
 details.fold>summary{cursor:pointer;list-style:none;display:flex;flex-wrap:wrap;
   align-items:baseline;gap:.15rem .7rem;padding:.5rem .7rem;border-radius:4px;
   border:1px solid var(--hairline);background:var(--surface)}
@@ -787,7 +920,7 @@ details.fold>summary .fl{color:var(--ink-soft);font-size:.82rem;min-width:0;flex
    happened to it is two facts; a third level would be a tree, and nobody reads a tree out
    loud. */
 .standup{border:1px solid var(--hairline);border-left:3px solid var(--calm);
-  background:var(--surface);border-radius:4px;padding:.7rem .9rem .8rem;margin:0 0 2.5rem}
+  background:var(--surface);border-radius:4px;padding:.7rem .9rem .8rem;margin:0 0 2rem}
 .standup .hd{display:flex;flex-wrap:wrap;align-items:baseline;gap:.25rem .6rem;
   margin-bottom:.5rem}
 .standup .tag{font-family:var(--mono);font-size:.68rem;text-transform:uppercase;
@@ -824,7 +957,7 @@ details.fold>summary .fl{color:var(--ink-soft);font-size:.82rem;min-width:0;flex
   .standup .bk{text-align:left;padding-top:0}
 }
 .sprint{border:1px solid var(--hairline);border-left:3px solid var(--accent);
-  background:var(--surface);border-radius:4px;padding:.6rem .85rem;margin:0 0 2.5rem;
+  background:var(--surface);border-radius:4px;padding:.6rem .85rem;margin:0 0 2rem;
   display:flex;flex-direction:column;gap:.28rem}
 .sprint .hd{display:flex;flex-wrap:wrap;align-items:baseline;gap:.25rem .6rem}
 .sprint .tag{font-family:var(--mono);font-size:.68rem;text-transform:uppercase;
@@ -1493,7 +1626,228 @@ UNTICKETED_ROWS = 12
 NOWORK_ROWS = 14
 
 
-def brief_block(data, here, fps):
+def spans(parts, here, fps):
+    """One derived sentence's parts, each resolved to the strongest link it can carry.
+
+    brief_block and standup_block had a copy of this each, and the headline made a third --
+    so it is one function now. The resolution order is the part worth keeping in one place:
+    a row on this page beats a link off it, because the claim both blocks make is that the
+    sections below are the evidence layer you expand into rather than a second place to go
+    looking. An external URL is the fallback for the facts nothing here holds. A span whose
+    target is not on this page renders as plain text, which is the rule the run-over-run
+    strip and the cliff section already follow -- an anchor to a row that was never rendered
+    is the same lie as a link to a 404.
+    """
+    out = []
+    for pt in parts or []:
+        if isinstance(pt, str):
+            out.append(esc(pt))
+            continue
+        t, of, fp = esc(pt.get("t", "")), pt.get("of"), pt.get("fp")
+        if of and fp and fp in fps.get(of, ()):
+            out.append(f'<a href="#{EVIDENCE_ID[of]}{esc(fp)}">{t}</a>')
+        elif pt.get("arc") in here:
+            out.append(f'<a href="#{anchor(pt["arc"])}">{t}</a>')
+        elif pt.get("url"):
+            out.append(link(pt["url"], t))
+        else:
+            out.append(t)
+    return "".join(out)
+
+
+def parts_text(parts):
+    """The same sentence with its targets dropped, for the one place that cannot carry them.
+
+    A door on the cockpit strip is itself a link, so an anchor inside it would be a second
+    target half a millimetre from the first -- the argument the ledger's own disclosure
+    headers settled when they refused to link their lead row. Same words, same source,
+    no targets: this reads `parts` exactly as spans() does and differs only in what it
+    hands back.
+    """
+    return "".join(pt if isinstance(pt, str) else str(pt.get("t", ""))
+                   for pt in parts or [])
+
+
+def brief_lines(data):
+    """arc-morning's lines, in the order it ranked them, with the v1 payload's fallback.
+
+    One reader for that payload rather than two. The headline takes the first line and the
+    brief takes the rest, and a second place deciding what "the lines" are would be a second
+    author for which fact this page opens on.
+    """
+    brief = data.get("brief") or {}
+    lines = brief.get("lines")
+    if lines:
+        return list(lines)
+    # A v1 payload, or an arc-morning too old to label its lines. The words are the part
+    # that matters and they are all here; one unlabelled line is a better degradation than
+    # an empty block.
+    parts = brief.get("parts") or []
+    return [{"lead": "", "parts": parts}] if parts else []
+
+
+def headline_block(data, here, fps):
+    """The one sentence this page opens with, set as the biggest thing on it.
+
+    It opened on its own title for a year. "Work Arcs" at 2.4rem was the largest type on a
+    page whose entire claim is that it leads with the most consequential fact, and a title
+    is the one thing on a dashboard that is never news -- so the masthead went to the corner
+    and this took its place.
+
+    Nothing re-ranks to do it: arc-morning already decided which fact leads, and this takes
+    that decision first-on-the-wire. Its label rides above as an eyebrow in arc-morning's
+    own vocabulary, because "jira disagrees" says what kind of fact is coming and this page
+    has no business inventing a word for it. And nothing is dropped by the promotion -- the
+    remaining lines render in the brief directly below, so the count is intact by
+    construction rather than by an announced truncation.
+    """
+    lines = brief_lines(data)
+    if not lines:
+        return ""
+    body = spans(lines[0].get("parts"), here, fps)
+    if not body:
+        return ""
+    lead = lines[0].get("lead") or ""
+    return ('<div class="headline">'
+            + (f'<span class="eyebrow">{esc(lead)}</span>' if lead else "")
+            + f"<p>{body}</p></div>")
+
+
+def standup_notes(data):
+    """The standup's beats and how many notes are under them.
+
+    One author for both, because three places print or point at that figure now -- the
+    block's own header, the door above it, and the mirror that keeps the two equal -- and a
+    count computed in two of them is a count that will disagree in one. A beat with no items
+    is not a beat: arc-standup emits the kind either way, and an empty one on the page would
+    be a heading standing over nothing.
+    """
+    beats = [b for b in (data.get("standup") or {}).get("beats") or []
+             if b.get("items")]
+    return beats, sum(len(b["items"]) for b in beats)
+
+
+def undismissed(entries):
+    """How many rows of a ledger side are standing.
+
+    Module-level because three places print this figure now -- the side's own heading, the
+    door above it and the mini-map above that -- and a count computed three times is a count
+    that will disagree in one of them. Acknowledged rows are out of it everywhere, which is
+    the rule the morning brief and the opening sentence already follow: a figure that
+    includes hidden rows disagrees with the list it points at.
+    """
+    return sum(1 for e in entries or [] if not e.get("dismissed"))
+
+
+def lead_of(e):
+    """The one ledger row a header names on its own line: its clock and its subject.
+
+    Not a link, wherever it is used: a fold header is a toggle and a cockpit door is a jump,
+    and an anchor inside either is a click that does one thing on the words and another half
+    a millimetre to their left. One author, because the ledger's own "N more" disclosure and
+    the door three screens above it name the same row and must call it the same thing.
+    """
+    d = e.get("days")
+    what = " ".join(x for x in (e.get("ref") or "",
+                                e.get("title") or e.get("promised") or "") if x)
+    return esc((f"{d}d \u2014 " if d is not None else "")
+               + (what.strip() or str(e.get("who") or "?")))
+
+
+def mirrored(n, sel, cls="dn"):
+    """A figure that is a copy of the one its own section prints, never a second count.
+
+    fold() refuses to collapse a section without stating its size; this is the same law
+    applied to a link that points at one. The number is rendered here from the same variable
+    the section renders from, and MIRROR_JS then keeps it equal to the element the section
+    actually printed -- so acknowledging a row cannot leave a door claiming a figure the list
+    under it stopped showing. Nothing recounts: the client copies text, it never tallies
+    rows, which is what keeps the section the only author of its own size.
+    """
+    return f'<span class="{cls}" data-mirror="{esc(sel)}">{n}</span>'
+
+
+def cockpit(a, doors):
+    """The doors into this page: the same ones, in the same order, every time it opens.
+
+    The first arrangement tried here chose what to lead with from the viewer's clock -- a
+    standup panel before the standup, loose ends in the afternoon -- and the verdict on it
+    was "i dont like the idea of it being unpredictable. emphasizing different sections
+    depending on the time of day is not a good solution to what im asking for". So nothing
+    on this strip moves. Spatial memory is the feature: everything has a place, nothing has
+    a time, and what differs between two opens of this page is the data.
+
+    A list of dicts rather than three hand-written blocks, so a fourth door is one entry.
+    Every door is absent when its own section is, for the reason every other link here is:
+    an anchor to a section that was never emitted is the same lie as a link to a 404.
+    """
+    if not doors:
+        return
+    a('<nav class="cockpit" aria-label="the three places this page is opened for">')
+    for d in doors:
+        a(f'<a class="door" data-door="{d["id"]}" href="#{d["href"]}">'
+          f'<span class="dk">{d["kick"]}</span>'
+          f'<span class="dv">{d["fig"]}</span>'
+          + (f'<span class="dl">{d["lead"]}</span>' if d.get("lead") else "")
+          + "</a>")
+    a("</nav>")
+
+
+def minimap(a, stops):
+    """Every section of this page, its own count, and one click to each.
+
+    The compressed form of the strip above it, and the answer to the one cost that made this
+    page a chore: three screenfuls of standing picture is three screenfuls to scroll past to
+    reach the section you opened it for. Sticky in CSS and nothing else -- no observer, no
+    scroll handler, no state -- so it works with scripting off, which is where navigation
+    belongs.
+
+    Its figures are mirrors like the doors\u2019, and a stop is emitted only for a section this
+    run actually rendered.
+    """
+    if not stops:
+        return
+    a('<nav class="minimap" aria-label="the sections of this page">')
+    for href, label, fig in stops:
+        a(f'<a href="#{esc(href)}">{esc(label)}'
+          + (f'<span class="mn">{fig}</span>' if fig else "") + "</a>")
+    a("</nav>")
+
+
+# Every figure on a door or in the mini-map is a copy of the one its own section prints. It
+# is rendered server-side from the same variable, so the page is already consistent with
+# scripting off; this exists for what happens after, when a acknowledged row changes a
+# section's count and a door three screens above it would otherwise keep claiming the old
+# one. It copies text and never counts rows -- the section stays the only author of its own
+# size -- and it observes rather than polls, so it costs nothing until something moves.
+MIRROR_JS = r"""
+(function(){
+  var ms=[].slice.call(document.querySelectorAll('[data-mirror]'));
+  if(!ms.length) return;
+  function src(el){
+    try{ return document.querySelector(el.getAttribute('data-mirror')); }
+    catch(e){ return null; }
+  }
+  function sync(){
+    ms.forEach(function(el){
+      var s=src(el); if(!s) return;
+      var t=(s.textContent||'').trim();
+      if(t&&el.textContent.trim()!==t) el.textContent=t;
+    });
+  }
+  sync();
+  try{
+    var obs=new MutationObserver(sync);
+    ms.forEach(function(el){
+      var s=src(el);
+      if(s) obs.observe(s,{childList:true,characterData:true,subtree:true});
+    });
+  }catch(e){}
+})();
+"""
+
+
+def brief_block(data, here, fps, skip=0):
     """The morning brief: one labelled line per fact, each linked to its own evidence.
 
     It was one paragraph and it was not being read. Five sentences, each carrying a claim, a
@@ -1514,37 +1868,12 @@ def brief_block(data, here, fps):
     already follow: an anchor to a row that was never rendered is the same lie as a link to
     a 404.
     """
-    brief = data.get("brief") or {}
-
-    def spans(parts):
-        out = []
-        for p in parts or []:
-            if isinstance(p, str):
-                out.append(esc(p))
-                continue
-            t, of, fp = esc(p.get("t", "")), p.get("of"), p.get("fp")
-            if of and fp and fp in fps.get(of, ()):
-                out.append(f'<a href="#{EVIDENCE_ID[of]}{esc(fp)}">{t}</a>')
-            elif p.get("arc") in here:
-                out.append(f'<a href="#{anchor(p["arc"])}">{t}</a>')
-            elif p.get("url"):
-                out.append(link(p["url"], t))
-            else:
-                out.append(t)
-        return "".join(out)
-
-    lines = brief.get("lines")
+    lines = brief_lines(data)[skip:]
     if not lines:
-        # A v1 payload, or an arc-morning too old to label its lines. The words are the part
-        # that matters and they are all here; one unlabelled row is a better degradation
-        # than an empty block.
-        parts = brief.get("parts") or []
-        if not parts:
-            return ""
-        lines = [{"lead": "", "parts": parts}]
+        return ""
     out = ['<ul class="brief">']
     for ln in lines:
-        body = spans(ln.get("parts"))
+        body = spans(ln.get("parts"), here, fps)
         if not body:
             continue
         out.append('<li>'
@@ -1614,35 +1943,24 @@ def standup_block(data, here, fps):
     exactly what it does, the moment the clock passes 10:30.
     """
     st = data.get("standup") or {}
-    beats = [b for b in st.get("beats") or [] if b.get("items")]
+    beats, notes = standup_notes(data)
     if not st.get("since"):
         return ""
-
-    def spans(parts):
-        out = []
-        for p in parts or []:
-            if isinstance(p, str):
-                out.append(esc(p))
-                continue
-            t, of, fp = esc(p.get("t", "")), p.get("of"), p.get("fp")
-            if of and fp and fp in fps.get(of, ()):
-                out.append(f'<a href="#{EVIDENCE_ID[of]}{esc(fp)}">{t}</a>')
-            elif p.get("arc") in here:
-                out.append(f'<a href="#{anchor(p["arc"])}">{t}</a>')
-            elif p.get("url"):
-                out.append(link(p["url"], t))
-            else:
-                out.append(t)
-        return "".join(out)
 
     head, since = st.get("for") or {}, st.get("since") or {}
     when = " &middot; ".join(x for x in (
         f'for {esc(head.get("when"))}' if head.get("when") else "",
         f'since {esc(since.get("when"))}' if since.get("when") else "") if x)
 
+    # The block's own size, on its own header, and the one figure the door above it
+    # mirrors. It was the one companion block on the page that never stated how much it was
+    # holding -- fold() has refused that of a collapsed section since the day it existed,
+    # and a door pointing at a section is held to the same law.
     out = ['<section class="standup" id="standup">', '<div class="hd">',
            '<span class="tag">Next standup</span>',
            f'<span class="when">{when}</span>',
+           f'<span class="when"><span id="su-n">{notes}</span> note'
+           + ("" if notes == 1 else "s") + "</span>",
            f'<button class="cp" id="sucopy" type="button" '
            f'data-text="{esc(st.get("text") or "")}">copy</button>']
     out.append("</div>")
@@ -1665,12 +1983,12 @@ def standup_block(data, here, fps):
     for b in beats:
         rows = []
         for it in b["items"]:
-            body = spans(it.get("parts"))
+            body = spans(it.get("parts"), here, fps)
             if not body:
                 continue
-            subs = "".join(f"<li>{spans(sb.get('parts'))}</li>"
+            subs = "".join(f"<li>{spans(sb.get('parts'), here, fps)}</li>"
                            for sb in it.get("subs") or []
-                           if spans(sb.get("parts")))
+                           if spans(sb.get("parts"), here, fps))
             rows.append(f"<li>{body}"
                         + (f'<ul class="sub">{subs}</ul>' if subs else "") + "</li>")
         if not rows:
@@ -2603,6 +2921,14 @@ def render(data, lede, focus_days, limit, cost=None):
     a("<title>Work Arcs</title>")
     a(f"<style>{CSS}</style>")
     a('<div class="page">')
+    # --- the masthead, in the corner ---------------------------------------
+    # A title is the one thing on a dashboard that is never news, and this one was the
+    # largest type on a page whose whole claim is that it opens with the most consequential
+    # fact. So it is a line: the name of the thing, and beside it every field the stamp has
+    # always carried -- the build time, the repo, the window and how it splits, the
+    # run-over-run chip. Those are the facts a reader audits everything below against, and
+    # they read perfectly well small. Nothing left the page; one thing stopped shouting.
+    a('<div class="masthead">')
     a("<h1>Work Arcs</h1>")
     a('<div class="stamp">')
     a(f"<span>{esc(stamp)}</span>")
@@ -2625,18 +2951,116 @@ def render(data, lede, focus_days, limit, cost=None):
                            f"since the last build{was}") + "</span>")
     elif sincer.get("why"):
         a(f'<span>no run-over-run diff — {esc(sincer["why"])}</span>')
-    a("</div>")
-    # The brief when there is one, the derived lede when there is not, and never both --
-    # see brief_block and derive_lede. A hand-passed --lede still wins over either, because
-    # it is the one opening paragraph a person typed on purpose.
+    a("</div></div>")
+    # The headline, then the rest of the brief under it -- and never a second opening
+    # claim beside either, see headline_block and derive_lede. arc-morning's first line is
+    # promoted to display size and its remaining lines render below it, so the promotion
+    # drops nothing: the count is intact by construction. A hand-passed --lede still wins
+    # over both, because it is the one opening sentence a person typed on purpose, and the
+    # derived lede is the degradation for a pipeline that never ran arc-morning.
     here = {x.get("id") for x in arcs}
-    block = brief_block(data, here, evidence_fps)
+    head = headline_block(data, here, evidence_fps)
     if lede:
-        a(f'<p class="lede">{lede}</p>')
-    elif block:
-        a(block)
+        a(f'<div class="headline"><p class="lede">{lede}</p></div>')
+    elif head:
+        a(head)
+        a(brief_block(data, here, evidence_fps, skip=1))
     else:
-        a(f'<p class="lede">{derive_lede(data, focus_days)}</p>')
+        a(f'<div class="headline">'
+          f'<p class="lede">{derive_lede(data, focus_days)}</p></div>')
+
+    # --- the doors, and the map ---------------------------------------------
+    # Three doors in one order, every time, and a sticky mini-map under them. Neither reads
+    # the clock and neither remembers anything: the strip that used to be here chose what to
+    # lead with from the time of day, and the verdict was "i dont like the idea of it being
+    # unpredictable". Everything has a place; nothing has a time.
+    #
+    # Every figure on both is a mirror of the count its own section prints -- see mirrored()
+    # -- and every entry is absent when its section is, because an anchor to a section that
+    # was never emitted is the same lie as a link to a 404.
+    news = [x for x in arcs if x.get("notify")]
+    news.sort(key=lambda x: (x.get("urgency", 99), -x.get("engagement", 0)))
+    sprint = data.get("sprint") or None
+    st = data.get("standup") or {}
+    su_beats, su_notes = standup_notes(data)
+    l_you = (ledger or {}).get("you_owe") or []
+    l_they = (ledger or {}).get("they_owe") or []
+    doors = []
+    if st.get("since"):
+        when = esc((st.get("for") or {}).get("when") or "")
+        fig = ((f'{mirrored(su_notes, "#su-n")} note'
+                + ("" if su_notes == 1 else "s")
+                + (f" for {when}" if when else ""))
+               if su_notes else "nothing yet" + (f" for {when}" if when else ""))
+        # The first thing he will say, which is arc-standup's own first beat and its own
+        # first item -- first on the wire, not a superlative computed here. Its beat's label
+        # rides in front because that label is what makes the sentence a standup note rather
+        # than a fact about the work.
+        su_lead = ""
+        if su_beats:
+            it = su_beats[0]["items"][0]
+            kind = su_beats[0].get("lead") or su_beats[0].get("kind") or ""
+            su_lead = esc((kind + " · " if kind else "") + parts_text(it.get("parts")))
+        doors.append({"id": "standup", "href": "standup", "kick": "Next standup",
+                      "fig": fig, "lead": su_lead})
+    if ledger is not None:
+        # The oldest loop, and the one comparison this page is allowed to make across the
+        # two sides. Neither list is re-ranked: each head is first on its own wire, where
+        # work-arcs put it longest-open-first, and all that happens here is that the two
+        # heads are read against the clock they both print. A tie goes to what you owe,
+        # because that is the half of the ledger you can close on your own.
+        heads = ([("you owe", e) for e in l_you[:1]]
+                 + [("they owe you", e) for e in l_they[:1]])
+        heads.sort(key=lambda pair: -(pair[1].get("days") or 0))
+        doors.append({"id": "ledger", "href": "ledger", "kick": "The ledger",
+                      "fig": (mirrored(undismissed(l_you), "#lg-you-n") + " you owe"
+                              " &middot; "
+                              + mirrored(undismissed(l_they), "#lg-they-n")
+                              + " they owe"),
+                      "lead": (esc(heads[0][0] + " · ") + lead_of(heads[0][1])
+                               if heads else "")})
+    doors.append({"id": "play", "href": "play", "kick": "In play",
+                  "fig": (mirrored(len(live), "#play-n") + " workstream"
+                          + ("" if len(live) == 1 else "s")),
+                  # The first row of the first group, which is the ordering the section
+                  # itself renders -- named by its group so the door says which clock the
+                  # row is under as well as which row it is.
+                  "lead": (esc(buckets[0][1].lower() + " · "
+                               + one_line(buckets[0][2][0])
+                               + (f" — {buckets[0][2][0].get('state')}"
+                                  if buckets[0][2][0].get("state") else ""))
+                           if buckets else "")})
+    cockpit(a, doors)
+
+    stops = [x for x in (
+        (("standup", "Standup",
+          mirrored(su_notes, "#su-n", "q") if su_notes else "")
+         if st.get("since") else None),
+        ("sprint", "Sprint", "") if sprint else None,
+        ("cameback", "Came back", str(len(news))),
+        (("ledger", "Ledger",
+          mirrored(undismissed(l_you), "#lg-you-n", "q") + "/"
+          + mirrored(undismissed(l_they), "#lg-they-n", "q"))
+         if ledger is not None else None),
+        ("play", "In play", mirrored(len(live), "#play-n", "q")),
+        ("only-here", "Only here", str(len(by_rung.get("local-only", []))))
+        if by_rung.get("local-only") else None,
+        ("cliff", "Cliff", mirrored(len(fell), '[data-count="cliff"]', "q"))
+        if fell else None,
+        ("parked", "Parked", mirrored(len(by_rung.get("parked", [])),
+                                      '[data-count="parked"]', "q"))
+        if by_rung.get("parked") else None,
+        ("settled", "Retired", str(len(by_rung.get("landed", []))
+                                   + len(by_rung.get("abandoned", []))))
+        if by_rung.get("landed") or by_rung.get("abandoned") else None,
+        ("jira", "Jira", str(len(gap.get("status_mismatch") or []))) if mism else None,
+        ("unticketed", "No ticket", str(len(gap.get("unticketed_work") or [])))
+        if gap.get("unticketed_work") else None,
+        ("curation", "Unsure", str(len(data.get("curation") or [])))
+        if data.get("curation") else None,
+        ("cost", "Cost", "") if cost else None,
+    ) if x]
+    minimap(a, stops)
 
     # --- the next standup, one block wide -----------------------------------
     # Directly under the brief and above the sprint strip, which is an argument about what
@@ -2667,7 +3091,6 @@ def render(data, lede, focus_days, limit, cost=None):
     # worse than a page that does not mention sprints. Present even when nothing joined,
     # though, because "17 tickets and not one of them has work behind it" is the loudest
     # thing this could ever say and it must not be silence.
-    sprint = data.get("sprint") or None
     if sprint:
         shown = {x.get("id") for x in arcs}
         a('<div class="sprint" id="sprint">')
@@ -3075,10 +3498,9 @@ def render(data, lede, focus_days, limit, cost=None):
     # The only thing on this page that is news rather than a state. It leaves by being
     # worked on: every entry postdates the last commit or session on its own arc, so
     # touching the work removes it without anything being dismissed.
-    news = [x for x in arcs if x.get("notify")]
-    news.sort(key=lambda x: (x.get("urgency", 99), -x.get("engagement", 0)))
-    a('<section data-disgroup>')
-    a("<h2>Since you last touched them</h2>")
+    a('<section id="cameback" data-disgroup>')
+    a('<div class="rung"><h2>Since you last touched them</h2>'
+      f'<span class="n">{len(news)}</span></div>')
     a('<p class="note">Things that came back after your last commit or session on them. '
       "Working on one removes it, and so does acknowledging it — the ✕ expires by "
       "itself if anything changes again. Everything else on this page is a standing "
@@ -3208,7 +3630,7 @@ def render(data, lede, focus_days, limit, cost=None):
         you = ledger.get("you_owe") or []
         covered = ledger.get("you_owe_covered") or 0
         closed = ledger.get("you_owe_closed") or []
-        a("<section>")
+        a('<section id="ledger">')
         a("<h2>The ledger</h2>")
         a('<p class="note">Open loops with a person on the other end, longest open '
           "first. Every row is derived — a review request&rsquo;s own timestamp, who "
@@ -3268,21 +3690,7 @@ def render(data, lede, focus_days, limit, cost=None):
                     + f' data-dismissed="{1 if e.get("dismissed") else 0}">'
                     + clock(e) + f'<div class="what">{inner}</div>{btn}</li>')
 
-        def visible(entries):
-            return sum(1 for e in entries if not e.get("dismissed"))
-
-        def lead_of(e):
-            """The one row a disclosure names on its own header line.
-
-            Its clock and its subject, and nothing else. Not a link: a header is a toggle,
-            and an anchor inside a <summary> is a click that does one thing on the words
-            and another half a millimetre to their left.
-            """
-            d = e.get("days")
-            what = " ".join(x for x in (e.get("ref") or "",
-                                        e.get("title") or e.get("promised") or "") if x)
-            return esc((f"{d}d — " if d is not None else "")
-                       + (what.strip() or str(e.get("who") or "?")))
+        visible = undismissed
 
         def you_row(e):
             """One row of what you owe, wherever on the side it ends up rendered.
@@ -3343,7 +3751,8 @@ def render(data, lede, focus_days, limit, cost=None):
                        + ledger_say(e, who))
 
         a('<div class="side">')
-        a(f'<h3>You owe them <span class="n" data-count>{visible(you)}</span></h3>')
+        a('<h3>You owe them '
+          f'<span class="n" id="lg-you-n" data-count>{visible(you)}</span></h3>')
         if you:
             # The five oldest loops stand; the rest are one line away. Twenty-nine rows of
             # "who is waiting on me" is a thing to scroll past, and the sixth-oldest of
@@ -3412,7 +3821,8 @@ def render(data, lede, focus_days, limit, cost=None):
                        + ledger_say(e, who))
 
         a('<div class="side">')
-        a(f'<h3>They owe you <span class="n" data-count>{visible(they)}</span></h3>')
+        a('<h3>They owe you '
+          f'<span class="n" id="lg-they-n" data-count>{visible(they)}</span></h3>')
         if they:
             # Eleven rows reading "no response from brian, vadym, ajit, Matt, ella" are
             # eleven copies of one fact: a reviewer pool that is not answering. They render
@@ -3597,7 +4007,8 @@ def render(data, lede, focus_days, limit, cost=None):
     # --- in play, by when you last touched it ------------------------------
     a("<section>")
     a('<div class="rung"><h2 id="play">In play</h2>'
-      f'<span class="n">{len(live)} workstreams</span></div>')
+      f'<span class="n"><span id="play-n">{len(live)}</span> workstream'
+      + ("" if len(live) == 1 else "s") + "</span></div>")
     a('<p class="note">Grouped by when you last touched each one, and within a group by '
       "what is waiting on you — a branch that stopped merging, a question, a red "
       "pipeline, an approval nobody acted on — before how much unfinished work it holds. "
@@ -4030,6 +4441,7 @@ def render(data, lede, focus_days, limit, cost=None):
     a(f"<script>{PARK_JS}</script>")
     a(f"<script>{INTERACT_JS}</script>")
     a(f"<script>{STANDUP_JS}</script>")
+    a(f"<script>{MIRROR_JS}</script>")
 
     a("<footer>Derived, never declared — arcs come from the files your work "
       "touched, not from what branches were named, and which branch is the work comes "
