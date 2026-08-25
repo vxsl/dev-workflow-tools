@@ -256,6 +256,9 @@ PUBLISH="${WORK_ARCS_PUBLISH:-1}"
 # else's in it to preserve; the conflict is still worth a line in the log. Set to 0 to
 # have the run report the conflict and leave the artifact alone.
 PUBLISH_SUPERSEDE="${WORK_ARCS_PUBLISH_SUPERSEDE:-1}"
+# Seconds in the first backoff after a busy render service, doubling-ish by attempt. A
+# seam for the tests, which should not spend fifteen seconds proving a retry happened.
+PUBLISH_RETRY_BASE="${WORK_ARCS_PUBLISH_RETRY_BASE:-5}"
 
 CRON_MARKER="# work-arcs-refresh"
 CRON_DEFAULT_TIME="07:10"
@@ -952,7 +955,7 @@ publish_page() {
                     rm -f "$req"
                     return 1
                 fi
-                local wait=$((tries * 5))
+                local wait=$((tries * PUBLISH_RETRY_BASE))
                 log "publish: the render service is busy — retrying in ${wait}s (attempt $((tries + 1)) of $max_tries)"
                 sleep "$wait" ;;
             400|409|412)

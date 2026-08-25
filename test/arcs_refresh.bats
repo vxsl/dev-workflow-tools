@@ -54,17 +54,26 @@ setup() {
     cp -r "$REPO_ROOT/systemd" "$FAKE_REPO/systemd"
     cp -r "$REPO_ROOT/lib" "$FAKE_REPO/lib"
     REFRESH="$FAKE_REPO/bin/arcs-refresh"
-    echo 'WORK_ARCS_ARTIFACT_URL=https://example.invalid/artifact' >"$FAKE_REPO/.env"
+    # A real-shaped artifact link, because the slug is parsed out of it and a publish with
+    # no slug is the one failure that is silent and permanent -- it makes a second
+    # artifact instead of updating this one.
+    export STUB_SLUG="11111111-2222-3333-4444-555555555555"
+    export ARTIFACT_URL="https://claude.ai/code/artifact/$STUB_SLUG"
+    echo "WORK_ARCS_ARTIFACT_URL=$ARTIFACT_URL" >"$FAKE_REPO/.env"
 
     export NOTIFY_LOG="$TEST_TMPDIR/notify.log"
     export STUB_DIR="$TEST_TMPDIR/stub"
     mkdir -p "$STUB_DIR"
     export STUB_USAGE="$TEST_TMPDIR/usage.json"
     export STUB_TOKEN_RESP="$TEST_TMPDIR/token-response.json"
+    export STUB_FRAMES="$TEST_TMPDIR/frames.json"
     # Exported here so a test can override them with a bare assignment, which is how the
     # rest of this file already reads.
     export STUB_USAGE_CODES=200
     export STUB_TOKEN_CODE=200
+    export STUB_FRAMES_CODE=200
+    export STUB_DEPLOY_CODES=200
+    export STUB_DEPLOY_MSG=refused
     export CRONTAB_FILE="$TEST_TMPDIR/crontab"
     export SYSTEMCTL_LOG="$TEST_TMPDIR/systemctl.log"
 
@@ -80,12 +89,17 @@ EOF
     # it carried, which is how a test can tell the retry used the fresh token.
     cat >"$HOME/bin/curl" <<'EOF'
 #!/bin/sh
-out=""; url=""; data=""; auth=""
+out=""; url=""; data=""; auth=""; hdrs=""
 while [ $# -gt 0 ]; do
     case "$1" in
         -o) out="$2"; shift 2 ;;
-        -H) case "$2" in Authorization:*) auth="$2" ;; esac; shift 2 ;;
-        --data) data="${2#@}"; shift 2 ;;
+        # -X takes a value. Without this case it fell through to the catch-all -*, which
+        # dropped the flag and left "POST" to be read as the URL -- so every frame call
+        # would have been answered by the /usage branch.
+        -X) shift 2 ;;
+        -H) hdrs="$hdrs$2
+"; case "$2" in Authorization:*) auth="$2" ;; esac; shift 2 ;;
+        --data|--data-binary) data="${2#@}"; shift 2 ;;
         -w|-m) shift 2 ;;
         -*) shift ;;
         *)  url="$1"; shift ;;
@@ -97,6 +111,35 @@ case "$url" in
     echo "token" >>"$STUB_DIR/calls"
     [ -n "$out" ] && cp "$STUB_TOKEN_RESP" "$out"
     printf '%s' "${STUB_TOKEN_CODE:-200}"
+    ;;
+*/api/frame/frames*)
+    echo "frames $auth" >>"$STUB_DIR/calls"
+    printf '%s' "$hdrs" >"$STUB_DIR/frames-headers"
+    [ -n "$out" ] && cp "$STUB_FRAMES" "$out"
+    printf '%s' "${STUB_FRAMES_CODE:-200}"
+    ;;
+*/api/frame/deploy/direct*)
+    # `grep -c` prints 0 AND exits 1 when it matches nothing, so a `|| echo 0` here would
+    # append a second zero and the arithmetic below would be a fatal syntax error -- which
+    # arrives at the caller as a bare HTTP 000, the same shape as an unreachable host.
+    n=$(grep -c '^deploy' "$STUB_DIR/calls" 2>/dev/null)
+    n=$(( ${n:-0} + 1 ))
+    echo "deploy $auth" >>"$STUB_DIR/calls"
+    printf '%s' "$hdrs" >"$STUB_DIR/deploy-headers"
+    # Every attempt kept separately: the supersede path sends a second, different body,
+    # and a test that can only see the last one cannot tell it apart from a first try.
+    [ -n "$data" ] && cp "$data" "$STUB_DIR/deploy-request-$n.json"
+    code=$(echo "${STUB_DEPLOY_CODES:-200}" | awk -v n="$n" '{print (n <= NF) ? $n : $NF}')
+    if [ -n "$out" ]; then
+        if [ "$code" = "200" ]; then
+            printf '{"slug":"%s","version":"v-new","title":"Work Arcs"}' \
+                "${STUB_SLUG:-}" >"$out"
+        else
+            printf '{"error":{"type":"invalid_request_error","message":"%s"}}' \
+                "${STUB_DEPLOY_MSG:-refused}" >"$out"
+        fi
+    fi
+    printf '%s' "$code"
     ;;
 *)
     echo "usage $auth" >>"$STUB_DIR/calls"
@@ -175,7 +218,44 @@ EOF
     # finishes in a millisecond instead of forty seconds.
     export WORK_ARCS_REFRESH_CMD="$TEST_TMPDIR/pipeline"
     pipeline_ok
+
+    # Publishing is off for the suite at large and turned on by the tests that are about
+    # it. Most tests here are about the quota guard and the lock, and a network write at
+    # the end of every one of them would be a second subject they never asked to test.
+    export WORK_ARCS_PUBLISH=0
+    # No real backoff: the retry is worth proving, the fifteen seconds are not.
+    export WORK_ARCS_PUBLISH_RETRY_BASE=0
+    frames_ok
 }
+
+# What the artifact API says the artifact currently is. The title and favicon matter
+# because deploy requires both and the script is supposed to echo back what is already
+# there rather than invent them; the version matters because it becomes baseVersion.
+frames_ok() {
+    cat >"$STUB_FRAMES" <<EOF
+{"frames": [
+  {"slug": "$STUB_SLUG", "title": "Work Arcs", "favicon": "🧭",
+   "description": "Work Arcs", "version": "v-old"},
+  {"slug": "99999999-9999-9999-9999-999999999999", "title": "Something Else",
+   "favicon": "📎", "version": "v-other"}
+]}
+EOF
+}
+
+# A page with bytes in it. pipeline_ok writes an empty one, which is fine for the tests
+# that only care that the pipeline ran and wrong for every test about publishing: an
+# empty page is refused before it reaches the network.
+pipeline_with_page() {
+    make_pipeline 'echo "  page: built"; printf "<h1>arcs</h1>" >"$XDG_STATE_HOME/work-arcs/page.html"; exit 0'
+}
+
+publishing_on() {
+    export WORK_ARCS_PUBLISH=1
+    pipeline_with_page
+}
+
+deploy_calls() { count_calls deploy; }
+deploy_request() { cat "$STUB_DIR/deploy-request-${1:-1}.json"; }
 
 teardown() {
     teardown_temp_dir
@@ -394,10 +474,11 @@ exit 0'
     ! notified
 }
 
-@test "a successful run leaves the publish line in the log" {
+@test "with publishing off the run still says how to publish by hand" {
     run "$REFRESH"
-    grep -q "publish .* to https://example.invalid/artifact" "$LOG"
-    grep -q "upload-only" "$LOG"
+    grep -q "publish: off (WORK_ARCS_PUBLISH=0)" "$LOG"
+    grep -q "publish .* to $ARTIFACT_URL" "$LOG"
+    [ "$(deploy_calls)" = 0 ]
 }
 
 @test "a successful run stamps the state file" {
@@ -408,8 +489,9 @@ exit 0'
     [ "$(jq -r '.page' "$STATE_JSON")" = "$STATE/page.html" ]
 }
 
-# This script cannot publish -- only a Claude session can -- so whatever stamped
-# published_at knows something a rebuild does not, and a rebuild must not erase it.
+# write_state does not own published_at -- stamp_published does, and it runs after. So a
+# rebuild that does not publish must leave the last publish's stamp standing rather than
+# erasing it or claiming this build was the published one.
 @test "a rebuild carries published_at through" {
     echo '{"published_at": 1700000000}' >"$STATE_JSON"
     run "$REFRESH"
@@ -956,7 +1038,195 @@ EOF
 }
 
 @test "an unknown argument is refused rather than ignored" {
-    run "$REFRESH" --publish
+    run "$REFRESH" --rebuild-everything
     [ "$status" -eq 2 ]
     ! ran_pipeline
+}
+
+# --- publishing ----------------------------------------------------------------------
+#
+# The run used to stop one step short: it built the page and logged an instruction telling
+# a person to open a session and finish the job. These are about the step that replaced it.
+
+@test "a successful run publishes the page it just built" {
+    publishing_on
+    run "$REFRESH"
+    [ "$status" -eq 0 ]
+    [ "$(deploy_calls)" = 1 ]
+    grep -q "published: $ARTIFACT_URL" "$LOG"
+    ! notified
+}
+
+@test "the publish carries the slug from the artifact URL" {
+    publishing_on
+    run "$REFRESH"
+    [ "$(deploy_request | jq -r '.slug')" = "$STUB_SLUG" ]
+}
+
+# Inventing these would rename the page and change the icon Kyle finds the tab by, so they
+# are read back from the artifact rather than decided here.
+@test "the publish echoes back the artifact's own title and favicon" {
+    publishing_on
+    run "$REFRESH"
+    [ "$(deploy_request | jq -r '.title')" = "Work Arcs" ]
+    [ "$(deploy_request | jq -r '.favicon')" = "🧭" ]
+}
+
+@test "the publish sends the page as the content" {
+    publishing_on
+    run "$REFRESH"
+    [ "$(deploy_request | jq -r '.content')" = "<h1>arcs</h1>" ]
+}
+
+@test "the publish sends the artifact's version as the precondition" {
+    publishing_on
+    run "$REFRESH"
+    [ "$(deploy_request | jq -r '.baseVersion')" = "v-old" ]
+}
+
+# The frame list has more than one artifact in it and only one of them is this page.
+@test "the publish reads the record for its own slug and not the first one" {
+    publishing_on
+    run "$REFRESH"
+    [ "$(deploy_request | jq -r '.title')" != "Something Else" ]
+}
+
+@test "a published run stamps published_at and the new version" {
+    publishing_on
+    run "$REFRESH"
+    [ "$(jq -r '.published_at | type' "$STATE_JSON")" = "number" ]
+    [ "$(jq -r '.published_version' "$STATE_JSON")" = "v-new" ]
+}
+
+# X-Frame-CP is what makes the gateway match the route at all. Without it the request 404s
+# in a way that looks exactly like a wrong path, so it is worth a test that names it.
+@test "the publish sends the frame routing headers" {
+    publishing_on
+    run "$REFRESH"
+    grep -q "^X-Frame-CP: go$" "$STUB_DIR/deploy-headers"
+    grep -q "^X-Frame-Surface: code$" "$STUB_DIR/deploy-headers"
+}
+
+@test "the publish uses the token the quota check already proved" {
+    publishing_on
+    run "$REFRESH"
+    # One usage call and one deploy, both on the stored token: proving the credential
+    # again for the write would be a second mint for no reason.
+    [ "$(token_calls)" = 0 ]
+    grep -q "^deploy Authorization: Bearer stale-token$" "$STUB_DIR/calls"
+}
+
+@test "a publish on a morning the token was stale uses the refreshed one" {
+    publishing_on
+    STUB_USAGE_CODES="401 200" run "$REFRESH"
+    grep -q "^deploy Authorization: Bearer fresh-token$" "$STUB_DIR/calls"
+}
+
+# --- publishing, when it does not work ------------------------------------------------
+
+@test "an artifact URL with no slug in it is refused before anything is sent" {
+    publishing_on
+    echo 'WORK_ARCS_ARTIFACT_URL=https://example.invalid/artifact' >"$FAKE_REPO/.env"
+    run "$REFRESH"
+    [ "$(deploy_calls)" = 0 ]
+    grep -q "not an artifact link" "$LOG"
+    grep -q "would create a second artifact" "$LOG"
+}
+
+@test "an empty page is refused before anything is sent" {
+    export WORK_ARCS_PUBLISH=1
+    pipeline_ok
+    run "$REFRESH"
+    [ "$(deploy_calls)" = 0 ]
+    grep -q "missing or empty" "$LOG"
+}
+
+# The build succeeded and the page on disk is good; only the upload failed. The run says
+# so out loud, because a page nobody can see is the failure this whole section prevents.
+@test "a failed publish notifies and points at the manual route" {
+    publishing_on
+    STUB_DEPLOY_CODES=500 run "$REFRESH"
+    notified
+    grep -q "the page on disk is good" "$LOG"
+}
+
+@test "a failed publish does not stamp published_at" {
+    publishing_on
+    STUB_DEPLOY_CODES=500 run "$REFRESH"
+    [ "$(jq -r '.published_at' "$STATE_JSON")" = "null" ]
+}
+
+# A plan cap will still be a plan cap in ten seconds, which is what separates this 429
+# from the 503 below.
+@test "a publish cap is not retried" {
+    publishing_on
+    STUB_DEPLOY_CODES="429 200" run "$REFRESH"
+    [ "$(deploy_calls)" = 1 ]
+    grep -q "publish cap" "$LOG"
+}
+
+@test "a busy render service is retried and then succeeds" {
+    publishing_on
+    STUB_DEPLOY_CODES="503 200" run "$REFRESH"
+    [ "$status" -eq 0 ]
+    [ "$(deploy_calls)" = 2 ]
+    grep -q "render service is busy" "$LOG"
+    grep -q "published:" "$LOG"
+}
+
+@test "a render service that stays busy gives up rather than looping" {
+    publishing_on
+    STUB_DEPLOY_CODES=503 run "$REFRESH"
+    [ "$(deploy_calls)" = 3 ]
+    grep -q "stayed busy across 3 attempts" "$LOG"
+}
+
+# Something else published between this run's read and its write. Nothing of that version
+# survives in what we are sending -- the page is rebuilt whole every run -- so the default
+# is to supersede it, and to say so.
+@test "an artifact that moved underneath the run is superseded" {
+    publishing_on
+    STUB_DEPLOY_CODES="409 200" run "$REFRESH"
+    [ "$status" -eq 0 ]
+    [ "$(deploy_calls)" = 2 ]
+    grep -q "moved since this run read it" "$LOG"
+    # The first attempt carried the precondition, the second dropped it and forced.
+    [ "$(deploy_request 1 | jq -r '.baseVersion')" = "v-old" ]
+    [ "$(deploy_request 2 | jq -r 'has("baseVersion")')" = "false" ]
+    [ "$(deploy_request 2 | jq -r '.force')" = "true" ]
+}
+
+@test "superseding can be turned off, and then a conflict is a failure" {
+    publishing_on
+    STUB_DEPLOY_CODES="409 200" WORK_ARCS_PUBLISH_SUPERSEDE=0 run "$REFRESH"
+    [ "$(deploy_calls)" = 1 ]
+    grep -q "refused with HTTP 409" "$LOG"
+}
+
+@test "an artifact this login cannot see is named as such" {
+    publishing_on
+    echo '{"frames": []}' >"$STUB_FRAMES"
+    run "$REFRESH"
+    [ "$(deploy_calls)" = 0 ]
+    grep -q "may belong to another login" "$LOG"
+}
+
+# --- --publish -------------------------------------------------------------------------
+
+@test "--publish uploads the page on disk without rebuilding it" {
+    export WORK_ARCS_PUBLISH=1
+    printf '<h1>arcs</h1>' >"$STATE/page.html"
+    run "$REFRESH" --publish
+    [ "$status" -eq 0 ]
+    [ "$(deploy_calls)" = 1 ]
+    # The expensive half did not run: no build line, and no quota read to gate one.
+    ! grep -q "refreshed in" "$LOG"
+    [ "$(usage_calls)" = 0 ]
+}
+
+@test "--publish reports a failure in its exit status" {
+    export WORK_ARCS_PUBLISH=1
+    printf '<h1>arcs</h1>' >"$STATE/page.html"
+    STUB_DEPLOY_CODES=500 run "$REFRESH" --publish
+    [ "$status" -eq 1 ]
 }
