@@ -430,18 +430,29 @@ print(slack_what(was, now))'
     # read, one click away. The model returns a message number and never a link, so the
     # quote and the URL are read out of the message list -- this asserts they survive the
     # trip through the snapshot, which holds neither.
+    #
+    # A quote travels as a record and not as a string, because a quote is a message
+    # somebody sent: the page renders it through say(), which sets the name and the face
+    # above the words. The strip under "what moved" was the last place still handing over
+    # an anonymous slab, and the shape is what stops it being one again.
     run wa '
+b = block(open_=[(4, "nobody has run the backfill")])
+b["open"][0]["who"] = "vadym"
 was = [slarc("A", ["a"], [block()])]
-now = [slarc("A", ["a"], [block(open_=[(4, "nobody has run the backfill")])])]
+now = [slarc("A", ["a"], [b])]
 p = srow(was, "2026-08-14T01:00:00-0700")
 c = srow(now, "2026-08-14T05:00:00-0700")
 e = wa.diff_runs(p, c, list(now), None)["changes"][0]["evidence"][0]
+q, = e["quotes"]
 print(e["kind"], e["ref"])
-print(e["quotes"])
-print(e["url"])'
+print(q["who"], "|", q["text"])
+print(e["url"])
+print(q["url"])'
     [ "${lines[0]}" = "slack #impl-trimet" ]
-    [ "${lines[1]}" = "['q:nobody has run the backfill']" ]
+    [ "${lines[1]}" = "vadym | q:nobody has run the backfill" ]
     [ "${lines[2]}" = "https://x.slack.com/archives/C1/p1755000000000004?thread_ts=1755000000.000001" ]
+    # The quote links to the message it is, not merely to the sentence it corroborates.
+    [ "${lines[3]}" = "${lines[2]}" ]
 }
 
 # ── the store itself ──────────────────────────────────────────────────────────
