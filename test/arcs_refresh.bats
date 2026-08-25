@@ -596,6 +596,36 @@ EOF
     [[ "$output" == *"after refreshing the access token"* ]]
 }
 
+@test "--check-refresh says when the stored token can still mint one" {
+    run "$REFRESH" --check-refresh
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"minted a new access token"* ]]
+    [ "$(usage_calls)" -eq 0 ]
+}
+
+# A diagnostic that leaks the thing it is diagnosing is worse than no diagnostic: this gets
+# run in a terminal and pasted into messages.
+@test "--check-refresh never prints a token" {
+    run "$REFRESH" --check-refresh
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"fresh-token"* ]]
+    [[ "$output" != *"stored-refresh"* ]]
+}
+
+@test "--check-refresh names why the endpoint refused" {
+    cat >"$STUB_TOKEN_RESP" <<'EOF'
+{"error": {"type": "rate_limit_error", "message": "Rate limited. Please try again later."}}
+EOF
+    STUB_TOKEN_CODE=429 run "$REFRESH" --check-refresh
+    [ "$status" -eq 4 ]
+    [[ "$output" == *"HTTP 429, rate_limit_error: Rate limited"* ]]
+}
+
+@test "--check-refresh does not run the pipeline" {
+    run "$REFRESH" --check-refresh
+    ! ran_pipeline
+}
+
 # --- the systemd user timer --------------------------------------------------------------
 #
 # The other half of the same eight days: `10 7 * * *` does not fire on a sleeping laptop

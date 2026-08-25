@@ -738,6 +738,7 @@ arcs-refresh --install-timer        # daily at 07:10, catches up after the lapto
 arcs-refresh --install-timer 06:30  # or whenever
 arcs-refresh --uninstall-timer      # disable it and remove the units
 arcs-refresh --check-quota          # what the guard currently thinks
+arcs-refresh --check-refresh        # can the stored refresh token still mint one?
 arcs-refresh --hook                 # the arc-record Stop hook block, not installed for you
 ```
 

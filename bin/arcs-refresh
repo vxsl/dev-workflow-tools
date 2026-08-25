@@ -94,6 +94,8 @@
 #   arcs-refresh                    run it now, the way the timer will
 #   arcs-refresh --force            run even if the quota guard says no
 #   arcs-refresh --check-quota      just the guard's verdict, then exit
+#   arcs-refresh --check-refresh    can the stored refresh token still mint one? no token
+#                                   is printed, only whether it worked
 #   arcs-refresh --install-timer    the systemd user timer: 07:10, catches up after sleep
 #   arcs-refresh --install-timer 06:30
 #   arcs-refresh --uninstall-timer  disable it and remove the units
@@ -746,6 +748,18 @@ case "${1:-}" in
     --uninstall-timer) uninstall_timer; exit $? ;;
     --install-cron)   install_cron "${2:-}"; exit $? ;;
     --uninstall-cron) uninstall_cron; exit $? ;;
+    # The credential half of --check-quota, on its own. Worth a flag because the log line
+    # it answers -- "refreshing it was refused" -- is the one a person has to act on, and
+    # the question "can this mint a token right now?" should not require corrupting a
+    # credentials file to ask. It prints the outcome and never the token.
+    --check-refresh)
+        if refresh_access_token; then
+            FRESH_ACCESS_TOKEN=""
+            echo "ok — the stored refresh token minted a new access token"
+            exit 0
+        fi
+        echo "failed — token endpoint HTTP $REFRESH_HTTP_CODE${REFRESH_ERROR:+, $REFRESH_ERROR}"
+        exit 4 ;;
     --check-quota)
         quota_verdict
         case "$QUOTA_VERDICT" in
