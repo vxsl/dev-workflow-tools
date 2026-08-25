@@ -243,13 +243,26 @@ FRESH_ACCESS_TOKEN=""
 # One GET with one bearer token, and the status kept where the caller can see it. That
 # last part is the change: 401 means this token is stale and 000 means there is no network
 # yet, and the whole fix rests on not treating them the same.
+# curl prints `%{http_code}` as 000 when it never reached the host AND exits non-zero, so
+# the `|| echo 000` this used to carry appended a second one and left "000000" in the
+# variable. Harmless while nothing read it; the retry-on-unreachable path reads it, and
+# would have compared "000000" against "000" and never retried -- the same class of quiet
+# wrong-for-the-right-reason failure as everything else in this file.
+http_code_or_000() {
+    case "$1" in
+        [0-9][0-9][0-9]) printf '%s' "$1" ;;
+        *)               printf '000' ;;
+    esac
+}
+
 usage_call() {
     local tok="$1" body
     body="$(mktemp)"
     USAGE_HTTP_CODE="$(curl -sS -m "$HTTP_TIMEOUT" -o "$body" -w '%{http_code}' \
         -H "Authorization: Bearer $tok" \
         -H "anthropic-beta: $OAUTH_BETA" \
-        "$USAGE_URL" 2>/dev/null || echo 000)"
+        "$USAGE_URL" 2>/dev/null || true)"
+    USAGE_HTTP_CODE="$(http_code_or_000 "$USAGE_HTTP_CODE")"
     if [ "$USAGE_HTTP_CODE" = "200" ] && jq -e . "$body" >/dev/null 2>&1; then
         USAGE_JSON="$body"
         return 0
@@ -316,7 +329,8 @@ refresh_access_token() {
     REFRESH_HTTP_CODE="$(curl -sS -m "$HTTP_TIMEOUT" -o "$resp" -w '%{http_code}' \
         -H 'Content-Type: application/json' \
         -H "anthropic-beta: $OAUTH_BETA" \
-        --data @"$req" "$OAUTH_TOKEN_URL" 2>/dev/null || echo 000)"
+        --data @"$req" "$OAUTH_TOKEN_URL" 2>/dev/null || true)"
+    REFRESH_HTTP_CODE="$(http_code_or_000 "$REFRESH_HTTP_CODE")"
     rm -f "$req"
 
     if [ "$REFRESH_HTTP_CODE" = "200" ]; then

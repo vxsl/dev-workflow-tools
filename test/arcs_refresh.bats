@@ -103,8 +103,13 @@ case "$url" in
     code=$(echo "${STUB_USAGE_CODES:-200}" | awk -v n="$n" '{print (n <= NF) ? $n : $NF}')
     [ -n "$out" ] && cp "$STUB_USAGE" "$out"
     printf '%s' "$code"
+    # Real curl prints 000 from -w AND exits non-zero when it never reached the host, so a
+    # caller that appends its own 000 on failure ends up comparing against "000000". The
+    # stub has to do both or the retry-on-unreachable path is tested against a fiction.
+    if [ "$code" = "000" ]; then exit 7; fi
     ;;
 esac
+exit 0
 EOF
 
     # `systemctl --user` on a machine with no user manager exits non-zero rather than
