@@ -52,6 +52,7 @@ setup() {
     mkdir -p "$FAKE_REPO/bin"
     cp "$REPO_ROOT/bin/arcs-refresh" "$FAKE_REPO/bin/arcs-refresh"
     cp -r "$REPO_ROOT/systemd" "$FAKE_REPO/systemd"
+    cp -r "$REPO_ROOT/lib" "$FAKE_REPO/lib"
     REFRESH="$FAKE_REPO/bin/arcs-refresh"
     echo 'WORK_ARCS_ARTIFACT_URL=https://example.invalid/artifact' >"$FAKE_REPO/.env"
 
@@ -124,8 +125,22 @@ esac
 exit 0
 EOF
 
-    # Present only so preflight passes; nothing in these tests reaches a model.
-    printf '#!/bin/sh\nexit 0\n' >"$HOME/bin/claude"
+    # Present so preflight passes, and -- since the session fallback shells out to it --
+    # recording where and how it was invoked, because running it in the wrong cwd puts a
+    # transcript in the corpus work-arcs reads back as work Kyle did.
+    cat >"$HOME/bin/claude" <<'EOF'
+#!/bin/sh
+{
+  printf 'cwd=%s\n' "$PWD"
+  printf 'quiet=%s\n' "${CLAUDE_NOTIFY_QUIET:-unset}"
+  printf 'args=%s\n' "$*"
+} >>"$STUB_DIR/claude-calls"
+[ -n "${STUB_CLAUDE_REFRESHES:-}" ] && cat >"$WORK_ARCS_CREDS" <<CREDS
+{"claudeAiOauth": {"accessToken": "session-token", "refreshToken": "stored-refresh",
+  "scopes": ["user:inference", "user:profile"]}}
+CREDS
+exit "${STUB_CLAUDE_EXIT:-0}"
+EOF
 
     cat >"$HOME/bin/crontab" <<'EOF'
 #!/bin/sh
@@ -138,6 +153,11 @@ EOF
 
     chmod +x "$HOME/bin/notification/claude-notify.sh" "$HOME/bin/curl" \
              "$HOME/bin/claude" "$HOME/bin/crontab" "$HOME/bin/systemctl"
+
+    # Off unless a test asks for it, so the many tests that never reach a 401 do not
+    # quietly depend on a session being able to rescue them.
+    export STUB_CLAUDE_REFRESHES=""
+    export STUB_CLAUDE_EXIT=0
 
     # The full credential shape, because the refresh request is built out of three of its
     # fields and a fixture with only the access token is the "nothing to refresh with" case.
@@ -420,7 +440,7 @@ exit 0'
     [ "$status" -eq 0 ]
     ran_pipeline
     [ "$(token_calls)" -eq 1 ]
-    grep -q "quota ok after refreshing the access token: 5h 20%" "$LOG"
+    grep -q "quota ok after minting a fresh access token: 5h 20%" "$LOG"
 }
 
 # A run that had to mint a token is not a run worth waking anybody for; it is the feature
@@ -507,20 +527,105 @@ exit 0'
 # Outcome three of three, and it must not read like outcome one. A refused refresh is a
 # login that needs a person, and the log line has to say so or the next reader goes
 # looking at the network again.
-@test "a refused refresh says the token expired, not that the endpoint was unreadable" {
-    STUB_USAGE_CODES=401 STUB_TOKEN_CODE=400 run "$REFRESH"
+# With the fallback switched off, a refused mint is the end of it -- and must not read like
+# a network fault, which is the sentence that hid this for eight days.
+@test "a refused mint says the token expired, not that the endpoint was unreadable" {
+    STUB_USAGE_CODES=401 STUB_TOKEN_CODE=400 WORK_ARCS_REFRESH_SESSION_FALLBACK=0 \
+        run "$REFRESH"
     [ "$status" -eq 3 ]
     ! ran_pipeline
-    grep -q "the access token is expired and refreshing it was refused (token endpoint HTTP 400)" "$LOG"
+    grep -q "the access token is expired and refreshing it was refused (token endpoint HTTP 400" "$LOG"
     grep -q "run any claude session to refresh it" "$LOG"
     ! grep -q "the usage endpoint could not be read" "$LOG"
 }
 
-@test "a token response with no access token in it is a refused refresh" {
+@test "a token response with no access token in it is a refused mint" {
     echo '{"error":"invalid_grant"}' >"$STUB_TOKEN_RESP"
-    STUB_USAGE_CODES=401 run "$REFRESH"
+    STUB_USAGE_CODES=401 WORK_ARCS_REFRESH_SESSION_FALLBACK=0 run "$REFRESH"
     [ "$status" -eq 3 ]
     grep -q "refreshing it was refused" "$LOG"
+}
+
+# --- the session fallback --------------------------------------------------------------
+#
+# Minting a token directly has never been observed to work from this machine -- the token
+# endpoint answers 429 to this client while Claude Code's own refresh, three minutes apart,
+# succeeded. What has been observed working is a live session refreshing the credential,
+# which is why the same quota check passed by hand at 10:00 on a morning it failed at
+# 07:10. So the refused mint falls through to the cheapest session there is.
+
+@test "a refused mint falls through to a claude session and the run goes ahead" {
+    STUB_CLAUDE_REFRESHES=1
+    STUB_USAGE_CODES="401 200" STUB_TOKEN_CODE=429 run "$REFRESH"
+    [ "$status" -eq 0 ]
+    ran_pipeline
+    grep -q "quota ok after a claude session refreshed the access token" "$LOG"
+    grep -q "running the cheapest claude session to refresh it instead" "$LOG"
+}
+
+# The token the retry carries has to come from re-reading the file the session rewrote,
+# not from the variable holding the one that already 401'd.
+@test "the retry after a session carries the token the session wrote" {
+    STUB_CLAUDE_REFRESHES=1
+    STUB_USAGE_CODES="401 200" STUB_TOKEN_CODE=429 run "$REFRESH"
+    [ "$status" -eq 0 ]
+    [[ "$(nth_usage_auth 1)" == *"Bearer stale-token"* ]]
+    [[ "$(nth_usage_auth 2)" == *"Bearer session-token"* ]]
+}
+
+# THE ONE THAT MATTERS BEYOND THIS FILE. A bare `claude -p` starts a real session: the Stop
+# hook notifies, and the transcript joins the corpus work-arcs and arc-cluster read. Every
+# morning the token went stale would otherwise show up on the page as work Kyle did, and
+# arc-backfill would feed it back as a prompt. lib/headless_claude puts it in the one
+# project directory every consumer skips.
+@test "the fallback session is isolated from the corpus it would otherwise pollute" {
+    STUB_CLAUDE_REFRESHES=1
+    STUB_USAGE_CODES="401 200" STUB_TOKEN_CODE=429 run "$REFRESH"
+    [ "$status" -eq 0 ]
+    grep -q "^cwd=.*/claude-headless$" "$STUB_DIR/claude-calls"
+    grep -q "^quiet=1$" "$STUB_DIR/claude-calls"
+}
+
+@test "the fallback session is the cheapest model, not the default one" {
+    STUB_CLAUDE_REFRESHES=1
+    STUB_USAGE_CODES="401 200" STUB_TOKEN_CODE=429 run "$REFRESH"
+    grep -q "^args=.*--model haiku" "$STUB_DIR/claude-calls"
+}
+
+@test "a fallback session that cannot run is reported as such" {
+    STUB_CLAUDE_EXIT=1
+    STUB_USAGE_CODES=401 STUB_TOKEN_CODE=429 run "$REFRESH"
+    [ "$status" -eq 3 ]
+    ! ran_pipeline
+    grep -q "a claude session could not refresh it either" "$LOG"
+}
+
+# A session can exit 0 without having refreshed anything, and that is a fourth outcome
+# rather than a repeat of the third.
+@test "a session that ran without refreshing anything is its own sentence" {
+    STUB_USAGE_CODES="401 401" STUB_TOKEN_CODE=429 run "$REFRESH"
+    [ "$status" -eq 3 ]
+    grep -q "a claude session ran but the usage endpoint still answered HTTP 401" "$LOG"
+}
+
+# Nothing reaches a model on a morning the token was fine, which is almost every morning.
+@test "no claude session is started when the stored token still works" {
+    run "$REFRESH"
+    [ "$status" -eq 0 ]
+    [ ! -f "$STUB_DIR/claude-calls" ]
+}
+
+@test "no claude session is started when minting a token worked" {
+    STUB_USAGE_CODES="401 200" run "$REFRESH"
+    [ "$status" -eq 0 ]
+    [ ! -f "$STUB_DIR/claude-calls" ]
+}
+
+# A network failure must not reach a model either: it says nothing about the credential.
+@test "no claude session is started for an unreachable endpoint" {
+    STUB_USAGE_CODES="000 000 000" run "$REFRESH"
+    [ "$status" -eq 3 ]
+    [ ! -f "$STUB_DIR/claude-calls" ]
 }
 
 # Nothing to refresh with is not a network round trip, and must not be reported as one.
@@ -593,7 +698,7 @@ EOF
 @test "--check-quota says when it had to refresh to answer" {
     STUB_USAGE_CODES="401 200" run "$REFRESH" --check-quota
     [ "$status" -eq 0 ]
-    [[ "$output" == *"after refreshing the access token"* ]]
+    [[ "$output" == *"after a token refresh"* ]]
 }
 
 @test "--check-refresh says when the stored token can still mint one" {

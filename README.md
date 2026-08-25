@@ -785,6 +785,21 @@ whole and unlocked, and a lost race there is a broken login rather than a stale 
 `~/bin/hud-claude-usage` has the same 401-means-stale limitation and keeps its stale cache
 instead; it could borrow this, but it lives outside this repo.
 
+**And if minting a token is refused, it asks Claude Code to do it.** Minting one directly
+has never been observed to work from this machine: the token endpoint answers `429
+rate_limit_error` to this client, while Claude Code's own refresh from the same machine
+three minutes later succeeded. What *has* been observed working is a live session
+refreshing the credential — that is exactly why the same quota check passed by hand at
+10:00 on a morning it had failed at 07:10. So a refused mint falls through to the cheapest
+session there is (`claude -p --model haiku`), and the retry re-reads the file that session
+rewrote. It runs through `lib/headless_claude`, which matters beyond this script: a bare
+`claude -p` starts a real session, so the Stop hook would notify and the transcript would
+join the corpus `work-arcs` and `arc-cluster` read — every morning the token went stale
+would appear on the page as work you did, and `arc-backfill` would feed it back as a
+prompt. Set `WORK_ARCS_REFRESH_SESSION_FALLBACK=0` to stand down instead. Nothing reaches a
+model on a morning the token was fine, on a network failure, or when the direct mint
+worked; `--check-refresh` asks whether the direct route is currently available at all.
+
 **It stands down rather than spend.** `extra_usage` is enabled on this account, so 100%
 of the weekly quota is where charging starts, not where anything stops. The run reads
 the utilisation first and skips above 80% of the 5-hour window or 90% of the 7-day one

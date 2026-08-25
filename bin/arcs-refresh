@@ -125,6 +125,9 @@
 #   WORK_ARCS_REFRESH_ON_UNKNOWN skip|run when the quota cannot be read    (default skip)
 #   WORK_ARCS_REFRESH_CMD        the pipeline to run                       (default arcs)
 #   WORK_ARCS_REFRESH_LOG_LINES  ring-trim the log to this many lines      (default 2000)
+#   WORK_ARCS_REFRESH_SESSION_FALLBACK
+#                                on 401, when minting a token directly is refused, run the
+#                                cheapest claude session to refresh it        (default 1)
 #   WORK_ARCS_REFRESH_NET_TRIES  usage reads before a dead network counts  (default 3)
 #   WORK_ARCS_REFRESH_NET_DELAY  seconds to wait between those             (default 10)
 #   WORK_ARCS_CREDS              the OAuth credential file to read from
@@ -210,6 +213,10 @@ HTTP_TIMEOUT=10
 # usage read that comes back with no HTTP status at all is not yet an answer. Three
 # tries ten seconds apart, which costs half a minute on the one morning a year the
 # machine genuinely has no network and buys back every morning it is merely slow.
+# On by default, because the alternative when a direct mint is refused is no page. It
+# costs one haiku call on a morning the token went stale and nothing on every other
+# morning; set it to 0 to have the run stand down instead.
+SESSION_FALLBACK="${WORK_ARCS_REFRESH_SESSION_FALLBACK:-1}"
 NET_TRIES="${WORK_ARCS_REFRESH_NET_TRIES:-3}"
 NET_DELAY="${WORK_ARCS_REFRESH_NET_DELAY:-10}"
 
@@ -252,7 +259,7 @@ trim_log() {
 # on the way to the number would be discarded with it.
 USAGE_JSON=""        # path to a temp file holding the response body, on success
 USAGE_FAILURE=""     # a sentence saying why there is no body, on failure
-USAGE_REFRESHED=0    # 1 when refreshing the access token is what made it work
+USAGE_REFRESHED=""   # "token" or "session" when a refresh is what made it work
 USAGE_HTTP_CODE=""   # the last status /usage gave, "000" when curl never got one
 REFRESH_HTTP_CODE="" # ditto for the token endpoint
 REFRESH_ERROR=""     # what the token endpoint said when it said no
@@ -377,11 +384,41 @@ refresh_access_token() {
     [ -n "$FRESH_ACCESS_TOKEN" ]
 }
 
+# THE FALLBACK, and on the evidence the better-founded of the two routes. Minting a token
+# directly has never been observed to work from here -- the endpoint answers 429 to this
+# client while Claude Code's own refresh from the same machine, three minutes apart,
+# succeeded -- whereas "a live session had refreshed the token" is exactly why the same
+# quota check passed by hand at 10:00 on a morning it had failed at 07:10. So when the
+# direct mint is refused, ask the program that owns the credential to refresh it the way it
+# always does: by running the cheapest session there is.
+#
+# Through lib/headless_claude because a bare `claude -p` is not free of consequences. It
+# starts a real session: the Stop hook fires a notification, and the transcript joins the
+# corpus work-arcs and arc-cluster read -- so without this, every morning the token was
+# stale would appear on the page as a piece of work Kyle did, and arc-backfill would feed
+# it back as a prompt. The helper puts the session in the one project directory every
+# consumer skips and silences the hook. It is the repo's convention and worth importing
+# rather than reimplementing in four lines of bash that would drift from it.
+refresh_via_session() {
+    local py="$REPO_DIR/lib/headless_claude.py"
+    [ -f "$py" ] || return 1
+    python3 - "$py" <<'PYEOF' >/dev/null 2>&1
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("headless_claude", sys.argv[1])
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+# The cheapest call that still authenticates, which is the only part that matters: the
+# answer is thrown away, the refreshed credential is the point.
+r = mod.run(["--model", "haiku", "Reply with the single word: ok"], timeout=120)
+sys.exit(0 if r.returncode == 0 else 1)
+PYEOF
+}
+
 # Sets USAGE_JSON on success and USAGE_FAILURE on failure, and the failures are worth
 # telling apart in the log: "there was no network", "your token was old and I fixed it",
 # and "your token was old and I could not" are three different mornings.
 fetch_usage() {
-    USAGE_JSON=""; USAGE_FAILURE=""; USAGE_REFRESHED=0
+    USAGE_JSON=""; USAGE_FAILURE=""; USAGE_REFRESHED=""
     local tok
     tok="$(jq -r '.claudeAiOauth.accessToken // empty' "$CREDS" 2>/dev/null || true)"
     if [ -z "$tok" ]; then
@@ -399,22 +436,41 @@ fetch_usage() {
         return 1
     fi
 
-    if ! refresh_access_token; then
-        USAGE_FAILURE="the access token is expired and refreshing it was refused (token endpoint HTTP $REFRESH_HTTP_CODE${REFRESH_ERROR:+, $REFRESH_ERROR}) — run any claude session to refresh it, or re-login"
+    if refresh_access_token; then
+        if usage_call_patiently "$FRESH_ACCESS_TOKEN"; then
+            FRESH_ACCESS_TOKEN=""
+            USAGE_REFRESHED=token
+            return 0
+        fi
+        FRESH_ACCESS_TOKEN=""
+        USAGE_FAILURE="the usage endpoint still answered HTTP $USAGE_HTTP_CODE with a freshly refreshed access token"
         return 1
     fi
 
-    if usage_call_patiently "$FRESH_ACCESS_TOKEN"; then
-        FRESH_ACCESS_TOKEN=""
-        USAGE_REFRESHED=1
+    local minted="token endpoint HTTP $REFRESH_HTTP_CODE${REFRESH_ERROR:+, $REFRESH_ERROR}"
+    if [ "$SESSION_FALLBACK" != 1 ]; then
+        USAGE_FAILURE="the access token is expired and refreshing it was refused ($minted) — run any claude session to refresh it, or re-login"
+        return 1
+    fi
+
+    log "minting a token directly was refused ($minted) — running the cheapest claude session to refresh it instead"
+    if ! refresh_via_session; then
+        USAGE_FAILURE="the access token is expired, minting one was refused ($minted) and a claude session could not refresh it either — re-login"
+        return 1
+    fi
+
+    # Re-read rather than reuse: the session refreshed the credential by rewriting the
+    # file, which is the one writer entitled to.
+    tok="$(jq -r '.claudeAiOauth.accessToken // empty' "$CREDS" 2>/dev/null || true)"
+    if [ -n "$tok" ] && usage_call_patiently "$tok"; then
+        USAGE_REFRESHED=session
         return 0
     fi
-    FRESH_ACCESS_TOKEN=""
-    USAGE_FAILURE="the usage endpoint still answered HTTP $USAGE_HTTP_CODE with a freshly refreshed access token"
+    USAGE_FAILURE="a claude session ran but the usage endpoint still answered HTTP $USAGE_HTTP_CODE ($minted before that)"
     return 1
 }
 
-QUOTA_VERDICT=""; QUOTA_REASON=""; QUOTA_5H=""; QUOTA_7D=""; QUOTA_REFRESHED=0
+QUOTA_VERDICT=""; QUOTA_REASON=""; QUOTA_5H=""; QUOTA_7D=""; QUOTA_REFRESHED=""
 
 # Verdict is ok, over or unknown, in QUOTA_VERDICT, with QUOTA_REFRESHED saying whether
 # reading it took a new token -- see the note on fetch_usage's globals for why this is not
@@ -424,7 +480,7 @@ QUOTA_VERDICT=""; QUOTA_REASON=""; QUOTA_5H=""; QUOTA_7D=""; QUOTA_REFRESHED=0
 # default of 80 permits a run at exactly 80% and refuses 81%. The comparison is jq's
 # because the endpoint reports floats and bash cannot compare them.
 quota_verdict() {
-    QUOTA_VERDICT=""; QUOTA_REASON=""; QUOTA_5H=""; QUOTA_7D=""; QUOTA_REFRESHED=0
+    QUOTA_VERDICT=""; QUOTA_REASON=""; QUOTA_5H=""; QUOTA_7D=""; QUOTA_REFRESHED=""
     if ! fetch_usage; then
         QUOTA_VERDICT=unknown
         QUOTA_REASON="$USAGE_FAILURE"
@@ -675,11 +731,11 @@ do_run() {
     quota_verdict
     case "$QUOTA_VERDICT" in
         ok)
-            if [ "$QUOTA_REFRESHED" = 1 ]; then
-                log "quota ok after refreshing the access token: 5h ${QUOTA_5H}% (max ${MAX_5H}), 7d ${QUOTA_7D}% (max ${MAX_7D})"
-            else
-                log "quota ok: 5h ${QUOTA_5H}% (max ${MAX_5H}), 7d ${QUOTA_7D}% (max ${MAX_7D})"
-            fi ;;
+            case "$QUOTA_REFRESHED" in
+                token)   log "quota ok after minting a fresh access token: 5h ${QUOTA_5H}% (max ${MAX_5H}), 7d ${QUOTA_7D}% (max ${MAX_7D})" ;;
+                session) log "quota ok after a claude session refreshed the access token: 5h ${QUOTA_5H}% (max ${MAX_5H}), 7d ${QUOTA_7D}% (max ${MAX_7D})" ;;
+                *)       log "quota ok: 5h ${QUOTA_5H}% (max ${MAX_5H}), 7d ${QUOTA_7D}% (max ${MAX_7D})" ;;
+            esac ;;
         over)
             if [ "$force" = 1 ]; then
                 log "quota over: $QUOTA_REASON — running anyway (--force)"
@@ -782,7 +838,7 @@ case "${1:-}" in
     --check-quota)
         quota_verdict
         case "$QUOTA_VERDICT" in
-            ok)   echo "ok — 5h ${QUOTA_5H}% (max ${MAX_5H}), 7d ${QUOTA_7D}% (max ${MAX_7D})$([ "$QUOTA_REFRESHED" = 1 ] && echo " (after refreshing the access token)" || true)"; exit 0 ;;
+            ok)   echo "ok — 5h ${QUOTA_5H}% (max ${MAX_5H}), 7d ${QUOTA_7D}% (max ${MAX_7D})${QUOTA_REFRESHED:+ (after a $QUOTA_REFRESHED refresh)}"; exit 0 ;;
             over) echo "over — $QUOTA_REASON"; exit 3 ;;
             *)    echo "unknown — $QUOTA_REASON"; exit 4 ;;
         esac ;;
