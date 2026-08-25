@@ -87,9 +87,16 @@ def led(consulted, complete, you=()):
             "complete": complete}
 
 def only_slack():
-    """No Slack token, Jira quiet: whatever goes wrong is GitLab's, not a co-factor."""
+    """No Slack token, Jira quiet: whatever goes wrong is GitLab's, not a co-factor.
+
+    The meeting sweep is stubbed for a second reason on top of that one. Unstubbed it
+    reaches a real Drive connector through a real model call, so this file did not fail
+    when the third ledger leg landed -- it hung, for as long as the suite was given.
+    No test may spend money or wait on a network to find out what glab did.
+    """
     os.environ.pop("SLACK_USER_TOKEN", None)
     wa.ledger_jira_stalled = lambda *a, **k: ([], True)
+    wa.ledger_meetings = lambda *a, **k: ([], True)
 
 $1
 PY
