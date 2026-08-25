@@ -84,10 +84,16 @@ def beat(d, when, kind):
     b = next((x for x in st["beats"] if x["kind"] == kind), None)
     return [i["text"] for i in (b or {}).get("items", [])]
 
-def subs(d, when, kind, i=0):
+def nsubs(d, when, kind):
+    """How many sub-lines the beat produced. Every beat is one line per thing now."""
     st = build(d, when)
     b = next((x for x in st["beats"] if x["kind"] == kind), None)
-    return [s["text"] for s in b["items"][i]["subs"]]
+    return sum(len(i["subs"]) for i in (b or {}).get("items", []))
+
+def spoken(d, when):
+    """The lines a person would actually read out: the block minus its headings."""
+    return [l for l in build(d, when)["text"].splitlines()
+            if l.startswith("  ") and l.strip()]
 
 $1
 PY
@@ -187,10 +193,36 @@ print(beat(d, "2026-08-24T09:00:00", "moved"))'
     run su 'd = payload(arcs=[arc("a", "finished last week", own_activity=1,
     branches=[{"name": "b", "mr_fate": {"state": "merged", "iid": 42,
                                         "at": "2026-08-22", "url": "u"}}])])
-print(beat(d, "2026-08-24T09:00:00", "moved"), subs(d, "2026-08-24T09:00:00", "moved"))'
+print(beat(d, "2026-08-24T09:00:00", "moved"))'
     [ "$status" -eq 0 ]
     [[ "$output" == *"finished last week"* ]]
     [[ "$output" == *"!42 landed"* ]]
+}
+
+@test "one workstream is one line, with nothing indented under it" {
+    # The version with sub-lines put the name on one line and the rung on the next, which
+    # is two lines to say one thing -- and the thing the second line said was a number.
+    run su 'sat = int(at("2026-08-22T14:00:00").timestamp())
+d = payload(arcs=[arc("a", "work", own_activity=sat, stage="in-review", state="in review",
+                      mrs=[{"iid": 7, "url": "u", "threads": []}],
+                      issues=[{"key": "UL-9", "status": "In Review",
+                               "updated": "2026-08-22", "url": ""}])])
+print(len(beat(d, "2026-08-24T09:00:00", "moved")), nsubs(d, "2026-08-24T09:00:00", "moved"))'
+    [ "$status" -eq 0 ]
+    [ "$output" = "1 0" ]
+}
+
+@test "a landing leads the beat even when something newer was touched after it" {
+    # A landing is the only finished thing in this beat. Recency orders everything else.
+    run su 'sat = int(at("2026-08-22T14:00:00").timestamp())
+d = payload(arcs=[arc("fresh", "touched yesterday", own_activity=sat + 9999, state="s"),
+                  arc("done", "merged on Saturday", own_activity=sat,
+    branches=[{"name": "b", "mr_fate": {"state": "merged", "iid": 42,
+                                        "at": "2026-08-22", "url": "u"}}])])
+for t in beat(d, "2026-08-24T09:00:00", "moved"): print(t)'
+    [ "$status" -eq 0 ]
+    [[ "$(echo "$output" | head -1)" == *"merged on Saturday"* ]]
+    [[ "$(echo "$output" | tail -1)" == *"touched yesterday"* ]]
 }
 
 @test "an MR that landed before the window is not this standup's news" {
@@ -202,16 +234,43 @@ print(beat(d, "2026-08-24T09:00:00", "moved"))'
     [ "$output" = "[]" ]
 }
 
-@test "a ticket is said as a status, never as a transition" {
-    # Nothing here saw the ticket before the window opened, so "moved to In Review" would
-    # be an inference. This stage does not make those.
+@test "the rung is work-arcs own word for it, said as it arrived" {
+    # Not recomposed here. A second vocabulary for one rung is a second author for one
+    # judgement, and the two would differ inside a month.
     run su 'sat = int(at("2026-08-22T14:00:00").timestamp())
-d = payload(arcs=[arc("a", "work", own_activity=sat, state="s",
-    issues=[{"key": "UL-1", "status": "In Review", "updated": "2026-08-22", "url": ""}])])
-print(subs(d, "2026-08-24T09:00:00", "moved"))'
+d = payload(arcs=[arc("a", "work", own_activity=sat, stage="came-back",
+                      state="no longer merges",
+                      mrs=[{"iid": 7, "url": "u", "threads": []}])])
+print(beat(d, "2026-08-24T09:00:00", "moved"))'
     [ "$status" -eq 0 ]
-    [[ "$output" == *"UL-1 In Review"* ]]
-    [[ "$output" != *"moved to"* ]]
+    [[ "$output" == *"!7 no longer merges"* ]]
+}
+
+@test "a rung work-arcs phrases as a count is said without the count" {
+    # The whole reason this file changed. "65 commits still local" is a number out of the
+    # page's own books; in an afternoon of agentic work it is a fact about the tooling.
+    run su 'sat = int(at("2026-08-22T14:00:00").timestamp())
+d = payload(arcs=[arc("a", "the release cut", own_activity=sat, stage="local-only",
+                      state="65 commits exist only here", unpushed_live=65)])
+st = build(d, "2026-08-24T09:00:00")
+print(beat(d, "2026-08-24T09:00:00", "moved"))
+print("65" in st["text"], "commit" in st["text"])'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"the release cut — still unpushed"* ]]
+    [[ "$(echo "$output" | tail -1)" = "False False" ]]
+}
+
+@test "a workstream on the unpushed rung with a review open says both halves" {
+    # work-arcs is explicit that a review plus commits no remote has is not simply "in
+    # review": the arc sits on the lower rung. The unpushed half leads, because it is the
+    # half nobody else can see.
+    run su 'sat = int(at("2026-08-22T14:00:00").timestamp())
+d = payload(arcs=[arc("a", "work", own_activity=sat, stage="local-only",
+                      state="85 commits exist only here", unpushed_live=85,
+                      mrs=[{"iid": 7, "url": "u", "threads": []}])])
+print(beat(d, "2026-08-24T09:00:00", "moved"))'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"still unpushed, !7 out for review"* ]]
 }
 
 @test "a workstream named after its ticket does not say the key twice" {
@@ -219,7 +278,7 @@ print(subs(d, "2026-08-24T09:00:00", "moved"))'
 d = payload(arcs=[arc("a", "UL-1918", ticket="UL-1918", own_activity=sat, state="s")])
 print(beat(d, "2026-08-24T09:00:00", "moved"))'
     [ "$status" -eq 0 ]
-    [ "$output" = "['UL-1918']" ]
+    [ "$output" = "['UL-1918 — s']" ]
 }
 
 @test "a workstream whose name is not its key leads with the key" {
@@ -228,7 +287,7 @@ d = payload(arcs=[arc("a", "derive geometry", ticket="UL-1852", own_activity=sat
                       state="s")])
 print(beat(d, "2026-08-24T09:00:00", "moved"))'
     [ "$status" -eq 0 ]
-    [ "$output" = "['UL-1852 derive geometry']" ]
+    [ "$output" = "['UL-1852 derive geometry — s']" ]
 }
 
 # ── what was discussed ────────────────────────────────────────────────────────
@@ -323,18 +382,77 @@ print(beat(d, "2026-08-24T09:00:00", "blocked"))'
     [[ "$output" == *"!101"* ]]
 }
 
-@test "a five-month stall is still said, but behind everything actionable" {
-    # Dropping it would let a real stall go quiet. Leading with it for the fortieth
-    # consecutive standup is how the room stops listening.
+@test "a five-month stall that did not change is not this standup's news" {
+    # The line this replaces read "still open, unchanged: DE-2585 (159d), UB-6663 (116d),
+    # UB-5628 (69d)" and was identical on every standup for as long as those sat there.
+    # Nothing on it was news, and it was the fortieth-consecutive-time failure committed
+    # in the one file that names it as the thing to avoid.
     run su 'd = payload(ledger={"they_owe": [
     owed("ticket-stalled", "DE-2585", 159, who="Neville"),
     owed("review-silence", "!100", 4, who=["brian"])],
     "you_owe": [], "you_owe_closed": []})
 for t in beat(d, "2026-08-24T09:00:00", "blocked"): print(t)'
     [ "$status" -eq 0 ]
-    [[ "$(echo "$output" | head -1)" == *"!100"* ]]
-    [[ "$(echo "$output" | tail -1)" == *"DE-2585"* ]]
-    [[ "$(echo "$output" | tail -1)" == *"unchanged"* ]]
+    [ "$(echo "$output" | grep -c .)" -eq 1 ]
+    [[ "$output" == *"!100"* ]]
+    [[ "$output" != *"DE-2585"* ]]
+}
+
+@test "a stall is said on the standup where it turns another month" {
+    # Said once, on the crossing. Dropping it outright would let a real stall go quiet;
+    # saying it every time is how the room learns to stop listening.
+    run su 'd = payload(ledger={"they_owe": [
+    owed("ticket-stalled", "DE-2585", 60, who="Neville")],
+    "you_owe": [], "you_owe_closed": []})
+for t in beat(d, "2026-08-24T09:00:00", "blocked"): print(t)'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"DE-2585"* ]]
+    [[ "$output" == *"another month"* ]]
+}
+
+@test "the same crossing cannot be said on the next standup" {
+    # Monday's window is the weekend, three days wide, and 60 days crosses inside it.
+    # Wednesday's window is two days and 62 days crosses nothing: the row has already had
+    # its say. This is the property the whole gate exists for.
+    run su 'def one(days, when):
+    d = payload(ledger={"they_owe": [owed("ticket-stalled", "DE-2585", days,
+                                          who="Neville")],
+                        "you_owe": [], "you_owe_closed": []})
+    return [t for t in beat(d, when, "blocked") if "DE-2585" in t]
+print(len(one(60, "2026-08-24T09:00:00")), len(one(62, "2026-08-26T09:00:00")))'
+    [ "$status" -eq 0 ]
+    [ "$output" = "1 0" ]
+}
+
+@test "everything you owe is one clause, not one line per category" {
+    # Four consecutive sentences about Kyle's inbox is a status report given to a room
+    # that came to hear an ask. Nothing is dropped -- the tail counts every row -- but
+    # only the kind teammates actually chase him for is named.
+    run su 'd = payload(ledger={"they_owe": [], "you_owe_closed": [], "you_owe":
+    [owed("review-owed", "!10408", 17, who="vadym")]
+    + [owed("reply-owed", "!96%d" % i, 13 - i, who="max") for i in range(5)]
+    + [owed("slack-mention", "#tech-drive", 10, who="kean")]
+    + [owed("slack-dm", "DM", 6, who="loganwenzel")]})
+for t in beat(d, "2026-08-24T09:00:00", "blocked"): print(t)'
+    [ "$status" -eq 0 ]
+    [ "$(echo "$output" | grep -c .)" -eq 1 ]
+    [[ "$output" == *"!10408"* ]]
+    [[ "$output" == *"7 more waiting on me"* ]]
+    [[ "$output" != *"tech-drive"* ]]
+    [[ "$output" != *"loganwenzel"* ]]
+}
+
+@test "a review he owes leads the clause even when something older is behind it" {
+    # A departure from the ledger's worst-first order, and a deliberate one: the ledger
+    # ranks by what costs Kyle most, a standup by what the room is waiting on. Teammates
+    # wait on his reviews; they never chase his DMs.
+    run su 'd = payload(ledger={"they_owe": [], "you_owe_closed": [], "you_owe": [
+    owed("slack-dm", "DM", 40, who="loganwenzel"),
+    owed("review-owed", "!10408", 3, who="vadym")]})
+print(beat(d, "2026-08-24T09:00:00", "blocked"))'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"!10408"* ]]
+    [[ "$output" != *"loganwenzel"* ]]
 }
 
 @test "what you owe is said out loud alongside what you are owed" {
@@ -344,9 +462,10 @@ for t in beat(d, "2026-08-24T09:00:00", "blocked"): print(t)'
     "you_owe_closed": []})
 for t in beat(d, "2026-08-24T09:00:00", "blocked"): print(t)'
     [ "$status" -eq 0 ]
-    [[ "$output" == *"nobody has reviewed"* ]]
-    [[ "$output" == *"I owe"* ]]
-    [[ "$output" == *"vadym"* ]]
+    [ "$(echo "$output" | grep -c .)" -eq 2 ]
+    [[ "$(echo "$output" | head -1)" == *"nobody has reviewed"* ]]
+    [[ "$(echo "$output" | tail -1)" == *"I owe"* ]]
+    [[ "$(echo "$output" | tail -1)" == *"vadym"* ]]
 }
 
 @test "a reviewer panel is trimmed to a sayable length, not read out entire" {
@@ -394,6 +513,57 @@ print(beat(d, "2026-08-24T09:00:00", "next"))'
     [[ "$output" != *"UL-1"* ]]
 }
 
+@test "what moved already said is not offered back as today's plan" {
+    # This beat used to open with the two most recent arcs unconditionally -- which are by
+    # definition the two `moved` had just listed -- so half of it was the previous beat
+    # repeated, in the phrasing that made it worst.
+    run su 'sat = int(at("2026-08-22T14:00:00").timestamp())
+d = payload(arcs=[arc("a", "the release cut", own_activity=sat, stage="local-only",
+                      state="65 commits exist only here")],
+            sprint={"issues": [{"key": "UL-2", "status": "In Progress", "summary": "mine",
+                                "handed_off": False, "done": False, "url": ""}]})
+print(beat(d, "2026-08-24T09:00:00", "moved"))
+print(beat(d, "2026-08-24T09:00:00", "next"))'
+    [ "$status" -eq 0 ]
+    [[ "$(echo "$output" | head -1)" == *"the release cut"* ]]
+    [[ "$(echo "$output" | tail -1)" != *"the release cut"* ]]
+    [[ "$(echo "$output" | tail -1)" == *"UL-2"* ]]
+}
+
+@test "the board leads what is in front of you, and fills the rest with workstreams" {
+    run su 'sat = int(at("2026-08-22T14:00:00").timestamp())
+d = payload(arcs=[arc("a", "not in moved", own_activity=sat - 99999, state="s")],
+            sprint={"issues": [{"key": "UL-2", "status": "In Progress", "summary": "mine",
+                                "handed_off": False, "done": False, "url": ""}]})
+for t in beat(d, "2026-08-24T09:00:00", "next"): print(t)'
+    [ "$status" -eq 0 ]
+    [[ "$(echo "$output" | head -1)" == *"UL-2"* ]]
+    [[ "$(echo "$output" | tail -1)" == *"not in moved"* ]]
+}
+
+@test "a workstream the cap cut is still free to be what is in front of you" {
+    # Cut by the cap is not the same as said. The exclusion is on what was actually
+    # spoken, so the fourth workstream can still be raised here.
+    run su 'sat = int(at("2026-08-22T14:00:00").timestamp())
+d = payload(arcs=[arc("a%d" % i, "work %d" % i, own_activity=sat - i, state="s")
+                  for i in range(5)])
+print(beat(d, "2026-08-24T09:00:00", "moved"))
+print(beat(d, "2026-08-24T09:00:00", "next"))'
+    [ "$status" -eq 0 ]
+    [[ "$(echo "$output" | head -1)" != *"work 3"* ]]
+    [[ "$(echo "$output" | tail -1)" == *"work 3"* ]]
+}
+
+@test "a long Jira summary is cut rather than read to the end of" {
+    run su 'd = payload(sprint={"issues": [{"key": "UL-1", "status": "In Progress",
+    "summary": "report fails to load with 500 errors when both line and reference "
+               "time range are active", "handed_off": False, "done": False, "url": ""}]})
+print(beat(d, "2026-08-24T09:00:00", "next"))'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"…"* ]]
+    [[ "$output" != *"are active"* ]]
+}
+
 @test "a parked workstream is not what is in front of you" {
     run su 'sat = int(at("2026-08-22T14:00:00").timestamp())
 d = payload(arcs=[arc("a", "set aside", own_activity=sat, stage="parked")])
@@ -409,9 +579,10 @@ print(beat(d, "2026-08-24T09:00:00", "next"))'
     run su 'sat = int(at("2026-08-22T14:00:00").timestamp())
 d = payload(arcs=[arc("a%d" % i, "work %d" % i, own_activity=sat - i, state="s")
                   for i in range(9)])
-print(beat(d, "2026-08-24T09:00:00", "moved")[-1])'
+print(len(beat(d, "2026-08-24T09:00:00", "moved")),
+      beat(d, "2026-08-24T09:00:00", "moved")[-1])'
     [ "$status" -eq 0 ]
-    [[ "$output" == *"3 more not listed"* ]]
+    [[ "$output" == "4 "*"6 more not listed"* ]]
 }
 
 @test "an empty graph is an empty block and not an error" {
@@ -429,7 +600,55 @@ d = payload(arcs=[arc("a", "the only thing", own_activity=sat, state="s")])
 st = build(d, "2026-08-24T09:00:00")
 print("the only thing" in st["text"], st["beats"][0]["items"][0]["text"])'
     [ "$status" -eq 0 ]
-    [ "$output" = "True the only thing" ]
+    [ "$output" = "True the only thing — s" ]
+}
+
+@test "the whole block is about eight lines on a corpus the size of the real one" {
+    # The number that matters. This is the shape of the payload the file was rewritten
+    # against -- six workstreams touched, eleven MRs nobody has reviewed, sixteen debts of
+    # his own, four long stalls, two sprint tickets -- and the version before this one
+    # spoke twenty-two lines of it.
+    run su 'sat = int(at("2026-08-22T14:00:00").timestamp())
+d = payload(
+    arcs=[arc("a%d" % i, "workstream %d" % i, own_activity=sat - i, stage="local-only",
+              state="%d commits exist only here" % (60 - i)) for i in range(6)],
+    sprint={"issues": [{"key": "UL-%d" % i, "status": "In Progress",
+                        "summary": "something on the board", "handed_off": False,
+                        "done": False, "url": ""} for i in range(2)]},
+    ledger={"you_owe_closed": [],
+            "they_owe": [owed("review-silence", "!104%02d" % i, 18 - i,
+                              who=["brian", "vadym", "ajit", "Matt", "ella"])
+                         for i in range(11)]
+                        + [owed("ticket-stalled", "DE-2585", 159, who="Neville"),
+                           owed("ticket-stalled", "UB-6663", 116, who="Irene")],
+            "you_owe": [owed("review-owed", "!1040%d" % i, 17 - i, who="vadym")
+                        for i in range(8)]
+                       + [owed("reply-owed", "!96%d" % i, 13 - i, who="max")
+                          for i in range(5)]
+                       + [owed("slack-mention", "#tech-drive", 10, who="kean"),
+                          owed("slack-dm", "DM", 6, who="loganwenzel")]})
+lines = spoken(d, "2026-08-24T09:00:00")
+print(len(lines))
+print("\n".join(lines))'
+    [ "$status" -eq 0 ]
+    [ "$(echo "$output" | head -1)" -le 8 ]
+    [[ "$output" != *"commit"* ]]
+    [[ "$output" != *"60"* ]]
+}
+
+@test "no beat anywhere says a number of commits" {
+    # An acceptance criterion rather than a preference: every count-bearing rung, all four
+    # beats, one assertion.
+    run su 'sat = int(at("2026-08-22T14:00:00").timestamp())
+d = payload(arcs=[
+    arc("a", "unpushed", own_activity=sat, stage="local-only", unpushed_live=65,
+        state="65 commits exist only here"),
+    arc("b", "residue", own_activity=sat - 1, stage="pre-landing",
+        state="12 branches older than !10398, merged 2026-08-14")])
+t = build(d, "2026-08-24T09:00:00")["text"]
+print("commit" in t, "branches older" in t, "65" in t, "12" in t)'
+    [ "$status" -eq 0 ]
+    [ "$output" = "False False False False" ]
 }
 
 @test "the graph passes through untouched with one key added" {

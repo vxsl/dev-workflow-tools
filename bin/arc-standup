@@ -24,11 +24,24 @@ one carrying it. A standup that opens on the same fact for the fortieth consecut
 is one nobody hears. What earns a standup line is what moved in the window, and what a
 person on the call can unstick today.
 
+**The currency is the rung, not the size.** "65 commits still local" is a number out of
+this page's own accounting, and in a week where an agent produced them in one afternoon it
+is a fact about the tooling rather than about the work. What a room can hear is where the
+work got to: it landed, it is out for review, it is written and not pushed anywhere yet.
+So no beat says a number of commits. See `rung_clause`.
+
+**The whole block is about eight lines.** Not because eight is a number worth defending
+but because this is spoken, from the top, in the forty-five seconds before somebody else
+goes. One workstream is one line. Everything Kyle owes is one clause, not four
+categories. Every cap sits well under what the ledger could fill it with, and a standing
+debt is said on the day it changes rather than on the forty days it does not. A block that
+has to be skimmed to be given is one that gets skimmed instead of given.
+
 Four beats, in the order a standup is actually given, each dropped when it holds nothing:
 
-    moved       what happened to the code -- MRs, commits, tickets
+    moved       what happened to the code -- the rung each workstream reached
     discussed   what was worked out in Slack and in review threads
-    blocked     who you are waiting on, and who is waiting on you
+    blocked     the asks the room can act on, and one clause for what you owe
     next        what is in front of you -- a prompt, not a claim
 
 Read `work-arcs --json` (through arc-brief, whose names this uses) on stdin, add one
@@ -42,11 +55,13 @@ clipboard: one composition, so the spoken version and the pasted version cannot 
 
 Nothing here counts or ranks anything that arrived already counted or ranked. The ledger
 comes down the wire sorted worst-first and is consumed in that order; `own_activity` is
-work-arcs' own answer to "when did Kyle last touch this"; the arc's name is arc-brief's.
-A ranking re-implemented here would be a second author for the same judgement and the two
-would differ inside a month. The one partition this stage does make -- fresh debts from
-long-stalled ones -- is a split on an age threshold rather than a competing score, and it
-preserves the ledger's order inside each half. See `blocked_beat`.
+work-arcs' own answer to "when did Kyle last touch this"; the arc's name is arc-brief's;
+the rung a workstream reached is work-arcs' `state` string, said in the words it arrived
+in. A ranking re-implemented here would be a second author for the same judgement and the
+two would differ inside a month. The partitions this stage does make -- landings ahead of
+everything else in `moved`, fresh debts ahead of long-stalled ones in `blocked` -- are
+splits on a fact each row already carries rather than competing scores, and each preserves
+the incoming order inside its halves. See `moved_beat` and `blocked_beat`.
 """
 
 import argparse
@@ -78,24 +93,34 @@ DEFAULT_DAYS = "mon,wed,fri"
 DEFAULT_TIME = "10:30"
 DEFAULT_TZ = "America/Los_Angeles"
 
-# How many arcs, conversations, debts and next-ups each beat will say. A standup is two
-# minutes; a beat that lists fourteen things is the ledger read aloud, which is the
-# failure this tool exists to avoid. Truncation is always announced -- see `capped` -- so
-# a short list never reads as a complete one.
+# How many arcs, conversations, asks and next-ups each beat will say. These add up to the
+# eight-line budget the module docstring sets, and they are deliberately far under what the
+# ledger could fill them with: on a corpus of 156 workstreams and 30-odd open debts, every
+# one of these caps bites. Truncation is always announced -- see `capped` -- so a short
+# list never reads as a complete one.
+#
+# An earlier set of these was 6/6/6/4, which is 22 spoken lines, and Kyle's verdict on it
+# was the reason this file changed: "the goal is to keep track of the broad strokes of my
+# work, not every singular commit everywhere". A cap that never bites is a cap in name.
 CAPS = {
-    "moved": int(os.environ.get("STANDUP_MOVED_MAX", "6")),
-    "discussed": int(os.environ.get("STANDUP_DISCUSSED_MAX", "6")),
-    # Six, because the blocked beat caps *groups* rather than rows and there are six kinds
-    # of debt: a cap under that would cut a whole category of thing he owes rather than
-    # shortening a list.
-    "blocked": int(os.environ.get("STANDUP_BLOCKED_MAX", "6")),
-    "next": int(os.environ.get("STANDUP_NEXT_MAX", "4")),
+    "moved": int(os.environ.get("STANDUP_MOVED_MAX", "3")),
+    "discussed": int(os.environ.get("STANDUP_DISCUSSED_MAX", "3")),
+    # Caps the *asks* half of the blocked beat only -- the debts other people owe, which
+    # are the lines the room is there to unstick. What Kyle owes is one clause built by
+    # `self_debt_line` and sits outside this cap, as does the month-turned tail, because
+    # neither can grow with the ledger.
+    "blocked": int(os.environ.get("STANDUP_BLOCKED_MAX", "2")),
+    "next": int(os.environ.get("STANDUP_NEXT_MAX", "2")),
 }
 
-# Where a debt stops being news and becomes weather. Past this, a ledger row is still said
-# -- dropping it would let a real stall go quiet -- but it is said once, in a tail line,
-# rather than taking one of the four slots a person on this call could actually act on.
+# Where a debt stops being news and becomes weather. Past this a ledger row is no longer
+# said every standup -- it is said on the standup where it turns another month, and is
+# otherwise the morning brief's business. See `milestone_line`.
 STALE_DAYS = int(os.environ.get("STANDUP_STALE_DAYS", "30"))
+
+# The interval a stalled row is allowed to speak on. Once per this many days of silence,
+# and never twice for the same crossing.
+MILESTONE_DAYS = int(os.environ.get("STANDUP_MILESTONE_DAYS", "30"))
 
 # A window this short means the page was rebuilt within minutes of a standup, so "nothing
 # moved" is a fact about the clock rather than about the work, and saying it without the
@@ -327,43 +352,71 @@ def arc_head(arc):
     return [span(name, arc=aid)]
 
 
-def plural(n, one, many=None):
-    return f"{n} {one}" if n == 1 else f"{n} {many or one + 's'}"
-
-
 # --------------------------------------------------------------------------- moved
 
 
-def mr_state_words(m):
-    """What a reviewer needs to know about an open MR, in the fewest words that are true.
+# The two rungs work-arcs phrases as a number. Everything else in `state` already arrives
+# as a phrase a room understands -- "in review", "no longer merges", "approved, not
+# merged", "still a draft", "pushed, no merge request" -- and is said in those words rather
+# than in words of ours, because a second vocabulary for one rung is a second author for
+# one judgement. These two it phrases as a count, and a count is the thing this beat is
+# not allowed to say: "65 commits exist only here" is a number out of this page's own
+# books, and the fact underneath it -- none of this is anywhere but the laptop -- is the
+# part a reviewer can do something about.
+#
+# Not "finished, not yet published", which is the tempting phrasing and one this file has
+# no standing to use: nothing upstream knows whether the work is finished. A rung says
+# where the work has got to, not how far along it is.
+COUNTED_RUNGS = {
+    "local-only": "still unpushed",
+    "pre-landing": "leftover drafts from before it landed",
+}
 
-    Ordered by what stops it landing. A conflict or a red pipeline is Kyle's to fix and is
-    said first; approval is somebody else's and is said last, because that is the half of
-    the sentence a standup exists to prompt.
+# Rungs that are a statement about a merge request, so the MR number is the reference the
+# room already shares and leads the clause: "!10554 no longer merges". The others are
+# statements about a branch or about a laptop and have no number to lead with.
+MR_RUNGS = {"in-review", "came-back", "no-reviewer"}
+
+
+def rung_clause(arc, landed=()):
+    """Where the work got to, in the fewest words that are true and no numbers at all.
+
+    A landing inside the window displaces the rung, because it is the only thing that can
+    happen to a branch that is finished: "!10416 landed" is the whole update and the rung
+    it is on now is implied by it.
+
+    Otherwise the rung is work-arcs' `state`, verbatim, with two substitutions and one
+    addition. The substitutions are `COUNTED_RUNGS`. The addition is the MR number, in
+    front, where the rung is about a merge request -- the room navigates by that number and
+    not by the workstream's name, which is arc-brief's summary and exists nowhere else.
+
+    `local-only` is the one rung that can be true at the same time as an open merge
+    request, and work-arcs is explicit that this is not simply "in review": an arc holding
+    a review *and* commits no remote has is on the lower rung. Both halves are said, in
+    that order, because the unpushed half is the one nobody else can see.
     """
-    bits = []
-    if m.get("draft"):
-        bits.append("draft")
-    if m.get("conflicts"):
-        bits.append("conflicts")
-    pipe = (m.get("pipeline") or {}).get("status") or ""
-    if pipe == "failed":
-        bits.append("pipeline red")
-    elif pipe == "success":
-        bits.append("green")
-    elif pipe in ("running", "pending"):
-        bits.append("pipeline " + pipe)
-    if m.get("approved"):
-        bits.append("approved")
-    else:
-        who = [r for r in (m.get("reviewers") or []) if r]
-        bits.append("not approved" + (f" ({', '.join(who)})" if who else
-                                      ", no reviewer asked"))
-    return ", ".join(bits)
+    if landed:
+        b, f = landed[0]
+        iid = f.get("iid")
+        ref = span(f"!{iid}", url=f.get("url")) if iid else (b.get("name") or "a branch")
+        verb = " landed" if f.get("state") == "merged" else " closed unmerged"
+        return [ref, verb, f" (+{len(landed) - 1} more)" if len(landed) > 1 else ""]
+
+    stage = arc.get("stage") or ""
+    mrs = arc.get("mrs") or []
+    ref = (span(f"!{mrs[0].get('iid')}", url=mrs[0].get("url")) if mrs else "")
+
+    if stage in COUNTED_RUNGS:
+        words = COUNTED_RUNGS[stage]
+        if stage == "local-only" and ref:
+            return [words + ", ", ref, " out for review"]
+        return [words]
+    words = arc.get("state") or "no visible change"
+    return [ref, f" {words}"] if ref and stage in MR_RUNGS else [words]
 
 
-def moved_beat(data, since):
-    """What happened to the code, one entry per workstream, newest first.
+def moved_beat(data, since, said=None):
+    """What happened to the code: one workstream, one line, the rung it reached.
 
     Membership is `own_activity` -- work-arcs' own answer to "when did Kyle last commit or
     open a session here" -- against the window, plus any workstream whose MR landed inside
@@ -371,9 +424,19 @@ def moved_beat(data, since):
     Tuesday has no activity of yours in this window at all, and it is the single most
     standup-worthy thing that can happen to a piece of work.
 
-    Order is `own_activity` descending, which is not a ranking this stage invented: it is
-    the same recency the arcs list is already sorted by, and the freshest thing is the one
-    you can still remember the details of when asked.
+    One line, not a line and a bullet list under it. The version that had sub-lines put the
+    workstream's name on one line and "65 commits still local" on the next, which is the
+    ledger indented: two lines to say one thing, and the thing they said was a number. The
+    rung goes on the line itself, where it is the second half of a sentence.
+
+    Order is landings first, then `own_activity` descending. Neither is a score invented
+    here: the landing split is a fact each arc carries, and the recency inside each half is
+    the same order the arcs list already arrived in. Landings lead because they are the
+    only finished thing in the beat, and the freshest thing leads the rest because it is
+    the one whose details you can still answer a question about.
+
+    Ids of the workstreams this named are added to `said`, so `next_beat` can leave them
+    out rather than restating them as today's plan.
     """
     out = []
     for arc in data.get("arcs") or []:
@@ -382,44 +445,19 @@ def moved_beat(data, since):
         landed = [(b, f) for b, f in landed
                   if f.get("state") in ("merged", "closed")
                   and date_in_window(f.get("at"), since)]
-        touched = in_window(own, since)
-        if not touched and not landed:
+        if not in_window(own, since) and not landed:
             continue
+        landed.sort(key=lambda x: (x[1].get("at") or "", x[1].get("iid") or 0),
+                    reverse=True)
+        out.append((bool(landed), own, arc.get("id"),
+                    line(arc_head(arc) + [" — "] + rung_clause(arc, landed))))
 
-        subs = []
-        # Landings first: it is the only thing here that is finished.
-        for b, f in sorted(landed, key=lambda x: x[1].get("at") or "", reverse=True):
-            iid = f.get("iid")
-            ref = f"!{iid}" if iid else b.get("name", "")
-            verb = "landed" if f.get("state") == "merged" else "closed unmerged"
-            subs.append(line([span(ref, url=f.get("url")), f" {verb}"]))
-
-        for m in arc.get("mrs") or []:
-            subs.append(line([span(f"!{m.get('iid')}", url=m.get("url")),
-                              " " + mr_state_words(m)]))
-
-        # Commits nobody else can see. On the page this is the loudest demand there is;
-        # at a standup it is a small honest aside, and it is said in those terms.
-        local = arc.get("unpushed_live") or 0
-        if touched and local:
-            subs.append(line([f"{plural(local, 'commit')} still local"]))
-
-        for it in arc.get("issues") or []:
-            if not date_in_window(it.get("updated"), since):
-                continue
-            # Stated as a status and a date, never as a transition. Nothing here saw the
-            # ticket before the window, so "moved to In Review" would be an inference and
-            # this file does not make those.
-            subs.append(line([span(it.get("key", ""), url=it.get("url")),
-                              f" {it.get('status') or 'no status'}"]))
-
-        if not subs:
-            subs = [line([arc.get("state") or "no visible change"])]
-
-        out.append((own, line(arc_head(arc), subs)))
-
-    out.sort(key=lambda x: (-x[0], x[1]["text"]))
-    return capped([ln for _, ln in out], "moved")
+    out.sort(key=lambda x: (not x[0], -x[1], x[3]["text"]))
+    # Only what was actually said. A workstream the cap cut was not mentioned, so `next` is
+    # free to raise it -- the one case where two beats naming the same work is the point.
+    if said is not None:
+        said.update(aid for _, _, aid, _ in out[:CAPS.get("moved", 3)])
+    return capped([ln for _, _, _, ln in out], "moved")
 
 
 # --------------------------------------------------------------------------- discussed
@@ -431,6 +469,13 @@ def moved_beat(data, since):
 # link is on the line, so the rest is one click away rather than gone.
 QUOTE_MAX = int(os.environ.get("STANDUP_QUOTE_MAX", "110"))
 
+# The same argument, shorter, for a Jira summary. A quote is the substance of its line and
+# earns the room; a summary sits behind a key the room already recognises and is there to
+# jog Kyle's memory, so it can be cut at the point where it stops doing that. Untrimmed,
+# UL-1482 read out to the end of "report fails to load with 500 errors when both line &
+# reference time range are active" -- a whole line of a two-minute update.
+SUMMARY_MAX = int(os.environ.get("STANDUP_SUMMARY_MAX", "60"))
+
 
 def clip(text, n=None):
     t = " ".join((text or "").split())
@@ -438,7 +483,7 @@ def clip(text, n=None):
     return t if len(t) <= n else t[:n].rsplit(" ", 1)[0] + "…"
 
 
-def discussed_beat(data, since):
+def discussed_beat(data, since, said=None):
     """What got worked out, in Slack and in review threads.
 
     This is the half of the work a commit log cannot show and the half a standup most
@@ -565,7 +610,10 @@ def age_of(row):
 # Everything the room can unstick comes before everything Kyle owes, because the ask is the
 # only part of a standup that needs the other people to be in the room -- and his own debts
 # are said straight after, out loud, because an ask from someone who volunteers what he is
-# sitting on is an ask that gets taken seriously.
+# sitting on is an ask that gets taken seriously. Said once, though, in one clause: the
+# version that gave each `you` kind its own line read out four consecutive sentences about
+# Kyle's inbox, which is a status report to a room that came to hear an ask. Only the first
+# of the four templates below is ever used -- see `self_debt_line`.
 #
 # The grouping itself is the fix for the shape this beat had first, which was twenty-nine
 # lines: eleven of them "nobody has reviewed !104xx", differing only in a number. That is
@@ -637,12 +685,102 @@ def group_line(rows, few, many, who_label):
     return line(parts)
 
 
-def blocked_beat(data, since):
-    """Who is waiting on whom, split by whether this call can move it.
+# Which of his own debts leads the one clause he gets. Not the ledger's worst, and the
+# departure wants justifying: the ledger ranks by what will cost Kyle most, and a standup
+# ranks by what the room is actually waiting on. What his teammates chase him for is
+# reviews -- they never chase his in-flight code -- so a review he owes is the one self-debt
+# with a claim on the meeting. A Slack DM he has not answered is his own business and the
+# morning brief's; it is counted here and not named.
+SELF_ORDER = ["review-owed", "reply-owed", "slack-mention", "slack-dm"]
+
+
+def self_debt_line(rows):
+    """Everything Kyle owes, as one thing to say.
+
+    The kind the room is waiting on is named with its reference and its age, in the same
+    two templates every other group uses; everything else he owes is one number on the end
+    of it. "I owe 8 reviews — oldest !10408 (17d) — vadym; 11 more waiting on me" is a
+    sentence a person says. The four-line version of it was a list of categories, and a
+    list of categories is what a ledger is for.
+
+    Nothing is dropped -- the tail counts every remaining row -- but nothing beyond the
+    lead group is named, because a name in this beat is an invitation to discuss it and the
+    only one worth discussing at a standup is the review somebody is blocked on.
+    """
+    if not rows:
+        return None
+    groups = {}
+    for r in rows:
+        groups.setdefault(r.get("kind"), []).append(r)
+    # Known kinds in the order above; anything new upstream falls in behind them in the
+    # ledger's own order, so a kind this file has never heard of can still lead the clause
+    # when it is the only thing he owes.
+    order = ([k for k in SELF_ORDER if k in groups]
+             + [k for k in groups if k not in SELF_ORDER])
+    lead = groups[order[0]]
+
+    tpl = next(((few, many, wl) for side, kind, few, many, wl in DEBT_GROUPS
+                if side == "you" and kind == order[0]), None)
+    if tpl:
+        parts = group_line(lead, *tpl)["parts"]
+    else:
+        parts = [f"I owe {who_of(lead[0])}: ", ref_span(lead[0]), age_of(lead[0])]
+
+    rest = len(rows) - len(lead)
+    return line(parts + ([f"; {rest} more waiting on me"] if rest else []))
+
+
+def window_days(since):
+    """The window in whole days, rounded up.
+
+    Up, and not to the nearest: the ledger's `days` is an integer work-arcs truncated at
+    the source, so the only safe comparison against it is one that cannot land short. A
+    window rounded down would step over the day a stall turns a month and that crossing
+    would never be said at all -- which is the failure the whole tail line exists to avoid.
+    """
+    secs = since.get("seconds") or 0
+    return max(1, -(-int(secs) // 86400))
+
+
+def milestone_line(rows, since):
+    """A long stall, said on the standup where it turns another month.
+
+    This replaces a line that read "still open, unchanged: DE-2585 (159d), UB-6663 (116d),
+    UB-5628 (69d), !10272 (39d)" and was, by construction, identical on every standup for
+    as long as those tickets sat there -- the fortieth-consecutive-time failure the module
+    docstring names, in the one place in this file that was actually committing it. Nothing
+    on that line was news; three of the four were months past anybody's ability to be
+    surprised by them.
+
+    A crossing is news, and it is news exactly once. A row is said on the standup whose
+    window contains the day its silence passed a multiple of `MILESTONE_DAYS`, and windows
+    do not overlap -- each opens at the standup the last one closed on -- so the same
+    crossing cannot be reported twice. Between crossings the row is silent here and loud
+    in the morning brief, which is the surface built for a cost only Kyle is carrying.
+    """
+    span_d = window_days(since)
+    turned = [r for r in rows
+              if isinstance(r.get("days"), int) and r["days"] > STALE_DAYS
+              and r["days"] // MILESTONE_DAYS > (r["days"] - span_d) // MILESTONE_DAYS]
+    if not turned:
+        return None
+    parts = ["another month with no movement: "]
+    for i, r in enumerate(turned[:FEW]):
+        if i:
+            parts.append(", ")
+        parts += [ref_span(r), age_of(r)]
+    if len(turned) > FEW:
+        parts.append(f", +{len(turned) - FEW} more")
+    return line(parts)
+
+
+def blocked_beat(data, since, said=None):
+    """The asks the room can act on, then one clause for everything Kyle owes.
 
     The ledger arrives sorted worst-first and that order is not re-litigated here. What
-    this does is *partition* it -- by kind, so eleven unreviewed MRs are one sentence, and
-    by age, so a five-month stall is not read out in front of a five-day one.
+    this does is *partition* it -- by side, so an ask comes before a confession; by kind, so
+    eleven unreviewed MRs are one sentence; and by age, so a five-month stall is not read
+    out in front of a five-day one.
 
     The age split is on a threshold rather than on a competing score, and it exists because
     the failure it fixes is specific and fatal to the tool. `they_owe` is led by a 159-day
@@ -650,45 +788,50 @@ def blocked_beat(data, since):
     Wednesday and Friday for five months and the room learns that these notes open with
     something nobody is going to do anything about, and stops listening before the item
     somebody could have fixed on the call. So the stalled rows are still said -- dropping
-    them would let a real stall go quiet -- but once, in a tail line, and never in front of
-    a live one.
+    them would let a real stall go quiet -- but on the day they change and not on the forty
+    days they do not. See `milestone_line`.
+
+    Three lines at the outside, and usually two: the asks (capped, because they are the
+    only half that can grow into a list), the one clause for what he owes, and the tail on
+    the rare standup where a stall turns a month.
     """
     led = data.get("ledger") or {}
-    rows = ([("they", r) for r in led.get("they_owe") or []]
-            + [("you", r) for r in led.get("you_owe") or []])
-    live = [(s, r) for s, r in rows
-            if not (isinstance(r.get("days"), int) and r["days"] > STALE_DAYS)]
-    stale = [(s, r) for s, r in rows
-             if isinstance(r.get("days"), int) and r["days"] > STALE_DAYS]
+    they = list(led.get("they_owe") or [])
+    mine = list(led.get("you_owe") or [])
+
+    def live(rows):
+        return [r for r in rows
+                if not (isinstance(r.get("days"), int) and r["days"] > STALE_DAYS)]
+
+    asks, owed = live(they), live(mine)
 
     out, claimed = [], set()
     for side, kind, few, many, who_label in DEBT_GROUPS:
-        grp = [r for s2, r in live if s2 == side and r.get("kind") == kind]
+        if side != "they":
+            continue
+        grp = [r for r in asks if r.get("kind") == kind]
         if not grp:
             continue
-        claimed.add((side, kind))
+        claimed.add(kind)
         out.append(group_line(grp, few, many, who_label))
     # Anything the table above has no phrase for is still said, in the ledger's own words,
     # rather than silently dropped: a new kind upstream must not make this beat quieter.
-    for side, r in live:
-        if (side, r.get("kind")) in claimed:
+    for r in asks:
+        if r.get("kind") in claimed:
             continue
-        verb = "waiting on" if side == "they" else "I owe"
-        out.append(line([f"{verb} {who_of(r)}: ", ref_span(r), age_of(r)]))
+        out.append(line([f"waiting on {who_of(r)}: ", ref_span(r), age_of(r)]))
 
     out = capped(out, "blocked")
-    if stale:
-        refs = ", ".join(f"{r.get('ref') or who_of(r)} ({r.get('days')}d)"
-                         for _, r in stale[:5])
-        more = f", +{len(stale) - 5} more" if len(stale) > 5 else ""
-        out.append(line([f"still open, unchanged: {refs}{more}"]))
+    for extra in (self_debt_line(owed), milestone_line(they + mine, since)):
+        if extra:
+            out.append(extra)
     return out
 
 
 # --------------------------------------------------------------------------- next
 
 
-def next_beat(data, since):
+def next_beat(data, since, said=None):
     """What is in front of you — offered as a prompt, because it cannot be derived.
 
     Nothing in this pipeline knows Kyle's intentions, and a page that stated them would be
@@ -696,25 +839,46 @@ def next_beat(data, since):
     know is what he was in the middle of and what the board says is his, and those two put
     together are enough to remember the answer from.
 
+    The board leads and the workstreams fill in behind it, which is the reverse of how this
+    beat was first written and the reverse for a reason. It used to open with the two most
+    recent arcs unconditionally -- which are, by definition, the two `moved` had just
+    listed -- so half of it was the previous beat repeated, in the phrasing that made it
+    worst: "65 commits exist only here", twice inside eight lines. Now `moved` says where
+    each workstream got to, and the only thing left for this beat that `moved` did not
+    already cover is what the board says is his.
+
+    So a workstream appears here only in the room left under the cap, and only if `moved`
+    did not name it: on a fresh window, where `moved` is empty because the last standup was
+    an hour ago, that is the whole beat and it is the right one. Being cut by the cap is not
+    the same as being said, so the fourth workstream is still eligible here.
+
     Sprint tickets that are handed off are excluded on purpose: `handed_off` is work-arcs'
     word for "the status says this is somebody else's move now", and reading one out as
     today's plan is how you promise a room something you are waiting on them for.
     """
     out = []
-    arcs = sorted((a for a in data.get("arcs") or [] if a.get("own_activity")),
-                  key=lambda a: -(a.get("own_activity") or 0))
-    for arc in arcs[:2]:
-        if (arc.get("settled") or arc.get("stage") == "parked"):
-            continue
-        out.append(line(arc_head(arc)
-                        + ([f" — {arc.get('state')}"] if arc.get("state") else [])))
-
-    sprint = data.get("sprint") or {}
-    for it in sprint.get("issues") or []:
+    for it in (data.get("sprint") or {}).get("issues") or []:
         if it.get("done") or it.get("handed_off"):
             continue
         out.append(line([span(it.get("key", ""), url=it.get("url")),
-                         f" {it.get('status') or ''} — {it.get('summary') or ''}"]))
+                         f" {it.get('status') or ''}",
+                         f" — {clip(it.get('summary'), SUMMARY_MAX)}"
+                         if it.get("summary") else ""]))
+
+    # Filler, and it fills rather than queues: an arc pushed past the cap would spend the
+    # beat's one truncation line on something `moved` had covered two lines earlier.
+    room = CAPS.get("next", 2) - len(out)
+    arcs = sorted((a for a in data.get("arcs") or [] if a.get("own_activity")),
+                  key=lambda a: -(a.get("own_activity") or 0))
+    for arc in arcs:
+        if room <= 0:
+            break
+        if arc.get("settled") or arc.get("stage") == "parked":
+            continue
+        if arc.get("id") in (said or ()):
+            continue
+        out.append(line(arc_head(arc) + [" — "] + rung_clause(arc)))
+        room -= 1
     return capped(out, "next")
 
 
@@ -755,9 +919,15 @@ def as_text(st):
 def build(data, now=None):
     cad = cadence(now)
     since = cad.get("since") or {}
+    # What a beat has already said, so a later one does not say it again. Passed rather
+    # than returned because only one pair of beats cares -- `moved` fills it, `next` reads
+    # it -- and a return value threaded through all four would put the coupling everywhere
+    # instead of in the two docstrings that explain it. BEATS' order is the standup's
+    # order, so a beat can only ever be told about beats that come before it.
+    said = set()
     beats = []
     for kind, lead, fn in BEATS:
-        items = fn(data, since) if since else []
+        items = fn(data, since, said) if since else []
         beats.append({"kind": kind, "lead": lead, "items": items})
 
     note = ""
