@@ -212,6 +212,20 @@ USAGE_URL="${WORK_ARCS_USAGE_URL:-https://api.anthropic.com/api/oauth/usage}"
 OAUTH_TOKEN_URL="${WORK_ARCS_OAUTH_TOKEN_URL:-https://platform.claude.com/v1/oauth/token}"
 OAUTH_CLIENT_ID="${WORK_ARCS_OAUTH_CLIENT_ID:-9d1c250a-e61b-44d9-88ed-5944d1962f5e}"
 OAUTH_BETA="${WORK_ARCS_OAUTH_BETA:-oauth-2025-04-20}"
+
+# The artifact API, read out of the shipped CLI the same way TOKEN_URL and CLIENT_ID were.
+# Artifacts are "frames" on the wire. Both claude.ai and api.anthropic.com front the same
+# service and answer identically; claude.ai is the default because it is the host the
+# artifact's own link is on, so a reader comparing the two sees one name.
+#
+# X-Frame-CP is the load-bearing header. Without it the gateway matches no route and
+# answers an ordinary 404 with a request_id -- which reads exactly like a wrong path and is
+# actually a missing header, so a future reader debugging a 404 here should suspect the
+# headers before the URL. Overridable for the same reason the OAuth constants are: they
+# belong to somebody else and will move without asking.
+FRAME_BASE="${WORK_ARCS_FRAME_BASE:-https://claude.ai}"
+FRAME_CLIENT_VERSION="${WORK_ARCS_FRAME_CLIENT_VERSION:-2.1.245}"
+FRAME_TIMEOUT="${WORK_ARCS_FRAME_TIMEOUT:-60}"
 NOTIFY="$HOME/bin/notification/claude-notify.sh"
 
 MAX_5H="${WORK_ARCS_REFRESH_MAX_5H:-80}"
@@ -231,6 +245,17 @@ HTTP_TIMEOUT=10
 SESSION_FALLBACK="${WORK_ARCS_REFRESH_SESSION_FALLBACK:-1}"
 NET_TRIES="${WORK_ARCS_REFRESH_NET_TRIES:-3}"
 NET_DELAY="${WORK_ARCS_REFRESH_NET_DELAY:-10}"
+
+# Publish the page after a successful build. On by default -- an unpublished rebuild is
+# a page nobody reads, which was the whole complaint. Set to 0 to go back to building
+# only and finishing the job by hand from a session.
+PUBLISH="${WORK_ARCS_PUBLISH:-1}"
+# What to do when the artifact moved under us -- someone published a different version
+# between this run's last read and its write. Superseding is the default because this
+# page is regenerated whole from local state every run, so there is nothing of anyone
+# else's in it to preserve; the conflict is still worth a line in the log. Set to 0 to
+# have the run report the conflict and leave the artifact alone.
+PUBLISH_SUPERSEDE="${WORK_ARCS_PUBLISH_SUPERSEDE:-1}"
 
 CRON_MARKER="# work-arcs-refresh"
 CRON_DEFAULT_TIME="07:10"
@@ -431,8 +456,14 @@ PYEOF
 # Sets USAGE_JSON on success and USAGE_FAILURE on failure, and the failures are worth
 # telling apart in the log: "there was no network", "your token was old and I fixed it",
 # and "your token was old and I could not" are three different mornings.
+# The token this run proved, kept for the length of the run so the publish at the end does
+# not have to mint a second one. Still never written to the credentials file -- that whole
+# argument is above refresh_access_token and is unchanged; this is the same shell variable
+# living a few minutes longer, and it is never logged.
+RUN_ACCESS_TOKEN=""
+
 fetch_usage() {
-    USAGE_JSON=""; USAGE_FAILURE=""; USAGE_REFRESHED=""
+    USAGE_JSON=""; USAGE_FAILURE=""; USAGE_REFRESHED=""; RUN_ACCESS_TOKEN=""
     local tok
     tok="$(jq -r '.claudeAiOauth.accessToken // empty' "$CREDS" 2>/dev/null || true)"
     if [ -z "$tok" ]; then
@@ -440,7 +471,7 @@ fetch_usage() {
         return 1
     fi
 
-    if usage_call_patiently "$tok"; then return 0; fi
+    if usage_call_patiently "$tok"; then RUN_ACCESS_TOKEN="$tok"; return 0; fi
 
     # A 401, and only a 401. A timeout or a 500 says something about the network and
     # nothing about the token, and spending a refresh on one would write "your login is
@@ -452,6 +483,7 @@ fetch_usage() {
 
     if refresh_access_token; then
         if usage_call_patiently "$FRESH_ACCESS_TOKEN"; then
+            RUN_ACCESS_TOKEN="$FRESH_ACCESS_TOKEN"
             FRESH_ACCESS_TOKEN=""
             USAGE_REFRESHED=token
             return 0
@@ -482,6 +514,7 @@ fetch_usage() {
     # existing so a test can hand the guard a fixture.
     tok="$(jq -r '.claudeAiOauth.accessToken // empty' "$CREDS" 2>/dev/null || true)"
     if [ -n "$tok" ] && usage_call_patiently "$tok"; then
+        RUN_ACCESS_TOKEN="$tok"
         USAGE_REFRESHED=session
         return 0
     fi
@@ -706,11 +739,262 @@ hook_installed() {
         "$HOME/.claude/settings.json" >/dev/null 2>&1
 }
 
+# --- publishing ------------------------------------------------------------------------------
+
+# For most of this file's life the run ended by logging an instruction: open a Claude Code
+# session and run /arcs, because the Artifact tool lives in a session and a timer is not
+# one. That was never a property of artifacts -- it was a property of not knowing the
+# route. The CLI publishes over ordinary HTTP, so this does too, and the last manual step
+# in a job that is otherwise unattended is gone.
+
+FRAME_HTTP_CODE=""; FRAME_BODY=""; FRAME_ERROR=""
+
+# The slug is the last path segment of the artifact link. Anything that does not look like
+# one is a mis-set WORK_ARCS_ARTIFACT_URL, which is worth naming rather than sending: a
+# publish with no slug does not fail, it silently creates a SECOND artifact at a new link,
+# and the page Kyle has open never changes again.
+artifact_slug() {
+    local url="${WORK_ARCS_ARTIFACT_URL:-}" slug
+    slug="${url%%\?*}"; slug="${slug%/}"; slug="${slug##*/}"
+    if [[ "$slug" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
+        printf '%s' "$slug"
+        return 0
+    fi
+    return 1
+}
+
+# One request to the artifact API. The body is a file and never an argument, for the same
+# reason the token grant's is -- an argument is in `ps` -- and here it is also the whole
+# 370KB page, which is not something to hand a process table.
+frame_call() {
+    local tok="$1" method="$2" path="$3" body_file="${4:-}"
+    [ -n "$FRAME_BODY" ] && rm -f "$FRAME_BODY"
+    FRAME_BODY="$(mktemp)"
+    local -a args=(
+        -sS -m "$FRAME_TIMEOUT" -o "$FRAME_BODY" -w '%{http_code}'
+        -X "$method"
+        -H "Authorization: Bearer $tok"
+        -H "anthropic-beta: $OAUTH_BETA"
+        -H "X-Frame-CP: go"
+        -H "X-Frame-Surface: code"
+        -H "X-Frame-Platform: cli"
+        -H "X-Frame-Client-Version: $FRAME_CLIENT_VERSION"
+    )
+    # --data-binary and not --data: `--data @file` strips newlines out of the file, which
+    # a compact JSON body survives by luck rather than design. Sending the bytes that were
+    # built is not a thing to leave to luck.
+    if [ -n "$body_file" ]; then
+        args+=( -H 'Content-Type: application/json' --data-binary @"$body_file" )
+    fi
+    FRAME_HTTP_CODE="$(curl "${args[@]}" "$FRAME_BASE$path" 2>/dev/null || true)"
+    FRAME_HTTP_CODE="$(http_code_or_000 "$FRAME_HTTP_CODE")"
+}
+
+# The same call with a token in front of it. The ladder is shorter than fetch_usage's on
+# purpose: by the time anything here runs, the quota check has already proven a credential
+# and, if it had to, already spent the session fallback to get one. A 401 in the couple of
+# minutes since then earns one mint, not a second session.
+frame_call_authed() {
+    local method="$1" path="$2" body_file="${3:-}" tok
+    FRAME_ERROR=""
+
+    tok="${RUN_ACCESS_TOKEN:-}"
+    [ -z "$tok" ] && tok="$(jq -r '.claudeAiOauth.accessToken // empty' "$CREDS" 2>/dev/null || true)"
+    if [ -z "$tok" ]; then
+        FRAME_HTTP_CODE="000"
+        FRAME_ERROR="no access token in $CREDS"
+        return 1
+    fi
+
+    frame_call "$tok" "$method" "$path" "$body_file"
+    [ "$FRAME_HTTP_CODE" != "401" ] && return 0
+
+    if refresh_access_token; then
+        frame_call "$FRESH_ACCESS_TOKEN" "$method" "$path" "$body_file"
+        RUN_ACCESS_TOKEN="$FRESH_ACCESS_TOKEN"
+        FRESH_ACCESS_TOKEN=""
+        return 0
+    fi
+    FRESH_ACCESS_TOKEN=""
+    FRAME_ERROR="the access token was refused and minting another was too (token endpoint HTTP $REFRESH_HTTP_CODE${REFRESH_ERROR:+, $REFRESH_ERROR})"
+    return 1
+}
+
+# What the artifact currently says about itself. Two things are wanted from it: the title
+# and favicon, because deploy/direct REQUIRES both and sending our own idea of them would
+# quietly rename the page Kyle finds by its icon -- and the version, which is the
+# precondition that turns a blind overwrite into a detectable conflict.
+FRAME_TITLE=""; FRAME_FAVICON=""; FRAME_DESCRIPTION=""; FRAME_VERSION=""
+frame_record() {
+    local slug="$1"
+    FRAME_TITLE=""; FRAME_FAVICON=""; FRAME_DESCRIPTION=""; FRAME_VERSION=""
+    if ! frame_call_authed GET "/api/frame/frames"; then
+        return 1
+    fi
+    if [ "$FRAME_HTTP_CODE" != "200" ]; then
+        FRAME_ERROR="the artifact list answered HTTP $FRAME_HTTP_CODE"
+        return 1
+    fi
+    local rec
+    rec="$(jq -c --arg s "$slug" '[.frames[]? | select(.slug == $s)] | first // empty' \
+        "$FRAME_BODY" 2>/dev/null || true)"
+    if [ -z "$rec" ]; then
+        FRAME_ERROR="this account can see no artifact with slug $slug — it may belong to another login"
+        return 1
+    fi
+    FRAME_TITLE="$(printf '%s' "$rec" | jq -r '.title // empty')"
+    FRAME_FAVICON="$(printf '%s' "$rec" | jq -r '.favicon // empty')"
+    FRAME_DESCRIPTION="$(printf '%s' "$rec" | jq -r '.description // empty')"
+    # Tolerated as absent: the field is the server's, and a publish without a precondition
+    # is worse than a publish with one but much better than no publish at all.
+    FRAME_VERSION="$(printf '%s' "$rec" | jq -r '.version // .current_version // empty')"
+    return 0
+}
+
+# Written next to the build stamp so `arcs` and the page can both tell a built page from a
+# published one. Kept separate from write_state because publishing happens after it and
+# can fail on its own -- a run that built and could not publish should say so in the state
+# file, not silently look like a run that never built.
+stamp_published() {
+    local version="$1" prev='{}'
+    [ -f "$STATE_FILE" ] && prev="$(cat "$STATE_FILE" 2>/dev/null || echo '{}')"
+    printf '%s' "$prev" | jq \
+        --argjson at "$(date +%s)" \
+        --arg iso "$(date -Is)" \
+        --arg version "$version" \
+        '. + {published_at: $at, published_at_iso: $iso,
+              published_version: (if $version == "" then null else $version end)}' \
+        >"$STATE_FILE.tmp" 2>/dev/null && mv "$STATE_FILE.tmp" "$STATE_FILE" || rm -f "$STATE_FILE.tmp"
+}
+
+# A short human-readable note on the version, shown in the artifact's version picker. The
+# date is the useful part: every entry in that list is otherwise identical, and "which
+# morning was this" is the only question anyone scrolling it is asking.
+publish_label() {
+    printf 'refresh %s' "$(date '+%b %-d %H:%M')"
+}
+
+# Send the page. Returns 0 only when the artifact actually moved.
+#
+# The statuses that matter, all of them learned from the CLI's own retry code rather than
+# guessed: 429 is a plan cap and is NOT worth retrying -- the answer will not change this
+# morning -- while 503 with a render_busy body is the service being busy and is worth a
+# short backoff. Everything else is an answer about the request.
+publish_page() {
+    local page="$1" slug label req tries=0 max_tries="${WORK_ARCS_PUBLISH_TRIES:-3}"
+
+    if ! slug="$(artifact_slug)"; then
+        log "publish: WORK_ARCS_ARTIFACT_URL is not an artifact link, so nothing was sent"
+        log "         (publishing without a slug would create a second artifact, not update this one)"
+        return 1
+    fi
+    if [ ! -s "$page" ]; then
+        log "publish: $page is missing or empty, so nothing was sent"
+        return 1
+    fi
+
+    if ! frame_record "$slug"; then
+        log "publish: could not read the artifact's current state — $FRAME_ERROR"
+        return 1
+    fi
+    if [ -z "$FRAME_TITLE" ] || [ -z "$FRAME_FAVICON" ]; then
+        log "publish: the artifact reports no title or favicon, and deploy requires both"
+        return 1
+    fi
+
+    label="$(publish_label)"
+    req="$(mktemp)"
+    # --rawfile, so the page is escaped into the JSON by jq rather than by anything here
+    # improvising quoting over 370KB of HTML.
+    jq -n \
+        --arg slug "$slug" \
+        --arg title "$FRAME_TITLE" \
+        --arg favicon "$FRAME_FAVICON" \
+        --arg description "$FRAME_DESCRIPTION" \
+        --arg label "$label" \
+        --arg version "$FRAME_VERSION" \
+        --rawfile content "$page" \
+        '{slug: $slug, title: $title, favicon: $favicon, label: $label, content: $content}
+         + (if $description == "" then {} else {description: $description} end)
+         + (if $version == "" then {} else {baseVersion: $version} end)' \
+        >"$req" 2>/dev/null
+
+    if ! jq -e '.content | length > 0' "$req" >/dev/null 2>&1; then
+        log "publish: the request body could not be built from $page"
+        rm -f "$req"
+        return 1
+    fi
+
+    while :; do
+        tries=$((tries + 1))
+        if ! frame_call_authed POST "/api/frame/deploy/direct" "$req"; then
+            log "publish: $FRAME_ERROR"
+            rm -f "$req"
+            return 1
+        fi
+
+        case "$FRAME_HTTP_CODE" in
+            200|201)
+                local version
+                version="$(jq -r '.version // empty' "$FRAME_BODY" 2>/dev/null || true)"
+                stamp_published "$version"
+                log "published: $WORK_ARCS_ARTIFACT_URL${version:+ (version $version)}"
+                rm -f "$req"
+                return 0 ;;
+            429)
+                # A plan cap, which is the one 429 that will still be a 429 in ten seconds.
+                log "publish: refused — the publish cap for this plan has been reached ($(frame_message))"
+                rm -f "$req"
+                return 1 ;;
+            503)
+                if [ "$tries" -ge "$max_tries" ]; then
+                    log "publish: the render service stayed busy across $tries attempts"
+                    rm -f "$req"
+                    return 1
+                fi
+                local wait=$((tries * 5))
+                log "publish: the render service is busy — retrying in ${wait}s (attempt $((tries + 1)) of $max_tries)"
+                sleep "$wait" ;;
+            400|409|412)
+                # The precondition failed: something published a different version between
+                # the read above and this write. Nothing of that version survives in what
+                # we are sending anyway -- the page is rebuilt whole from local state every
+                # run -- so the default is to supersede it and say so.
+                if [ "$PUBLISH_SUPERSEDE" = 1 ] && jq -e 'has("baseVersion")' "$req" >/dev/null 2>&1; then
+                    log "publish: the artifact moved since this run read it — superseding with the fresh rebuild"
+                    jq 'del(.baseVersion) + {force: true}' "$req" >"$req.tmp" 2>/dev/null \
+                        && mv "$req.tmp" "$req" || rm -f "$req.tmp"
+                    continue
+                fi
+                log "publish: refused with HTTP $FRAME_HTTP_CODE — $(frame_message)"
+                rm -f "$req"
+                return 1 ;;
+            *)
+                log "publish: HTTP $FRAME_HTTP_CODE — $(frame_message)"
+                rm -f "$req"
+                return 1 ;;
+        esac
+    done
+}
+
+# Whatever the server said, in one short line. Two shapes for the same reason the token
+# endpoint has two: a frame error is {error: {type, message}} and a plain one is {message},
+# and a reader that handles only one logs a bare status code.
+frame_message() {
+    local msg
+    msg="$(jq -r '
+        (if (.error | type) == "object" then (.error.message // .error.type)
+         else (.message // .error // empty) end) // empty' "$FRAME_BODY" 2>/dev/null || true)"
+    [ -z "$msg" ] && msg="$(head -c 200 "$FRAME_BODY" 2>/dev/null | tr -d '\n')"
+    printf '%s' "${msg:0:200}"
+}
+
 # --- the run -------------------------------------------------------------------------------
 
 # Written after a successful build so the page can say how old it is without anyone timing
-# it. `published_at` is carried through rather than rewritten: this script cannot publish
-# -- only a Claude session can -- so whatever last stamped it knows something this does not.
+# it. `published_at` is carried through rather than rewritten -- stamp_published owns it,
+# and it is written after this, so a run that builds and then fails to publish leaves the
+# previous publish's stamp standing rather than claiming this build was published.
 write_state() {
     local dur="$1" bytes="$2" five="$3" seven="$4" page="$5" prev='{}'
     [ -f "$STATE_FILE" ] && prev="$(cat "$STATE_FILE" 2>/dev/null || echo '{}')"
@@ -818,11 +1102,17 @@ do_run() {
     write_state "$elapsed" "$bytes" "$QUOTA_5H" "$QUOTA_7D" "$page"
 
     log "refreshed in ${elapsed}s — $page ($bytes bytes)"
-    if [ -n "${WORK_ARCS_ARTIFACT_URL:-}" ]; then
-        log "publish: from a Claude Code session, \`publish $page to $WORK_ARCS_ARTIFACT_URL\`"
-        log "         or just /arcs — the build is already done, so it is upload-only"
-    else
+    if [ -z "${WORK_ARCS_ARTIFACT_URL:-}" ]; then
         log "publish: no WORK_ARCS_ARTIFACT_URL in .env, so a publish would make a new artifact"
+    elif [ "$PUBLISH" != 1 ]; then
+        log "publish: off (WORK_ARCS_PUBLISH=$PUBLISH) — from a session, \`publish $page to $WORK_ARCS_ARTIFACT_URL\`"
+    elif ! publish_page "$page"; then
+        # A built page nobody can see is the failure this whole section exists to prevent,
+        # so it is worth a notification rather than a line in a log nobody reads. The build
+        # still succeeded, and the exit status says so: the page on disk is good and the
+        # next run will try again.
+        notify "the page rebuilt but could not be published — see $LOG_FILE"
+        log "         the page on disk is good — from a session, \`publish $page to $WORK_ARCS_ARTIFACT_URL\`"
     fi
     hook_installed || log "note: the arc-record Stop hook is not installed — \`arcs-refresh --hook\`"
 
@@ -861,6 +1151,12 @@ case "${1:-}" in
             over) echo "over — $QUOTA_REASON"; exit 3 ;;
             *)    echo "unknown — $QUOTA_REASON"; exit 4 ;;
         esac ;;
+    # Upload what is already on disk, without rebuilding it. The build is the expensive
+    # half and it is already done; this is the half that used to need a person.
+    --publish)
+        page="${WORK_ARCS_PAGE:-$STATE/page.html}"
+        if publish_page "$page"; then exit 0; fi
+        exit 1 ;;
     --force)       force=1 ;;
     "")            ;;
     *)             echo "arcs-refresh: unknown argument '$1' (try --help)" >&2; exit 2 ;;

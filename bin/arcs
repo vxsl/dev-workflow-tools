@@ -6,10 +6,12 @@
 # time, so the page came back with a different --focus than the last one and looked like the
 # work had changed when only the window had.
 #
-# Publishing is deliberately NOT here, and cannot be: the page lives as a Claude Code
-# artifact, and only a Claude Code session can write to that URL. So this script does every
-# deterministic part and then prints exactly what the publish step needs. `/arcs` is the
-# one-word version that does both.
+# Publishing is not here, but it is no longer impossible: for a long time the note in this
+# spot said only a Claude Code session could write to an artifact URL, which turned out to
+# be a fact about the Artifact tool rather than about artifacts. `arcs-refresh --publish`
+# does it over plain HTTP, and the timer now finishes the job on its own. This script stays
+# build-only -- it is the deterministic half, and keeping the network write in the thing
+# that already owns credentials and retries is better than teaching two programs to do it.
 #
 # The standup notes are part of the rebuild and not a mode of it: what to say on Monday is
 # a projection of the same graph as everything else, and a second command to remember on a
@@ -177,8 +179,8 @@ fi
 if [ -n "$URL" ]; then
     echo "  live:  $URL"
     echo
-    echo "  To republish, from a Claude Code session:"
-    echo "    publish $OUT to $URL"
+    echo "  To republish:"
+    echo "    arcs-refresh --publish"
 else
     echo
     echo "  No WORK_ARCS_ARTIFACT_URL set — add it to .env and this will print the"
