@@ -63,10 +63,12 @@ def dropped(aid, label, why, cliff=9, **kw):
                      "forgotten": {"verdict": True, "why": why, "fp": "fg-" + aid}}
     return a
 
-def mismatch(key, status, unpushed, **kw):
+def mismatch(key, status, unpushed, days=None, **kw):
+    days = unpushed if days is None else days
+    scale = am.work_scale(days, unpushed)[0]
     m = {"issue": {"key": key, "status": status, "url": ""},
-         "arc": {"unpushed_live": unpushed}, "ref": key,
-         "why": "status '%s' but %d commits never pushed" % (status, unpushed),
+         "arc": {"unpushed_live": unpushed, "unpushed_days": days}, "ref": key,
+         "why": "status '%s' but %s never pushed" % (status, scale),
          "fp": "gp-" + key}
     m.update(kw)
     return m
@@ -378,12 +380,30 @@ print(says(payload(ledger=LEDGER,
 
 @test "the widest mismatch wins, on the same rule the lede used" {
     run am '
-mism = [mismatch("UL-1", "In Review", 6), mismatch("UL-2", "In Qualification", 202),
-        mismatch("UL-3", "Releasing", 1)]
+mism = [mismatch("UL-1", "In Review", 6, days=4), mismatch("UL-2", "In Qualification", 202, days=9),
+        mismatch("UL-3", "Releasing", 1, days=1)]
 print(says(payload(gap={"status_mismatch": mism}), "contradiction"))'
     [[ "$output" == *"UL-2"* ]]
-    [[ "$output" == *"202 of its commits have never reached a remote"* ]]
+    [[ "$output" == *"9 days of work on it never reached a remote"* ]]
     [[ "$output" == *"the widest of 3 tickets"* ]]
+}
+
+@test "widest means the most work, not the most commits" {
+    # 202 commits over one afternoon is one agentic session; 9 days of work is nine days
+    # of work. Ranking on the commit count put the churn first.
+    run am '
+mism = [mismatch("UL-1", "In Review", 12, days=9), mismatch("UL-2", "In Qualification", 202, days=1)]
+print(says(payload(gap={"status_mismatch": mism}), "contradiction"))'
+    [[ "$output" == *"UL-1"* ]]
+    [[ "$output" == *"9 days of work on it never reached a remote"* ]]
+    [[ "$output" != *"202"* ]]
+}
+
+@test "one day and one commit is less than a day, and carries no numeral at all" {
+    run am '
+print(says(payload(gap={"status_mismatch": [mismatch("UL-9", "Done", 1, days=1)]}),
+           "contradiction"))'
+    [[ "$output" == *"less than a day"*"work on it never reached a remote"* ]]
 }
 
 @test "the forgotten order comes down the wire and is never re-sorted here" {
