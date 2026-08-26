@@ -3646,7 +3646,7 @@ CURATION_ANSWERS = {
 KEYISH = re.compile(r"^[A-Z][A-Z0-9]*-\d+$")
 
 
-def curation_name(q, arc, key):
+def curation_name(q, arc):
     """The name a workstream goes by on this page, never a name composed here.
 
     The brief's, where there is one, exactly as the reviewing zone, the cliff list and the
@@ -3658,15 +3658,15 @@ def curation_name(q, arc, key):
     LOOKUP is wanted: `--jira-ify` takes the label, and a card printing the pretty name
     into a command would print a command that does not run.
     """
-    return str((arc.get("brief") or {}).get("name") or q.get(key) or "?")
+    return str((arc.get("brief") or {}).get("name") or q.get("arc") or "?")
 
 
-def curation_subject(q, arc=None):
+def curation_subject(q, arc):
     """What a card is about, in one phrase: the branch for a membership, the workstream
     for the other two. Never composed here beyond choosing which field it is -- a page
     that reworded a name would be a second author for it."""
     if q.get("kind") in ("residue", "unticketed"):
-        return curation_name(q, arc or {}, "arc")
+        return curation_name(q, arc)
     return str(q.get("branch") or q.get("arc") or "?")
 
 
@@ -3909,7 +3909,7 @@ def curation_cards(a, queue, by_id, gap, here):
           f'<span class="tag">{esc(CURATION_TAG.get(kind, kind))}</span>'
           f'<span class="subj">{esc(curation_subject(q, arc))}</span>'
           + (f'<span class="qi">in</span>'
-             + arc_name_span(curation_name(q, arc, "arc"))
+             + arc_name_span(curation_name(q, arc))
              if kind == "membership" and q.get("arc") else "")
           + "</span>")
         a('<div class="qbody">')
