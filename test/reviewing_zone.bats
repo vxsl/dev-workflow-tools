@@ -287,7 +287,8 @@ d = re.search(r'<a class="door" data-door="reviewing".*?</a>', nav, re.S).group(
 print(re.sub(r'<[^>]+>', '', re.search(r'<span class="dl">(.*?)</span>',
                                        d, re.S).group(1)).strip())
 ZZLEAD
-    [[ "${lines[0]}" == "!10500 "* ]]
+    # Clock then subject, the shape the ledger's own door already uses.
+    [[ "${lines[0]}" == "40d — !10500 "* ]]
 }
 
 @test "the door sits where its section does, between the ledger and what is in play" {

@@ -3776,9 +3776,11 @@ def render(data, lede, focus_days, limit, cost=None):
         doors.append({"id": "reviewing", "href": "reviewing", "kick": "Reviewing",
                       "fig": (mirrored(undismissed(reviews), "#rv-n")
                               + " ongoing"),
-                      "lead": (esc((reviews[0].get("ref") or "") + " "
-                                   + (reviews[0].get("title") or "")).strip()
-                               if reviews else "")})
+                      # The same shape the ledger's door uses for its own head row, from
+                      # the same function -- a clock and a subject. A review row carries
+                      # `days`, `ref` and `title` exactly as a ledger row does, so this is
+                      # a reuse rather than a second composition of the same sentence.
+                      "lead": lead_of(reviews[0]) if reviews else ""})
     doors.append({"id": "play", "href": "play", "kick": "In play",
                   "fig": (mirrored(len(live), "#play-n") + " workstream"
                           + ("" if len(live) == 1 else "s")),
