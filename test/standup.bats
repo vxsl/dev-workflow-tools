@@ -69,6 +69,25 @@ def owed(kind, ref, days, **kw):
     e.update(kw)
     return e
 
+def review(iid, days, turn, rounds, **kw):
+    """One ongoing review, in the shape work-arcs puts on the wire.
+
+    my_last and their_last are real instants rather than dates, which is the whole reason
+    this beat can be windowed exactly -- so every test that cares hands them in.
+    """
+    r = {"iid": iid, "ref": "!%d" % iid, "title": "the %d change" % iid,
+         "url": "https://gitlab.example/mr/%d" % iid,
+         "author": kw.pop("author", "logan"), "source_branch": "br-%d" % iid,
+         "asked": "2026-07-01", "days": days, "whose_turn": turn, "rounds": rounds,
+         "quiet_days": 1, "arc": None, "fp": "rfp%d" % iid,
+         "my_last": 0, "their_last": 0, "their_last_is_proxy": False}
+    r.update(kw)
+    return r
+
+def ep(s):
+    """An instant in the fixtures' own timezone, as the epoch the wire carries."""
+    return int(at(s).timestamp())
+
 def payload(**kw):
     d = {"generated": "2026-08-24T09:00:00-0700", "me": "kylegm", "arcs": [],
          "sprint": {}, "ledger": {"they_owe": [], "you_owe": [], "you_owe_closed": []}}
@@ -466,6 +485,102 @@ for t in beat(d, "2026-08-24T09:00:00", "blocked"): print(t)'
     [[ "$(echo "$output" | head -1)" == *"nobody has reviewed"* ]]
     [[ "$(echo "$output" | tail -1)" == *"I owe"* ]]
     [[ "$(echo "$output" | tail -1)" == *"vadym"* ]]
+}
+
+# ── the reviews he is in the middle of ───────────────────────────────────────
+#
+# Kyle says these out loud -- "i have 6802" -- and until `reviews[]` existed nothing in
+# this file could. The risk is not omission: twenty-one of his twenty-three reviews are his
+# move, so the failure mode is reading the whole list out. What is pinned below is the
+# partition that stops that, and the clock the window is measured on.
+
+@test "a review nobody touched in the window is not standup material" {
+    run su 'd = payload(reviews=[review(10500, 40, "mine", 0,
+    my_last=ep("2026-08-01T09:00:00"), their_last=ep("2026-08-02T09:00:00"))],
+    ledger={"they_owe": [], "you_owe": [], "you_owe_closed": []})
+for t in beat(d, "2026-08-24T09:00:00", "blocked"): print(t)'
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"moved"* ]]
+}
+
+@test "a review either side touched in the window is said, with rounds and whose move" {
+    run su 'd = payload(reviews=[review(10265, 20, "theirs", 12, author="ella",
+    my_last=ep("2026-08-20T09:00:00"), their_last=ep("2026-08-22T09:00:00"))],
+    ledger={"they_owe": [], "you_owe": [], "you_owe_closed": []})
+for t in beat(d, "2026-08-24T09:00:00", "blocked"): print(t)'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"!10265"* ]]
+    [[ "$output" == *"ella"* ]]
+    [[ "$output" == *"round 12"* ]]
+    [[ "$output" == *"their move"* ]]
+}
+
+@test "a round of his own landing in the window counts as movement" {
+    run su 'd = payload(reviews=[review(10475, 7, "mine", 5,
+    my_last=ep("2026-08-22T14:00:00"), their_last=ep("2026-08-01T09:00:00"))],
+    ledger={"they_owe": [], "you_owe": [], "you_owe_closed": []})
+for t in beat(d, "2026-08-24T09:00:00", "blocked"): print(t)'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"!10475"* ]]
+    [[ "$output" == *"round 5"* ]]
+}
+
+@test "the ball in his court is said only for reviews the ledger cannot hold" {
+    # `rounds > 0` and "he has already spoken on it" are the same test read from two
+    # sides, and the second is exactly what drops a merge request out of `you_owe`. So
+    # the two halves partition the list: nothing is said twice and nothing is lost.
+    run su 'd = payload(reviews=[
+    review(10600, 30, "mine", 0),
+    review(10601, 20, "mine", 4)],
+    ledger={"they_owe": [], "you_owe_closed": [],
+            "you_owe": [owed("review-owed", "!10600", 30, who="logan")]})
+for t in beat(d, "2026-08-24T09:00:00", "blocked"): print(t)'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"!10601"* ]]
+    # !10600 is the ledger clause’s business and is named there, once.
+    [ "$(echo "$output" | grep -c '''!10600''')" -eq 1 ]
+}
+
+@test "a reference the ledger clause just read out is not read out again" {
+    run su 'd = payload(reviews=[review(10408, 17, "mine", 2, author="vadym")],
+    ledger={"they_owe": [], "you_owe_closed": [],
+            "you_owe": [owed("review-owed", "!10408", 17, who="vadym")]})
+for t in beat(d, "2026-08-24T09:00:00", "blocked"): print(t)'
+    [ "$status" -eq 0 ]
+    [ "$(echo "$output" | grep -c '''!10408''')" -eq 1 ]
+}
+
+@test "twenty-three reviews are two lines with a stated remainder, never a list" {
+    run su 'rs = [review(10600 + i, 40 - i, "mine", 1 + i) for i in range(23)]
+d = payload(reviews=rs,
+    ledger={"they_owe": [], "you_owe": [], "you_owe_closed": []})
+for t in beat(d, "2026-08-24T09:00:00", "blocked"): print(t)'
+    [ "$status" -eq 0 ]
+    [ "$(echo "$output" | grep -c .)" -le 2 ]
+    [[ "$output" == *"more"* ]]
+}
+
+@test "no reviews on the wire leaves the beat exactly as it was" {
+    run su 'd = payload(ledger={"they_owe": [], "you_owe_closed": [],
+    "you_owe": [owed("review-owed", "!10408", 17, who="vadym")]})
+for t in beat(d, "2026-08-24T09:00:00", "blocked"): print(t)'
+    [ "$status" -eq 0 ]
+    [ "$(echo "$output" | grep -c .)" -eq 1 ]
+    [[ "$output" == *"I owe"* ]]
+}
+
+@test "a review reference points at its row in the page's reviewing section" {
+    run su 'd = payload(reviews=[review(10265, 20, "theirs", 12, author="ella",
+    my_last=ep("2026-08-22T09:00:00"), their_last=ep("2026-08-23T09:00:00"))],
+    ledger={"they_owe": [], "you_owe": [], "you_owe_closed": []})
+st = build(d, "2026-08-24T09:00:00")
+b = next(x for x in st["beats"] if x["kind"] == "blocked")
+for it in b["items"]:
+    for p in it["parts"]:
+        if isinstance(p, dict):
+            print(p.get("t"), p.get("of"), p.get("fp"))'
+    [ "$status" -eq 0 ]
+    [ "$output" = "!10265 review rfp10265" ]
 }
 
 @test "a reviewer panel is trimmed to a sayable length, not read out entire" {

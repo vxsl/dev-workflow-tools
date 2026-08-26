@@ -303,7 +303,10 @@ body{margin:0;background:var(--ground);color:var(--ink);font-family:var(--sans);
    the left -- the same edge its own section wears, so the door and the place it lands you
    are the same object seen twice. That is wayfinding and not severity: nothing here is
    ranked against anything else here. */
-.cockpit{display:grid;grid-template-columns:repeat(auto-fit,minmax(13rem,1fr));
+/* The track floor is what decides how many doors fit on one row, and the strip was built
+   to grow -- so it moves when the strip does. At 13rem the fifth door wrapped to a line of
+   its own, which reads as an afterthought rather than as a peer of the four beside it. */
+.cockpit{display:grid;grid-template-columns:repeat(auto-fit,minmax(12rem,1fr));
   gap:.7rem;margin:0 0 2.2rem;padding:0;list-style:none}
 .cockpit .door{display:flex;flex-direction:column;gap:.2rem;text-decoration:none;
   background:var(--surface);border-radius:6px;padding:.85rem 1rem .9rem;min-width:0;
@@ -686,7 +689,6 @@ a:hover{text-decoration-color:currentColor}
 .reviewing li:first-child{border-top:0}
 .reviewing .clk{font-family:var(--mono);font-size:.78rem;color:var(--ink-soft);flex:none;
   min-width:2.8rem;text-align:right;font-variant-numeric:tabular-nums}
-.reviewing .clk.hot{color:var(--hot);font-weight:700}
 .reviewing .what{min-width:0;flex:1 1 auto}
 .reviewing .ref{font-family:var(--mono);font-size:.78rem}
 /* A line of running text and deliberately not a flex row: the separators are written into
@@ -3325,8 +3327,7 @@ def reviewing(a, reviews, drafts, here, by_id):
     n = undismissed(reviews)
     a('<section id="reviewing">')
     a('<div class="rung"><h2>Reviewing</h2>'
-      f'<span class="n"><span id="rv-n" data-count>{n}</span> merge request'
-      + ("" if n == 1 else "s") + " of theirs</span></div>")
+      f'<span class="n"><span id="rv-n" data-count>{n}</span> ongoing</span></div>')
     a('<p class="note">Somebody else&rsquo;s merge requests you are engaged in, yours '
       "first and then longest-running &mdash; the order work-arcs ranked them in, not a "
       "second one composed here. This is not the ledger and not a workstream of yours: a "
@@ -3389,13 +3390,10 @@ def reviewing(a, reviews, drafts, here, by_id):
             # An anchor to a row the focus window never rendered is the same lie as a
             # link to a 404 -- the rule the run-over-run strip and the sprint strip
             # already follow -- so outside the window the join is stated and not linked.
-            facts.append(f'<a class="arcl" href="#{anchor(arc)}"{via}>{label}</a>'
-                         if arc in here else
-                         f'<span class="arcl"{via}>{label}</span>')
+            facts.append("in " + (f'<a class="arcl" href="#{anchor(arc)}"{via}>{label}</a>'
+                                  if arc in here else
+                                  f'<span class="arcl"{via}>{label}</span>'))
         clk = r.get("days")
-        # Its own clock, and the same hot threshold the ledger uses on its own: a
-        # fortnight of a loop is a loop that has demonstrably failed to close.
-        hot = " hot" if isinstance(clk, int) and clk >= 14 else ""
         asked = (f' title="from the merge request&rsquo;s creation — no note records '
                  f'when you were asked"' if r.get("asked_is_proxy")
                  else f' title="asked {esc(r.get("asked") or "")}"'
@@ -3403,7 +3401,7 @@ def reviewing(a, reviews, drafts, here, by_id):
         a(f'<li data-fp="{esc(fp)}"'
           + (f' id="rv-{esc(fp)}"' if fp else "")
           + f' data-dismissed="{1 if r.get("dismissed") else 0}">'
-          + f'<span class="clk{hot}"{asked}>'
+          + f'<span class="clk"{asked}>'
           + (f"{clk}d" if isinstance(clk, int) else "&mdash;") + "</span>"
           + '<div class="what">'
           + link(r.get("url", ""), esc(r.get("ref", "")), "ref")
