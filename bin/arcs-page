@@ -2928,15 +2928,15 @@ def brief_block(data, here, fps):
     # thing on the page. Every other section here states its own contract in a note and
     # this was the last one making claims without one.
     return ('<ul class="brief">' + "".join(out) + "</ul>"
-            + '<p class="note brnote">Each line is one derived fact and its controls are '
-            "its row&rsquo;s own. <strong>&#x2715; acknowledges</strong> what the line "
+            + '<p class="note brnote">Each line is one derived fact, and its controls '
+            "are its row&rsquo;s own. <strong>&#x2715; acknowledges</strong> what the line "
             "names &mdash; the same fingerprint and the same store as the &#x2715; on that "
-            "row below, so the row fades on this click too. Acknowledge everything the "
-            "opening line names and the next line takes its place at once; the line it "
-            "displaces drops back to the top of this list, struck, and &#x2715; takes it "
-            "back. <strong>&#x2197;</strong> opens the ticket, merge request or thread the "
-            "line quotes, for the lines whose words point at the evidence on this page "
-            "instead.</p>")
+            "row below, so the row fades on this click too, and acknowledging everything "
+            "the opening line names hands the slot to the next line at once. The displaced "
+            "line drops back here, struck, and &#x2715; takes it back; tomorrow&rsquo;s "
+            "build composes its own opening line out of what is still standing. "
+            "<strong>&#x2197;</strong> opens the ticket, merge request or thread a line "
+            "quotes, where its words point at the evidence on this page instead.</p>")
 
 
 # What the copy button does, and the whole of why it is a button rather than a link to a

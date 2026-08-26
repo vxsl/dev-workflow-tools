@@ -5,8 +5,13 @@
 // stores and one attribute -- what the page arrived carrying, what this browser has
 // clicked, and whether a row renders faded -- and all three are expressible without a
 // renderer. So this shims exactly the surface the load path touches and answers every
-// selector but `[data-fp]` with nothing, which is a true description of a page that has
-// only acknowledgeable rows on it.
+// selector it was not given a fixture for with nothing, which is a true description of a
+// page that has only the things the fixture named on it.
+//
+// It holds two kinds of thing now: acknowledgeable rows, and the brief's lines. The second
+// is here because the headline answers to a ✕ -- which line opens the page is decided in
+// this JS, from the same store the rows are decided from, and that decision was the one
+// thing about the loudest sentence on the page that nothing could check.
 //
 // The rule it is held to: nothing here may decide anything. The seed, the rows and
 // localStorage go in, the real INTERACT_JS runs untouched, and the fade, the stores and the
@@ -83,10 +88,50 @@ function makeRow(spec) {
   return row;
 }
 
+// One brief line, drawn the way arcs-page draws it: once as a candidate for the headline
+// slot and once as a row of the shortlist, each carrying the fingerprints its sentence
+// names and one control group per fingerprint. The pair is the whole mechanism -- the
+// client never composes a sentence, it chooses which half of each pair is not hidden --
+// so a fixture holding only one of the two would be testing something the page does not do.
+//
+// `fps` is what the line names. A line naming nothing is a real case and the important
+// one: it can never be fully acknowledged and so can never be stepped past.
+function makeLine(spec, i) {
+  const fps = spec.fps || [];
+  const build = (el) => {
+    el.dataset.linefps = fps.join(' ');
+    el.__ba = {};
+    fps.forEach((fp) => {
+      const sub = el.append(new El('a'));      // the subject inside the sentence
+      sub.dataset.sfp = fp;
+      const ba = el.append(new El('span', 'ba'));
+      ba.dataset.ackfp = fp;
+      ba.dataset.dismissed = '0';
+      el.__ba[fp] = ba.append(new El('button', 'dis'));
+    });
+    return el;
+  };
+  const head = build(new El('div', 'headline'));
+  head.dataset.hline = String(i);
+  head.hidden = i !== 0;
+  const row = build(new El('li'));
+  row.dataset.bline = String(i);
+  row.hidden = i === 0;
+  return { head, row };
+}
+
 function makeHarness(opts) {
   const rows = (opts.rows || []).map(makeRow);
   const byFp = {};
   rows.forEach(r => { byFp[r.dataset.fp] = r; });
+  const lines = (opts.brief || []).map(makeLine);
+  const heads = lines.map(l => l.head), brows = lines.map(l => l.row);
+  const collect = (els, attr) => {
+    const out = [];
+    els.forEach(el => el.children.forEach(c => {
+      if (c.dataset[attr] !== undefined) out.push(c); }));
+    return out;
+  };
   const seedText = JSON.stringify(opts.seed || {});
   const store = Object.assign({}, opts.storage || {});
   const timers = [];
@@ -99,7 +144,15 @@ function makeHarness(opts) {
 
   const document = {
     getElementById(id) { return id === 'ackseed' ? ackseed : null; },
-    querySelectorAll(sel) { return sel === '[data-fp]' ? rows.slice() : []; },
+    querySelectorAll(sel) {
+      if (sel === '[data-fp]') return rows.slice();
+      if (sel === '[data-hline]') return heads.slice();
+      if (sel === '[data-bline]') return brows.slice();
+      if (sel === '[data-ackfp]') return collect(heads, 'ackfp')
+        .concat(collect(brows, 'ackfp'));
+      if (sel === '[data-sfp]') return collect(heads, 'sfp').concat(collect(brows, 'sfp'));
+      return [];
+    },
     querySelector() { return null; },
     createElement(tag) { return new El(tag); },
     addEventListener(kind, fn) { if (kind === 'click') clickHandler = fn; },
@@ -150,6 +203,28 @@ function makeHarness(opts) {
       clickHandler({ target: byFp[fp].__dis, preventDefault() {}, stopPropagation() {} });
     },
     faded(fp) { return byFp[fp].dataset.dismissed === '1'; },
+    // The ✕ on a brief line rather than on a row: same handler, same store, and the point
+    // of clicking it here is that the row three screens down has to move too.
+    clickLine(i, fp, where) {
+      if (!clickHandler) throw new Error('no click handler registered');
+      const el = (where === 'row' ? brows : heads)[i].__ba[fp];
+      clickHandler({ target: el, preventDefault() {}, stopPropagation() {} });
+    },
+    // Which line is in the headline slot, and what the shortlist under it is showing. The
+    // two answers together are the whole of what the promotion decides.
+    headline() { return heads.findIndex(el => !el.hidden); },
+    listed() { return brows.map(el => !el.hidden); },
+    struck() { return brows.map(el => el.dataset.acked === '1'); },
+    // The subject inside a sentence, and the control aimed at it.
+    subjectStruck(i, fp) {
+      const el = heads[i].children.concat(brows[i].children)
+        .filter(c => c.dataset.sfp === fp);
+      return el.map(c => c.dataset.sack === '1');
+    },
+    controlOn(i, fp) {
+      return [heads[i], brows[i]].map(
+        el => el.children.filter(c => c.dataset.ackfp === fp)[0].dataset.dismissed === '1');
+    },
     read(key) { return key in store ? JSON.parse(store[key]) : null; },
     storage() { return Object.assign({}, store); },
     // Fire the batched publish the way the quiet period would, and hand back the seed that

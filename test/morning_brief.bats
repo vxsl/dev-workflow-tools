@@ -193,6 +193,65 @@ print(says(payload(gap={"status_mismatch": mism}), "contradiction"))'
     [[ "$output" == *"of 2 tickets"* ]]
 }
 
+@test "acknowledging every row the opening line names takes that line off the next build" {
+    # The question the headline's instant promotion is the other half of the answer to: "if
+    # i ack/dismiss de-2585 and !10408, will they disappear from the title?" The client
+    # steps past the line the moment both are clicked; this is the rebuild agreeing, which
+    # is the half that has to keep agreeing after the browser is closed. The ledger sentence
+    # names both sides, so both have to be gone before it can be.
+    run am '
+d = payload(ledger={"they_owe": [owed("ticket-stalled", "DE-2585", 160, who="Neville")],
+                    "you_owe": [owed("review-owed", "!10408", 18, who="vadym")]})
+
+def named(doc):
+    return sorted(p["fp"] for s in am.compose(doc) for p in s["parts"]
+                  if not isinstance(p, str) and p.get("fp"))
+
+before = named(d)
+for side in ("they_owe", "you_owe"):
+    for e in d["ledger"][side]:
+        e["dismissed"] = True
+print(" ".join(before), "|", " ".join(named(d)) or "-")'
+    # Both open the page; neither survives the ✕, and there is nothing left to say instead.
+    [ "$output" = "fp-!10408 fp-DE-2585 | -" ]
+}
+
+@test "no line names a row that has been acknowledged, in any of the three families" {
+    # The rule stated over the whole document rather than one sentence at a time. Every
+    # fingerprint arc-morning can put on the wire comes from a row a ✕ can reach, and the
+    # loudest paragraph on the page is exactly where that has to be honoured or the
+    # mechanism is decorative.
+    run am '
+mism = [mismatch("UL-1", "In Review", 5, stale=40),
+        mismatch("UL-2", "Releasing", 1, stale=30)]
+d = payload(ledger={"they_owe": [owed("ticket-stalled", "DE-1", 149, who="Neville"),
+                                 owed("ticket-stalled", "DE-2", 20, who="Irene")],
+                    "you_owe": [owed("review-owed", "!1", 30, who="vadym")]},
+            arcs=[dropped("a1", "one", "40 commits, then nothing.", cliff=9),
+                  dropped("a2", "two", "9 commits, then nothing.", cliff=20)],
+            forgotten=["a1", "a2"],
+            gap={"status_mismatch": mism})
+
+def named(doc):
+    out = set()
+    for s in am.compose(doc):
+        for p in s["parts"]:
+            if not isinstance(p, str) and p.get("fp"):
+                out.add(p["fp"])
+    return out
+
+live = named(d)
+# One row of each family acknowledged -- a ledger row, a cliff verdict, a Jira mismatch.
+gone = {"fp-DE-1", "fg-a1", "gp-UL-1"}
+d["ledger"]["they_owe"][0]["dismissed"] = True
+d["arcs"][0]["activity"]["forgotten"]["dismissed"] = True
+d["gap"]["status_mismatch"][0]["dismissed"] = True
+after = named(d)
+print(sorted(gone - live), sorted(gone & after))'
+    # Every one of them opened the page before the ✕, and none of them does after it.
+    [ "$output" = "[] []" ]
+}
+
 @test "an acknowledged cliff verdict is not the freshest thing you dropped" {
     run am '
 d = payload(arcs=[dropped("a1", "one", "40 commits, then nothing.", cliff=9),
