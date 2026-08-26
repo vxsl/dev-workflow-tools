@@ -1493,14 +1493,77 @@ INTERACT_JS = r"""
   var DKEY='work-arcs:dismissed:v1', dstore=read(DKEY), ddirty=false;
   function dwrite(){ try{ localStorage.setItem(DKEY,JSON.stringify(dstore)); }catch(e){} }
   function dnote(fp){ var v=dstore[fp]; return (v&&v.note)||''; }
+
+  // What this page ARRIVED carrying, as against what has been clicked in this browser. The
+  // distinction is the whole of the un-acknowledge channel: a ✕ on something the pipeline
+  // already holds has to be NAMED on the way back, because the merge at the other end is a
+  // union and a union can only ever add. A ✕ on something only this browser knows about
+  // needs no such notice -- leaving it out of the next seed is enough.
+  //
+  // Two sources and not one. The seed block is the data half of the pipeline's record and
+  // each row's `data-dismissed` is the rendering half, and the two part company the moment
+  // this page publishes itself: the seed is rewritten by the client and the attributes stay
+  // whatever the last rebuild baked. Reading the seed alone lost every acknowledgement that
+  // had been taken back once already -- which is how a ✕ on a server-faded row came to
+  // publish nothing at all, and the row came back faded on the very next reload.
+  var seedJson=(function(){
+    var el=document.getElementById('ackseed');
+    try{ return JSON.parse((el&&el.textContent)||'{}')||{}; }catch(e){ return {}; }
+  })();
+  var seedDis={};
+  (function(){
+    var got=seedJson.dismissed;
+    if(got&&typeof got==='object')
+      Object.keys(got).forEach(function(k){ seedDis[k]=got[k]; });
+  })();
+
   var rows=[].slice.call(document.querySelectorAll('[data-fp]')), present={};
   rows.forEach(function(el){
     if(!el.dataset.fp) return;
     if(!(el.dataset.fp in present))
       present[el.dataset.fp]={ref:el.dataset.ref
         ||(el.querySelector('.ref')||{}).textContent||''};
-    if(el.dataset.dismissed==='1' && !(el.dataset.fp in dstore))
-      dstore[el.dataset.fp]=1;                    // adopt what the file already said
+    if(el.dataset.dismissed==='1' && !(el.dataset.fp in seedDis))
+      seedDis[el.dataset.fp]=1;                   // the rendering half of the same record
+  });
+
+  // --- acknowledgements taken back ------------------------------------------
+  // The ✕es clicked a second time, on rows the pipeline still believes are acknowledged.
+  // This has to persist, and that is not an optimisation: what comes back from a publish is
+  // the same baked HTML with one block replaced, so the row is still faded in the markup,
+  // and without a record here the next load would adopt that fade straight back and quietly
+  // undo the click. An entry lives until a freshly built page stops arriving with that
+  // fingerprint acknowledged -- the pipeline has caught up and there is nothing left to
+  // take back -- because keeping it past that would un-acknowledge a later re-acknowledgement
+  // nobody asked to have undone.
+  var UKEY='work-arcs:undismissed:v1', ustore=read(UKEY);
+  function uwrite(){ try{ localStorage.setItem(UKEY,JSON.stringify(ustore)); }catch(e){} }
+  (function(){
+    var dirty=false;
+    Object.keys(ustore).forEach(function(k){
+      if(!(k in seedDis)){ delete ustore[k]; dirty=true; return; }
+      // The two are disjoint by construction below; if a corrupted store ever holds a
+      // fingerprint in both, the take-back is the later act and outranks the adoption --
+      // whichever way it goes, what is displayed and what is published agree.
+      if(k in dstore) delete dstore[k];
+    });
+    if(dirty) uwrite();
+  })();
+  // Called wherever a write to dstore could have gone either way, rather than inlined at
+  // the ✕: two places on this page take an acknowledgement back -- the ✕ and the no-ticket
+  // question's answers -- and a third added later that forgets to say so would be an
+  // un-acknowledgement that silently never leaves the browser, which is the exact failure
+  // this pair exists to end.
+  function forget(fp){
+    if(fp in seedDis){ ustore[fp]=Math.floor(Date.now()/1000); uwrite(); } }
+  function keep(fp){ if(fp in ustore){ delete ustore[fp]; uwrite(); } }
+
+  rows.forEach(function(el){
+    var fp=el.dataset.fp;
+    if(!fp) return;
+    // Adopt what the file already said -- unless this viewer has taken it back, in which
+    // case the fade is lifted here, at load, and stays lifted until the pipeline agrees.
+    if(el.dataset.dismissed==='1' && !(fp in dstore) && !(fp in ustore)) dstore[fp]=1;
   });
   var pruned=false;
   Object.keys(dstore).forEach(function(k){
@@ -1868,6 +1931,7 @@ INTERACT_JS = r"""
       var el=dis.closest('[data-fp]'), fp=el&&el.dataset.fp;
       if(!fp) return;
       if(fp in dstore) delete dstore[fp]; else dstore[fp]=1;
+      if(fp in dstore) keep(fp); else forget(fp);
       ddirty=true; dwrite(); apply(); return; }
     var det=t.closest?t.closest('.tree .det'):null;
     if(det){ ev.preventDefault();
@@ -1910,6 +1974,9 @@ INTERACT_JS = r"""
       logAnswer({kind:'unticketed', answer:urow.dataset.answer||'unanswered',
                  arc:urow.dataset.arc, arc_id:urow.dataset.arcid, fp:ufp,
                  fingerprint:urow.dataset.fingerprint});
+      // `ticket` and taking an answer back both leave the row un-acknowledged, and on a row
+      // the pipeline already holds that is an un-acknowledgement like any other.
+      if(ufp in dstore) keep(ufp); else forget(ufp);
       dwrite(); apply(); return; }
     var iy=t.closest?t.closest('.cur .q[data-kind="residue"] .yn button'):null;
     if(iy){ ev.preventDefault();
@@ -2016,22 +2083,33 @@ INTERACT_JS = r"""
   var SEEDRE=/(<script type="application\/json" id="ackseed">)([\s\S]*?)(<\/script>)/;
   // Where the shell's injected preamble ends and this page's own stored bytes begin.
   var RUNTIME_END='<!-- /frame-runtime -->';
-  var art=null, pubTimer=null, pubBusy=false, pubAgain=false;
-  var seedDis={};                        // the acknowledgements this page arrived carrying
+  var art=null, pubTimer=null, pubBusy=false, pubAgain=false, pubSent=null;
   var PUBLISH_QUIET=4000;                // ms of stillness before a save
 
   function ackPayload(){
     var now=Math.floor(Date.now()/1000), dis={};
-    Object.keys(dstore).forEach(function(k){
-      var v=dstore[k];
-      dis[k]={ref:(present[k]||{}).ref||'', at:(v&&v.at)||now, note:dnote(k)};
-    });
-    // The acknowledgements this page was handed and no longer holds. A union at the other
-    // end can only ever add, so this is the only way a ✕ clicked a second time reaches the
-    // pipeline -- and it is named outright rather than inferred from an absence, because
-    // "not in this seed" is also what a store the page never rendered looks like.
+    // A union, and then exactly one subtraction. What this page arrived carrying is the
+    // pipeline's record and localStorage is this browser's; publishing the browser's alone
+    // would drop every acknowledgement made on another device out of the page's own account
+    // of itself, and there is no way to read that absence back -- "not in this seed" is also
+    // what a store the page never rendered looks like. The union is the page's honest total
+    // knowledge, and only an explicit un-✕ may take anything out of it.
+    function put(k, v){
+      var had=dis[k]||{};
+      dis[k]={ref:(present[k]||{}).ref||(v&&v.ref)||had.ref||'',
+              at:(v&&v.at)||had.at||now,
+              note:(v&&v.note)||had.note||''};
+    }
+    Object.keys(seedDis).forEach(function(k){ put(k, seedDis[k]); });
+    Object.keys(dstore).forEach(function(k){ put(k, dstore[k]); });
+    // The acknowledgements this page was handed and has been told to let go of. A union at
+    // the other end can only ever add, so this is the only way a ✕ clicked a second time
+    // reaches the pipeline -- and it is the store of explicit take-backs rather than
+    // whatever the union happens to be missing, because an absence means nothing here: a
+    // fingerprint the page never rendered is absent too, and expiring one of those is
+    // apply_dismissals' job and not a click's.
     var undis=[];
-    Object.keys(seedDis).forEach(function(k){ if(!(k in dstore)) undis.push(k); });
+    Object.keys(ustore).forEach(function(k){ delete dis[k]; undis.push(k); });
     return {dismissed:dis, detached:tstore, confirmed:cstore, intended:istore,
             residue:rstore, filed:fstore, answers:astore, undismissed:undis};
   }
@@ -2071,7 +2149,8 @@ INTERACT_JS = r"""
         // would replace the dashboard with it -- there is no partial update to fall back
         // on. The seed block is the stronger of the two and does the real work.
         if(!SEEDRE.test(src)) throw {code:'no_seed'};
-        var body=JSON.stringify(ackPayload()).replace(/<\//g,'<\\/');
+        pubSent=ackPayload();
+        var body=JSON.stringify(pubSent).replace(/<\//g,'<\\/');
         var next=src.replace(SEEDRE,function(_,open,was,close){ return open+body+close; });
         return art.publish(next).catch(function(e){
           // The one retry, and it is a question about shape rather than a hope. What the
@@ -2086,6 +2165,14 @@ INTERACT_JS = r"""
         // The view reloads to what was just published, so little after this runs for long.
         // The message is set anyway: a publish that succeeds and reloads slowly must not
         // look like one that hung.
+        // What was just published is what this page now arrives carrying, so a ✕ clicked
+        // in the seconds before the reload lands still has something to name on the way
+        // back. The take-backs already sent stay in their store: the pipeline does not read
+        // them until its next rebuild, and until then this page's own markup still fades
+        // those rows.
+        if(pubSent&&pubSent.dismissed)
+          Object.keys(pubSent.dismissed).forEach(function(k){
+            if(!(k in seedDis)) seedDis[k]=pubSent.dismissed[k]; });
         ddirty=tdirty=cdirty=fdirty=idirty=rdirty=adirty=false;
         pubBusy=false;
         say('Saved to the published page.');
@@ -2122,16 +2209,17 @@ INTERACT_JS = r"""
   // moment it opened would mint a version every morning for no judgement at all, and would
   // race the rebuild that had just made it.
   (function(){
-    var seed=document.getElementById('ackseed'), on={};
-    try{ on=JSON.parse((seed&&seed.textContent)||'{}')||{}; }catch(e){ on={}; }
     var pairs=[['dismissed',dstore],['detached',tstore],['confirmed',cstore],
                ['intended',istore],['residue',rstore],['filed',fstore]];
     var moved=false;
     pairs.forEach(function(pair){
-      var got=on[pair[0]];
+      var got=seedJson[pair[0]];
       if(!got||typeof got!=='object') return;
       Object.keys(got).forEach(function(k){
-        if(pair[0]==='dismissed') seedDis[k]=1;
+        // An acknowledgement this viewer has taken back is not adopted back out of the
+        // seed the taking-back has not reached yet. Everything else about the seed is
+        // additive; this one key is the only thing on the page that can subtract.
+        if(pair[0]==='dismissed' && (k in ustore)) return;
         // Only what this browser has not got. The store here is the in-page authority
         // after load and may hold a click made since the page was built; the file's copy
         // of the same key is the older answer to the same question.
