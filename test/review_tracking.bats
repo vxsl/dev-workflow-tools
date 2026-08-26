@@ -138,7 +138,7 @@ def fake_glab(mrs, discussions, me="kyle"):
 def arc(aid, branches, mrs=(), reviews=(), **kw):
     a = {"id": aid, "label": aid, "kind": "ticket", "ticket": None, "issues": [],
          "branches": list(branches), "mrs": list(mrs), "sessions": [], "stashes": [],
-         "reviews": list(reviews), "role": "authored", "engagement": 0}
+         "reviews": list(reviews), "engagement": 0}
     a.update(kw)
     return a
 
@@ -274,10 +274,13 @@ bs = wa.collect_branches(REPO, "origin/main")
 a = arc("x", [bs["UL-1816"]], mrs_known=True)
 wa.finalize(a, REPO, "origin/main")
 print("kinds", sorted(d["kind"] for d in a["demands"]))
-print("stage", a["stage"], "role", a["role"])'
+print("stage", a["stage"], "checkout_only", wa.checkout_only(a))
+print("state", a["state"])'
     [ "$status" -eq 0 ]
     [[ "$output" == *"kinds []"* ]]
-    [[ "$output" == *"role review"* ]]
+    [[ "$output" == *"stage checkout checkout_only True"* ]]
+    # Whose branch it is, from the commits on it, and never an accusation about one.
+    [[ "$output" == *"ella"* ]]
     [[ "$output" != *"unreviewed"* ]]
 }
 
@@ -292,10 +295,10 @@ bs = wa.collect_branches(REPO, "origin/main")
 a = arc("x", [bs["UL-1816"]], mrs_known=True)
 wa.finalize(a, REPO, "origin/main")
 print("kinds", sorted(d["kind"] for d in a["demands"]))
-print("role", a["role"])'
+print("checkout_only", wa.checkout_only(a))'
     [ "$status" -eq 0 ]
     [[ "$output" == *"unreviewed"* ]]
-    [[ "$output" == *"role authored"* ]]
+    [[ "$output" == *"checkout_only False"* ]]
 }
 
 @test "an arc of your own work that contains one of their branches is not a review" {
@@ -308,9 +311,9 @@ print("role", a["role"])'
 bs = wa.collect_branches(REPO, "origin/main")
 a = arc("x", [bs["UB-6802"], bs["UB-6888"]], mrs_known=True)
 wa.finalize(a, REPO, "origin/main")
-print("role", a["role"])'
+print("checkout_only", wa.checkout_only(a))'
     [ "$status" -eq 0 ]
-    [[ "$output" == *"role authored"* ]]
+    [[ "$output" == *"checkout_only False"* ]]
 }
 
 # ── R3: which merge requests make the reviewing list ──────────────────────────
@@ -485,24 +488,21 @@ print("n", len(led["reviews"]), "known", led["reviews_known"])'
     run wa '
 a = arc("theirs", [{"name": "UL-1816", "role": "checkout", "sha": "s", "unpushed": 0,
                     "commits_ahead": 1, "age_days": 3, "parents": [], "pushed": True,
-                    "committed": 0, "own_committed": 0}], role="review",
-        stage="reviewing", state="checkout of someone/s branch")
+                    "committed": 0, "own_committed": 0}],
+        stage="checkout", state="checkout of ella/s branch")
 r = {"iid": 10530, "ref": "!10530", "source_branch": "UL-1816", "author": "logan",
      "whose_turn": "mine", "rounds": 3, "my_last": 100, "their_last": 200, "arc": None}
 wa.attach_reviews([a], [r])
 print("joined", r["arc"], "how", r["arc_via"])
 print("on_arc", len(a["reviews"]))
-print("state", a["state"])
-print("own_activity", a["own_activity"])'
+print("own_activity", wa.own_activity(a))'
     [ "$status" -eq 0 ]
     [[ "$output" == *"joined theirs"* ]]
     [[ "$output" == *"on_arc 1"* ]]
-    # The sentence is upgraded from the plain one; what it says is not pinned, only that it
-    # names the merge request and the person whose it is.
-    [[ "$output" == *"!10530"* ]]
-    [[ "$output" == *"logan"* ]]
-    # Your word on their merge request is the only touch of yours a pure review has.
-    [[ "$output" == *"own_activity 100"* ]]
+    # A word you said on their merge request is not a touch on any workstream here. It
+    # used to be folded in so that a checkout-only arc had one clock of yours instead of
+    # none; those arcs are not emitted any more and the clause went with them.
+    [[ "$output" == *"own_activity 0"* ]]
 }
 
 @test "failing that, a review joins the arc that names the same ticket" {
@@ -510,7 +510,7 @@ print("own_activity", a["own_activity"])'
 a = arc("UL-1816", [{"name": "UL-1816-local-copy", "role": "checkout", "sha": "s",
                      "unpushed": 0, "commits_ahead": 1, "age_days": 3, "parents": [],
                      "pushed": True, "committed": 0, "own_committed": 0}],
-        role="review", stage="reviewing", state="x", ticket="UL-1816")
+        stage="checkout", state="x", ticket="UL-1816")
 r = {"iid": 1, "ref": "!1", "source_branch": "UL-1816-theirs", "author": "logan",
      "whose_turn": "theirs", "rounds": 1, "my_last": 5, "their_last": 1, "arc": None}
 wa.attach_reviews([a], [r])
@@ -543,7 +543,7 @@ a = arc("mine", [{"name": "UL-1816", "role": "authored", "sha": "s", "unpushed":
 r = {"iid": 1, "ref": "!1", "source_branch": "UL-1816", "author": "logan",
      "whose_turn": "mine", "rounds": 1, "my_last": 9999, "their_last": 1, "arc": None}
 wa.attach_reviews([a], [r])
-print("role", a["role"], "own_activity", a["own_activity"])'
+print("own_activity", wa.own_activity(a))'
     [ "$status" -eq 0 ]
     [[ "$output" == *"own_activity 50"* ]]
 }

@@ -324,6 +324,65 @@ def own_branch(b):
     return b.get("role", "authored") != "checkout"
 
 
+def checkout_only(arc):
+    """Is there nothing of yours in this workstream at all?
+
+    Kyle: "if there's a checkout-only arc with none of my own work, doesn't that mean
+    that it's not an arc at all?" It does. An arc is a piece of work of yours, and a
+    directory holding somebody else's branch is not one -- it is evidence that you were
+    reading their branch, which is a fact about a review and belongs on the review.
+
+    Exactly the old `role == "review"` test, kept whole and given a name: one commit of
+    yours anywhere in the arc, or one merge request of yours joined to it, and the mixed
+    case stays a workstream. `UB-6802` is 22 commits of yours and 17 of Ella's and calling
+    that a review would lose the work.
+    """
+    return (bool(arc.get("branches")) and not arc.get("mrs")
+            and not any(own_branch(b) for b in arc.get("branches", [])))
+
+
+def branch_owner(arc):
+    """Whose branch this is, in as few words as the commits will support.
+
+    The address's local part and nothing more: "ella@example.com" is a fact and "Ella" is
+    a guess about a person's name, which is the kind of guess that gets somebody else's
+    colleague addressed by the wrong first name on a page they read every morning. Where
+    the commits name nobody, the sentence says "someone" rather than inventing a party.
+    """
+    for b in arc.get("branches", []):
+        who = (b.get("foreign_author") or "").split("@")[0].strip()
+        if who:
+            return f"{who}'s branch"
+    return "someone's branch"
+
+
+def checkout_promoted(arc):
+    """Why a checkout is a workstream anyway, or None where it is not.
+
+    Kyle drew this boundary himself: "what if i check something out and start to make
+    changes on it but havent committed yet. that would be an arc... right?" Uncommitted
+    work is his work in its most at-risk form -- on no branch, no remote, in no reflog --
+    so the working tree is the line, not the commit.
+
+    A stash counts for the same reason and is the same fact one step further along: it is
+    uncommitted work he deliberately put somewhere. Sessions are NOT on this list, and the
+    omission is the point: a transcript that mentions a branch is a record of having read
+    it, which is exactly what reviewing looks like, and promoting on it would put every
+    checkout straight back where it was.
+
+    An unreadable working tree promotes too. A workstream deleted because a subprocess
+    failed is a workstream deleted on no evidence at all.
+    """
+    if arc.get("stashes"):
+        return "stash"
+    if any(b.get("dirty") is True for b in arc.get("branches", [])):
+        return "dirty"
+    if any(b.get("dirty") is None and b.get("worktree")
+           for b in arc.get("branches", [])):
+        return "unreadable"
+    return None
+
+
 def collect_branches(repo, main_ref):
     """Every unmerged local branch with the facts that decide its state."""
     ident = own_authors(repo)
@@ -342,10 +401,18 @@ def collect_branches(repo, main_ref):
             "age_days": days_ago(ts),
         }
 
-    worktrees = set()
+    # The path as well as the name, because a branch checked out somewhere is the only
+    # kind that can have uncommitted work in it, and the working tree that holds it is the
+    # only place that can be asked.
+    worktrees, worktree_path, at = set(), {}, None
     for line in lines(git(repo, "worktree", "list", "--porcelain")):
-        if line.startswith("branch refs/heads/"):
-            worktrees.add(line[len("branch refs/heads/"):])
+        if line.startswith("worktree "):
+            at = line[len("worktree "):]
+        elif line.startswith("branch refs/heads/"):
+            name = line[len("branch refs/heads/"):]
+            worktrees.add(name)
+            if at:
+                worktree_path[name] = at
 
     for name, b in branches.items():
         ahead = git(repo, "rev-list", "--count", f"{main_ref}..{name}").strip()
@@ -389,6 +456,12 @@ def collect_branches(repo, main_ref):
         b["subjects"], b["commits"] = [], []
         b["own_commits"] = b["foreign_commits"] = 0
         own_at = 0
+        # Whose branch this is, where it is not yours. The log is newest first, so the
+        # first foreign address is the person currently working here rather than whoever
+        # opened the file two years ago. Read on the walk that was happening anyway, which
+        # is why this and not the merge request sweep: that sweep only names the branches
+        # with an open MR that named you a reviewer, and a checkout can outlive both.
+        b["foreign_author"] = ""
         for line in lines(git(repo, "log", "--format=%ct%x09%ae%x09%h%x09%s", "-200",
                               f"{main_ref}..{name}")):
             when, _, rest = line.partition("\t")
@@ -402,6 +475,8 @@ def collect_branches(repo, main_ref):
                 b["subjects"].append(subject)
             mine = author_is_own(email, ident)
             b["own_commits" if mine else "foreign_commits"] += 1
+            if not mine and not b["foreign_author"]:
+                b["foreign_author"] = email
             if when.isdigit():
                 b["commits"].append({"at": int(when), "sha": sha})
                 if mine and int(when) > own_at:
@@ -423,7 +498,56 @@ def collect_branches(repo, main_ref):
         # implying it covered the lot.
         if b["commits_ahead"] > 200:
             b["authorship_capped"] = 200
+    _read_dirt(repo, branches, worktree_path)
     return branches
+
+
+def _read_dirt(repo, branches, worktree_path):
+    """Which of somebody else's branches you have uncommitted work sitting on.
+
+    Kyle: "what if i check something out and start to make changes on it but havent
+    committed yet. that would be an arc... right?" It would, and this is the only fact
+    that can say so. A checkout with no commit of yours is otherwise indistinguishable
+    from a branch you fetched and never opened, and the difference between them is a
+    working tree with changes in it -- uncommitted work being the most at-risk form work
+    takes, since it is on no branch, no remote and in no reflog.
+
+    Asked only of the branches it can be true of, and that bound is what makes it free:
+    a branch with no worktree has no working tree to be dirty, and a branch carrying a
+    commit of yours is already work of yours by a cheaper test. Measured on the real
+    corpus: 15 of 443 branches are checkouts and 11 of those have worktrees, so this is
+    11 `git status` calls and 0.3s rather than 248 and half a minute.
+
+    Three values, not two. False is clean, True is dirty, and None is a working tree git
+    would not answer for -- a directory that has been moved or deleted out from under the
+    worktree list, which is common enough on a laptop with 248 of them. None is not clean:
+    the demotion below keeps an arc it cannot read, because dropping a workstream on a
+    failed subprocess is the one outcome no amount of correctness later recovers.
+    """
+    ask = {n: worktree_path[n] for n, b in branches.items()
+           if b.get("role") == "checkout" and n in worktree_path}
+    if not ask:
+        return
+
+    def one(item):
+        name, at = item
+        try:
+            r = subprocess.run(["git", "-C", at, "status", "--porcelain"],
+                               capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            return name, None
+        if r.returncode != 0:
+            return name, None
+        return name, bool(r.stdout.strip())
+
+    with futures.ThreadPoolExecutor(max_workers=8) as pool:
+        for name, verdict in pool.map(one, sorted(ask.items())):
+            branches[name]["dirty"] = verdict
+    unreadable = [n for n in ask if branches[n].get("dirty") is None]
+    if unreadable:
+        print(f"  branches: {len(unreadable)} checked-out working tree(s) would not say "
+              "whether they are clean — they are kept as workstreams rather than read as "
+              f"empty ({', '.join(sorted(unreadable)[:3])})", file=sys.stderr)
 
 
 def unpushed_authored(repo, names):
@@ -6468,8 +6592,14 @@ def own_activity(arc):
     """
     ts = [_own_touch(b) for b in arc.get("branches", [])]
     ts += [s.get("last", 0) for s in arc.get("sessions", [])]
-    if arc.get("role") == "review":
-        ts += [r.get("my_last", 0) for r in arc.get("reviews", [])]
+    # A word you said on somebody else's merge request is NOT a touch on any workstream
+    # here, and the clause that used to fold it in is gone with the arcs it was bounded to.
+    # It existed so that a checkout-only arc had one clock of yours instead of none; those
+    # arcs are no longer emitted, and on the two kinds that are left it would do only harm.
+    # On a mixed workstream the bound already forbade it -- a note on Ella's branch must
+    # not silence the news that your own branch stopped merging -- and on a promoted
+    # checkout the touch that matters is the uncommitted work, which carries no instant a
+    # review comment could honestly stand in for.
     return max(ts) if ts else 0
 
 
@@ -6548,8 +6678,11 @@ FORGOTTEN_EXEMPT = {
     # A checkout of someone's branch cannot be work you forgot, because it was never work
     # you were doing. Without this the test fires on exactly the wrong evidence: `UL-1816`
     # carries 25 of Logan's commits, which clears `min_commits` on its own, so the arc
-    # would be accused of a cliff built entirely out of another person's rhythm.
-    "reviewing": "a checkout of someone else's branch, not work of yours",
+    # would be accused of a cliff built entirely out of another person's rhythm. Most of
+    # these never reach here now -- demote_checkouts drops them -- and the exemption stays
+    # for the ones that do: uncommitted work on a colleague's branch is at-risk work, but
+    # the cliff would still be measured against their rhythm and not yours.
+    "checkout": "a checkout of someone else's branch, not work of yours",
 }
 
 
@@ -7323,17 +7456,13 @@ def finalize(arc, repo=None, main_ref="origin/main"):
     if (arc.get("ticket_authority") or {}).get("key"):
         arc["ticket"] = arc["ticket_authority"]["key"]
     arc["historical_branches"] = sum(1 for b in arc["branches"] if b.get("historical"))
-    # Whose work this workstream IS, aggregated from the branches. "review" only when
-    # nothing here is yours: one commit of your own anywhere in the arc, or one merge
-    # request of your own joined to it, and it is a workstream you are working on that
-    # happens to contain a colleague's branch. The mixed case is the common one and it is
-    # deliberately NOT relabelled -- `UB-6802` is 22 commits of yours and 17 of Ella's, and
-    # calling that a review would lose the work. What makes reviewing first-class is the
-    # review row itself, which joins to the arc from `reviews[]` rather than renaming it.
-    arc["role"] = ("review"
-                   if arc["branches"] and not arc["mrs"]
-                   and not any(own_branch(b) for b in arc["branches"])
-                   else "authored")
+    # `role` used to sit here, and "review" was one of its two values. It is gone with the
+    # arcs that carried it: a workstream containing nothing of yours is not a workstream
+    # with a label on it, it is not a workstream, and demote_checkouts stops emitting it.
+    # What survives here is the one case that IS yours -- a colleague's branch with your
+    # uncommitted work sitting on it -- and it says so in `state` below rather than in a
+    # category. A dead value left behind would have been read as "this exists and is
+    # merely rare", which is the opposite of what happened to it.
 
     # Which merge requests are out being qualified, joined per MR through its own ticket.
     # Empty on the first pass, when no Jira call has happened yet -- like everything else
@@ -7393,16 +7522,25 @@ def finalize(arc, repo=None, main_ref="origin/main"):
         n, d = arc.get("residue_commits", 0), arc.get("residue_days", 0)
         arc["state"] = ("residue — " + (work_scale(d, n)[0] if n else "nothing")
                         + " not counted")
-    elif arc["role"] == "review":
+    elif checkout_only(arc):
         # Its own rung, because every other one on the ladder is a claim about work of
         # yours and none of them is true here. Left to the fallback this arc reported
         # "pushed, no merge request" -- an accusation about a colleague's branch -- and
         # where the checkout carried local commits it reported days of YOUR work sitting
-        # only on this laptop. The honest sentence is small and it is upgraded in
-        # `attach_reviews` the moment a merge request can be joined to it, which is where
-        # the round count and whose turn it is come from.
-        arc["stage"] = "reviewing"
-        arc["state"] = "checkout of someone's branch"
+        # only on this laptop.
+        #
+        # Most of these never reach a reader: demote_checkouts drops them, and the branch
+        # becomes evidence on the review it belongs to. The ones that survive are the ones
+        # with uncommitted work on them, and that is what the sentence says. `work_scale`
+        # is the authority on how much work something is and is deliberately not consulted:
+        # this is a state, not an amount, and nothing here has counted anything.
+        arc["stage"] = "checkout"
+        why, whose = checkout_promoted(arc), branch_owner(arc)
+        arc["state"] = {
+            "dirty": f"uncommitted changes on {whose}",
+            "stash": f"stashed changes on {whose}",
+            "unreadable": f"{whose} — git would not say if the tree is clean",
+        }.get(why, f"checkout of {whose}")
     elif stale_draft:
         arc["stage"] = "pre-landing"
         ref = next(b["predates_landing"] for b in live_b if b.get("predates_landing"))
@@ -7530,26 +7668,105 @@ def attach_reviews(arcs, reviews):
             continue
         r["arc"], r["arc_via"] = arc.get("id"), via
         arc["reviews"].append(r)
+    # Nothing follows the join, and two things that used to are worth naming as gone.
+    #
+    # `own_activity` was recomputed here so that a checkout-only arc had one clock of yours
+    # -- the last word you said on the merge request -- instead of none. Those arcs are not
+    # emitted any more, and on a workstream that IS yours a note on somebody else's branch
+    # was never a touch on it; see own_activity for the bound.
+    #
+    # And a state upgrade: "reviewing !10530 for logan, round 3", written onto an arc whose
+    # stage was `reviewing`. It is gone with that stage. A mixed workstream is its own work
+    # and a promoted checkout is uncommitted work of yours, and both had a truer sentence
+    # already that this would have overwritten with one about somebody else's merge request.
 
+
+def demote_checkouts(arcs):
+    """Stop calling a directory holding somebody else's branch a workstream of yours.
+
+    Kyle: "if there's a checkout-only arc with none of my own work, doesn't that mean that
+    it's not an arc at all?" It does, and the whole of this is that one sentence carried
+    out. An arc is a piece of work of yours. A branch of Logan's you fetched to read is
+    evidence that you were reading it, and evidence belongs on the thing it is evidence
+    for -- which is the review, not a workstream invented to hold the directory.
+
+    Called after attach_reviews and before everything that ranks or diffs arcs, because
+    both halves of the answer need the join to have happened: a checkout with a review on
+    it becomes that review's evidence, and a checkout with none becomes a `checkouts` row.
+
+    Returns (arcs, checkouts). Three rules and each one is a thing that could go wrong:
+
+    * NOTHING IS DELETED IN SILENCE. A local head this tool stops mentioning anywhere is a
+      regression, not a cleanup -- a branch nobody can see is a branch nobody remembers to
+      remove. Every demoted branch leaves either as evidence on a review row or as a
+      `checkouts` entry, and the counts are printed.
+    * THE PROMOTION BOUNDARY IS THE WORKING TREE, not the commit -- see checkout_promoted.
+      A checkout you have started changing is your work, and it is your work in the form
+      that would be lost the most completely.
+    * WHERE A REVIEW JOINED, ALL OF THE ARC'S BRANCHES ARE ITS EVIDENCE. The join is by
+      source branch OR by ticket, so an arc can join a review through a branch that is not
+      the merge request's own -- a local copy under a different name. Splitting the arc's
+      branches between "evidence" and "unattached checkout" on that distinction would put
+      the same piece of work in two places under two headings.
+    """
+    kept, checkouts, promoted, evidence = [], [], 0, 0
     for a in arcs:
-        # After the join, because on a review arc the last word you said on the merge
-        # request is the only touch of yours that exists -- see own_activity.
-        a["own_activity"] = own_activity(a)
-        # `notify` is deliberately not recomputed. It is the came-back demands that
-        # postdate your last touch, and a review arc holds no came-back demand at all: it
-        # has no merge request of yours for one to hang off, and the branch-pipeline demand
-        # no longer fires on a branch that is not yours. There is nothing here for a raised
-        # clock to suppress, so nothing has to be re-derived to keep the two agreeing.
-        if a.get("stage") != "reviewing" or not a["reviews"]:
+        if not checkout_only(a):
+            kept.append(a)
             continue
-        # The honest sentence, upgraded from "checkout of someone's branch" now that there
-        # is a merge request to name. Only where the stage is still `reviewing`: a park is
-        # a declaration and outranks anything derived, and finalize has already had its say
-        # about everything else.
-        r = a["reviews"][0]
-        turn = "your turn" if r["whose_turn"] == "mine" else "their turn"
-        rounds = f", round {r['rounds']}" if r["rounds"] else ""
-        a["state"] = f"reviewing {r['ref']} for {r['author']}{rounds}, {turn}"
+        why = checkout_promoted(a)
+        if why:
+            a["checkout_promoted"] = why
+            kept.append(a)
+            promoted += 1
+            continue
+        sessions = len(a.get("sessions") or [])
+        names = sorted(b["name"] for b in a.get("branches", []))
+        joined = a.get("reviews") or []
+        if joined:
+            for r in joined:
+                # The arc it named is about to stop existing, so the pointer to it goes
+                # too rather than being left to dangle -- `arc: null` is what every review
+                # that joined nothing already carries, and a renderer needs no new rule.
+                # What replaces it says the same thing without an arc: the branch is here.
+                r["arc"], r["arc_via"] = None, ""
+                r["checked_out"] = True
+                r["checkout_branches"] = names
+                r["checkout_sessions"] = sessions
+                r["checkout_age_days"] = min(
+                    (b.get("age_days") for b in a["branches"]
+                     if b.get("age_days") is not None), default=None)
+                evidence += 1
+            continue
+        for b in a.get("branches", []):
+            checkouts.append({
+                "branch": b["name"],
+                "age_days": b.get("age_days"),
+                # Whose it is, from the commits on it -- see branch_owner for why the
+                # address and not a name.
+                "owner": (b.get("foreign_author") or "").split("@")[0],
+                "worktree": bool(b.get("worktree")),
+                # Named and null rather than absent: "no open merge request names you a
+                # reviewer of this" is the fact, and a missing key cannot say it.
+                "iid": None,
+                "sessions": sessions,
+                # What it used to be filed under, so a reader who remembers yesterday's
+                # page can find where a row went.
+                "was_arc": a.get("id"),
+            })
+    # Total order with a total tiebreak, like every list this file hands on: oldest first,
+    # because a checkout nobody has touched in three months is the one worth deleting, then
+    # the branch name, which is unique.
+    checkouts.sort(key=lambda c: (-(c["age_days"] or 0), c["branch"]))
+    left = len(arcs) - len(kept)
+    if left or checkouts:
+        print(f"  arcs: {left} workstream(s) held nothing of yours and left the list — "
+              f"{evidence} became evidence on a review you are giving, {len(checkouts)} "
+              "are listed as checkouts", file=sys.stderr)
+    if promoted:
+        print(f"  arcs: {promoted} checkout(s) stayed workstreams — uncommitted work of "
+              "yours is sitting on them", file=sys.stderr)
+    return kept, checkouts
 
 
 # ── what moved since the last build ────────────────────────────────────────────
@@ -7716,7 +7933,8 @@ def _mr_ref(ref):
     return int(m.group(1)) if m else None
 
 
-def snapshot_of(arcs, ledger, known, repo, generated, reviews=(), approved=()):
+def snapshot_of(arcs, ledger, known, repo, generated, reviews=(), approved=(),
+                checkouts=()):
     """The smallest per-arc state the next run needs to say what moved, and no more.
 
     Everything here is either an identity (the branch set), a fact that can move on its
@@ -7805,6 +8023,12 @@ def snapshot_of(arcs, ledger, known, repo, generated, reviews=(), approved=()):
     return {"v": SNAPSHOT_V, "generated": generated, "repo": repo,
             "reviews": review_rows,
             "reviews_approved": approved_rows,
+            # Branch names only. Nothing about a checkout moves in a way worth reporting --
+            # it is somebody else's branch and its every clock is theirs -- so this is here
+            # for one purpose: a snapshot that predates demote_checkouts has no such key at
+            # all, and that absence is how the next run knows the arc count fell because
+            # these left rather than because fifteen workstreams were regrouped overnight.
+            "checkouts": sorted(c["branch"] for c in checkouts or []),
             # Which universes this run actually consulted. A --no-mr run knows nothing
             # about merge requests, and the difference between "no MRs" and "nobody
             # looked" is the difference between a fact and a fabrication -- so the diff
@@ -8138,6 +8362,14 @@ def diff_runs(prev, cur, arcs, ledger):
         # exactly those the ones that could never be reported. Each row names the arc it
         # joined to when it did, which is all a renderer needs to put it in either place.
         "reviews": _review_changes(prev, cur) if cmp_reviews else [],
+        # True once and then never again. The run that first stops emitting checkout-only
+        # workstreams drops several arcs, and without a word about it the diff reports them
+        # as rows regrouped or gone -- a fact about the work, which it is not. A flag rather
+        # than a count, because the count is the number of ARCS demoted and only the run
+        # itself knows it: some of them left as evidence on a review and so are in no list
+        # here. The next run's baseline carries the key, so this is False from then on and a
+        # checkout appearing or disappearing later is ordinary branch news.
+        "checkouts_first_seen": prev.get("checkouts") is None,
     }
 
 
@@ -8702,6 +8934,14 @@ def main():
     reviews_known = bool(ledger) and bool((ledger or {}).get("reviews_known"))
     attach_reviews(arcs, reviews)
 
+    # And then the arcs that turned out not to be arcs. Here because attach_reviews has
+    # just run -- a checkout with a review on it becomes that review's evidence and needs
+    # the join to know -- and before everything below, so that no ranking, no cliff, no
+    # snapshot and no question ever sees a workstream that holds nothing of yours.
+    was_arcs = len(arcs)
+    arcs, checkouts = demote_checkouts(arcs)
+    checkouts_left = was_arcs - len(arcs)
+
     # Both of its exclusions -- parked, and whose clock is running -- are only settled by
     # now: apply_parked has just run, and `stage` came from the finalize pass after
     # reconcile. Before apply_dismissals, which needs the verdicts to know what is
@@ -8786,7 +9026,7 @@ def main():
                                       # sweep that half-answered would report every review
                                       # it missed as having vanished.
                                       "reviews": reviews_known},
-                       args.repo.name, generated, reviews, reviews_approved)
+                       args.repo.name, generated, reviews, reviews_approved, checkouts)
     prev, no_prev = load_snapshot(args.repo.name)
     if prev is None:
         since = {"v": SNAPSHOT_V, "previous_generated": None, "interval_seconds": None,
@@ -8805,6 +9045,10 @@ def main():
         print(f"  {since['changed']} of {since['compared']} workstreams moved since the "
               f"last build ({since['not_compared']['arcs']} regrouped or new, so not "
               "compared)", file=sys.stderr)
+        if since.get("checkouts_first_seen") and checkouts_left:
+            print(f"  {checkouts_left} of those are checkout-only rows that left the arc "
+                  "list this build — they are checkouts or review evidence now, not "
+                  "workstreams", file=sys.stderr)
 
     # Taken before the window filters, for the same reason the run-over-run diff is: an arc
     # that fell off a cliff five weeks ago is by construction outside a two-week window, so
@@ -8934,6 +9178,13 @@ def main():
             # rather than merely being smaller. Same row shape, with `approved_at` on it.
             "reviews_approved": reviews_approved,
             "reviews_approved_n": len(reviews_approved),
+            # Somebody else's branches sitting in this repo with no work of yours on them
+            # and no review of yours joined to them. They used to be workstreams, which was
+            # a claim -- "you have 167 pieces of work on the go" counted fifteen directories
+            # holding Logan's branches. They are listed rather than dropped: a local head
+            # this tool stops mentioning is a head nobody remembers to delete.
+            "checkouts": checkouts,
+            "checkouts_n": len(checkouts),
             # What the Slack thread lens saw and what it could not, top-level because it is
             # a fact about the run rather than about any one workstream -- and because the
             # page's boundary note is read off it. `denied` is the two scopes this token
@@ -9092,6 +9343,15 @@ def main():
         # mean opposite things.
         print("── reviewing ────────────────────────────────────────────")
         print("  GitLab was not asked, so what you are reviewing is unknown this run")
+        print()
+    if checkouts:
+        # Beside the reviewing section because that is what they mostly are: branches you
+        # fetched to read. Counted rather than listed in full, and the oldest few named,
+        # because the useful question about a checkout is whether it can be deleted.
+        oldest = ", ".join(f"{c['branch']} ({c['age_days']}d)" for c in checkouts[:3])
+        rest = f" and {len(checkouts) - 3} more" if len(checkouts) > 3 else ""
+        print(f"  {len(checkouts)} checkout(s) of other people's branches, no work of "
+              f"yours on them — {oldest}{rest}")
         print()
     for a in arcs:
         c = a["counts"]
