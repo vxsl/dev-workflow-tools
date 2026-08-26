@@ -710,6 +710,17 @@ opening sentence and the morning brief both take its head, and so the three cann
 three different worst tickets — nor can a sentence link to a row the table's fourteen-row
 cap removed.
 
+And the fold counts what is **left** to deal with. It was the last one on the page still
+stating its raw total: every other fold with a `✕` in it prints the unacknowledged count and
+names an unacknowledged row as its worst, while this one printed a bare string with no span
+for the client's recount to write into and no mirror in the rail, so acknowledging a row moved
+neither figure. That was survivable while the only `✕` for these rows was three screens down
+inside the section, and it stopped being survivable the moment the opening sentence grew one:
+`UB-6668` is what a brief line is about, so a reader now acknowledges it from the first thing
+they read, watches the headline answer, and finds the header and the rail still claiming nine.
+A `✕` that changes no figure anywhere does nothing, and this page says so about itself in four
+other places.
+
 **`--authoritative-ticket` says what an arc’s work IS**, which is the one thing neither
 git nor Jira can settle. `UL-1852` reached review as one merge request; file overlap had
 already gathered eleven other branches into the same arc — experiments, backups, a
