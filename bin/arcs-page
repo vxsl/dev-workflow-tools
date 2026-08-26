@@ -406,7 +406,14 @@ html{scroll-padding-top:1.5rem}
    name for anything. It appears only on a line that names more than one row, where the
    pair would otherwise be two identical ✕es with no way to tell which was which. */
 .acts{display:inline-flex;flex-wrap:wrap;gap:.5rem;align-items:center;
-      justify-self:end;vertical-align:middle}
+      vertical-align:middle}
+/* The rail only ends the line where the line has a rail to end in. In the brief that is
+   the grid\u2019s third column; under a headline there is no column, and a control set flush
+   to the right of a three-line display sentence reads as belonging to the page rather than
+   to the sentence it is aimed at. `justify-self` is not inert on a block-level box in a
+   modern engine -- it shrink-wraps it and pushes it to the end -- so it is scoped rather
+   than left to be harmless. */
+.brief li .acts{justify-self:end}
 .headline .acts{display:flex;margin-top:.9rem}
 .ba{display:inline-flex;gap:.28rem;align-items:center}
 .bal{font-family:var(--mono);font-size:.62rem;color:var(--ink-faint);
@@ -2653,8 +2660,8 @@ def line_acts(line, here, fps):
         if named:
             out.append(f'<span class="bal">{t}</span>')
         if out_url:
-            out.append(f'<a class="bo" href="{esc(out_url)}" title="open {t}" '
-                       f'aria-label="open {t}">&#x2197;</a>')
+            out.append(link(out_url, "&#x2197;", "bo",
+                            f'title="open {t}" aria-label="open {t}"'))
         if on_page:
             out.append('<button class="dis" type="button" '
                        f'title="acknowledge {t} — the same ✕ as its row below, and it '
@@ -2928,15 +2935,12 @@ def brief_block(data, here, fps):
     # thing on the page. Every other section here states its own contract in a note and
     # this was the last one making claims without one.
     return ('<ul class="brief">' + "".join(out) + "</ul>"
-            + '<p class="note brnote">Each line is one derived fact, and its controls '
-            "are its row&rsquo;s own. <strong>&#x2715; acknowledges</strong> what the line "
-            "names &mdash; the same fingerprint and the same store as the &#x2715; on that "
-            "row below, so the row fades on this click too, and acknowledging everything "
-            "the opening line names hands the slot to the next line at once. The displaced "
-            "line drops back here, struck, and &#x2715; takes it back; tomorrow&rsquo;s "
-            "build composes its own opening line out of what is still standing. "
-            "<strong>&#x2197;</strong> opens the ticket, merge request or thread a line "
-            "quotes, where its words point at the evidence on this page instead.</p>")
+            + '<p class="note brnote"><strong>&#x2715; acknowledges</strong> what a line '
+            "names, under the same fingerprint as the &#x2715; on the row below &mdash; "
+            "which fades on this click too. Acknowledge everything the opening line names "
+            "and the next line takes the slot at once, the displaced one dropping back "
+            "here struck; the next build composes its own. <strong>&#x2197;</strong> opens "
+            "the ticket, merge request or thread a line quotes.</p>")
 
 
 # What the copy button does, and the whole of why it is a button rather than a link to a
@@ -3484,17 +3488,23 @@ def first_clause(text):
     return head if len(head) <= CLAUSE_MAX else ""
 
 
-def link(url, text, cls=""):
+def link(url, text, cls="", attrs=""):
     """A hyperlink where there is somewhere to go, and plain text where there is not.
 
     Half the value of this page is being one click from the thing each row asserts. The
     other half is not lying about it: a branch that was never pushed has no page on
     GitLab, and a link to a 404 is worse than a label.
+
+    `attrs` is for a link whose text is a glyph and so cannot say where it goes -- the
+    arrow at a brief line's end is the only one. It exists so that caller does not write
+    its own anchor: how this page leaves itself is one decision, made here, and a second
+    anchor composed elsewhere is the one that will forget `rel` when it matters.
     """
     c = f' class="{cls}"' if cls else ""
+    a = f" {attrs}" if attrs else ""
     if not url:
-        return f"<span{c}>{text}</span>"
-    return f'<a{c} href="{esc(url)}" target="_blank" rel="noopener">{text}</a>'
+        return f"<span{c}{a}>{text}</span>"
+    return f'<a{c}{a} href="{esc(url)}" target="_blank" rel="noopener">{text}</a>'
 
 
 MRKDWN_HOLD = "\x00%d\x00"
