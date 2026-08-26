@@ -1298,6 +1298,10 @@ arcs-refresh --install-timer 06:30  # or whenever
 arcs-refresh --uninstall-timer      # disable it and remove the units
 arcs-refresh --check-quota          # what the guard currently thinks
 arcs-refresh --check-refresh        # can the stored refresh token still mint one?
+arcs-refresh --publish              # upload the page already on disk, without rebuilding
+arcs-refresh --ingest               # read the published page back, adopt what it recorded
+arcs-refresh --read-page FILE       # write out what the artifact is currently serving
+arcs-refresh --capabilities         # what the artifact may do, on what runtime contract
 arcs-refresh --hook                 # the arc-record Stop hook block, not installed for you
 ```
 
@@ -1381,9 +1385,70 @@ notifications. Everything goes to `~/.local/state/work-arcs/refresh.log` (ring-t
 the desktop notification fires only on a skip or a failure. `flock` keeps it from racing
 a manual `arcs` — both would move the run-over-run snapshot baseline.
 
-**It builds; it does not publish.** The page is a Claude Code artifact and only a Claude
-session can write to that URL. The gain is that `/arcs` becomes upload-only against a
-page that is minutes old.
+**It builds and it publishes.** For months the timer built the page and then logged an
+instruction: open a Claude Code session and run `/arcs`. That was never a property of
+artifacts — it was a property of not knowing the route. The CLI publishes over ordinary
+HTTP, so this does: `POST /api/frame/deploy/direct` with the four `X-Frame-*` headers the
+CLI sends and the OAuth bearer this script already mints for the quota check. The
+load-bearing one is `X-Frame-CP`; without it the gateway matches no route and answers a
+perfectly ordinary 404 with a request id, which reads like a wrong path and is actually a
+missing header. The `User-Agent` matters too — the first live run answered 403, not 401 and
+not 404, because something in front of the service refuses a client it does not recognise.
+
+The title and favicon come from the artifact's own record rather than from here, because
+deploy requires both and inventing them would rename the page Kyle finds by its icon. The
+version comes from there too and goes back as `baseVersion`, so a blind overwrite becomes a
+detectable conflict — superseded by default, since the page is rebuilt whole from local
+state every run and there is nothing of anyone else's in it to keep. Superseding is now a
+*reread* rather than a refusal to say which version it replaces: the moment the page began
+publishing itself, the version a supersede would overwrite became one somebody's **click**
+made. The token the quota check proved is held for the length of the run instead of being
+dropped, so the publish does not mint a second one, and it is still never written back to
+the credentials file. Knobs: `WORK_ARCS_PUBLISH`, `WORK_ARCS_PUBLISH_SUPERSEDE`,
+`WORK_ARCS_PUBLISH_TRIES`.
+
+**Every publish restates what the page may do.** A capability declaration is a full set —
+anything stored and not restated is revoked — so a republish that quietly omitted it would
+leave every `✕` on the page local again, which is the failure this whole loop ends wearing
+the face of a feature that works. `WORK_ARCS_PUBLISH_CAPABILITIES` defaults to
+`artifact,downloads`, and the runtime contract travels with it because the API refuses a
+capability declaration that arrives without one. It is pinned (`WORK_ARCS_PUBLISH_CONTRACT`,
+`0.2.23`) and never `latest`: `latest` would move the runtime under a live page whenever the
+platform released one, and this page's code is written against a contract it can name.
+`--capabilities` is how you check the declaration the whole save-back rests on without
+opening a browser; `--read-page` writes out what is actually being served, which is the only
+way to see it, since the page is on disk nowhere after a publish and what is in the state dir
+is what was *built*.
+
+**And it reads the page back before it rebuilds it.** `--ingest` fetches the published page,
+cuts out the `ackseed` block and hands it to `work-arcs --ingest-acks`, which is the only new
+writer and lives there because that is where every one of those stores is already written.
+`arcs-refresh` moves bytes; it does not know what a dismissal is or what expires one, and it
+must not — a second program with an opinion about a store's semantics is a second program to
+keep in step. The adoption is a **union**, because the page's copy is whatever that browser
+last saw: a page open since Tuesday holds Tuesday's set, and letting it replace the file
+would silently undo every judgement made anywhere else since. The one exception is
+`undismissed`, the page naming fingerprints it was seeded with and no longer holds, which is
+the one judgement a union cannot express. Nothing else is ever removed; expiry belongs to
+`apply_dismissals`, the only thing that knows whether a fact moved. Answers dedupe on
+`(kind, subject, answer, second)`, so ingesting the same page twice cannot count one click as
+two.
+
+Failures are loud in the log and in `refresh.json` under `ingest` and `ingest_ok`, never
+fatal, and never a notification. Those are three faces of one rule: a lost acknowledgement
+must not be quiet; a morning with no page is worse than a morning whose page repeats one row;
+and the notification budget is the whole reason a notification means anything, on a step that
+will fail whenever the network is slow and costs only that morning's clicks — the page still
+holds them for the next run.
+
+Reading the page takes two calls to two hosts, and which route is which cost one wrong guess.
+`/api/frame/read/<slug>` answers `{contract, capabilities}` — what the artifact is *allowed*
+to do — and carries no page at all. `/api/frame/<slug>?via=model_read` is the boot response:
+the live version and a short-lived asset token. The page itself is on a different host
+entirely, at `https://<slug>.frame.claudeusercontent.com/_f/<ver>/index.html?__frame_t=…`,
+where the token in the query string is the whole credential. The OAuth bearer is deliberately
+not sent there: different host, would not be accepted, and a credential does not go anywhere
+it is not needed.
 
 Written for cron's environment rather than a login shell's, which is not cosmetic:
 `claude` lives in `~/.local/bin` and `lib/headless_claude.py` calls it by bare name, so
@@ -1391,6 +1456,87 @@ with cron's `PATH=/usr/bin:/bin` every model call raises `FileNotFoundError`, ea
 caught, and the pipeline exits 0 having built a page with no arc names on it. Preflight
 refuses to start when a required program is missing, and `could not run claude` in the
 output counts as a failed run whatever the exit status says.
+
+### `arcs-serve`
+The same page, in the habitat where you can act on it. The work-arcs page has been a
+published artifact for months and that was right: an artifact is reachable from a phone,
+survives this laptop, and costs nothing to hand to somebody. What it cannot do is touch this
+machine. Every card on it names a session, a worktree, a branch that exists twenty
+centimetres away, and the only thing the page could offer about any of them was text you
+re-type into a terminal — one brain in orch, one brain in the arcs page, and the seam between
+them a human being copying a uuid.
+
+```bash
+arcs-serve                    # 127.0.0.1:7379, serving ~/.local/state/work-arcs/page.html
+arcs-serve --port 7400
+```
+
+**Two habitats, one page.** Not another page — the *same* page, the same bytes `arcs-refresh`
+already wrote, served at `127.0.0.1` where a click can reach tmux. The published artifact
+stays what it is: read, acknowledge, file. Here, and only here, the verbs exist. The rule this
+daemon exists to keep is that there is never a second page to maintain: the artifact and the
+cockpit render from one build, what differs between them is **capability, never content, and
+never the clock**, and a fact discovered here has to reach the artifact by being in the page
+rather than by being in this process. That is why this file serves a file and does not render
+one — it has no opinion about arcs.
+
+**The charset is the one thing it must not delegate.** The stored page has no `<meta
+charset>` and never did: what `arcs-page` emits is a fragment the artifact runtime wraps in
+its own `<head>`, and that head is where the encoding declaration lives. Served naked over
+HTTP with no charset in the `Content-Type`, a browser falls back to its locale default and
+every em-dash, arrow and ✓ becomes mojibake — which is exactly what happened the first time
+this page was opened from `file://`. So the daemon states utf-8 on the wire, and `no-store`
+for the same family of reason: the page is rebuilt every morning under the same path, and a
+cockpit showing yesterday's arcs because a validator matched is a cockpit that lies quietly.
+
+**The verbs are tmux, and they are not orch.** `open` resumes a detached session and puts an
+attach window in the default server's `orch` session; `opendir` opens a shell in a worktree.
+Both are 1:1 bridges over tmux and nothing else. The first draft was going to shell out to
+`orch resume` and `orch watch`, and a survey of orch's internals found those vestigial or
+gated on `$TMUX` — which a systemd-started daemon can never have, so `orch watch` would have
+refused every request. What orch itself actually does is the invocation reproduced here
+verbatim: sessions live as detached tmux sessions named by their bare uuid on the
+`orch-sessions` socket, and you reach one by attaching to it. The seam for the tests is
+therefore `$WORK_ARCS_TMUX_BIN` and not an orch path — stubbing a binary this program never
+calls would assert only that the stub stayed unused. The daemon adds no judgement of its own:
+it validates the target, runs the argv list, and relays what tmux said verbatim, refusals
+included. It will not start a tmux server, because a daemon that quietly spawns a window host
+is a daemon that puts your windows somewhere you did not ask for.
+
+**Security is the whole reason this is not merely a convenience**, because this process turns
+an HTTP request into a command on the machine. Three properties hold it safe and none are
+optional. It binds `127.0.0.1` **only** — not `0.0.0.0` with a firewall in front, not
+`localhost` resolved by whatever the resolver feels like, and the listening socket's address
+is asserted in the tests by reading `/proc/net/tcp`, because a docstring claiming loopback is
+not loopback. `POST /act` requires the header `X-Arcs-Act: 1` and 403s without it: the guard
+works by arithmetic rather than by trust, since a page on another origin cannot set a custom
+request header without a CORS preflight and this daemon emits no `Access-Control-*` header of
+any kind for one to succeed against — a hostile tab can make it 403 and nothing else. And
+nothing else is served: not a directory listing, not a sibling of `page.html`, not a path
+traversal dressed up in `%2e%2e`. Targets are validated before they are arguments — a uuid
+must match the uuid shape, a directory must resolve under `$HOME` — and both verbs run as
+argv lists, with no shell string anywhere in the file for a target to be interpolated into.
+
+`GET /` and `/health` are side-effect-free, always; `/health` probes tmux with a 2s timeout
+and caches the answer for thirty seconds, so a page polling it costs one pair of subprocesses
+a half-minute rather than one a second. `/term/<uuid>` is the documented exception: it starts
+a `ttyd` if there is not already one for that uuid, idempotent per uuid, reaped when the ttyd
+exits, capped at four concurrent, bound to `lo`, and behind the same header as the verbs. It
+answers 200 with JSON rather than the obvious 302, because the fetch that had to carry the
+CSRF header cannot read a `Location` off an opaque redirect — what a terminal drawer needs is
+the URL, not a navigation.
+
+The log ring-trims every two hundred lines as well as on start and stop: a cap checked only at
+startup is no cap on a process that never restarts, and the unit restarts on failure rather
+than on a log that grew.
+
+Env: `WORK_ARCS_SERVE_PORT` (7379), `WORK_ARCS_PAGE` (the state dir's `page.html`),
+`WORK_ARCS_SERVE_LOG_LINES` (2000), `WORK_ARCS_TMUX_BIN`, `WORK_ARCS_TTYD_BIN`,
+`WORK_ARCS_TERM_MAX` (4). A `--user` unit ships in `systemd/work-arcs-serve.service` and is
+**deliberately not enabled by anything in this repo**.
+
+*In flight tonight:* the page's own wiring to these verbs — nothing `arcs-page` emits calls
+`/act` or `/term` yet, so the cockpit's buttons are the next step rather than a shipped one.
 
 ## Shell Integration
 
