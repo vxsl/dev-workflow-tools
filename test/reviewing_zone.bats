@@ -167,7 +167,7 @@ ZZORDER
     [ "${lines[0]}" = "!10500 !10510 !10520 !10265" ]
 }
 
-@test "nothing is cut: every review on the wire has a row" {
+@test "nothing is cut: five stand, the rest are announced and still in the document" {
     many="$(python3 -c '
 import json
 rs = [{"iid": 9000 + i, "ref": "!%d" % (9000 + i), "title": "t%d" % i,
@@ -183,10 +183,93 @@ print(json.dumps({"reviews": rs, "reviews_known": True,
     run python3 - "$TEST_TMPDIR/p.html" <<'ZZALL'
 import re, sys
 html = re.sub(r'<script.*?</script>', '', open(sys.argv[1]).read(), flags=re.S)
-ul = re.search(r'<ul class="reviewing".*?</ul>', html, re.S).group(0)
-print(len(re.findall(r'<li data-fp=', ul)))
+sec = re.search(r'<section id="reviewing">.*?</section>', html, re.S).group(0)
+uls = re.findall(r'<ul class="reviewing">.*?</ul>', sec, re.S)
+# Every one of them is on the page: the disclosure is a fold, not a cap.
+print(len(re.findall(r'<li data-fp=', sec)))
+print(len(re.findall(r'<li data-fp=', uls[0])))
+# And the fold states its own size, which is the remainder and never a rounded one.
+more = re.search(r'<details class="more"><summary>(.*?)</summary>', sec, re.S).group(1)
+print(re.search(r'<b>(\d+)</b>', more).group(1))
+# The heading over the whole section still counts every row, standing or folded.
+print(re.search(r'id="rv-n"[^>]*>([^<]*)<', sec).group(1))
 ZZALL
     [ "${lines[0]}" = "23" ]
+    [ "${lines[1]}" = "5" ]
+    [ "${lines[2]}" = "18" ]
+    [ "${lines[3]}" = "23" ]
+}
+
+# The wire is longest-running-first, so reading the first five off it put a merge request
+# nobody had said a word on for four months at the top of the section and yesterday's
+# movement below the fold -- the ranking inverted by accident. What stands is the first
+# five that are still moving; what has gone quiet is set faint and waits with the rest. The
+# order itself is never touched, which is what this pins: the fold holds the wire's own
+# sequence with the standing rows lifted out of it, not a re-sort.
+@test "a review quieter than its own rhythm waits in the fold, and nothing is re-sorted" {
+    quiet="$(python3 -c '
+import json
+def rv(iid, days, quiet):
+    return {"iid": iid, "ref": "!%d" % iid, "title": "t%d" % iid,
+            "url": "https://g/%d" % iid, "author": "logan", "source_branch": "b%d" % iid,
+            "asked": "2026-07-01", "days": days, "my_last": 1, "their_last": 2,
+            "whose_turn": "mine", "rounds": 1, "quiet_days": quiet, "arc": None,
+            "fp": "f%d" % iid}
+rs = [rv(9001, 129, 126), rv(9002, 120, 9), rv(9003, 60, 2), rv(9004, 30, 1),
+      rv(9005, 20, 18), rv(9006, 10, 1), rv(9007, 5, 1), rv(9008, 2, 0)]
+print(json.dumps({"reviews": rs, "reviews_known": True,
+                  "ledger": {"you_owe": [], "they_owe": [], "slack": True,
+                             "slack_complete": True, "reviews": rs,
+                             "reviews_known": True}}))')"
+    page "$(doc "$quiet")" > "$TEST_TMPDIR/p.html"
+    run python3 - "$TEST_TMPDIR/p.html" <<'ZZQUIET'
+import re, sys
+html = re.sub(r'<script.*?</script>', '', open(sys.argv[1]).read(), flags=re.S)
+sec = re.search(r'<section id="reviewing">.*?</section>', html, re.S).group(0)
+uls = re.findall(r'<ul class="reviewing">.*?</ul>', sec, re.S)
+refs = lambda u: " ".join(re.findall(r'class="ref"[^>]*>(![0-9]+)<', u))
+print(refs(uls[0]))
+print(refs(uls[1]))
+# 9001 has said nothing in 126 of its 129 days and 9005 in 18 of its 20; 9008 is merely
+# the ninth-longest-running, which is a different reason to be here and a different ink.
+faint = [re.search(r'class="ref"[^>]*>(![0-9]+)<', li).group(1)
+         for li in re.findall(r'<li data-fp=.*?</li>', sec, re.S) if 'class="slow"' in li]
+print(" ".join(faint))
+more = re.search(r'<details class="more"><summary>(.*?)</summary>', sec, re.S).group(1)
+print(re.findall(r'<b>(\d+)</b>', more))
+ZZQUIET
+    [ "${lines[0]}" = "!9002 !9003 !9004 !9006 !9007" ]
+    [ "${lines[1]}" = "!9001 !9005 !9008" ]
+    [ "${lines[2]}" = "!9001 !9005" ]
+    # How many are behind the disclosure, and how many of those stopped rather than queued.
+    [ "${lines[3]}" = "['3', '2']" ]
+}
+
+# A review opened yesterday and untouched since has been silent for its whole life, which a
+# ratio on its own calls "gone quiet" and a reader calls new. The floor under the rhythm
+# test is what keeps the two apart.
+@test "a day-old review has not gone quiet, however little has happened on it" {
+    fresh="$(python3 -c '
+import json
+rs = [{"iid": 9100 + i, "ref": "!%d" % (9100 + i), "title": "t%d" % i,
+       "url": "https://g/%d" % i, "author": "logan", "source_branch": "b%d" % i,
+       "asked": "2026-08-24", "days": 1, "my_last": 1, "their_last": 2,
+       "whose_turn": "mine", "rounds": 0, "quiet_days": 1, "arc": None,
+       "fp": "n%d" % i} for i in range(3)]
+print(json.dumps({"reviews": rs, "reviews_known": True,
+                  "ledger": {"you_owe": [], "they_owe": [], "slack": True,
+                             "slack_complete": True, "reviews": rs,
+                             "reviews_known": True}}))')"
+    page "$(doc "$fresh")" > "$TEST_TMPDIR/p.html"
+    run python3 - "$TEST_TMPDIR/p.html" <<'ZZFRESH'
+import re, sys
+html = re.sub(r'<script.*?</script>', '', open(sys.argv[1]).read(), flags=re.S)
+sec = re.search(r'<section id="reviewing">.*?</section>', html, re.S).group(0)
+print("FAINT" if 'class="slow"' in sec else "NONE-FAINT")
+print("FOLD" if '<details class="more">' in sec else "NO-FOLD")
+ZZFRESH
+    [ "${lines[0]}" = "NONE-FAINT" ]
+    [ "${lines[1]}" = "NO-FOLD" ]
 }
 
 @test "the drafts the sweep left out are announced with their real count" {
@@ -237,7 +320,7 @@ html = re.sub(r'<script.*?</script>', '', open(sys.argv[1]).read(), flags=re.S)
 ul = re.search(r'<ul class="reviewing".*?</ul>', html, re.S).group(0)
 for li in re.findall(r'<li class="grp".*?</li>', ul, re.S):
     turn = re.search(r'data-turn="([a-z]+)"', li).group(1)
-    n = re.search(r'data-turncount="[a-z]+">(\d+)<', li).group(1)
+    n = re.search(r'data-turncount="[a-z]+"[^>]*>(\d+)<', li).group(1)
     print(turn, n, "WARM" if 'class="gl mine"' in li else "PLAIN")
 # The rows stay in the order they arrived in, headers or no headers.
 print([re.search(r'data-fp="rfp(\d+)"', li).group(1)
@@ -246,6 +329,46 @@ ZZGRP
     [ "${lines[0]}" = "mine 3 WARM" ]
     [ "${lines[1]}" = "theirs 1 PLAIN" ]
     [ "${lines[2]}" = "['10500', '10510', '10520', '10265']" ]
+}
+
+# A group that runs across the fold is headed on both sides of it, because a reader who
+# opens the disclosure should not have to scroll back up to learn whose turn the rows under
+# their cursor are. The count beside each heading is the group's own size wherever its rows
+# are standing -- deliberately the same number in the window and in the fold, so it reads as
+# a property of the group rather than a tally of the lines directly below it, and the
+# disclosure states its own size separately.
+@test "the fold keeps the headings, and a heading counts its whole group" {
+    split="$(python3 -c '
+import json
+def rv(iid, days, turn):
+    return {"iid": iid, "ref": "!%d" % iid, "title": "t%d" % iid,
+            "url": "https://g/%d" % iid, "author": "logan", "source_branch": "b%d" % iid,
+            "asked": "2026-07-01", "days": days, "my_last": 1, "their_last": 2,
+            "whose_turn": turn, "rounds": 1, "quiet_days": 1, "arc": None,
+            "fp": "s%d" % iid}
+rs = [rv(9200 + i, 40 - i, "mine") for i in range(8)]
+rs += [rv(9300, 30, "theirs"), rv(9301, 20, "theirs")]
+print(json.dumps({"reviews": rs, "reviews_known": True,
+                  "ledger": {"you_owe": [], "they_owe": [], "slack": True,
+                             "slack_complete": True, "reviews": rs,
+                             "reviews_known": True}}))')"
+    page "$(doc "$split")" > "$TEST_TMPDIR/p.html"
+    run python3 - "$TEST_TMPDIR/p.html" <<'ZZSPLIT'
+import re, sys
+html = re.sub(r'<script.*?</script>', '', open(sys.argv[1]).read(), flags=re.S)
+sec = re.search(r'<section id="reviewing">.*?</section>', html, re.S).group(0)
+for li in re.findall(r'<li class="grp".*?</li>', sec, re.S):
+    print(re.search(r'data-turn="([a-z]+)"', li).group(1),
+          re.search(r'data-turncount="[a-z]+"[^>]*>(\d+)<', li).group(1))
+# Exactly one of them carries the id the door mirrors, so there is one source and not two.
+print(sec.count('id="rv-turn-mine"'))
+ZZSPLIT
+    # The window holds five of the eight yours; the fold picks the group up again and then
+    # crosses into theirs.
+    [ "${lines[0]}" = "mine 8" ]
+    [ "${lines[1]}" = "mine 8" ]
+    [ "${lines[2]}" = "theirs 2" ]
+    [ "${lines[3]}" = "1" ]
 }
 
 # Provenance, carried and not printed. Sixteen of twenty-three turns on the real corpus
@@ -336,6 +459,73 @@ ZZMIRROR
     [ "${lines[0]}" = "1 4 ['4', '4']" ]
     [ "${lines[1]}" = "ALL-EQUAL" ]
     [ "${lines[2]}" = "2" ]
+}
+
+# "23 ongoing" is a census: it reads the same on a morning when every one of them is with
+# its author as on a morning when every one is with you, and a figure that cannot change
+# what you do is one the eye stops reading. What can is how many are yours -- which is a
+# number the section already prints over its own group, so the door copies it rather than
+# working it out again.
+@test "the reviewing door leads with how many are yours and keeps the census under it" {
+    page "$(doc)" > "$TEST_TMPDIR/p.html"
+    run python3 - "$TEST_TMPDIR/p.html" <<'ZZFIG'
+import re, sys
+html = open(sys.argv[1]).read()
+nav = re.search(r'<nav class="cockpit".*?</nav>', html, re.S).group(0)
+d = re.search(r'<a class="door" data-door="reviewing".*?</a>', nav, re.S).group(0)
+big = re.search(r'<span class="dn" data-mirror="([^"]+)">(\d+)<', d)
+print(big.group(1), big.group(2))
+# And the section printed that element, with that number in it -- a mirror and not a count.
+src = re.search(r'id="rv-turn-mine"[^>]*>(\d+)<', html)
+print(src.group(1) if src else "NO-SOURCE")
+sub = re.search(r'<span class="dsub">of <span class="dq" data-mirror="#rv-n">(\d+)<', d)
+print(sub.group(1) if sub else "NO-CENSUS")
+ZZFIG
+    [ "${lines[0]}" = "#rv-turn-mine 3" ]
+    [ "${lines[1]}" = "3" ]
+    [ "${lines[2]}" = "4" ]
+}
+
+# Where the wire is not in two runs there is no heading to mirror, and a door pointing at an
+# element the section never printed is the same lie as a link to a 404. It falls back to the
+# figure the section did print.
+@test "an unpartitioned wire leaves the door mirroring a figure that exists" {
+    run python3 - "$REPO_ROOT/bin/arcs-page" "$(doc)" <<'ZZFALL'
+import json, re, subprocess, sys
+d = json.loads(sys.argv[2])
+d["reviews"] = [d["reviews"][i] for i in (0, 3, 1, 2)]
+r = subprocess.run([sys.executable, sys.argv[1], "--focus", "30"],
+                   input=json.dumps(d), capture_output=True, text=True)
+html = r.stdout
+nav = re.search(r'<nav class="cockpit".*?</nav>', html, re.S).group(0)
+door = re.search(r'<a class="door" data-door="reviewing".*?</a>', nav, re.S).group(0)
+print("NO-DANGLE" if "rv-turn-mine" not in html else "DANGLING")
+print(re.search(r'data-mirror="([^"]+)"', door).group(1))
+ZZFALL
+    [ "${lines[0]}" = "NO-DANGLE" ]
+    [ "${lines[1]}" = "#rv-n" ]
+}
+
+# Every figure the strip and the rail repeat is a copy of one its own section printed. The
+# law existed before this section did; what is new is that it now has two of them.
+@test "every mirror on the page points at something the page rendered" {
+    page "$(doc)" > "$TEST_TMPDIR/p.html"
+    run python3 - "$TEST_TMPDIR/p.html" <<'ZZRESOLVE'
+import re, sys
+html = re.sub(r'<script.*?</script>', '', open(sys.argv[1]).read(), flags=re.S)
+ids = set(re.findall(r'\sid="([^"]+)"', html))
+bad = []
+for sel in set(re.findall(r'data-mirror="([^"]+)"', html)):
+    sel = sel.replace("&quot;", '"')
+    if sel.startswith("#"):
+        if sel[1:] not in ids:
+            bad.append(sel)
+    elif sel.startswith("["):
+        if sel.strip("[]").replace('"', "&quot;") not in html:
+            bad.append(sel)
+print(sorted(bad) or "all resolve")
+ZZRESOLVE
+    [ "${lines[0]}" = "all resolve" ]
 }
 
 @test "the door names the first row on the wire, not a row it chose itself" {

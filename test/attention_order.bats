@@ -203,6 +203,34 @@ PY
     [[ "$output" == *"nobody was asked to read | are pushed but never proposed"* ]]
 }
 
+# Four display figures at 2rem across the middle of the page, every one of them already
+# printed on the rail or on a door three inches to the left. That is not emphasis, it is
+# repetition wearing emphasis' clothes -- so the strip is lines now, in the shape of the
+# disclosure that sits directly under it. Demoted and not deleted: this pins that every
+# count, every subtitle and every anchor came through the change.
+@test "the conditions are lines, and every count, subtitle and anchor survives" {
+    page "$(doc)" > "$TEST_TMPDIR/page.html"
+    run python3 - "$TEST_TMPDIR/page.html" <<'PY'
+import re, sys
+html = open(sys.argv[1]).read()
+strip = re.search(r'<ul class="conditions">.*?</ul>', html, re.S).group(0)
+rows = re.findall(r'<li>.*?</li>', strip, re.S)
+print(len(rows))
+# Every row still carries its figure, its label, its subtitle and its anchor.
+print("WHOLE" if all(re.search(r'class="v">\d+<', r) and 'class="l"' in r
+                     and 'class="sub"' in r and 'href="#' in r for r in rows)
+      else "LOST-SOMETHING")
+# And no row is a display figure any more: the count is set in the page's own body face,
+# which is what a line is.
+print("LINES" if '<span class="v">' not in strip else "TILES")
+# One line each, in the source order the strip already argues for.
+print(" ".join(re.search(r'class="v">(\d+)<', r).group(1) for r in rows))
+PY
+    [ "${lines[0]}" = "5" ]
+    [ "${lines[1]}" = "WHOLE" ]
+    [ "${lines[2]}" = "LINES" ]
+}
+
 @test "the local-only tile keeps its scale and still opens the disclosure" {
     # Moved one place to the right, not demoted and not shrunk. The tile is the only way
     # into the ranked list of which work is only here, and that list is the whole reason

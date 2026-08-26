@@ -335,6 +335,11 @@ body{margin:0;background:var(--ground);color:var(--ink);font-family:var(--sans);
    the illustration of it. */
 .cockpit .dl{font-size:.78rem;color:var(--ink-faint);line-height:1.35;min-width:0;
   overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-top:.1rem}
+/* The denominator under a figure that is a share of it. `.dv` is a wrapping flex row, so a
+   full-basis item is a line of its own without a second container -- and it is set quiet
+   because it is context for the number above it rather than a second number to read. */
+.cockpit .dsub{flex:1 0 100%;font-size:.74rem;color:var(--ink-faint);line-height:1.3}
+.cockpit .dq{font-family:var(--mono);font-variant-numeric:tabular-nums}
 /* Anchored rows land clear of the top of the viewport, and clear of the collapsed nav
    strip where there is one. */
 html{scroll-padding-top:1.5rem}
@@ -731,7 +736,27 @@ a:hover{text-decoration-color:currentColor}
 .reviewing .arcl{color:var(--ink-soft)}
 .reviewing .arcl[title]{cursor:help}
 .reviewing li .dis{margin-left:auto;align-self:center}
-.reviewing+.showdis{margin-left:.2rem}
+.rvz+.showdis{margin-left:.2rem}
+/* A review nobody has said a word on for longer than half its own life. Set in the ink the
+   row's own subtitle already uses -- same row, same shape, same controls, one step back --
+   because de-emphasis is not hiding and there is nothing here a reader is being spared. It
+   never appears in the standing five; the fold says how many of its rows are like this, and
+   the `quiet Nd` figure on the row carries the reason in its title. */
+.reviewing li.slow .what,.reviewing li.slow .clk{color:var(--ink-faint)}
+.reviewing li.slow .ref,.reviewing li.slow .rn,.reviewing li.slow .arcl{
+  color:var(--ink-faint)}
+/* The rest of the list, one line away. The ledger's own disclosure, restated for this
+   section rather than shared with it: the two sit in different containers and a selector
+   reaching across both would tie the ledger's spacing to this list's. */
+#reviewing details.more{margin-top:.5rem}
+#reviewing details.more>summary{cursor:pointer;list-style:none;
+  font-size:.8rem;color:var(--ink-soft);padding:.15rem 0}
+#reviewing details.more>summary::-webkit-details-marker{display:none}
+#reviewing details.more>summary::before{content:"▸ ";color:var(--ink-faint)}
+#reviewing details.more[open]>summary::before{content:"▾ "}
+#reviewing details.more>summary:hover{color:var(--ink)}
+#reviewing details.more>summary b{color:var(--ink);font-weight:600}
+#reviewing details.more>ul{margin-top:.5rem}
 /* `.quiet` already carries the surface, the radius and the padding this needs, so the
    empty state is styled by the same rule the ledger's own is. */
 section#reviewing .covered{margin:.55rem 0 0;font-size:.76rem;color:var(--ink-faint)}
@@ -1077,18 +1102,24 @@ td .dis{vertical-align:middle}
    in its own right rather than a lesser version of a stalled review. So: no hero figure
    (that would name one of them THE number), no severity hue (that would rank them by
    colour), equal tiles. Each states a condition and how much of it there is. */
-.conditions{display:grid;grid-template-columns:repeat(auto-fit,minmax(11rem,1fr));
-  gap:.7rem;margin:0 0 2rem;list-style:none;padding:0}
-.conditions a{display:flex;flex-direction:column;gap:.15rem;text-decoration:none;
-  background:var(--surface);border-radius:6px;padding:.85rem .95rem;height:100%}
+/* Lines, not tiles. Peers still -- one shape, one ink, no hero figure and no severity hue,
+   which is the rule above and it is unchanged. What changed is the register: a row of 2rem
+   display numerals in the middle of the page reads as the page's own headline, and these
+   are its footnotes. They take the shape of the disclosure that already sits directly
+   underneath them, so the strip and its one openable member read as one stack of facts
+   rather than as a billboard with an appendix. */
+.conditions{display:flex;flex-direction:column;gap:.2rem;margin:0 0 2rem;
+  list-style:none;padding:0}
+.conditions a{display:flex;flex-wrap:wrap;align-items:baseline;gap:.1rem .5rem;
+  text-decoration:none;background:var(--surface);border-radius:6px;
+  padding:.4rem .8rem;font-size:.88rem;color:var(--ink-soft)}
 .conditions a:hover{background:var(--surface-2)}
-/* Proportional figures, deliberately: tabular-nums gives every digit the width of a 0,
-   which makes a value like 740 look loose at display size. Tabular is for columns. */
-.conditions .v{font-family:var(--display);font-size:2rem;font-weight:600;
-  line-height:1;color:var(--ink);letter-spacing:-.03em;
-  font-variant-numeric:tabular-nums}
-.conditions .l{font-size:.78rem;color:var(--ink-soft);line-height:1.35;text-wrap:pretty}
-.conditions .sub{font-family:var(--sans);font-size:.74rem;color:var(--ink-faint)}
+/* Tabular now that they are a column of figures read against each other down the left
+   edge, which is the one case the note above reserves it for. */
+.conditions .v{font-family:var(--sans);font-weight:600;color:var(--ink);
+  font-variant-numeric:tabular-nums;min-width:1.6rem;text-align:right}
+.conditions .l{color:var(--ink-soft);line-height:1.35;text-wrap:pretty}
+.conditions .sub{font-family:var(--sans);font-size:.78rem;color:var(--ink-faint)}
 
 /* The one tile you can open. Every other condition on the strip points at a section that
    already lists its members; "exists only on this laptop" pointed at nothing, because the
@@ -1118,7 +1149,7 @@ td .dis{vertical-align:middle}
    this found the sentence that used to be here. */
 details.parked,details.atrisk{margin-top:.4rem}
 details.parked{--disc:var(--parked)}
-details.atrisk{--disc:var(--accent);margin:-1.4rem 0 2rem}
+details.atrisk{--disc:var(--accent);margin:-1.8rem 0 2rem}
 details.parked>summary,details.atrisk>summary{cursor:pointer;font-size:.88rem;
   color:var(--ink-soft);padding:.55rem .8rem;border-radius:6px;
   background:var(--surface);list-style:none}
@@ -1921,13 +1952,18 @@ INTERACT_JS = r"""
     // The whose-turn headings in Reviewing. They state a count over rows a ✕ can remove,
     // so they are recounted exactly as the ledger's aggregate rows are -- and a group with
     // nothing visible left in it has nothing to head, so it goes the same way.
-    document.querySelectorAll('.reviewing li.grp').forEach(function(h){
-      var ul=h.closest('.reviewing'), t=h.dataset.turn;
-      var vis=ul.querySelectorAll('li[data-turn="'+t+'"][data-fp]'
-                                  +':not([data-dismissed="1"])').length;
+    // Scoped to the zone rather than to one list: the rows of a group now live in the
+    // standing five and in the fold under it, and a heading that counted only the list it
+    // sits in would say one thing above the fold and another inside it about the same
+    // group. The figure is the group's whole size wherever its rows are, which is what the
+    // server printed and what the door mirrors.
+    document.querySelectorAll('.rvz li.grp').forEach(function(h){
+      var z=h.closest('.rvz'), t=h.dataset.turn;
+      var vis=z.querySelectorAll('li[data-turn="'+t+'"][data-fp]'
+                                 +':not([data-dismissed="1"])').length;
       var n=h.querySelector('[data-turncount]');
       if(n) n.textContent=vis;
-      h.hidden=(vis===0 && ul.dataset.show!=='1');
+      h.hidden=(vis===0 && z.dataset.show!=='1');
     });
     // Everywhere else gets an auto-appended disclosure so nothing is concealed.
     document.querySelectorAll('[data-disgroup]').forEach(function(g){
@@ -3477,6 +3513,13 @@ OPEN_BUCKETS = ("today", "week")
 # how "who is waiting on me" became something to scroll rather than something to read.
 LEDGER_ROWS = 5
 
+# How many reviews of other people's stand before the rest go behind a disclosure. Named
+# beside LEDGER_ROWS rather than beside the section it governs, because the two are one
+# decision about how long a list of somebody else's loops may run before it stops being
+# read -- and this section is the one that had not learned it yet. Twenty-three rows,
+# rendered whole, in the middle of the page.
+REVIEW_ROWS = 5
+
 # How many silent review requests it takes before they render as one row instead of many.
 # Two near-identical rows are two facts; eleven are a single fact about a reviewer pool,
 # and reading them one at a time is what made this section feel like a list of complaints.
@@ -3932,6 +3975,53 @@ def curation_cards(a, queue, by_id, gap, here):
     a("</details>")
 
 
+# How long a review has to have been silent before the silence is a fact about it rather
+# than about the weekend. A ratio has nothing to say at the bottom of its range -- a merge
+# request opened yesterday and untouched since has been quiet for its entire life without
+# having gone quiet at all -- so the rhythm test below is floored here, at the shortest gap
+# that is not a Friday and the Monday after it.
+QUIET_FLOOR = 7
+
+
+def gone_quiet(r):
+    """Whether a review has been silent for longer than its own rhythm accounts for.
+
+    Derived, never declared, and derived from two fields the row was handed rather than
+    from a score composed here. `quiet_days` past the half-way mark of `days` is the whole
+    of the rhythm test: a fortnight of nothing on a four-month conversation is that
+    conversation's normal pace, and four days of nothing on a five-day one is it stopping.
+    QUIET_FLOOR is the floor under it, for the reason given where it is named.
+
+    It answers yes or no about one row and the only thing it decides is which ink the row is
+    set in and whether the visible window may draw it. It ranks nothing: the order the
+    reviews arrive in is work-arcs' and this does not touch it -- see reviewing().
+    """
+    q, d = r.get("quiet_days"), r.get("days")
+    if not isinstance(q, int) or not isinstance(d, int):
+        return False
+    return q >= QUIET_FLOOR and q * 2 > d
+
+
+def turn_runs(reviews):
+    """Whose turn it is on each row, whether the wire is in two runs by it, and each side's
+    size.
+
+    One author for the partition, because two places read it now: the section draws the
+    group headings from it and the door three screens above prints the your-turn figure the
+    headings state. Computing it twice is how a door comes to claim a number the section
+    under it never printed.
+
+    `grouped` is a claim about the shape of the list rather than an assumption about it.
+    work-arcs ranks these yours-first, so the list IS in two runs -- but a graph from a
+    month ago or a ranking that changes would not be, and a heading over a group that is
+    not a group is worse than the repetition it was meant to fix.
+    """
+    turns = ["mine" if r.get("whose_turn") == "mine" else "theirs" for r in reviews]
+    runs = sum(1 for i, t in enumerate(turns) if i == 0 or t != turns[i - 1])
+    grouped = bool(turns) and runs <= 2 and len(set(turns)) == runs
+    return turns, grouped, {t: turns.count(t) for t in set(turns)}
+
+
 def reviewing(a, reviews, drafts, here, by_id):
     """The reviews you are in the middle of, as work with a clock rather than as debts.
 
@@ -3951,10 +4041,26 @@ def reviewing(a, reviews, drafts, here, by_id):
     Wire order, untouched. work-arcs ranks these yours-first then longest-running with the
     iid as a total tiebreak, and a second ranking written here would be a second author for
     "which review matters most" -- the same law the ledger's sides and the forgotten list
-    are already held to. Nothing is truncated either: the row Kyle named out loud sits at
-    the far end of that order, because it is the one review of the twenty-three whose ball
-    is in somebody else's court, and a cap tuned to the top of the list would have hidden
-    exactly the row the section was asked for.
+    are already held to.
+
+    What IS decided here is how much of that order stands. Twenty-three rows rendered whole
+    in the middle of the page is a wall, which is the one complaint this page keeps being
+    rebuilt to answer, and it arrived through the one section that had not learned the
+    ledger's lesson yet. So the ledger's cut, exactly: REVIEW_ROWS stand, the rest are one
+    line away behind a disclosure that states its own size and what is in it. Nothing is
+    dropped, nothing is capped silently, and every row is in the document -- a ✕, a mirror
+    and an anchor all still find the ones in the fold.
+
+    Which five stand is the other half, and it is a selection rather than a sort. The wire
+    is longest-running-first, so the top of it is where the oldest engagements are -- and
+    the oldest engagement here is a merge request nobody has said a word on for a hundred
+    and twenty-six days. Reading the first five off the wire put that at the top of the
+    section and yesterday's movement below the fold, which is the ranking inverted by
+    accident. So the window takes the first REVIEW_ROWS rows that have not gone quiet, in
+    the wire's own order, and every row that has gone quiet is set faint and waits in the
+    disclosure. gone_quiet() is read off fields the row was handed; no row is moved past
+    another, no score is composed, and the list inside the fold is the wire's order with the
+    five that stand lifted out of it.
 
     The only thing given emphasis is whose turn it is. Everything else on the row -- the
     days, the rounds, the quiet -- is a figure, and a page that colours every figure has
@@ -3963,13 +4069,12 @@ def reviewing(a, reviews, drafts, here, by_id):
     And whose turn it is is said once per group rather than once per row. Twenty-one of
     twenty-three rows read "your turn" in warm, which is a majority state repeated
     twenty-one times: it stops carrying information, and it buries the two rows that are
-    the exception -- the exact rows Kyle named when he asked for this section. The
-    boundary being drawn is already on the wire, because work-arcs ranks these yours-first
-    and the sort is what puts them in two runs; rendering it is not a second ranking and
-    nothing here reorders anything. Where the wire is NOT in two runs -- an older graph, a
-    ranking that changes -- the headers are not drawn at all and every row keeps its own
-    label, because a heading over a group that is not a group is worse than the repetition
-    it was meant to fix.
+    the exception -- the exact rows Kyle named when he asked for this section. The boundary
+    being drawn is already on the wire -- see turn_runs() -- and the count beside each
+    heading is the group's own size wherever its rows are standing, not a tally of the rows
+    directly under it: it is the same figure in the window and in the fold precisely so it
+    reads as a property of the group rather than of the five lines below it, and the
+    disclosure states its own size separately.
     """
     n = undismissed(reviews)
     a('<section id="reviewing">')
@@ -3979,7 +4084,12 @@ def reviewing(a, reviews, drafts, here, by_id):
       "first and then longest-running &mdash; the order work-arcs ranked them in, not a "
       "second one composed here. This is not the ledger and not a workstream of yours: a "
       "ledger row is a debt that closes the moment the other person moves, and a review "
-      "carries on after they do. Every figure is derived. The clock is how long the "
+      "carries on after they do. Five rows stand and the rest are one line away, the cut "
+      "the ledger already makes &mdash; and what stands is the longest-running five still "
+      "moving, because a review nobody has said a word on for longer than half its own "
+      "life has stopped being the thing to read first. Those are set faint and wait in the "
+      "disclosure with the others; nothing is reordered to put them there. Every figure is "
+      "derived. The clock is how long the "
       "engagement has run since you were asked; <b>rounds</b> counts batches of your own "
       "comments, so six notes in one sitting are one round and not six; whose turn it is "
       "is read off the notes where they answer it, and off the merge request&rsquo;s own "
@@ -4000,26 +4110,37 @@ def reviewing(a, reviews, drafts, here, by_id):
           "you or open under your review.</div>")
         a("</section>")
         return
-    # Whether the wire order actually partitions into "mine" then "theirs". It does, and it
-    # does because work-arcs sorts on it -- but this is checked rather than assumed, since
-    # the headers are a claim about the shape of the list and a claim that is wrong about
-    # a graph from a month ago is worse than the repetition it replaces.
-    turns = ["mine" if r.get("whose_turn") == "mine" else "theirs" for r in reviews]
-    runs = sum(1 for i, t in enumerate(turns) if i == 0 or t != turns[i - 1])
-    grouped = runs <= 2 and len(set(turns)) == runs
-    counts = {t: turns.count(t) for t in set(turns)}
-    a('<ul class="reviewing" data-disgroup data-countfor="#rv-n">')
-    for i, (r, mine) in enumerate(zip(reviews, turns)):
-        fp = r.get("fp", "")
+    turns, grouped, counts = turn_runs(reviews)
+    slow = [gone_quiet(r) for r in reviews]
+    # The window and the remainder, as two index lists over one unreordered wire. `window`
+    # is a selection -- the first REVIEW_ROWS indices that are still moving, in the order
+    # they arrive -- and `rest` is every index the window did not take, also in the order
+    # they arrive. Neither list sorts anything, which is the whole point: the fold holds the
+    # wire's own sequence with five lines lifted out of it.
+    window = [i for i, q in enumerate(slow) if not q][:REVIEW_ROWS]
+    shown = set(window)
+    rest = [i for i in range(len(reviews)) if i not in shown]
+    headed = set()
+
+    def group_head(mine):
+        """One whose-turn heading. The count is the group's own size, said the same in the
+        window and in the fold; the client keeps it in step with the ✕, like every other
+        figure on this page a ✕ can change under it. The first one drawn carries the id the
+        door mirrors -- the section stays the author of the figure the strip repeats."""
+        first = mine not in headed
+        headed.add(mine)
+        return (f'<li class="grp" data-turn="{mine}">'
+                f'<span class="gl{" mine" if mine == "mine" else ""}">'
+                + ("your turn" if mine == "mine" else "their turn")
+                + f'</span><span class="gn" data-turncount="{mine}"'
+                + (f' id="rv-turn-{mine}"' if first else "")
+                + ' title="the whole of this group, wherever its rows are standing">'
+                + f"{counts[mine]}</span></li>")
+
+    def row(i):
+        r, mine = reviews[i], turns[i]
         turn_mine = mine == "mine"
-        if grouped and (i == 0 or mine != turns[i - 1]):
-            # The count is the group's own and the client keeps it in step, like every
-            # other figure on this page that a ✕ can change under it.
-            a(f'<li class="grp" data-turn="{mine}">'
-              f'<span class="gl{" mine" if turn_mine else ""}">'
-              + ("your turn" if turn_mine else "their turn")
-              + f'</span><span class="gn" data-turncount="{mine}">{counts[mine]}</span>'
-                "</li>")
+        fp = r.get("fp", "")
         # The one figure allowed a colour, and the only one anybody acts on -- said once
         # over the group it applies to, and on the row only where there is no group to say
         # it over. The proxy note rides in the title rather than in the sentence: whether
@@ -4047,7 +4168,14 @@ def reviewing(a, reviews, drafts, here, by_id):
             facts.append(turn)
         quiet = r.get("quiet_days")
         if isinstance(quiet, int) and quiet > 0:
-            facts.append(f'quiet <span class="rn">{quiet}</span>d')
+            # The figure that decides the row's ink, carrying the reason it does. A row set
+            # fainter than its neighbours with nothing on it to say why is a rendering the
+            # reader has to guess at.
+            facts.append('quiet <span class="rn"'
+                         + (' title="silent for longer than half the engagement&rsquo;s '
+                            'own life, and for more than a week — which is why this row '
+                            'is set faint and waits here"' if slow[i] else "")
+                         + f">{quiet}</span>d")
         arc = r.get("arc")
         if arc:
             label = esc(str(((by_id.get(arc) or {}).get("brief") or {}).get("name")
@@ -4069,24 +4197,61 @@ def reviewing(a, reviews, drafts, here, by_id):
         # this corpus sixteen of twenty-three turns are read off a push, so printing it
         # would be the same majority-state-repeated-per-row the heading exists to undo --
         # and it is provenance, which a reader looks up once rather than reads every day.
-        a(f'<li data-fp="{esc(fp)}" data-turn="{mine}"'
-          + (' title="no note is newer than the merge request&rsquo;s own last update, '
-             'so a push is standing in for a word"'
-             if r.get("their_last_is_proxy") else "")
-          + (f' id="rv-{esc(fp)}"' if fp else "")
-          + f' data-dismissed="{1 if r.get("dismissed") else 0}">'
-          + f'<span class="clk"{asked}>'
-          + (f"{clk}d" if isinstance(clk, int) else "&mdash;") + "</span>"
-          + '<div class="what">'
-          + link(r.get("url", ""), esc(r.get("ref", "")), "ref")
-          + f' {esc(r.get("title", ""))}'
-          + f'<span class="who">{" &middot; ".join(facts)}</span></div>'
-          + ('<button class="dis" type="button" aria-label="acknowledge this review — '
-             'it returns on its own when the engagement moves" title="acknowledge — '
-             'returns on its own when the engagement moves">&#x2715;</button>'
-             if fp else "")
-          + "</li>")
+        return (f'<li data-fp="{esc(fp)}" data-turn="{mine}"'
+                + (' class="slow"' if slow[i] else "")
+                + (' title="no note is newer than the merge request&rsquo;s own last '
+                   'update, so a push is standing in for a word"'
+                   if r.get("their_last_is_proxy") else "")
+                + (f' id="rv-{esc(fp)}"' if fp else "")
+                + f' data-dismissed="{1 if r.get("dismissed") else 0}">'
+                + f'<span class="clk"{asked}>'
+                + (f"{clk}d" if isinstance(clk, int) else "&mdash;") + "</span>"
+                + '<div class="what">'
+                + link(r.get("url", ""), esc(r.get("ref", "")), "ref")
+                + f' {esc(r.get("title", ""))}'
+                + f'<span class="who">{" &middot; ".join(facts)}</span></div>'
+                + ('<button class="dis" type="button" aria-label="acknowledge this review '
+                   '— it returns on its own when the engagement moves" title="acknowledge '
+                   '— returns on its own when the engagement moves">&#x2715;</button>'
+                   if fp else "")
+                + "</li>")
+
+    def rows(idxs):
+        """One list, with a heading wherever the turn changes inside it. A group that runs
+        across the fold is headed on both sides of it: a reader who opens the disclosure
+        should not have to scroll back up to learn which turn the rows under their cursor
+        are."""
+        prev = None
+        for i in idxs:
+            if grouped and turns[i] != prev:
+                a(group_head(turns[i]))
+            prev = turns[i]
+            a(row(i))
+
+    # The zone rather than the list carries the acknowledgement group now, because the
+    # rows live in two lists and a ✕ in either has to move the same figure. Nothing else
+    # about it changes: the section is still the only author of its own size, and
+    # `data-countfor` still points at the count the heading printed.
+    a('<div class="rvz" data-disgroup data-countfor="#rv-n">')
+    a('<ul class="reviewing">')
+    rows(window)
     a("</ul>")
+    if rest:
+        # States its own size and its own composition, like every other cut on this page.
+        # The quiet figure is the one thing a reader needs to reconcile the window with the
+        # wire: five rows stand, eighteen are here, and this says how many of the eighteen
+        # are here because they stopped rather than because they were sixth.
+        qn = sum(1 for i in rest if slow[i])
+        a('<details class="more"><summary>'
+          f'<b>{len(rest)}</b> more, in the same order &mdash; yours first, then '
+          "longest-engaged"
+          + (f' &mdash; <b>{qn}</b> of them quiet longer than the engagement&rsquo;s own '
+             "rhythm accounts for" if qn else "")
+          + "</summary>")
+        a('<ul class="reviewing">')
+        rows(rest)
+        a("</ul></details>")
+    a("</div>")
     if drafts:
         # Announced with its real count, like every other cut on this page. A draft is
         # not a review you are in the middle of, and leaving one out silently would make
@@ -4447,9 +4612,23 @@ def render(data, lede, focus_days, limit, cost=None):
         # The figure is the section's own, mirrored, and the lead is the first row on the
         # wire. Not "the worst": the ranking came down from work-arcs and naming its head
         # is reading it, whereas choosing one here would be writing a second one.
+        #
+        # And the figure is the one number on it that decides anything today. "23 ongoing"
+        # is a census: it is the same on a morning when every one of them is with its author
+        # as on a morning when every one is with you, and a figure that cannot change what
+        # you do is a figure the eye stops reading. What can is how many of them are YOURS,
+        # which is the count the section's own "your turn" heading prints -- mirrored, not
+        # recounted, so the section stays the author of it. The census keeps its place
+        # underneath, quieter, because dropping it would be hiding the denominator.
+        _, rv_grouped, rv_counts = turn_runs(reviews)
+        rv_mine = rv_counts.get("mine", 0) if rv_grouped else 0
         doors.append({"id": "reviewing", "href": "reviewing", "kick": "Reviewing",
-                      "fig": (mirrored(undismissed(reviews), "#rv-n")
-                              + " ongoing"),
+                      "fig": ((mirrored(rv_mine, "#rv-turn-mine") + " your turn"
+                               + '<span class="dsub">of '
+                               + mirrored(undismissed(reviews), "#rv-n", "dq")
+                               + " ongoing</span>")
+                              if rv_mine else
+                              mirrored(undismissed(reviews), "#rv-n") + " ongoing"),
                       # The same shape the ledger's door uses for its own head row, from
                       # the same function -- a clock and a subject. A review row carries
                       # `days`, `ref` and `title` exactly as a ledger row does, so this is
@@ -4475,11 +4654,27 @@ def render(data, lede, focus_days, limit, cost=None):
     if data.get("curation"):
         n = len(data["curation"])
         first = data["curation"][0]
+        # The count stays in the corner where it always was, and the lead line becomes the
+        # top question's own subject -- the string the card at the head of the queue prints
+        # in its heading, from the same function, rather than the raw wire label this used
+        # to reach for. The two differ: the label is what the split pass called the
+        # workstream and the subject is what the card calls it, and a door naming a card by
+        # a different string than the card uses makes a reader check whether they are the
+        # same thing. Its kind rides in front, in the one word the queued strip uses, for
+        # the reason the standup door's beat label does: it is what makes the phrase a
+        # question rather than a fact about the work.
+        first_arc = by_id.get(first.get("arc_id")) or {}
         doors.append({"id": "curation", "href": "curation", "kick": "Tidy",
                       "fig": (mirrored(n, '[data-count="curation"]') + " question"
                               + ("" if n == 1 else "s")),
-                      "lead": esc(str(first.get("arc")
-                                      or first.get("branch") or "?"))})
+                      # A branch on its own says almost nothing, which is exactly why the
+                      # card pairs it with the workstream it is being asked to hang in --
+                      # so the door prints the same pair, on the card's own condition.
+                      "lead": esc(CURATION_TAG.get(first.get("kind") or "membership", "")
+                                  + " · " + curation_subject(first, first_arc)
+                                  + (" in " + curation_name(first, first_arc)
+                                     if first.get("kind") in (None, "membership")
+                                     and first.get("arc") else ""))})
     cockpit(a, doors)
 
     stops = [x for x in (
@@ -5501,11 +5696,23 @@ def render(data, lede, focus_days, limit, cost=None):
         (len(done), "have landed or been abandoned", "retired from the list below",
          "#settled"),
     ]
+    # One line each, in the shape the disclosure directly under them already uses. They
+    # were four display figures at 2rem across a card row in the middle of the page, and
+    # every one of those figures is printed somewhere else: the rail carries the local-only
+    # count, the parked count and the retired count, and the doors carry the ledger's and
+    # the queue's. A number set two inches tall that a reader has already read three inches
+    # to the left is not emphasis, it is repetition wearing emphasis' clothes -- and it was
+    # spending a fifth of a screenful to do it.
+    #
+    # Demoted and not deleted: every count is here, every subtitle is here, every anchor is
+    # here, and three of these facts -- what has come back, what is out for review, what is
+    # pushed but never proposed -- are carried by no rail stop and no door, so losing them
+    # would be losing them. De-emphasis is not hiding.
     a('<ul class="conditions">')
     for n, label, sub, href in tiles:
         if not n:
             continue
-        a(f'<li><a href="{href}"><span class="v">{n}</span>'
+        a(f'<li><a href="{href}"><b class="v">{n}</b>'
           f'<span class="l">{label}</span><span class="sub">{sub}</span></a></li>')
     a("</ul>")
 

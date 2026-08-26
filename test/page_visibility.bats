@@ -495,6 +495,50 @@ ZZCUR
     grep -q 'data-door="curation"' "$TEST_TMPDIR/p.html"
 }
 
+# The door used to name the queue's head by the raw wire label -- the string the split pass
+# called the workstream -- while the card at the head of the queue named it by something
+# else. A door naming a card by a different string than the card uses makes a reader check
+# whether they are the same thing, so both read it off the same function now.
+@test "the tidy door leads with the string the top card prints, not the wire label" {
+    page "$(python3 - <<'ZZMEM'
+import json
+qs = [{"kind": "membership", "arc": "the wire label nobody says out loud",
+       "arc_id": "smp", "branch": "many-reqs", "fp": "m1", "with": "other-br",
+       "shared": 2, "files": [], "co_members": [], "confidence": 0.4,
+       "why": "two files overlap"}]
+arcs = [{"id": "smp", "label": "the wire label nobody says out loud", "kind": "cluster",
+         "stage": "local-only", "state": "only here", "urgency": 5, "age_days": 3,
+         "unpushed_live": 2, "unpushed_days": 2, "unpushed_dates": ["2026-08-01"],
+         "engagement": 10, "branches": [], "mrs": [], "stashes": [], "sessions": [],
+         "issues": [], "demands": [], "counts": {},
+         "brief": {"name": "Dove timeFilter hydration"}}]
+print(json.dumps({"generated": 1756000000, "repo": "ul", "main": "origin/main",
+                  "me": "kyle", "arc_count": 1, "arcs": arcs, "forgotten": [],
+                  "only_here": ["smp"], "curation": qs}))
+ZZMEM
+)" >"$TEST_TMPDIR/p.html"
+    run python3 - "$TEST_TMPDIR/p.html" <<'ZZTIDY'
+import re, sys
+html = open(sys.argv[1]).read()
+nav = re.search(r'<nav class="cockpit".*?</nav>', html, re.S).group(0)
+d = re.search(r'<a class="door" data-door="curation".*?</a>', nav, re.S).group(0)
+lead = re.sub(r'<[^>]+>', '', re.search(r'<span class="dl">(.*?)</span>',
+                                        d, re.S).group(1)).strip()
+print(lead)
+# The card at the head of the queue says the same two things, in the same words.
+card = re.search(r'<span class="qh">.*?</span></span>', html, re.S).group(0)
+subj = re.search(r'<span class="subj">([^<]*)<', card).group(1)
+tag = re.search(r'<span class="tag">([^<]*)<', card).group(1)
+print("SAME-SUBJECT" if subj in lead and tag in lead else "%s / %s" % (tag, subj))
+# The count keeps its corner.
+print(re.sub(r'<[^>]+>', '', re.search(
+    r'<span class="dv">(.*?)(?=<span class="dl">|</a>)', d, re.S).group(1)).strip())
+ZZTIDY
+    [ "${lines[0]}" = "grouping · many-reqs in Dove timeFilter hydration" ]
+    [ "${lines[1]}" = "SAME-SUBJECT" ]
+    [ "${lines[2]}" = "1 question" ]
+}
+
 # The fold's own law applied to a link at it: a chip reading "tidy · 0" is a chore invented
 # for a person who has none.
 @test "at zero questions there is no chip and no stop" {
