@@ -203,7 +203,7 @@ ZZDRAFT
 
 # ── every row carries the facts that make it first-class ─────────────────────
 
-@test "a row names its author, its rounds and whose turn it is" {
+@test "a row names its author and its rounds, and its group names whose turn it is" {
     page "$(doc)" > "$TEST_TMPDIR/p.html"
     run python3 - "$TEST_TMPDIR/p.html" <<'ZZROW'
 import re, sys
@@ -214,17 +214,56 @@ row = [li for li in re.findall(r'<li data-fp=.*?</li>', ul, re.S)
 who = re.search(r'<span class="who">(.*?)</span></div>', row, re.S).group(1)
 print("AUTHOR" if "ella" in who else "NO-AUTHOR")
 print("ROUNDS" if re.search(r'>12</span> rounds', who) else "NO-ROUNDS")
-print("THEIRS" if 'class="turn"' in who and "their turn" in who else "NO-TURN")
-# Emphasis goes to the one row that wants something, and only there.
-mine = [li for li in re.findall(r'<li data-fp=.*?</li>', ul, re.S) if "!10500" in li][0]
-print("MINE-WARM" if 'class="turn mine"' in mine else "NOT-WARM")
-print("ACK" if 'class="dis"' in row and 'id="rv-rfp10265"' in row else "NO-ACK")
+# The label is the group's now. Repeating it on every row said nothing about any of
+# them, and it buried the one row of the four that is the exception.
+print("NO-ROW-LABEL" if "their turn" not in who else "ROW-LABEL")
+print("IN-GROUP" if 'data-turn="theirs"' in row else "UNGROUPED")
 ZZROW
     [ "${lines[0]}" = "AUTHOR" ]
     [ "${lines[1]}" = "ROUNDS" ]
-    [ "${lines[2]}" = "THEIRS" ]
-    [ "${lines[3]}" = "MINE-WARM" ]
-    [ "${lines[4]}" = "ACK" ]
+    [ "${lines[2]}" = "NO-ROW-LABEL" ]
+    [ "${lines[3]}" = "IN-GROUP" ]
+}
+
+# The boundary is already on the wire -- work-arcs ranks these yours-first -- so drawing
+# it is a rendering of an existing order and never a second ranking. Nothing here pins
+# wording; what is pinned is that there are two groups, in the wire's order, each stating
+# the size of what is under it.
+@test "whose turn it is is said once per group, in the wire's order" {
+    page "$(doc)" > "$TEST_TMPDIR/p.html"
+    run python3 - "$TEST_TMPDIR/p.html" <<'ZZGRP'
+import re, sys
+html = re.sub(r'<script.*?</script>', '', open(sys.argv[1]).read(), flags=re.S)
+ul = re.search(r'<ul class="reviewing".*?</ul>', html, re.S).group(0)
+for li in re.findall(r'<li class="grp".*?</li>', ul, re.S):
+    turn = re.search(r'data-turn="([a-z]+)"', li).group(1)
+    n = re.search(r'data-turncount="[a-z]+">(\d+)<', li).group(1)
+    print(turn, n, "WARM" if 'class="gl mine"' in li else "PLAIN")
+# The rows stay in the order they arrived in, headers or no headers.
+print([re.search(r'data-fp="rfp(\d+)"', li).group(1)
+       for li in re.findall(r'<li data-fp=.*?</li>', ul, re.S)])
+ZZGRP
+    [ "${lines[0]}" = "mine 3 WARM" ]
+    [ "${lines[1]}" = "theirs 1 PLAIN" ]
+    [ "${lines[2]}" = "['10500', '10510', '10520', '10265']" ]
+}
+
+# A heading over a group that is not a group is worse than the repetition it replaces, so
+# a wire order that does not partition keeps every row's own label.
+@test "an unsorted wire order gets no headings and keeps its row labels" {
+    run python3 - "$REPO_ROOT/bin/arcs-page" "$(doc)" <<'ZZMIX'
+import json, re, subprocess, sys
+d = json.loads(sys.argv[2])
+d["reviews"] = [d["reviews"][i] for i in (0, 3, 1, 2)]
+r = subprocess.run([sys.executable, sys.argv[1], "--focus", "30"],
+                   input=json.dumps(d), capture_output=True, text=True)
+html = re.sub(r'<script.*?</script>', '', r.stdout, flags=re.S)
+ul = re.search(r'<ul class="reviewing".*?</ul>', html, re.S).group(0)
+print("NO-HEADINGS" if '<li class="grp"' not in ul else "HEADINGS")
+print("ROW-LABELS" if ul.count("your turn") == 3 else "MISSING-LABELS")
+ZZMIX
+    [ "${lines[0]}" = "NO-HEADINGS" ]
+    [ "${lines[1]}" = "ROW-LABELS" ]
 }
 
 @test "a joined workstream is linked where its row exists and stated where it does not" {

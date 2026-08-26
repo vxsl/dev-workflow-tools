@@ -714,6 +714,19 @@ a:hover{text-decoration-color:currentColor}
    direction is left in the row's own grey, since a review sitting with its author asks
    nothing of you and colouring it would say otherwise. */
 .reviewing .turn.mine{color:var(--warm);font-weight:600}
+/* Whose turn it is, said once over the rows it applies to. A heading and not a row: it
+   carries no clock, no acknowledgement and no link, and it must never be mistaken for a
+   review. The count beside it is the group's own and the client keeps it in step. */
+.reviewing li.grp{display:flex;gap:.4rem;align-items:baseline;padding:.5rem .9rem .25rem;
+  border-top:1px solid var(--hairline)}
+.reviewing li.grp:first-child{border-top:0}
+.reviewing li.grp[hidden]{display:none}
+.reviewing li.grp+li{border-top:0}
+.reviewing .gl{font-family:var(--sans);font-size:.7rem;font-weight:700;
+  letter-spacing:.07em;text-transform:uppercase;color:var(--ink-faint)}
+.reviewing .gl.mine{color:var(--warm)}
+.reviewing .gn{font-family:var(--mono);font-size:.7rem;color:var(--ink-faint);
+  font-variant-numeric:tabular-nums}
 .reviewing .turn[title]{cursor:help}
 .reviewing .arcl{color:var(--ink-soft)}
 .reviewing .arcl[title]{cursor:help}
@@ -1900,6 +1913,17 @@ INTERACT_JS = r"""
           side=g.closest('.side');
       if(n) n.textContent=vis;
       g.hidden=(vis===0 && !(side&&side.dataset.show==='1'));
+    });
+    // The whose-turn headings in Reviewing. They state a count over rows a ✕ can remove,
+    // so they are recounted exactly as the ledger's aggregate rows are -- and a group with
+    // nothing visible left in it has nothing to head, so it goes the same way.
+    document.querySelectorAll('.reviewing li.grp').forEach(function(h){
+      var ul=h.closest('.reviewing'), t=h.dataset.turn;
+      var vis=ul.querySelectorAll('li[data-turn="'+t+'"][data-fp]'
+                                  +':not([data-dismissed="1"])').length;
+      var n=h.querySelector('[data-turncount]');
+      if(n) n.textContent=vis;
+      h.hidden=(vis===0 && ul.dataset.show!=='1');
     });
     // Everywhere else gets an auto-appended disclosure so nothing is concealed.
     document.querySelectorAll('[data-disgroup]').forEach(function(g){
@@ -3888,6 +3912,17 @@ def reviewing(a, reviews, drafts, here, by_id):
     The only thing given emphasis is whose turn it is. Everything else on the row -- the
     days, the rounds, the quiet -- is a figure, and a page that colours every figure has
     said nothing about any of them.
+
+    And whose turn it is is said once per group rather than once per row. Twenty-one of
+    twenty-three rows read "your turn" in warm, which is a majority state repeated
+    twenty-one times: it stops carrying information, and it buries the two rows that are
+    the exception -- the exact rows Kyle named when he asked for this section. The
+    boundary being drawn is already on the wire, because work-arcs ranks these yours-first
+    and the sort is what puts them in two runs; rendering it is not a second ranking and
+    nothing here reorders anything. Where the wire is NOT in two runs -- an older graph, a
+    ranking that changes -- the headers are not drawn at all and every row keeps its own
+    label, because a heading over a group that is not a group is worse than the repetition
+    it was meant to fix.
     """
     n = undismissed(reviews)
     a('<section id="reviewing">')
@@ -3917,14 +3952,31 @@ def reviewing(a, reviews, drafts, here, by_id):
           "you or open under your review.</div>")
         a("</section>")
         return
+    # Whether the wire order actually partitions into "mine" then "theirs". It does, and it
+    # does because work-arcs sorts on it -- but this is checked rather than assumed, since
+    # the headers are a claim about the shape of the list and a claim that is wrong about
+    # a graph from a month ago is worse than the repetition it replaces.
+    turns = ["mine" if r.get("whose_turn") == "mine" else "theirs" for r in reviews]
+    runs = sum(1 for i, t in enumerate(turns) if i == 0 or t != turns[i - 1])
+    grouped = runs <= 2 and len(set(turns)) == runs
+    counts = {t: turns.count(t) for t in set(turns)}
     a('<ul class="reviewing" data-disgroup data-countfor="#rv-n">')
-    for r in reviews:
+    for i, (r, mine) in enumerate(zip(reviews, turns)):
         fp = r.get("fp", "")
-        turn_mine = r.get("whose_turn") == "mine"
-        # The one figure allowed a colour, and the only one anybody acts on. The proxy
-        # note rides in the title rather than in the sentence: whether the turn was read
-        # off a note or off a push is the sort of provenance a reader goes looking for
-        # once, not something to print on twenty-three rows.
+        turn_mine = mine == "mine"
+        if grouped and (i == 0 or mine != turns[i - 1]):
+            # The count is the group's own and the client keeps it in step, like every
+            # other figure on this page that a ✕ can change under it.
+            a(f'<li class="grp" data-turn="{mine}">'
+              f'<span class="gl{" mine" if turn_mine else ""}">'
+              + ("your turn" if turn_mine else "their turn")
+              + f'</span><span class="gn" data-turncount="{mine}">{counts[mine]}</span>'
+                "</li>")
+        # The one figure allowed a colour, and the only one anybody acts on -- said once
+        # over the group it applies to, and on the row only where there is no group to say
+        # it over. The proxy note rides in the title rather than in the sentence: whether
+        # the turn was read off a note or off a push is the sort of provenance a reader
+        # goes looking for once, not something to print on twenty-three rows.
         turn = ('<b class="turn mine"' if turn_mine else '<span class="turn"') + (
             ' title="no note is newer than the merge request&rsquo;s own last update, '
             'so a push is standing in for a word"'
@@ -3943,7 +3995,15 @@ def reviewing(a, reviews, drafts, here, by_id):
             # words and not in mono, because "none yet" is a sentence and mono on this page
             # is data and only data.
             facts.append("no round yet")
-        facts.append(turn)
+        if not grouped:
+            facts.append(turn)
+        elif r.get("their_last_is_proxy"):
+            # The exception the group heading cannot carry, kept on the row it belongs to.
+            # It is the one thing about whose-turn that is not the same for everybody in
+            # the group, and it is rare -- which is exactly what a row is for.
+            facts.append('<span class="turn" title="no note is newer than the merge '
+                         "request&rsquo;s own last update, so a push is standing in for "
+                         'a word">read off a push</span>')
         quiet = r.get("quiet_days")
         if isinstance(quiet, int) and quiet > 0:
             facts.append(f'quiet <span class="rn">{quiet}</span>d')
@@ -3963,7 +4023,7 @@ def reviewing(a, reviews, drafts, here, by_id):
                  f'when you were asked"' if r.get("asked_is_proxy")
                  else f' title="asked {esc(r.get("asked") or "")}"'
                  if r.get("asked") else "")
-        a(f'<li data-fp="{esc(fp)}"'
+        a(f'<li data-fp="{esc(fp)}" data-turn="{mine}"'
           + (f' id="rv-{esc(fp)}"' if fp else "")
           + f' data-dismissed="{1 if r.get("dismissed") else 0}">'
           + f'<span class="clk"{asked}>'
