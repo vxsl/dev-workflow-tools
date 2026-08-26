@@ -158,8 +158,8 @@ live([{"sessionId": "s1", "status": "busy", "cwd": REPO, "name": "orch:whatever"
 data([])
 arcs = [arc("a1", ["UB-1"]), arc("a2", ["UB-2"])]
 # The same session on both branches, later on UB-2.
-bench, known, why = wa.orch_join(arcs, sidx([("UB-1", "s1", NOW - 900, REPO),
-                                             ("UB-2", "s1", NOW, REPO)]), Path(REPO))
+idx = sidx([("UB-1", "s1", NOW - 900, REPO), ("UB-2", "s1", NOW, REPO)])
+bench, known, why, states = wa.orch_join(arcs, idx, Path(REPO))
 print(arcs[0]["orch"]["n"], arcs[1]["orch"]["n"])
 print(bench[0]["arc"], bench[0]["branch"], bench[0]["also_touched"])'
     [ "${lines[0]}" = "0 1" ]
@@ -176,7 +176,8 @@ live([{"sessionId": "s1", "status": "idle", "cwd": REPO,
        "name": "orch:UL-1853: FE: metadata geometry"}])
 data([])
 arcs = [arc("a1", ["UB-1"], label="UB-6919")]
-bench, known, why = wa.orch_join(arcs, sidx([("UB-1", "s1", NOW, REPO)]), Path(REPO))
+bench, known, why, states = wa.orch_join(
+    arcs, sidx([("UB-1", "s1", NOW, REPO)]), Path(REPO))
 print(bench[0]["via"])
 print(bench[0]["arc"], bench[0]["arc_label"])'
     [ "${lines[0]}" = "UL-1853: FE: metadata geometry" ]
@@ -193,7 +194,7 @@ live([{"sessionId": "here", "status": "busy", "cwd": REPO},
       {"sessionId": "elsewhere", "status": "busy", "cwd": str(TMP / "other")}])
 data([])
 arcs = [arc("a1", ["main"])]
-bench, known, why = wa.orch_join(
+bench, known, why, states = wa.orch_join(
     arcs, sidx([("main", "here", NOW, REPO),
                 ("main", "elsewhere", NOW, str(TMP / "other"))]), Path(REPO))
 print(arcs[0]["orch"]["n"])
@@ -212,7 +213,8 @@ db([{"session_id": "s1"}])
 live([{"sessionId": "s1", "status": "busy", "cwd": wt}])
 data([])
 arcs = [arc("a1", ["UB-1"])]
-bench, known, why = wa.orch_join(arcs, sidx([("UB-1", "s1", NOW, wt)]), Path(REPO))
+bench, known, why, states = wa.orch_join(
+    arcs, sidx([("UB-1", "s1", NOW, wt)]), Path(REPO))
 print(arcs[0]["orch"]["n"], bench[0]["arc"])'
     [ "$output" = "1 a1" ]
 }
@@ -242,9 +244,9 @@ db([{"session_id": "s1"}])
 live([{"sessionId": "s1", "status": "idle", "cwd": REPO}])
 data([])
 arcs = [arc("a1", ["UB-1"]), arc("a2", ["UB-2"]), arc("a3", ["UB-3"])]
-bench, known, why = wa.orch_join(arcs, sidx([("UB-1", "s1", NOW - 60, REPO),
-                                             ("UB-2", "s1", NOW - 30, REPO),
-                                             ("UB-3", "s1", NOW, REPO)]), Path(REPO))
+idx = sidx([("UB-1", "s1", NOW - 60, REPO), ("UB-2", "s1", NOW - 30, REPO),
+            ("UB-3", "s1", NOW, REPO)])
+bench, known, why, states = wa.orch_join(arcs, idx, Path(REPO))
 print([a["orch"]["n"] for a in arcs], bench[0]["also_touched"])'
     [ "$output" = "[0, 0, 1] 2" ]
 }
@@ -257,8 +259,8 @@ db([{"session_id": "s1", "is_live": 1}, {"session_id": "s2", "is_live": 0}])
 live([{"sessionId": "s2", "status": "busy", "cwd": REPO}])
 data([])
 arcs = [arc("a1", ["UB-1"])]
-bench, known, why = wa.orch_join(arcs, sidx([("UB-1", "s1", NOW, REPO),
-                                             ("UB-1", "s2", NOW, REPO)]), Path(REPO))
+idx = sidx([("UB-1", "s1", NOW, REPO), ("UB-1", "s2", NOW, REPO)])
+bench, known, why, states = wa.orch_join(arcs, idx, Path(REPO))
 print(sorted((s["id"], s["live"]) for s in arcs[0]["orch"]["sessions"]))
 print([b["id"] for b in bench])'
     [ "${lines[0]}" = "[('s1', False), ('s2', True)]" ]
@@ -272,7 +274,8 @@ shutil.rmtree(os.environ["WORK_ARCS_CLAUDE_SESSIONS_DIR"])
 db([{"session_id": "s1", "is_live": 1}])
 data([])
 arcs = [arc("a1", ["UB-1"])]
-bench, known, why = wa.orch_join(arcs, sidx([("UB-1", "s1", NOW, REPO)]), Path(REPO))
+bench, known, why, states = wa.orch_join(
+    arcs, sidx([("UB-1", "s1", NOW, REPO)]), Path(REPO))
 print(known, arcs[0]["orch"]["sessions"][0]["live"], len(bench))
 print("said something" if why else "said nothing")'
     [ "${lines[0]}" = "True True 1" ]
@@ -289,7 +292,7 @@ live([{"sessionId": "s1", "status": "shell", "cwd": REPO},
       {"sessionId": "s2", "cwd": REPO},
       {"sessionId": "s3", "status": "busy", "cwd": REPO}])
 data([])
-bench, known, why = wa.orch_join([], {}, Path(REPO))
+bench, known, why, states = wa.orch_join([], {}, Path(REPO))
 print(sorted((b["id"], str(b["state"])) for b in bench))'
     [ "$output" = "[('s1', 'shell'), ('s2', 'None'), ('s3', 'busy')]" ]
 }
@@ -301,7 +304,8 @@ live([{"sessionId": "s1", "status": "busy", "cwd": REPO},
       {"sessionId": "s2", "status": "busy", "cwd": str(TMP / "elsewhere")}])
 data([])
 arcs = [arc("a1", ["UB-1"])]
-bench, known, why = wa.orch_join(arcs, sidx([("UB-1", "s1", NOW, REPO)]), Path(REPO))
+bench, known, why, states = wa.orch_join(
+    arcs, sidx([("UB-1", "s1", NOW, REPO)]), Path(REPO))
 print(len(bench), [b["arc"] for b in bench])'
     [ "$output" = "2 ['a1', None]" ]
 }
@@ -317,7 +321,7 @@ live([{"sessionId": "s1", "status": "idle", "cwd": REPO, "statusUpdatedAt": 1787
 data([])
 arcs = [arc("a1", ["UB-1"])]
 idx = sidx([("UB-1", s, NOW, REPO) for s in ("s1", "s3", "s4")])
-bench, known, why = wa.orch_join(arcs, idx, Path(REPO))
+bench, known, why, states = wa.orch_join(arcs, idx, Path(REPO))
 print([b["id"] for b in bench])'
     [ "$output" = "['s3', 's4', 's1', 's2', 's5']" ]
 }
@@ -330,7 +334,7 @@ long = "word " * 200
 db([{"session_id": "s1", "last_assistant_message_text": long}])
 live([{"sessionId": "s1", "status": "idle", "cwd": REPO}])
 data([])
-bench, known, why = wa.orch_join([], {}, Path(REPO))
+bench, known, why, states = wa.orch_join([], {}, Path(REPO))
 s = bench[0]
 print(s["summary_src"], len(s["summary"]) <= wa.ORCH_SUMMARY_CHARS + 1,
       s["summary"].endswith(chr(8230)))'
@@ -345,7 +349,7 @@ data([])
 notes([{"session_id": "s1", "message": "an older word"},
        {"session_id": "other", "message": "not this one"},
        {"session_id": "s1", "message": "the last word"}])
-bench, known, why = wa.orch_join([], {}, Path(REPO))
+bench, known, why, states = wa.orch_join([], {}, Path(REPO))
 print(bench[0]["summary_src"], "|", bench[0]["summary"])'
     [ "$output" = "notification | the last word" ]
 }
@@ -355,7 +359,7 @@ print(bench[0]["summary_src"], "|", bench[0]["summary"])'
 db([{"session_id": "s1"}])
 live([{"sessionId": "s1", "status": "idle", "cwd": REPO}])
 data([])
-bench, known, why = wa.orch_join([], {}, Path(REPO))
+bench, known, why, states = wa.orch_join([], {}, Path(REPO))
 print(bench[0]["summary"], bench[0]["summary_src"])'
     [ "$output" = "None None" ]
 }
@@ -384,7 +388,7 @@ live([{"sessionId": "s1", "status": "idle", "cwd": REPO, "name": "orch:from the 
       {"sessionId": "s3", "status": "idle", "cwd": REPO},
       {"sessionId": "s4", "status": "idle", "cwd": REPO}])
 data([{"name": "from the path", "repo_path": REPO}])
-bench, known, why = wa.orch_join([], {}, Path(REPO))
+bench, known, why, states = wa.orch_join([], {}, Path(REPO))
 seen = {b["id"]: b["via"] for b in bench}
 print(seen["s1"], "|", seen["s3"], "|", seen["s4"])
 rows = wa._orch_db()[0]
@@ -398,7 +402,7 @@ print(wa._orch_via(None, rows["s2"], {}))'
 db([{"session_id": "s1"}])
 live([{"sessionId": "s1", "status": "idle", "cwd": str(TMP / "nowhere")}])
 data([{"name": "some other thing", "repo_path": REPO}])
-bench, known, why = wa.orch_join([], {}, Path(REPO))
+bench, known, why, states = wa.orch_join([], {}, Path(REPO))
 print(bench[0]["via"])'
     [ "$output" = "None" ]
 }
@@ -411,7 +415,7 @@ data([{"name": "running", "repo_path": REPO, "auto_running": True,
        "auto_current_todo_id": "t1", "auto_coord_sid": "s1", "auto_impl_sids": ["s2"]},
       {"name": "finished", "repo_path": str(TMP / "b"), "auto_running": False,
        "auto_current_todo_id": "t9", "auto_coord_sid": "s3", "auto_impl_sids": []}])
-bench, known, why = wa.orch_join([], {}, Path(REPO))
+bench, known, why, states = wa.orch_join([], {}, Path(REPO))
 seen = {b["id"]: (b["auto"], b["auto_todo"]) for b in bench}
 print(seen["s1"], seen["s2"], seen["s3"])'
     [ "$output" = "(True, 't1') (True, 't1') (False, '')" ]
@@ -423,7 +427,7 @@ print(seen["s1"], seen["s2"], seen["s3"])'
     run wa '
 import shutil
 shutil.rmtree(os.environ["WORK_ARCS_CLAUDE_SESSIONS_DIR"])
-bench, known, why = wa.orch_join([arc("a1", ["UB-1"])], {}, Path(REPO))
+bench, known, why, states = wa.orch_join([arc("a1", ["UB-1"])], {}, Path(REPO))
 print(known, len(bench), bool(why))'
     [ "$output" = "False 0 True" ]
 }
@@ -433,7 +437,8 @@ print(known, len(bench), bool(why))'
 live([{"sessionId": "s1", "status": "busy", "cwd": REPO}])
 # No database, no data.json, no notification log.
 arcs = [arc("a1", ["UB-1"])]
-bench, known, why = wa.orch_join(arcs, sidx([("UB-1", "s1", NOW, REPO)]), Path(REPO))
+bench, known, why, states = wa.orch_join(
+    arcs, sidx([("UB-1", "s1", NOW, REPO)]), Path(REPO))
 print(known, len(bench), bench[0]["arc"], bench[0]["state"])
 print(bool(why))'
     [ "${lines[0]}" = "True 1 a1 busy" ]
@@ -447,7 +452,7 @@ db([{"session_id": "s1", "title": "orch:old build", "is_live": 1,
      "last_activity": "2026-08-01T00:00:00Z", "message_count": 7}], columns=cols)
 live([{"sessionId": "s1", "status": "idle", "cwd": REPO}])
 data([])
-bench, known, why = wa.orch_join([], {}, Path(REPO))
+bench, known, why, states = wa.orch_join([], {}, Path(REPO))
 print(known, bench[0]["via"], "|", bench[0]["messages"], bench[0]["summary"])'
     [ "$output" = "True old build | 7 None" ]
 }
@@ -458,7 +463,7 @@ db([])
 live([])
 data([])
 arcs = [arc("a1", ["UB-1"]), arc("a2", ["UB-2"])]
-bench, known, why = wa.orch_join(arcs, {}, Path(REPO))
+bench, known, why, states = wa.orch_join(arcs, {}, Path(REPO))
 print(known, [a["orch"] for a in arcs] == [{"sessions": [], "n": 0, "more": 0, "live": 0}] * 2)'
     [ "$output" = "True True" ]
 }
@@ -474,7 +479,7 @@ data([])
 arcs = [arc("a1", ["UB-1"])]
 # s1 is the newest of the idle ones; s7 is live and must lead whatever its turn said.
 idx = sidx([("UB-1", s, NOW - i * 60, REPO) for i, s in enumerate(ids)])
-bench, known, why = wa.orch_join(arcs, idx, Path(REPO))
+bench, known, why, states = wa.orch_join(arcs, idx, Path(REPO))
 o = arcs[0]["orch"]
 print(o["n"], o["more"], o["live"], [s["id"] for s in o["sessions"]])'
     [ "$output" = "7 4 1 ['s7', 's1', 's2']" ]
@@ -486,9 +491,8 @@ db([{"session_id": "known"}])
 live([])
 data([])
 arcs = [arc("a1", ["UB-1"])]
-bench, known, why = wa.orch_join(arcs, sidx([("UB-1", "known", NOW, REPO),
-                                             ("UB-1", "stranger", NOW, REPO)]),
-                                 Path(REPO))
+idx = sidx([("UB-1", "known", NOW, REPO), ("UB-1", "stranger", NOW, REPO)])
+bench, known, why, states = wa.orch_join(arcs, idx, Path(REPO))
 print(arcs[0]["orch"]["n"], [s["id"] for s in arcs[0]["orch"]["sessions"]])'
     [ "$output" = "1 ['known']" ]
 }
@@ -601,13 +605,38 @@ print(idx["UB-1"]["entries"], idx["UB-1"]["last"] == idx["UB-1"]["sess"]["aaa"])
     [ "${lines[2]}" = "3 True" ]
 }
 
+@test "a run that could not read busy/idle compares no states" {
+    # The narrower gate. With the status directory gone the sessions are still known --
+    # the database says which are live -- and not one word about what any of them is
+    # doing is. A snapshot of that against the next healthy run would report every
+    # session on the machine as having just picked up work.
+    run wa '
+import shutil
+shutil.rmtree(os.environ["WORK_ARCS_CLAUDE_SESSIONS_DIR"])
+db([{"session_id": "s1", "is_live": 1}])
+data([])
+bench, known, why, states = wa.orch_join([], {}, Path(REPO))
+print(known, states, len(bench), bench[0]["state"])
+k = {"mrs": True, "ledger": True, "issues": True, "slack": True, "reviews": True}
+was = wa.snapshot_of([], None, dict(k, orch=states), "ul", "2026-08-26T01:00:00-0700",
+                     sessions=wa._orch_snapshot(bench))
+now = wa.snapshot_of([], None, dict(k, orch=True), "ul", "2026-08-26T02:00:00-0700",
+                     sessions={"s1": {"state": "busy", "arc": None, "label": "",
+                                      "via": ""}})
+d = wa.diff_runs(was, now, [], None)
+print(d["sessions"], "orch" in d["skipped_universes"])'
+    [ "${lines[0]}" = "True False 1 None" ]  # the database enumerates them, with no state
+    [ "${lines[1]}" = "[] True" ]
+}
+
 @test "a branch nobody worked on in this repo has no sessions and no error" {
     run wa '
 db([{"session_id": "s1"}])
 live([])
 data([])
 arcs = [arc("a1", ["UB-9"])]
-bench, known, why = wa.orch_join(arcs, sidx([("UB-1", "s1", NOW, REPO)]), Path(REPO))
+bench, known, why, states = wa.orch_join(
+    arcs, sidx([("UB-1", "s1", NOW, REPO)]), Path(REPO))
 print(known, arcs[0]["orch"]["n"], len(bench))'
     [ "$output" = "True 0 0" ]
 }

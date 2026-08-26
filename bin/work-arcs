@@ -8166,15 +8166,23 @@ def orch_join(arcs, sessions, repo=None):
 
     Sets `arc["orch"]` on every arc -- always, so an arc with nothing running says so
     with a zero rather than with a missing key nobody can tell from a source that failed.
-    Returns (bench, known, why): the bench is every LIVE session with the arc it lands on
-    or null, which is the question the per-arc lists structurally cannot answer -- most
-    live sessions at any moment are working on something that is not a workstream in this
-    repo at all, and those are exactly the ones a per-arc home would hide.
+    Returns (bench, known, why, states): the bench is every LIVE session with the arc it
+    lands on or null, which is the question the per-arc lists structurally cannot answer
+    -- most live sessions at any moment are working on something that is not a workstream
+    in this repo at all, and those are exactly the ones a per-arc home would hide.
 
     `known` is false only when NOTHING could be read. A partial read is still knowledge:
     with the database gone the live files still say who is running, so `known` stays true
     and `why` names what is missing. The alternative -- one flag for four sources -- would
     throw away the three that answered to report the one that did not.
+
+    `states` is narrower and exists for the run-over-run diff alone: whether busy/idle is
+    known this run. Only the status files produce those words, so a run that lost that
+    one source has sessions (off the database's `is_live`) with no state on any of them --
+    and a snapshot of that, compared against the next healthy run, would report every
+    session on the machine as having just picked up work. `known` is the wrong gate for
+    the diff for exactly that reason: it would be true through the outage that makes the
+    comparison meaningless.
 
     Recency is deliberately not a filter. A session whose last turn on an arc predates
     the focus window is still listed on that arc: how much history a card shows is a
@@ -8192,6 +8200,13 @@ def orch_join(arcs, sessions, repo=None):
     # one this tool's own turn evidence puts on an arc. The database holds every session
     # ever seen in every repo on the machine, and a bench of 319 of those is not a bench.
     wanted = set(live) | set(attribution)
+    if why_live:
+        # With the status files unreadable, the database's own column is the only
+        # enumeration of live sessions left, so it has to seed the set as well as answer
+        # about it. Only in that case: healthy, `is_live` lags a process by minutes and
+        # the files are the population, so consulting it would put sessions on the bench
+        # that finished before the run started.
+        wanted |= {sid for sid, row in db.items() if row.get("is_live")}
     need_note = {sid for sid in wanted
                  if not (db.get(sid) or {}).get("last_assistant_message_text")}
     notified, why_note = _orch_notifications(need_note)
@@ -8284,7 +8299,7 @@ def orch_join(arcs, sessions, repo=None):
     bench.sort(key=lambda r: r["state_at"] or "", reverse=True)
     bench.sort(key=lambda r: 0 if r["state"] == "busy" else 1)
     bench.sort(key=lambda r: 0 if r["arc"] else 1)
-    return bench, known, why
+    return bench, known, why, not why_live
 
 
 def _orch_snapshot(bench):
@@ -9552,7 +9567,7 @@ def main():
     # soon as it has answered, and one `git worktree list` for the repo test. Measured at
     # 30ms on the real corpus -- ten of that the worktree list, which has 253 of them --
     # against a pipeline whose git work alone is tens of seconds.
-    orch_bench, orch_known, orch_why = orch_join(arcs, sessions, args.repo)
+    orch_bench, orch_known, orch_why, orch_states = orch_join(arcs, sessions, args.repo)
     if not orch_known:
         print(f"  orch is unreadable, so what is running is unknown this run — "
               f"{orch_why}", file=sys.stderr)
@@ -9640,7 +9655,12 @@ def main():
                                       # here can half-answer; this one cannot -- the
                                       # status files ARE the population, so a run that
                                       # read them read all of them.
-                                      "orch": orch_known},
+                                      # `orch_states` and not `orch_known`: the
+                                      # comparison is between two busy/idle words and
+                                      # only the status files write those, so a run that
+                                      # lost that one source must not be one end of it --
+                                      # see orch_join.
+                                      "orch": orch_states},
                        args.repo.name, generated, reviews, reviews_approved, checkouts,
                        _orch_snapshot(orch_bench))
     prev, no_prev = load_snapshot(args.repo.name)
@@ -9819,6 +9839,12 @@ def main():
             # when `orch_known` is false.
             "orch_known": orch_known,
             "orch_why": orch_why,
+            # Narrower than `orch_known` and separate from it: whether busy/idle is known
+            # this run. A run that read orch's database but not Claude Code's status files
+            # knows which sessions exist and not one word about what any of them is doing,
+            # and a renderer that drew an idle dot on all of them would be inventing the
+            # calmest possible lie.
+            "orch_states_known": orch_states,
             # Somebody else's branches sitting in this repo with no work of yours on them
             # and no review of yours joined to them. They used to be workstreams, which was
             # a claim -- "you have 167 pieces of work on the go" counted fifteen directories
