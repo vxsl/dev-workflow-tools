@@ -561,3 +561,172 @@ ZZSEED
     page "$(cur_doc)" >"$TEST_TMPDIR/p.html"
     [ "$(grep -c 'id="ackseed">.*</script>' "$TEST_TMPDIR/p.html")" -eq 1 ]
 }
+
+# --- the queue as cards -------------------------------------------------------------------
+#
+# Kyle: "the questions section just looks like a wall of text, im assuming there's some more
+# graphical and/or semantic way to show it so i can understand what it's proposing at a
+# glance easier." Nothing below pins a word of copy. What is pinned is the grammar: which
+# question gets a picture, which gets none, how many cards are on the screen at once, and
+# that the ones behind the window are announced rather than dropped.
+
+cards_doc() {
+    python3 - <<'ZZCARDS'
+import json
+
+def br(n, **kw):
+    b = {"name": n, "sha": "a" * 7, "unpushed": 3, "commits_ahead": 3, "parents": []}
+    b.update(kw)
+    return b
+
+arc = {"id": "A", "label": "A", "kind": "cluster", "stage": "local-only",
+       "state": "local-only state", "urgency": 5, "age_days": 4, "engagement": 300,
+       "unpushed_live": 9, "unpushed_days": 4, "unpushed_dates": [],
+       "authoritative": "A-head", "counts": {"branches": 3},
+       "branches": [br("A-head"), br("A-cut", parents=["A-head"]), br("stray")],
+       "mrs": [], "stashes": [], "sessions": [], "issues": [], "demands": [],
+       "activity": {"invested": True, "series": [[40, 3], [38, 2], [36, 4]],
+                    "cliff_days": 36, "typical_gap_days": 2, "last_active": "2026-07-20"}}
+
+qs = [{"kind": "membership", "branch": "stray", "arc": "A", "arc_id": "A", "fp": "m1",
+       "confidence": 0.12, "why": "held by the corroboration floor", "with": "A-head",
+       "shared": 12, "files": ["src/one.py", "src/two.py"], "links": 1, "peers": 2,
+       "co_members": ["A-head", "A-cut"], "commits": 3, "age_days": 4,
+       "flagged_by_model": False, "authoritative": False},
+      {"kind": "residue", "arc": "A", "arc_id": "A", "fp": "r1", "fingerprint": "ff",
+       "branches": ["A-head"], "scale": "4 days of work", "days": 4, "commits": 9,
+       "cliff_days": 36, "gap_days": 2, "beats": 18.0, "at_risk_place": 2,
+       "why": "quiet against its own rhythm", "stage": "local-only"},
+      {"kind": "unticketed", "arc": "A", "arc_id": "A", "fp": "u1", "fingerprint": "gg",
+       "branches": ["A-head"], "scale": "4 days of work", "days": 4, "commits": 9,
+       "engagement": 300, "age_days": 4, "stage": "local-only", "file_as": [],
+       "why": "nothing in Jira names it"}]
+qs += [dict(qs[0], fp="m%d" % i, branch="stray%d" % i) for i in range(2, 8)]
+
+print(json.dumps({"generated": 1756000000, "repo": "ul", "main": "origin/main",
+                  "me": "kyle", "arc_count": 1, "arcs": [arc], "forgotten": [],
+                  "only_here": [], "curation": qs}))
+ZZCARDS
+}
+
+# The section is the whole queue and the window is how much of it is on the screen. A queue
+# truncated at emission could never be un-truncated here, so what the page does instead is
+# open one, strip a few, and say how many are behind them.
+@test "every question is a card, one is open, and the rest of the window is a strip" {
+    page "$(cards_doc)" >"$TEST_TMPDIR/p.html"
+    run python3 - "$TEST_TMPDIR/p.html" <<'ZZWIN'
+import re, sys
+html = re.sub(r'<script.*?</script>', '', open(sys.argv[1]).read(), flags=re.S)
+cur = re.search(r'<div class="cur".*?</details>', html, re.S).group(0)
+cards = re.findall(r'<div class="q( open)?"[^>]*?( hidden)?>', cur)
+print(len(cards), sum(1 for c in cards if c[0]), sum(1 for c in cards if c[1]))
+print("ANNOUNCED" if re.search(r'class="qmore"[^>]*>[^<]*4 more', cur) else "SILENT")
+print("WINDOW" if 'data-window="5"' in cur else "NO-WINDOW")
+ZZWIN
+    # Nine questions, one of them open, four of them past the window and announced.
+    [ "${lines[0]}" = "9 1 4" ]
+    [ "${lines[1]}" = "ANNOUNCED" ]
+    [ "${lines[2]}" = "WINDOW" ]
+}
+
+# A grouping question IS structural, so it is drawn: the arc's own tree, the questioned
+# branch ringed at the place the file overlap puts it, and the tie on a third edge
+# treatment -- solid already means "cut from" and dashed already means "the same commits
+# again", and this claim is neither.
+@test "a grouping question draws the tree and the tie it is asking about" {
+    page "$(cards_doc)" >"$TEST_TMPDIR/p.html"
+    run python3 - "$TEST_TMPDIR/p.html" <<'ZZTREE'
+import re, sys
+html = re.sub(r'<script.*?</script>', '', open(sys.argv[1]).read(), flags=re.S)
+card = re.search(r'<div class="q open" data-kind="membership".*?\n</div></div>',
+                 html, re.S).group(0)
+print("TREE" if '<div class="tree">' in card else "NO-TREE")
+print("PROPOSED" if 'class="edge prop"' in card else "NO-EDGE")
+print("NOT-COPY" if 'class="edge copy prop"' not in card else "BORROWED")
+print("RINGED" if 'class="askring"' in card else "NO-RING")
+print("TIE" if re.search(r'class="c tie"[^>]*>[^<]*12 shared files', card) else "NO-TIE")
+print("LEGEND" if "dotted" in card else "NO-LEGEND")
+print("METER" if 'class="meter"' in card else "NO-METER")
+print("CHIPS" if card.count('class="chip') >= 3 else "NO-CHIPS")
+ZZTREE
+    [ "${lines[0]}" = "TREE" ]
+    [ "${lines[1]}" = "PROPOSED" ]
+    [ "${lines[2]}" = "NOT-COPY" ]
+    [ "${lines[3]}" = "RINGED" ]
+    [ "${lines[4]}" = "TIE" ]
+    [ "${lines[5]}" = "LEGEND" ]
+    [ "${lines[6]}" = "METER" ]
+    [ "${lines[7]}" = "CHIPS" ]
+}
+
+# An intent question is temporal, so it gets the cliff picture with the moment the work
+# stopped marked. A no-ticket question gets none: the fact is an ABSENCE -- Jira has never
+# heard of any of it -- and a drawn absence is decoration.
+@test "an intent question draws its cliff and a no-ticket question draws nothing" {
+    page "$(cards_doc)" >"$TEST_TMPDIR/p.html"
+    run python3 - "$TEST_TMPDIR/p.html" <<'ZZDRAW'
+import re, sys
+html = re.sub(r'<script.*?</script>', '', open(sys.argv[1]).read(), flags=re.S)
+cur = re.search(r'<div class="cur".*?</details>', html, re.S).group(0)
+res = re.search(r'<div class="q"? ?[^>]*data-kind="residue".*?\n</div></div>',
+                cur, re.S).group(0)
+unt = re.search(r'<div class="q"? ?[^>]*data-kind="unticketed".*?\n</div></div>',
+                cur, re.S).group(0)
+print("SPARK" if 'class="spark"' in res else "NO-SPARK")
+print("MARKED" if 'class="stop"' in res else "UNMARKED")
+print("SCALE" if re.search(r'class="big">4 days of work', res) else "NO-SCALE")
+print("NO-DIAGRAM" if "<svg" not in unt else "DECORATED")
+print("SCALE-TOO" if re.search(r'class="big">4 days of work', unt) else "NO-SCALE")
+print("ROW-LINK" if 'href="#un-u1"' in unt else "NO-ROW-LINK")
+ZZDRAW
+    [ "${lines[0]}" = "SPARK" ]
+    [ "${lines[1]}" = "MARKED" ]
+    [ "${lines[2]}" = "SCALE" ]
+    [ "${lines[3]}" = "NO-DIAGRAM" ]
+    [ "${lines[4]}" = "SCALE-TOO" ]
+    # No gap fold on this document, so there is no row down there to point at.
+    [ "${lines[5]}" = "NO-ROW-LINK" ]
+}
+
+# The omnibus paragraph explained three question types and six outcomes above three
+# controls that share a page. A consequence belongs on the control that causes it.
+@test "every answer is a button carrying what it does" {
+    page "$(cards_doc)" >"$TEST_TMPDIR/p.html"
+    run python3 - "$TEST_TMPDIR/p.html" <<'ZZANS'
+import re, sys
+html = re.sub(r'<script.*?</script>', '', open(sys.argv[1]).read(), flags=re.S)
+cur = re.search(r'<div class="cur".*?</details>', html, re.S).group(0)
+btns = re.findall(r'<button type="button" data-a="([a-z]+)">'
+                  r'<span class="lb">[^<]+</span><span class="cq">([^<]+)</span>', cur)
+kinds = {}
+for a, says in btns:
+    kinds[a] = bool(says.strip())
+print(sorted(kinds), all(kinds.values()))
+print("NO-LINKS" if '<a ' not in re.search(r'<span class="yn">.*?</span>',
+                                           cur, re.S).group(0) else "LINKS")
+ZZANS
+    [ "${lines[0]}" = "['fine', 'intended', 'keep', 'noise', 'pry', 'residue', 'ticket'] True" ]
+    [ "${lines[1]}" = "NO-LINKS" ]
+}
+
+# The one answer whose consequence happens somewhere else, so the card points at the row it
+# would acknowledge -- and only where the fold actually rendered that row. An anchor into
+# nothing is a dead link in the one block whose whole claim is that its sentences check out.
+@test "a no-ticket card links the fold row it is about, and only where that row exists" {
+    run python3 - "$REPO_ROOT/bin/arcs-page" "$(cards_doc)" <<'ZZLINK'
+import json, re, subprocess, sys
+d = json.loads(sys.argv[2])
+d["gap"] = {"unticketed_work": [
+    {"id": "A", "label": "A", "gap_fp": "u1", "unpushed_live": 9, "unpushed_days": 4,
+     "counts": {"branches": 1, "sessions": 1}, "branches": [], "filing": {"options": []}}],
+    "tickets_without_work": [], "status_mismatch": []}
+r = subprocess.run([sys.executable, sys.argv[1], "--focus", "30"],
+                   input=json.dumps(d), capture_output=True, text=True)
+html = re.sub(r'<script.*?</script>', '', r.stdout, flags=re.S)
+cur = re.search(r'<div class="cur".*?</details>', html, re.S).group(0)
+print("LINKED" if 'href="#un-u1"' in cur else "UNLINKED")
+print("LANDS" if 'id="un-u1"' in html else "DANGLING")
+ZZLINK
+    [ "${lines[0]}" = "LINKED" ]
+    [ "${lines[1]}" = "LANDS" ]
+}
