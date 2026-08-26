@@ -189,16 +189,6 @@ notified() {
     ! notified
 }
 
-@test "prep composed for a standup that has been and gone is not delivered" {
-    # A page last built before Monday's call: its window closed at a meeting already given,
-    # so its notes are a record rather than a preparation.
-    write_sidecar "2026-08-24T10:30:00-07:00"
-    run "$NOTIFY_CMD" --at "$WED_BEFORE"
-    [ "$status" -eq 3 ]
-    ! notified
-    grep -q "has been and gone" "$LOG"
-}
-
 @test "prep built any time since the last standup is for the next one" {
     # The 07:10 Wednesday build and a Tuesday-afternoon build both name Wednesday 10:30,
     # because the window is the interval between two standups rather than the age of a file.
@@ -216,19 +206,107 @@ notified() {
     grep -q "nothing to report" "$LOG"
 }
 
-@test "no prep on disk is a logged refusal and not a crash" {
+# --- degrading, and saying so -----------------------------------------------------------
+#
+# The block failing to build is the morning its absence matters most, and the failure this
+# guards against is the one this whole program was written to end arriving in a new
+# costume: a person at 10:29 who has nothing, because the thing that had something never
+# said it had nothing. So the moment still gets its card -- the clock, the reason, the link
+# -- and the reason is on the screen rather than only in refresh.log.
+#
+# What makes that safe rather than a status bot is the gate order, and it is asserted from
+# both sides below: the clock is consulted before the prep is looked for, so an empty state
+# directory is silent every hour of the week except the one this speaks in.
+
+@test "a build that never wrote the prep still gets the moment announced" {
     run "$NOTIFY_CMD" --at "$WED_BEFORE"
-    [ "$status" -eq 3 ]
-    ! notified
-    grep -q "no prep on disk" "$LOG"
+    [ "$status" -eq 0 ]
+    notified
+    grep -q "=== Standup in 14 min — no prep to hand over" "$NOTIFY_LOG"
+    grep -q "nothing has built" "$NOTIFY_LOG"
+    grep -q "https://example.invalid/artifact" "$NOTIFY_LOG"
+    grep -q "handed over a pointer" "$LOG"
 }
 
-@test "a sidecar that is not JSON is a logged refusal and not a crash" {
+@test "a sidecar that will not parse says which failure it was, not just that one happened" {
+    # A build that never ran wants arcs; a build that ran and wrote this wants looking at.
+    # A person with fourteen minutes can only act on the one they can name.
     echo 'not json at all' >"$SIDECAR"
+    run "$NOTIFY_CMD" --at "$WED_BEFORE"
+    [ "$status" -eq 0 ]
+    grep -q "will not parse" "$NOTIFY_LOG"
+    ! grep -q "nothing has built" "$NOTIFY_LOG"
+}
+
+@test "prep composed for a standup that has been and gone is replaced, not delivered" {
+    # A page last built before Monday's call: its window closed at a meeting already given,
+    # so its notes are a record rather than a preparation. None of them reaches the screen.
+    write_sidecar "2026-08-24T10:30:00-07:00"
+    run "$NOTIFY_CMD" --at "$WED_BEFORE"
+    [ "$status" -eq 0 ]
+    grep -q "has been and gone" "$NOTIFY_LOG"
+    ! grep -q "UL-1852 landed" "$NOTIFY_LOG"
+    grep -q "handed over a pointer" "$LOG"
+}
+
+@test "the clock is asked before the prep, so a missing page is silent out of the window" {
+    # The whole of what keeps the degradation from being a notification about a state
+    # directory. Same absent sidecar as the first test in this section, wrong quarter hour.
+    run "$NOTIFY_CMD" --at "$WED_MORNING"
+    [ "$status" -eq 3 ]
+    ! notified
+    grep -q "15 minutes before one" "$LOG"
+}
+
+@test "a missing page on a day with no standup is silent" {
+    run "$NOTIFY_CMD" --at "$TUE_BEFORE"
+    [ "$status" -eq 3 ]
+    ! notified
+}
+
+@test "a pointer spends the morning's one interruption" {
+    # Having said the page did not build, saying it again four minutes later is the nagging
+    # this refuses to do -- and a build that lands at 10:17 does not get to re-announce it.
+    run "$NOTIFY_CMD" --at "$WED_BEFORE"
+    [ "$status" -eq 0 ]
+    write_sidecar
+    run "$NOTIFY_CMD" --at "2026-08-26T10:20:00-07:00"
+    [ "$status" -eq 3 ]
+    [ "$(grep -c '^===' "$NOTIFY_LOG")" -eq 1 ]
+    grep -q "already delivered" "$LOG"
+}
+
+@test "a block that built and is empty stays silent rather than degrading" {
+    # The one silence that stays: this is a finished report, not a failed build, and
+    # pointing at a page to say there is nothing on it is the worst ratio here.
+    write_sidecar "2026-08-26T10:30:00-07:00" true
     run "$NOTIFY_CMD" --at "$WED_BEFORE"
     [ "$status" -eq 3 ]
     ! notified
-    grep -q "no prep on disk" "$LOG"
+    grep -q "nothing to report" "$LOG"
+}
+
+@test "force shows the stale block rather than a pointer, because it was asked for" {
+    # --force is somebody asking to see what is there. A pointer is not an answer to that.
+    write_sidecar "2026-08-24T10:30:00-07:00"
+    run "$NOTIFY_CMD" --force --at "$WED_BEFORE"
+    [ "$status" -eq 0 ]
+    grep -q "UL-1852 landed" "$NOTIFY_LOG"
+    grep -q "force past staleness" "$LOG"
+}
+
+@test "a pointer that cannot be delivered is a failure like any other" {
+    export WORK_ARCS_NOTIFY="$TEST_TMPDIR/nothing-here"
+    run "$NOTIFY_CMD" --at "$WED_BEFORE"
+    [ "$status" -eq 1 ]
+    [ ! -f "$MARKER" ]
+}
+
+@test "check names the pointer as its own outcome" {
+    run "$NOTIFY_CMD" --check --at "$WED_BEFORE"
+    [ "$status" -eq 0 ]
+    [[ "$output" == "would notify with a pointer: "* ]]
+    ! notified
 }
 
 # --- once, and only once --------------------------------------------------------------

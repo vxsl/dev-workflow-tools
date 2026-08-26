@@ -37,8 +37,8 @@ is here to recover Friday afternoon, not this morning.
 That is also the freshness test, and it is exact rather than a guess at an age: the sidecar
 records the standup it was composed for, and it is delivered only when that is the standup
 about to happen. A page built any time since Monday's call is prep for Wednesday's. A page
-built before Monday's call is prep for a meeting that has been and gone -- and that is
-silence plus a line in the log, never the wrong eight lines.
+built before Monday's call is prep for a meeting that has been and gone -- and what that
+gets is the pointer below, never the wrong eight lines.
 
 The sidecar is `standup.json` beside the page, written by `arcs` at the end of a finished
 build. It carries `text` verbatim, which is the field the page's copy button also carries,
@@ -66,10 +66,24 @@ claude-notify.sh sits behind it for a machine with no GTK or no display. See `su
 **It gives, and never asks.** No question, no queue, no "did you update the board" -- the
 shape being avoided here is a status bot, and a prompt that arrives uninvited is one the
 eye learns to skip. At most one notification per standup, recorded in a marker beside the
-sidecar. Silence when the block has nothing to say, and silence on every failure: what a
-failure gets is a line in refresh.log, because a job nobody watches has to be able to say
-what it did and an unexplained silence is the one thing this whole workstream keeps
-relearning.
+sidecar, and the pointer below spends that one just as the block does.
+
+**When the block is not there, the moment still is.** A build that never ran, a sidecar
+that will not parse, a page not rebuilt since the last call -- in the quarter hour before a
+standup each of those is answered with a short card carrying the clock, the sentence naming
+which of them happened, and the link. That is the shape the 10:15 popup had before any of
+this, kept for exactly the case it was always right for: correct notes are what this
+delivers, and knowing there are none is worth more than a silence indistinguishable from
+the timer being off. The degradation is on the screen and not only in refresh.log, because
+that file is read after something has gone wrong and been noticed, and being noticed is the
+part that was missing. The gate order is what keeps this from becoming the status bot: the
+clock is asked first, so a half-written state directory on a Tuesday is silent and the same
+directory at 10:15 on a Wednesday is not. See `decide`.
+
+The one silence that stays is a block that built and is empty. That is a finished report
+rather than a failure, and pointing at a page to say there is nothing on it is the worst
+ratio this could send. Every refusal still writes its sentence to refresh.log, because a
+job nobody watches has to be able to say what it did.
 
     arc-standup-notify                  gate on the clock, then notify -- what the timer runs
     arc-standup-notify --check          say what it would do and why, and do nothing
@@ -88,11 +102,14 @@ Tuning, read from .env or the environment:
     WORK_ARCS_NOTIFY_MARKUP  set to 1 when that one parses its body as Pango markup
     STANDUP_NOTIFY_ACCENT  the popup's border colour                      (#a8d8a8)
 
-Exit codes are distinct because a unit reads them: 0 delivered, 3 decided not to
+Exit codes are distinct because a unit reads them: 0 delivered -- the block or the
+pointer, both of them being something that reached the screen -- 3 decided not to
 speak and said why in the log, 1 it should have spoken and the delivery failed, 2 a
 bad argument. Only 1 is a failure -- the timer's unit names 3 in SuccessExitStatus,
 because "today is not a standup day" sitting in `systemctl --user status` as a red
-line is how a status command trains you to stop reading it.
+line is how a status command trains you to stop reading it. A pointer is 0 rather
+than its own code for the same reason: it is the degraded mode working, and the log
+line saying so is where that belongs.
 """
 
 import argparse
@@ -191,11 +208,24 @@ def log(msg):
 # time, and have I already handed it over.
 
 def read_sidecar():
+    """The prep, and -- when there is none -- which kind of nothing it is.
+
+    Told apart because the two nothings read differently at 10:15 and are fixed by
+    different things: a file that was never written means no build has finished since the
+    last standup, and a file that will not parse means one finished and wrote something
+    broken. Both degrade to the same pointer, and the person reading it needs the sentence.
+    """
     try:
-        data = json.loads(SIDECAR.read_text())
-    except (OSError, ValueError):
-        return None
-    return data if isinstance(data, dict) else None
+        raw = SIDECAR.read_text()
+    except OSError:
+        return None, f"nothing has built {SIDECAR} since the last standup"
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return None, f"the prep at {SIDECAR} will not parse"
+    if not isinstance(data, dict):
+        return None, f"the prep at {SIDECAR} is not the shape a finished build writes"
+    return data, None
 
 
 def read_marker():
@@ -224,44 +254,33 @@ def fmt_minutes(mins):
     return f"{hours / 24:.0f}d"
 
 
-def decide(cad, st, now, lead, force=False):
-    """Whether to speak, and the sentence that says why either way.
+def decide(cad, st, missing_why, now, lead, force=False):
+    """What to say, and the sentence that says why.
 
-    Returns (fire, why, overrode) -- `overrode` naming the gates --force walked past, so a
-    forced delivery cannot be mistaken in the log for one the clock asked for.
+    Returns (mode, why, overrode). `mode` is "full" when the composed block is ready to
+    hand over, "pointer" when the moment has come and the block has not, and "silent" when
+    this is not the moment. `overrode` names the gates --force walked past, so a forced
+    delivery cannot be mistaken in the log for one the clock asked for.
+
+    **The clock is asked before the prep, and that order is the whole of the degradation.**
+    A page that failed to build is worth interrupting somebody about only in the quarter
+    hour they were going to be interrupted anyway. Asked the other way round -- prep first,
+    the order this had when silence was its only refusal -- every afternoon with a
+    half-written state directory becomes a notification, which is the status bot this is
+    written not to be.
+
+    Every refusal is still a sentence rather than a boolean, because the only witness to a
+    morning this said nothing on is the log, and "no" is not a diagnosis.
     """
     overrode = []
-    if st is None:
-        return False, ("no prep on disk — nothing has built "
-                       f"{SIDECAR} yet (run arcs)"), overrode
 
     target = (cad.get("for") or {}).get("iso")
     if not target:
-        return False, "the cadence names no upcoming standup", overrode
-
-    # The freshness test, and the whole of it: the prep names the meeting it was composed
-    # for. Same meeting, right window -- a build from any time since the last standup was
-    # computing this exact interval. A different meeting means the page has not been
-    # rebuilt since that one happened, and its notes are a record of a call already given.
-    built_for = (st.get("for") or {}).get("iso")
-    if built_for != target:
-        was = (st.get("for") or {}).get("when") or "an earlier standup"
-        why = (f"the prep on disk is for {was}, which has been and gone — nothing has "
-               "rebuilt the page since")
-        if not force:
-            return False, why, overrode
-        overrode.append("staleness")
-
-    if st.get("empty"):
-        why = "nothing to report in this window — saying so out loud is the standup's job"
-        if not force:
-            return False, why, overrode
-        overrode.append("an empty block")
-
+        return "silent", "the cadence names no upcoming standup", overrode
     try:
         when = datetime.fromisoformat(target)
     except ValueError:
-        return False, f"the cadence gave an unreadable instant ({target!r})", overrode
+        return "silent", f"the cadence gave an unreadable instant ({target!r})", overrode
     minutes = (when - now).total_seconds() / 60.0
 
     # Open on one side only. Below zero cannot happen -- arc-standup's `for` is the next
@@ -272,31 +291,88 @@ def decide(cad, st, now, lead, force=False):
         why = (f"{day}'s standup is {fmt_minutes(minutes)} away — this speaks in the "
                f"{lead} minutes before one, and never after it has started")
         if not force:
-            return False, why, overrode
+            return "silent", why, overrode
         overrode.append("the clock")
 
     seen = read_marker().get("for")
     if seen == target:
         why = f"already delivered for {(cad.get('for') or {}).get('day', 'this standup')}"
         if not force:
-            return False, why, overrode
+            return "silent", why, overrode
         overrode.append("the once-a-standup marker")
 
-    ago = fmt_minutes(minutes)
-    return True, (f"{(cad.get('for') or {}).get('when', 'the standup')} is {ago} away"
-                  + (f" (--force past {', '.join(overrode)})" if overrode else "")), overrode
+    # Past here the moment is real -- a standup morning, inside the window, nobody told yet
+    # -- and something reaches the screen unless the block itself is the reason not to.
+
+    if st is None:
+        return "pointer", missing_why, overrode
+
+    # The freshness test, and the whole of it: the prep names the meeting it was composed
+    # for. Same meeting, right window -- a build from any time since the last standup was
+    # computing this exact interval. A different meeting means the page has not been
+    # rebuilt since that one happened, and its notes are a record of a call already given.
+    # Under --force it is handed over regardless: somebody who typed --force is asking to
+    # see what is there, and a pointer is not an answer to that question.
+    built_for = (st.get("for") or {}).get("iso")
+    if built_for != target:
+        was = (st.get("for") or {}).get("when") or "an earlier standup"
+        why = (f"the prep on disk is for {was}, which has been and gone — nothing has "
+               "rebuilt the page since")
+        if not force:
+            return "pointer", why, overrode
+        overrode.append("staleness")
+
+    # A built block with nothing in it is the one silence that stays, and it is not a
+    # degradation: it is a finished report that happens to be empty. Interrupting somebody
+    # to point at a page and say there is nothing on it is the worst ratio here.
+    if st.get("empty"):
+        why = "nothing to report in this window — saying so out loud is the standup's job"
+        if not force:
+            return "silent", why, overrode
+        overrode.append("an empty block")
+
+    return "full", (f"{(cad.get('for') or {}).get('when', 'the standup')} is "
+                    f"{fmt_minutes(minutes)} away"), overrode
 
 
 # --------------------------------------------------------------------------- delivery
 
-def summary_line(cad, now):
+def lead_phrase(cad, now):
+    """How long is left, which is the half of the summary both kinds of card share."""
     head = cad.get("for") or {}
     try:
         mins = (datetime.fromisoformat(head["iso"]) - now).total_seconds() / 60.0
-        lead = f"in {fmt_minutes(mins)}"
+        return f"Standup in {fmt_minutes(mins)}"
     except (KeyError, ValueError):
-        lead = "soon"
-    return f"Standup {lead} — {head.get('when', 'next')}"
+        return "Standup soon"
+
+
+def summary_line(cad, now):
+    return f"{lead_phrase(cad, now)} — {(cad.get('for') or {}).get('when', 'next')}"
+
+
+def pointer(cad, now, why):
+    """The card for the morning the block is not there: the clock, the reason, the link.
+
+    This is the shape the 10:15 popup had before any of this existed -- a nudge and a URL
+    -- and it is kept for exactly the case that shape was always right for. A page that
+    failed to build is the morning somebody most needs telling, and telling them in
+    refresh.log is telling nobody: the file is read when something has already gone wrong
+    and been noticed, which is the state this is trying to prevent.
+
+    It says which failure it hit rather than "unavailable", because the two have different
+    repairs -- a build that never ran wants `arcs`, a build that ran and wrote a broken
+    sidecar wants looking at -- and a person with fourteen minutes can only act on the one
+    they can name. The link is the last line either way, in the same place the full card
+    puts it, so the click is in the same place whichever card arrived.
+    """
+    head = cad.get("for") or {}
+    day = (head.get("day") or "the next").upper()
+    lines = [f"FOR {day}'S STANDUP — the notes are not there.", "", why + ".", ""]
+    url = os.environ.get("WORK_ARCS_ARTIFACT_URL", "").strip()
+    lines.append(url if url else
+                 "No WORK_ARCS_ARTIFACT_URL to point at either — run arcs.")
+    return f"{lead_phrase(cad, now)} — no prep to hand over", "\n".join(lines)
 
 
 def body_text(st):
@@ -516,28 +592,39 @@ def main(argv=None):
         return install_timer(cad, lead)
 
     now = cad["now"]
-    st = read_sidecar()
+    st, missing_why = read_sidecar()
 
     if args.show:
         if st is None:
-            print(f"arc-standup-notify: no prep at {SIDECAR}", file=sys.stderr)
+            print(f"arc-standup-notify: {missing_why}", file=sys.stderr)
             return 3
         sys.stdout.write(body_text(st) + "\n")
         return 0
 
-    fire, why, _ = decide(cad, st, now, lead, force=args.force)
+    mode, why, overrode = decide(cad, st, missing_why, now, lead, force=args.force)
+    # The force annotation is on the log line and never on the card. The log has to be able
+    # to tell a delivery the clock asked for from one a person did; the person holding the
+    # screen already knows which they typed.
+    detail = why + (f" (--force past {', '.join(overrode)})" if overrode else "")
 
     # The same code the real run would exit with, so `--check && something` reads the way
     # it looks and a person comparing the two is not comparing two conventions.
     if args.check:
-        print(("would notify: " if fire else "would say nothing: ") + why)
-        return 0 if fire else 3
+        print({"full": "would notify: ",
+               "pointer": "would notify with a pointer: ",
+               "silent": "would say nothing: "}[mode] + detail)
+        return 3 if mode == "silent" else 0
 
-    if not fire:
-        log(f"said nothing — {why}")
+    if mode == "silent":
+        log(f"said nothing — {detail}")
         return 3
 
-    ok, err = deliver(summary_line(cad, now), body_text(st))
+    if mode == "pointer":
+        summary, body = pointer(cad, now, why)
+    else:
+        summary, body = summary_line(cad, now), body_text(st)
+
+    ok, err = deliver(summary, body)
     if not ok:
         log(f"prep was ready and could not be delivered — {err}")
         return 1
@@ -549,10 +636,17 @@ def main(argv=None):
     # Not on --force, and this is not a detail: --force is a person asking to see it now,
     # and burning the morning's one automatic delivery to answer that would make looking at
     # the thing the reason it never arrived.
+    #
+    # The pointer spends it too. It is the morning's interruption, and having said "the
+    # page did not build" once, saying it again at 10:16 is the nagging this refuses to do.
     if not args.force:
         write_marker((cad.get("for") or {}).get("iso"), now)
+
+    if mode == "pointer":
+        log(f"handed over a pointer instead of the prep — {detail}")
+        return 0
     said = sum(len(b.get("items") or []) for b in st.get("beats") or [])
-    log(f"delivered {said} line" + ("" if said == 1 else "s") + f" — {why}")
+    log(f"delivered {said} line" + ("" if said == 1 else "s") + f" — {detail}")
     return 0
 
 

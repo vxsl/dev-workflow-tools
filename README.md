@@ -1018,9 +1018,17 @@ arc-standup --at 2026-08-24T09:00  # any standup's window, without waiting for i
 The block above was correct for weeks and was not being used, because correct is not the
 same as present: it sits on a page you have to remember to open, and the quarter hour
 before a call is exactly when nobody remembers a page exists. Two weeks of measurement
-found not one of the page's own controls ever touched. So the same eight lines now arrive
-on the screen at 10:15 on a standup morning — a desktop notification carrying the block
-verbatim, with the artifact URL as its last line.
+found not one of the page's own controls ever touched. So the same lines now arrive on the
+screen at 10:15 on a standup morning — a popup carrying the block verbatim, with the
+artifact URL as its last line.
+
+**The popup rather than a notification, because of how tall the block is.** dunst caps a
+notification at about thirteen lines and the composed block runs past twenty, so what a
+notification silently drops is its tail: BLOCKED / ASKS and IN FRONT OF YOU, the two beats
+you can act on during the call. `claude-notify-popup.py` sizes its window to its content;
+`claude-notify.sh` sits behind it for a machine with no GTK or no display, and a fall to it
+writes a line to `refresh.log` rather than quietly running in the degraded mode for a
+month.
 
 **It delivers the morning's composition rather than a fresh one**, and that is a choice
 rather than a shortcut. A re-run at 10:10 would cost model calls, would have to sit behind
@@ -1043,17 +1051,47 @@ calendar on every run through `arc-standup`'s own `cadence()`. A cadence changed
 and never reinstalled costs a wasted wake-up, never a wrong one.
 
 **It gives and never asks**, which is the whole difference between this and a status bot.
-No question, no queue, at most one notification per standup, and silence when the block has
-nothing in it. It is silent on failure too — every refusal writes a sentence to
-`refresh.log` instead, because an unexplained absence is the failure this workstream keeps
-rediscovering. Five refusals it will log by name: no prep on disk, prep composed for a
-standup that has been and gone, an empty block, the wrong quarter hour, and one already
-delivered this morning.
+No question, no queue, at most one interruption per standup, and silence when the block
+built and has nothing in it — that is a finished report rather than a failure, and pointing
+at a page to say there is nothing on it is the worst ratio it could send.
+
+**When the block is not there, the moment still is.** A build that never ran, a sidecar
+that will not parse, a page not rebuilt since the last call — in the quarter hour before a
+standup each of those gets a short card instead: the clock, the sentence naming which of
+the three happened, and the link. That is the shape the 10:15 popup had before any of this
+existed, kept for exactly the case it was always right for, because knowing there are no
+notes is worth more than a silence indistinguishable from the timer being off. It says
+which failure it hit rather than "unavailable" — a build that never ran wants `arcs`, a
+build that wrote a broken sidecar wants looking at, and with fourteen minutes you can only
+act on the one you can name. The degradation is on the screen and not only in
+`refresh.log`, because that file gets read *after* something has gone wrong and been
+noticed, and being noticed was the part that was missing.
+
+What keeps that from being a notification about a state directory is the gate order: the
+clock is asked **before** the prep is looked for. An empty state directory is silent every
+hour of the week except the one this speaks in. And the card spends the morning's one
+interruption just as the block does — having said the page did not build, saying it again
+at 10:16 is the nagging this refuses to do. Every refusal still writes its sentence to
+`refresh.log`: the wrong quarter hour, a day with no standup, an empty block, and one
+already delivered this morning.
+
+`--force` is the one exception to the degrading, and deliberately: somebody who typed it is
+asking to see what is there, so stale prep is handed over rather than replaced by a pointer
+— and it never spends the morning's automatic delivery, because looking at the thing must
+not become the reason it never arrived.
 
 Env: `STANDUP_NOTIFY_LEAD` (15 minutes before the standup), `WORK_ARCS_ARTIFACT_URL` (the
-line that makes the page reachable from the popup) and `WORK_ARCS_NOTIFY` (the notifier,
-`~/bin/notification/claude-notify.sh`). The cadence knobs are `arc-standup`'s, shared
-rather than duplicated.
+line that makes the page reachable from the popup), `STANDUP_NOTIFY_ACCENT` (the popup's
+border colour, fixed rather than per-session so the card is recognisable before it is
+read), and `WORK_ARCS_NOTIFY` (one notifier instead of the two above, with
+`WORK_ARCS_NOTIFY_MARKUP=1` when it parses its body as Pango markup). The cadence knobs are
+`arc-standup`'s, shared rather than duplicated.
+
+Exit codes are distinct because the unit reads them: `0` reached the screen — the block or
+the card — `3` declined and said why in the log, `1` should have spoken and the delivery
+failed. Only `1` is a failure; the unit names `3` in `SuccessExitStatus`, because "today is
+not a standup day" showing red in `systemctl --user status` three mornings a week is how a
+status command trains you to stop reading it.
 
 ```bash
 arc-standup-notify --install-timer   # Mon,Wed,Fri 10:15, derived from the cadence
