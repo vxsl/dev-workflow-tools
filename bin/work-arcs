@@ -2843,7 +2843,13 @@ def apply_dismissals(ledger, arcs=None, gap=None, prune=False):
     you have acknowledged is no longer news.
     """
     store = load_store(DISMISSED, "the dismissal store")
-    live = {}
+    # `field` is how a universe says what word to write the mark under. Everything that
+    # arrived here first uses `dismissed`, and the two gap folds cannot: their rows are the
+    # arc and the issue themselves, objects the rest of the page renders on their own
+    # terms, and marking a workstream `dismissed` would read as the workstream having been
+    # acknowledged rather than the one sentence about its missing ticket. Same store, same
+    # expiry, same click -- its own word.
+    live, field = {}, {}
     for e in (ledger["they_owe"] + ledger["you_owe"]) if ledger else []:
         live[e["fp"]] = e
     for arc in arcs or []:
@@ -2859,6 +2865,17 @@ def apply_dismissals(ledger, arcs=None, gap=None, prune=False):
     for m in (gap or {}).get("status_mismatch") or []:
         if m.get("fp"):
             live[m["fp"]] = m
+    # The two folds that had no ✕ at all until now. Both are pruned on the same gate as
+    # everything else -- `gap is not None` is already in it, so a run that could not reach
+    # Jira never deletes an acknowledgement on a row it could not build.
+    for a in (gap or {}).get("unticketed_work") or []:
+        if a.get("gap_fp"):
+            live[a["gap_fp"]] = a
+            field[a["gap_fp"]] = "gap_dismissed"
+    for i in (gap or {}).get("tickets_without_work") or []:
+        if i.get("gap_fp"):
+            live[i["gap_fp"]] = i
+            field[i["gap_fp"]] = "gap_dismissed"
     # Only a positive verdict is dismissable. The negative ones exist so a consumer can ask
     # why an arc was *not* called forgotten, and there is nothing there to acknowledge --
     # putting them in this universe would fill the store with rows nobody can ever click.
@@ -2870,7 +2887,7 @@ def apply_dismissals(ledger, arcs=None, gap=None, prune=False):
         expired = {k: v for k, v in store.items() if k not in live}
         for k, v in expired.items():
             del store[k]
-            print(f"  dismissal of {v.get('ref', k)} expired — the fact under it "
+            print(f"  dismissal of {v.get('ref') or k} expired — the fact under it "
                   "moved", file=sys.stderr)
         if expired:
             try:
@@ -2879,7 +2896,7 @@ def apply_dismissals(ledger, arcs=None, gap=None, prune=False):
                 pass
     for k in store:
         if k in live:
-            live[k]["dismissed"] = True
+            live[k][field.get(k, "dismissed")] = True
     for arc in arcs or []:
         arc["notify"] = [d for d in arc.get("notify", [])
                          if not d.get("dismissed")]
@@ -3863,6 +3880,30 @@ def reconcile(arcs, issues):
     # reopen an acknowledged row every morning, which is the one thing a ✕ must not do.
     for m in mismatched:
         m["fp"] = _dfp("gap", m["issue"]["key"], m["why"])
+    # The other two folds, fingerprinted on the same contract and for the reason the
+    # mismatch rows were: every row on this page that states a fact a person can have
+    # already dealt with needs a way to say so, and these two were the last that had none.
+    # "Real work with no ticket" is the fold Kyle named -- some of its rows are work that
+    # is genuinely fine without one, and with no ✕ on them the only way to stop the page
+    # repeating them was to file paperwork nobody wanted.
+    #
+    # `gap_fp` and not `fp`, because the row IS the arc and IS the issue: these lists hold
+    # the same objects the workstream cards and the ticket rows elsewhere render, and a
+    # bare `fp` on an arc would collide with the meaning `fp` already has everywhere else
+    # on this page -- a fact about a demand, a ledger row, a thread. The acknowledgement is
+    # of one sentence about the workstream, never of the workstream.
+    for a in unticketed:
+        # The tips, so the acknowledgement is of THIS work having no ticket. Another day's
+        # commits land and the row comes back, which is right: "I know, and it is fine"
+        # was said about a half-day experiment, not about the week it has since become.
+        # The two other ways this row stops being true -- it gains a ticket, or the work
+        # settles -- delete the row itself, and the prune takes the acknowledgement with it.
+        a["gap_fp"] = _dfp("unticketed", a["id"], a.get("fingerprint"))
+    for i in no_work:
+        # The status, so correcting the ticket revives the row. Nothing about work is in it
+        # because there is none: this row exists precisely because no branch, no session and
+        # no merge request names this key, and the moment one does the row is gone.
+        i["gap_fp"] = _dfp("no-work", i["key"], i.get("status"))
     return {"unticketed_work": unticketed, "tickets_without_work": no_work,
             "status_mismatch": mismatched}
 
@@ -4660,6 +4701,9 @@ def question_line(q):
     if q.get("kind") == "residue":
         return (f"{q['arc'][:38]:<38}  {q['scale']:>10}  "
                 f"still intended work?  ({q['why']})")
+    if q.get("kind") == "unticketed":
+        return (f"{q['arc'][:38]:<38}  {q['scale']:>10}  "
+                f"real work that needs a ticket?  ({q['why']})")
     size = f"+{q['commits']}" if q["commits"] else "no commits"
     mark = " ← the arc's own MR" if q.get("authoritative") else ""
     return (f"{q['branch'][:38]:<38}  {size:>10}  "
@@ -4731,14 +4775,58 @@ def question_preview(q):
     return "\n".join(out)
 
 
+def unticketed_preview(q):
+    """The evidence for a no-ticket question: how much work, and what would file it.
+
+    Same shape as the other two previews and for the same reason -- one layout across a
+    mixed queue, so a reader never has to work out which kind of question they are on
+    before they can read it. What differs is the last block: this is the only question
+    whose "yes" is an action somewhere else, so the command that carries it out is printed
+    with the question rather than left for the person to go and look up.
+    """
+    out = [f"{q['arc']}", ""]
+    out.append(f"  {q['scale']} across {len(q['branches'])} branch"
+               f"{'' if len(q['branches']) == 1 else 'es'}, "
+               f"and Jira has never heard of any of it.")
+    out.append("")
+    out.append(f"  last touched            {q['age_days']} days ago")
+    out.append(f"  still outstanding       {q['commits']} unpushed, rung {q['stage']}")
+    out.append(f"  weight of evidence      {q['engagement']}")
+    if q.get("file_as"):
+        out.append("  a key it could take     "
+                   + ", ".join(o["key"] for o in q["file_as"]))
+    out.append("")
+    for n in q["branches"][:8]:
+        out.append(f"    {n}")
+    if len(q["branches"]) > 8:
+        out.append(f"    … and {len(q['branches']) - 8} more")
+    out.append("")
+    out.append("  y  yes, it needs one — nothing is written; the row stays, which is")
+    out.append("     what wanting a ticket looks like. To file it now:")
+    out.append(f"       work-arcs --jira-ify {shlex.quote(q['arc'])}")
+    out.append("  n  fine without one — real work, no paperwork wanted; the row is")
+    out.append("     acknowledged and comes back if the work grows")
+    out.append("  x  noise — not work worth a row; acknowledged the same way, and the")
+    out.append("     answer is recorded as a different judgement from n")
+    out.append("  s  skip — no record either way; it comes back next build")
+    return "\n".join(out)
+
+
 def curate(queue, cluster_assign):
     """`--curate`: answer what this build is least sure of, one keystroke each.
 
-    Two kinds of question and one keystroke vocabulary. Membership asks "is this branch
-    this work?" and residue asks "is this still intended work?", and in both `y` means the
-    derivation is right and `n` means it is not -- so a person answers a mixed queue
-    without having to hold two mappings in their head. Which question they are on is said
-    by the row and spelled out in full by its preview.
+    Three kinds of question and one keystroke vocabulary. Membership asks "is this branch
+    this work?", residue asks "is this still intended work?", and no-ticket asks "does this
+    need a ticket?" -- and in all three `y` means the derivation is right and `n` means it
+    is not, so a person answers a mixed queue without having to hold three mappings in
+    their head. Which question they are on is said by the row and spelled out in full by
+    its preview.
+
+    `x` is the one key that is not universal, and it exists because one question has three
+    honest answers rather than two: "fine without a ticket" and "noise" both stop the row
+    shouting and are not the same judgement, and an eval set that cannot tell them apart
+    cannot score any change to what `unticketed_work` selects. Where a question has no
+    third answer, `x` is a skip -- pressing an unoffered key must never record something.
 
     The whole loop exists because the clustering's residual error needs a human and an
     unguided human does not curate. So the rules are about the asking, not the answering:
@@ -4773,9 +4861,10 @@ def curate(queue, cluster_assign):
         # question by parsing the rendered line back would be a parser waiting to meet a
         # branch called `a b`; carrying the key is not.
         for q in queue:
-            (tmp / q["fp"]).write_text(residue_preview(q)
-                                       if q.get("kind") == "residue"
-                                       else question_preview(q))
+            (tmp / q["fp"]).write_text(
+                residue_preview(q) if q.get("kind") == "residue"
+                else unticketed_preview(q) if q.get("kind") == "unticketed"
+                else question_preview(q))
         pending = list(queue)
         answered = 0
         while pending:
@@ -4783,8 +4872,8 @@ def curate(queue, cluster_assign):
             r = subprocess.run(
                 [fzf, "--ansi", "--reverse", "--height=100%", "--info=inline",
                  "--pointer=▶", "--no-multi", "--no-sort", "--cycle",
-                 "--delimiter=\t", "--with-nth=2..", "--expect=y,n,s",
-                 "--header", f"y yes · n no · s skip · esc done   "
+                 "--delimiter=\t", "--with-nth=2..", "--expect=y,n,x,s",
+                 "--header", f"y yes · n no · x noise · s skip · esc done   "
                              f"({len(pending)} left, {answered} answered)",
                  "--prompt", "is the derivation right? > ",
                  "--preview", f"cat {shlex.quote(str(tmp))}/{{1}}",
@@ -4794,9 +4883,21 @@ def curate(queue, cluster_assign):
             key = parts[0].strip() if parts else ""
             fp = parts[1].split("\t", 1)[0] if len(parts) > 1 else ""
             q = next((x for x in pending if x["fp"] == fp), None)
-            if not q or key not in ("y", "n"):
+            if not q or key not in ("y", "n", "x"):
                 break                       # esc, s, or nothing selected: leave it be
-            if q.get("kind") == "residue":
+            if key == "x" and q.get("kind") != "unticketed":
+                break                       # a key this question does not offer is a skip
+            if q.get("kind") == "unticketed":
+                ans = {"y": "ticket", "n": "fine", "x": "noise"}[key]
+                answer_unticketed(q, ans)
+                print({"ticket": f"  ✓ wants a ticket  {q['arc']} — "
+                                 f"work-arcs --jira-ify {shlex.quote(q['arc'])}",
+                       "fine": f"  ✕ fine unfiled    {q['arc']} — acknowledged; "
+                               "back if the work grows",
+                       "noise": f"  ✕ noise           {q['arc']} — acknowledged; "
+                                "back if the work grows"}[ans],
+                      file=sys.stderr)
+            elif q.get("kind") == "residue":
                 answer_residue(q, key == "y")
                 print(f"  {'✓ intended' if key == 'y' else '✕ residue '}  {q['arc']}"
                       + ("" if key == "y"
@@ -5351,22 +5452,129 @@ def answer_residue(q, intended):
 RESIDUE_SLOTS = int(os.environ.get("ARC_RESIDUE_SLOTS", "1"))
 
 
-def combined_queue(memberships, residues, cap=CURATION_CAP, floor=RESIDUE_SLOTS):
+def unticketed_queue(gap, cap=CURATION_CAP):
+    """The workstreams Jira has never heard of, worth asking about, biggest first.
+
+    The fold this reads from is the one Kyle named: "'real work with no ticket' has some
+    items that i need to be able to dismiss easily". Giving those rows a ✕ is half the
+    answer and it is the passive half -- the person has to go to the fold, read it and act.
+    The queue is the active half: the same rows, offered where questions already get
+    answered, in the one place on this page a person has already agreed to be asked things.
+
+    One question per workstream and no exclusions of its own, because the selection is
+    already `reconcile`'s and it is a strict one: an arc with a ticket is out, an arc with
+    nothing outstanding is out (see `outstanding` -- a ticket opened for work that already
+    shipped is paperwork nobody will ever close), and so is anything under the engagement
+    floor or past thirty days. What is left is exactly the set the fold prints, so a
+    question here can never be about a row a reader cannot find.
+
+    Acknowledged rows are out, and that is the loop closing rather than a filter: `n` and
+    `x` write the same acknowledgement the fold's ✕ writes, so answering a question here
+    removes the row from the fold, from the lede's count and from this queue at once. A
+    question a person has already answered coming back next morning is the single fastest
+    way to teach someone that answering is pointless.
+
+    Ranked by days of work at stake, biggest first: the whole claim of the fold is that
+    work invisible to Jira is invisible to capacity, burndown and every rollup, and the
+    size of what is invisible is the size of that claim. Then commits, then engagement,
+    then the id -- total, because arc-brief caches on evidence text and a queue that
+    shuffled between two builds of one graph would ask the same five questions in a
+    different order every morning.
+    """
+    out = []
+    for a in (gap or {}).get("unticketed_work") or []:
+        if a.get("gap_dismissed") or not a.get("gap_fp"):
+            continue
+        days = a.get("unpushed_days", 0)
+        scale = work_scale(days, a.get("unpushed_live", 0))[0]
+        out.append({
+            "kind": "unticketed",
+            "arc": a.get("label") or a["id"],
+            "arc_id": a["id"],
+            # The fold's own row fingerprint, not a second one. Two fingerprints over one
+            # fact would let the question and the row it is about be acknowledged
+            # separately, and the page would show a ✕'d row still being asked about.
+            "fp": a["gap_fp"],
+            "fingerprint": a.get("fingerprint"),
+            "branches": sorted(b["name"] for b in a.get("branches") or []),
+            "scale": scale,
+            "days": days,
+            "commits": a.get("unpushed_live", 0),
+            "engagement": a.get("engagement", 0),
+            "age_days": a.get("age_days", 0),
+            "stage": a.get("stage") or "",
+            # What the page's filing control would do, where there is anything to do.
+            # Computed by `filing` like every other filing on the page, and carried rather
+            # than recomputed: a workstream with no ticket usually offers nothing, but an
+            # arc whose merge request names a key its branches do not is exactly the case
+            # where one click settles the whole question.
+            "file_as": [{"key": o["key"], "branch": o["branch"], "via": o["via"]}
+                        for o in ((a.get("filing") or {}).get("options") or [])],
+            "why": (f"{scale} across {len(a.get('branches') or [])} branch"
+                    f"{'' if len(a.get('branches') or []) == 1 else 'es'}, "
+                    f"nothing in Jira names it"),
+        })
+    out.sort(key=lambda q: (-q["days"], -q["commits"], -q["engagement"], q["arc_id"]))
+    return out[:cap]
+
+
+def answer_unticketed(q, answer):
+    """Record one verdict about work Jira has never heard of.
+
+    Three answers and only two of them write anything, because only two of them are claims
+    this file can act on. "It needs a ticket" is a claim about the future -- there is no
+    ticket yet to file it under -- so it is logged as the label it is and the row stays
+    exactly where it was, still counted and still shouting, which is what wanting a ticket
+    looks like. Filing it is the separate act the command and the page's filing control
+    both carry out.
+
+    The other two are acknowledgements written through the one dismissal store, so the
+    fold's ✕, this question and `--dismiss` cannot disagree about a row. They differ only
+    in the note, and the note is the point: an eval set that cannot tell "real work, no
+    paperwork wanted" from "not work at all" cannot score any change to what
+    `unticketed_work` selects, and that selection is the thing the answers exist to
+    improve.
+    """
+    at = int(time.time())
+    if answer in ("fine", "noise"):
+        store = load_store(DISMISSED, "the dismissal store")
+        store[q["fp"]] = {"ref": q["arc"], "at": at, "note": answer}
+        DISMISSED.parent.mkdir(parents=True, exist_ok=True)
+        DISMISSED.write_text(json.dumps(store, indent=1, sort_keys=True))
+    log_answer({"at": at, "kind": "unticketed", "answer": answer,
+                "arc": q["arc"], "arc_id": q["arc_id"], "fp": q["fp"],
+                "fingerprint": q.get("fingerprint"),
+                "branches": list(q.get("branches") or ()),
+                "days": q.get("days"), "commits": q.get("commits"),
+                "engagement": q.get("engagement"), "age_days": q.get("age_days"),
+                "why": q.get("why"), "via": q.get("via") or "cli"})
+
+
+def combined_queue(memberships, residues, unticketed=(), cap=CURATION_CAP,
+                   floor=RESIDUE_SLOTS):
     """One queue of at most `cap` questions, membership first and intent guaranteed a seat.
 
     The cap is shared rather than one each, because it is a budget of attention and not a
     budget of question types: five is what fits on a screen and what a person will answer
-    between two other things, and ten questions in two sections is the backlog the whole
-    loop was designed not to become.
+    between two other things, and fifteen questions in three sections is the backlog the
+    whole loop was designed not to become.
 
     Within it, membership leads and intent holds a floor -- see RESIDUE_SLOTS for the
     measurement that made the floor necessary. Neither kind is padded: where there is
     nothing to ask of one kind the other simply fills the queue, so a reserved slot can
     never show a question that did not exist.
+
+    No-ticket questions take what is left and hold no floor, and that is a claim about what
+    each kind costs to get wrong rather than about what each is worth. A branch in the
+    wrong arc poisons every number downstream of the grouping; a workstream wrongly called
+    residue is counted as debt it is not. A no-ticket row that goes unasked for a morning
+    is a sentence in a fold, and the fold now carries its own ✕ -- so this kind is the one
+    with somewhere else to be answered, which makes it the right one to yield the seat.
     """
-    mem, res = list(memberships), list(residues)
+    mem, res, unt = list(memberships), list(residues), list(unticketed)
     keep = min(len(res), floor)
-    return (mem[:max(0, cap - keep)] + res)[:cap]
+    out = (mem[:max(0, cap - keep)] + res)[:cap]
+    return (out + unt)[:cap]
 
 
 def co_members(cluster_assign, branch):
@@ -8259,12 +8467,18 @@ def main():
     # questions, and a run that builds a queue nobody sees would spend a Slack join on it
     # and then announce an abstention about a section it was never going to print.
     residues = []
+    unfiled = []
     if args.curate or args.json:
         residues, why_not = residue_queue(arcs, ledger, gap is not None, intended,
                                           only_here_ids)
         if why_not:
             print(f"  {why_not}", file=sys.stderr)
-    curation = combined_queue(curation, residues)
+        # After apply_dismissals, which is the whole point: a row acknowledged on the page
+        # yesterday must not be asked about this morning. `gap` is None on a run that could
+        # not reach Jira, and then this asks nothing rather than asking about a fold it
+        # could not build -- the same abstention residue_queue makes for the same reason.
+        unfiled = unticketed_queue(gap)
+    curation = combined_queue(curation, residues, unfiled)
 
     if args.curate:
         return curate(curation, cluster_assign)
