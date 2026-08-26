@@ -2894,12 +2894,22 @@ def apply_dismissals(ledger, arcs=None, gap=None, prune=False):
                 DISMISSED.write_text(json.dumps(store, indent=1, sort_keys=True))
             except OSError:
                 pass
+    kept = {}
     for k in store:
         if k in live:
             live[k][field.get(k, "dismissed")] = True
+            kept[k] = store[k]
     for arc in arcs or []:
         arc["notify"] = [d for d in arc.get("notify", [])
                          if not d.get("dismissed")]
+    # The acknowledgements that still refer to something this run rendered. Returned rather
+    # than left to be re-derived, because the page publishes them back: a seed carrying
+    # every fingerprint the file ever held would grow without bound inside a document with
+    # a hard size limit, and would offer a browser rows to adopt for facts that no longer
+    # exist. Only what matched, and only where a universe was actually built -- which is
+    # why this is a subset and never a replacement for the file. Adopting is a union at the
+    # other end, so a fingerprint left out of a seed is never lost.
+    return kept
 
 
 def set_dismissed(ledger, spec, undo=False):
@@ -2929,6 +2939,154 @@ def set_dismissed(ledger, spec, undo=False):
               f"{DISMISSED}", file=sys.stderr)
     DISMISSED.parent.mkdir(parents=True, exist_ok=True)
     DISMISSED.write_text(json.dumps(store, indent=1, sort_keys=True))
+
+
+ACK_STORES = {
+    "dismissed": (lambda: DISMISSED, "the dismissal store"),
+    "detached": (lambda: DETACHED, "the detachment store"),
+    "confirmed": (lambda: CONFIRMED, "the confirmation store"),
+    "intended": (lambda: INTENDED, "the intended store"),
+    "residue": (lambda: RESIDUE, "the residue store"),
+    "filed": (lambda: TICKET_AUTHORITY, "the ticket-authority store"),
+}
+"""Every store a published page can record a judgement into, and the name it travels under.
+
+One table rather than six branches inside the ingest, because the whole contract of
+`--ingest-acks` is that the page names a store and work-arcs writes it: a reader has to be
+able to see in one place exactly which files a published artifact can reach.
+
+`filed` is `authoritative-ticket.json` under the name the page's own store has always used
+(see FKEY in arcs-page). The two spellings are a historical accident and renaming either
+would empty a browser's localStorage on the next build, so the mapping is stated here.
+"""
+
+
+def _answer_key(row):
+    """What makes two eval-set lines the same answer.
+
+    The judgement and what it was about, plus the second it was given in. Not the whole
+    row: the page records fewer fields about one answer than the CLI does, and a key over
+    everything present would let the same click be counted twice because one writer knew
+    the arc's engagement and the other did not.
+    """
+    return (row.get("kind") or "membership", row.get("branch") or row.get("arc_id") or "",
+            row.get("answer") or "", row.get("at") or 0)
+
+
+def ingest_acks(path):
+    """`--ingest-acks FILE`: adopt what a published page recorded, into the stores.
+
+    The loop this closes is the one the acknowledgement system never had. Every ✕ and every
+    answer on the page has always been recorded honestly -- in the browser's localStorage,
+    where the pipeline cannot see it -- and reached these files only through a manual
+    download into ~/.local/state/work-arcs, a chore that has never once been done. So the
+    derived layers went on repeating what had already been dealt with, and the single most
+    useful thing a person can do to this dashboard was the thing it made least convenient.
+
+    This is deliberately the only new writer, and it is in this file because this file is
+    where every one of these stores is already written. arcs-refresh moves the bytes: it
+    reads the published page, cuts out the seed and hands it here. It does not know what a
+    dismissal is, what expires one, or what shape an entry has, and it must not -- a second
+    program with an opinion about a store's semantics is a second program to keep in step,
+    and the two would disagree the day either was improved.
+
+    Merging is a UNION with one exception. Adding is safe in a way replacing is not: the
+    page's copy is whatever the browser last saw, so a page open since Tuesday holds
+    Tuesday's set, and letting it replace the file would silently undo every judgement made
+    anywhere else since. An entry already here is left exactly as it is.
+
+    The exception is the point of the feature, because a union alone can only ever add.
+    `undismissed` is the page naming the fingerprints it was SEEDED with and no longer
+    holds -- an acknowledgement taken back, which is a judgement like any other and the one
+    a union cannot express. Nothing else is ever removed here; expiry is apply_dismissals'
+    job and it is the only thing that knows whether a fact moved.
+
+    Answers append to the eval set, deduped on (kind, subject, answer, second), because a
+    run that ingests the same page twice -- a rebuild that fails after the ingest, a page
+    republished unchanged -- must not double-count a click. Every failure is returned
+    rather than raised: this runs at the top of an unattended rebuild, and a malformed seed
+    must cost the acknowledgements it carried, never the morning's page.
+    """
+    report = {"read": False, "stores": {}, "answers": 0, "undismissed": 0, "errors": []}
+    try:
+        raw = Path(path).read_text()
+    except OSError as e:
+        report["errors"].append(f"could not read {path}: {e}")
+        return report
+    try:
+        seed = json.loads(raw)
+    except ValueError as e:
+        report["errors"].append(f"{path} is not readable JSON: {e}")
+        return report
+    if not isinstance(seed, dict):
+        report["errors"].append(f"{path} holds {type(seed).__name__} where an object "
+                                "belongs")
+        return report
+    report["read"] = True
+
+    for name, (where, what) in ACK_STORES.items():
+        incoming = seed.get(name)
+        if incoming is None:
+            continue
+        if not isinstance(incoming, dict):
+            report["errors"].append(f"the page's {name} is "
+                                    f"{type(incoming).__name__}, not an object")
+            continue
+        target = where()
+        store = load_store(target, what)
+        added = 0
+        for k, v in incoming.items():
+            if not isinstance(k, str) or k in store:
+                continue
+            # `1` is the shape the page's acknowledgement store has always used for a plain
+            # ✕ and it carries nothing. Given a home here it becomes the entry the CLI
+            # writes, so `--dismiss` and a click leave the same kind of record.
+            if v == 1 or not isinstance(v, dict):
+                v = {"ref": "", "at": int(time.time()), "note": ""}
+            store[k] = v
+            added += 1
+        gone = 0
+        if name == "dismissed":
+            for k in seed.get("undismissed") or []:
+                if isinstance(k, str) and k in store:
+                    del store[k]
+                    gone += 1
+            report["undismissed"] = gone
+        if added or gone:
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(json.dumps(store, indent=1, sort_keys=True))
+            except OSError as e:
+                report["errors"].append(f"could not write {target}: {e}")
+                continue
+        report["stores"][name] = {"added": added, "removed": gone}
+
+    answers = seed.get("answers")
+    if answers is not None:
+        if not isinstance(answers, list):
+            report["errors"].append("the page's answers is "
+                                    f"{type(answers).__name__}, not a list")
+        else:
+            seen = set()
+            try:
+                with CURATION_LABELS.open() as f:
+                    for line in f:
+                        try:
+                            seen.add(_answer_key(json.loads(line)))
+                        except ValueError:
+                            continue
+            except OSError:
+                pass
+            for row in answers:
+                if not isinstance(row, dict):
+                    continue
+                k = _answer_key(row)
+                if k in seen:
+                    continue
+                seen.add(k)
+                log_answer(row)
+                report["answers"] += 1
+    return report
 
 
 def build_ledger(repo, mrs, meetings=True):
@@ -7992,6 +8150,13 @@ def main():
                         "fingerprint prefix). Expires itself the moment the fact "
                         "under it changes, so it can never hide a new development")
     p.add_argument("--undismiss", metavar="REF", help="bring a ledger row back")
+    p.add_argument("--ingest-acks", metavar="FILE",
+                   help="adopt the judgements a published page recorded — the seed block "
+                        "cut out of the artifact's HTML — into the stores that own them. "
+                        "A union: nothing already here is replaced, and the only removal "
+                        "is a fingerprint the page names as an acknowledgement taken "
+                        "back. Writes nothing else and runs no pipeline, so it is cheap "
+                        "enough to sit at the top of every rebuild")
     p.add_argument("--authoritative", metavar="ARC=BRANCH",
                    help="name the branch that IS an arc's work when the derivation gets it "
                         "wrong. Optional: it only corrects, nothing depends on it, and it "
@@ -8028,6 +8193,37 @@ def main():
     p.add_argument("--json", action="store_true", help="emit the graph")
     args = p.parse_args()
     load_env()
+
+    # Before anything reads a repo, and before the exit below that refuses a run with no
+    # JIRA_REPO. This writes stores and needs nothing else: no git, no GitLab, no Jira, no
+    # clock but its own. It sits at the top of the rebuild so the judgements a person made
+    # on the published page are in the files BEFORE the build that renders them --
+    # ingesting afterwards would publish a page that had already ignored them.
+    if args.ingest_acks:
+        r = ingest_acks(args.ingest_acks)
+        for e in r["errors"]:
+            print(f"⚠ ingest-acks: {e}", file=sys.stderr)
+        if not r["read"]:
+            sys.exit(1)
+        for name, got in sorted(r["stores"].items()):
+            if got["added"] or got["removed"]:
+                print(f"✓ {name}: {got['added']} adopted"
+                      + (f", {got['removed']} taken back" if got["removed"] else ""),
+                      file=sys.stderr)
+        if r["answers"]:
+            print(f"✓ {r['answers']} answer(s) from the page added to the eval set",
+                  file=sys.stderr)
+        if not (r["answers"] or any(g["added"] or g["removed"]
+                                    for g in r["stores"].values())):
+            print("✓ nothing new on the page — every judgement it carries was already "
+                  "here", file=sys.stderr)
+        # Partial success is still a failure to report. A seed that parsed but whose
+        # `confirmed` section was the wrong shape has lost the confirmations in it, and the
+        # caller logs what this exits with -- a silent 0 there is the lost-acknowledgement
+        # failure wearing a success.
+        if r["errors"]:
+            sys.exit(1)
+        return
 
     global TICKET_RE
     TICKET_RE = _ticket_re()
@@ -8387,10 +8583,10 @@ def main():
     # completeness and not presence -- no token, or --no-slack-threads, means there are no
     # blocks and there never were, so nothing can be missing and a stale acknowledgement on
     # some OTHER universe must still be able to expire.
-    apply_dismissals(ledger, arcs, gap,
-                     prune=bool(ledger and ledger.get("complete")
-                                and slack_lens.get("complete")
-                                and gap is not None and args.json))
+    acks_live = apply_dismissals(ledger, arcs, gap,
+                                 prune=bool(ledger and ledger.get("complete")
+                                            and slack_lens.get("complete")
+                                            and gap is not None and args.json))
 
     # Before --active and --focus, and that is the whole point of the feature. The arcs
     # this diff exists to speak about are the ones the window hides: "of your 58
@@ -8585,6 +8781,25 @@ def main():
             # row, and a store built from rows alone would drop its filing the first time
             # the page saved one.
             "filings": filings_live,
+            # Every judgement a person has made that the page has to be able to publish
+            # back, in the shape each store already keeps. The page seeds its browser
+            # stores from this and republishes the merged result; arcs-refresh cuts the
+            # block out of the published HTML and hands it to `--ingest-acks`, which is the
+            # only writer. That is the whole loop, and it is why this is here rather than
+            # reconstructed by the page from the rows it happens to render: a workstream
+            # outside the focus window has no row, and a seed built from rows alone would
+            # drop its acknowledgement the first time the page published.
+            #
+            # `dismissed` is the live subset -- what apply_dismissals matched to a row this
+            # run actually built -- and never the whole file. See its return value.
+            "acks": {
+                "dismissed": acks_live,
+                "detached": load_store(DETACHED, "the detachment store"),
+                "confirmed": load_store(CONFIRMED, "the confirmation store"),
+                "intended": load_store(INTENDED, "the intended store"),
+                "residue": load_store(RESIDUE, "the residue store"),
+                "filed": filings_live,
+            },
             "stale_parks": stale_parks,
             "stale_detached": stale_detached,
             "stale_confirmed": stale_confirmed,
