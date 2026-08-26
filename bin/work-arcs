@@ -9548,9 +9548,10 @@ def main():
     # the detachments and the demotion have all had their say. Read-only against every
     # one of its four sources, and it writes nothing anywhere -- orch owns that state.
     # Cheap enough to be unconditional: one sqlite read of a 319-row table, a glob of
-    # fifty small json files, one workstream file and a backwards walk of a log that
-    # stops as soon as it has answered. Measured at 21ms on the real corpus, against a
-    # pipeline whose git work alone is tens of seconds.
+    # fifty small json files, one workstream file, a backwards walk of a log that stops as
+    # soon as it has answered, and one `git worktree list` for the repo test. Measured at
+    # 30ms on the real corpus -- ten of that the worktree list, which has 253 of them --
+    # against a pipeline whose git work alone is tens of seconds.
     orch_bench, orch_known, orch_why = orch_join(arcs, sessions, args.repo)
     if not orch_known:
         print(f"  orch is unreadable, so what is running is unknown this run — "
