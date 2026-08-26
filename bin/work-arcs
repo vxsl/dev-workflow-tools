@@ -279,8 +279,54 @@ def session_index(projects_dir):
     return idx
 
 
+def own_authors(repo):
+    """Which commit authors are *you*, from git's own config and nothing else.
+
+    The author, never the committer. A rebase rewrites the committer to whoever ran it, so
+    a branch of somebody else's work that you rebased once reads as entirely yours by
+    committer and entirely theirs by author -- and the second is the true one.
+
+    Two tests, exact first. `user.email` matched outright is the whole answer for anything
+    committed under the address git is configured with here. The fallback is for older
+    commits made under a different address: the local part is split into tokens and
+    admitted only when EVERY token of it is one of your own name's, so
+    `kyle.grimsrud-manz@old.example` passes and a colleague's `kyle.smith@` does not --
+    `smith` is not a token of your name. The asymmetry is deliberate: a foreign commit
+    read as yours is precisely the pollution this exists to remove, so the fallback is
+    built to fail towards "not you".
+    """
+    email = git(repo, "config", "--get", "user.email").strip().lower()
+    return ({email} if email else set()), own_name_tokens(repo)
+
+
+def author_is_own(email, ident):
+    """One commit's author email against the identity `own_authors` returned."""
+    emails, tokens = ident
+    email = (email or "").strip().lower()
+    if not email:
+        return False
+    if email in emails:
+        return True
+    parts = {t for t in re.split(r"[^a-z0-9]+", email.split("@")[0])
+             if len(t) >= 3 and not t.isdigit()}
+    return bool(parts) and bool(tokens) and parts <= tokens
+
+
+def own_branch(b):
+    """Is this branch work of yours? Unknown authorship reads as yours.
+
+    The default is the load-bearing half. Every clock in this file used to be built on
+    `committed` with no notion of who made it, so a branch dict from anywhere that never
+    read authorship must keep behaving exactly as it did -- absent evidence is not evidence
+    of a checkout, and treating it as one would silently drop real work out of every age
+    and every activity clock the moment a caller passed a synthetic branch.
+    """
+    return b.get("role", "authored") != "checkout"
+
+
 def collect_branches(repo, main_ref):
     """Every unmerged local branch with the facts that decide its state."""
+    ident = own_authors(repo)
     fmt = "%(refname:short)\t%(objectname)\t%(committerdate:unix)"
     out = git(repo, "for-each-ref", "--no-merged", main_ref, f"--format={fmt}", "refs/heads")
     branches = {}
@@ -331,10 +377,22 @@ def collect_branches(repo, main_ref):
         # branches carry more than 20 commits and the deepest carries 94, so 200 clears the
         # corpus with room; measured again, the whole for-each-ref sweep costs 1.14s at -20
         # and 1.28s at -200.
+        #
+        # The author email rides along on the same call for the same reason the date does:
+        # it costs no git invocation and it is the only thing that can tell your work here
+        # from somebody else's. Without it a branch you checked out to review reads as a
+        # branch you wrote -- its tip's committerdate becomes your last activity, its age
+        # becomes the workstream's age, and the page reports a review as a fortnight of
+        # your own work sitting on this laptop. Measured on the real corpus: 15 of 442
+        # local branches carry no commit of yours at all (seven of them Logan's), and 78
+        # more are shared.
         b["subjects"], b["commits"] = [], []
-        for line in lines(git(repo, "log", "--format=%ct%x09%h%x09%s", "-200",
+        b["own_commits"] = b["foreign_commits"] = 0
+        own_at = 0
+        for line in lines(git(repo, "log", "--format=%ct%x09%ae%x09%h%x09%s", "-200",
                               f"{main_ref}..{name}")):
             when, _, rest = line.partition("\t")
+            email, _, rest = rest.partition("\t")
             sha, _, subject = rest.partition("\t")
             # An empty subject stays dropped, which is what `lines()` did back when the
             # format was %s alone and the whole line went blank. It matters: mark_duplicates
@@ -342,9 +400,29 @@ def collect_branches(repo, main_ref):
             # be contained in every set and so declared a copy of whatever outranked it.
             if subject.strip():
                 b["subjects"].append(subject)
+            mine = author_is_own(email, ident)
+            b["own_commits" if mine else "foreign_commits"] += 1
             if when.isdigit():
                 b["commits"].append({"at": int(when), "sha": sha})
+                if mine and int(when) > own_at:
+                    own_at = int(when)
         b["subjects"] = b["subjects"][:20]
+        # One commit of yours ahead of main and the branch is work of yours, whatever the
+        # ratio: a single fix you pushed onto a colleague's branch is still you having
+        # worked here, and the counts are on the row for anyone who wants the ratio. The
+        # clocks below do not use this label at all -- they use `own_committed` directly --
+        # so a branch that is 1/12 yours contributes exactly the one date it should.
+        b["role"] = "authored" if b["own_commits"] else "checkout"
+        # When you last committed here yourself, as distinct from when the ref last moved.
+        # 0 where you never did, and `own_age_days` is None there rather than 999: an age
+        # nobody can measure is absent, not enormous.
+        b["own_committed"] = own_at
+        b["own_age_days"] = days_ago(own_at) if own_at else None
+        # The walk is capped at 200 like `subjects` and `commits`, so on a branch deeper
+        # than that the split is over the newest 200 commits and says so rather than
+        # implying it covered the lot.
+        if b["commits_ahead"] > 200:
+            b["authorship_capped"] = 200
     return branches
 
 
@@ -5714,6 +5792,23 @@ def arc_fingerprint(arc):
     return h.hexdigest()[:16]
 
 
+def _own_touch(b):
+    """When YOU last committed on this branch. The ref's own date only where nobody asked.
+
+    `committed` is the tip's committerdate and belongs to whoever made the tip, which on a
+    branch checked out to review is not you. Measured: `UB-6802` reads a tip one day old
+    against your own newest commit there eight days old, so every clock built on `committed`
+    reported a colleague's afternoon as yours. `own_committed` is 0 on a branch you never
+    committed to, which is what makes a checkout contribute nothing here rather than
+    contributing somebody else's calendar.
+
+    The fallback matters and is not a formality: a synthetic branch dict, or one from a path
+    that never read authorship, has no `own_committed` key at all. Absent is not zero -- it
+    means nobody looked -- so it degrades to the old answer rather than to silence.
+    """
+    return b["own_committed"] if "own_committed" in b else b.get("committed", 0)
+
+
 def own_activity(arc):
     """The last time you yourself did anything here, as an epoch.
 
@@ -5721,9 +5816,17 @@ def own_activity(arc):
     and I have not looked at it yet" is a comparison, not a checkbox: once he commits or
     opens a session on the arc after the event, he has engaged with it and it stops being
     news. Derived, so it self-heals -- and it expires in the only direction that matters.
+
+    Three kinds of touch, and the third is why reviewing is first-class. Commits of your
+    own, sessions held on the arc's branches, and a word you said on a merge request that
+    joins here: writing a review IS doing something on this workstream, and leaving it out
+    made every arc you were only reviewing look untouched by you since the day you cloned
+    it. `reviews` is attached after the ledger and is simply absent on every path that has
+    no GitLab, which costs nothing -- the other two answer on their own.
     """
-    ts = [b.get("committed", 0) for b in arc.get("branches", [])]
+    ts = [_own_touch(b) for b in arc.get("branches", [])]
     ts += [s.get("last", 0) for s in arc.get("sessions", [])]
+    ts += [r.get("my_last", 0) for r in arc.get("reviews", [])]
     return max(ts) if ts else 0
 
 
@@ -5799,6 +5902,11 @@ SERIES_DAYS = int(os.environ.get("WORK_ARCS_ACTIVITY_DAYS", "120"))
 FORGOTTEN_EXEMPT = {
     "in-review": "out for review — the clock is a reviewer's, not yours",
     "pre-landing": "drafts from before a sibling landed, not an open loop",
+    # A checkout of someone's branch cannot be work you forgot, because it was never work
+    # you were doing. Without this the test fires on exactly the wrong evidence: `UL-1816`
+    # carries 25 of Logan's commits, which clears `min_commits` on its own, so the arc
+    # would be accused of a cliff built entirely out of another person's rhythm.
+    "reviewing": "a checkout of someone else's branch, not work of yours",
 }
 
 
@@ -6304,8 +6412,11 @@ def demands(arc):
 
     for b in arc.get("branches", []):
         pipe = b.get("pipeline") or {}
+        # Not on a branch you merely have checked out. A red pipeline on somebody else's
+        # branch is a fact about their work, and "fix this" is not a thing this page may
+        # say about it -- the same line `unreviewed` below now draws, for the same reason.
         if (pipe.get("status") == "failed" and not b.get("superseded_by")
-                and not b.get("historical")):
+                and not b.get("historical") and own_branch(b)):
             out.append({"kind": "pipeline",
                         "what": f"{b['name']} pipeline failed on {pipe.get('at','')}",
                         "url": pipe.get("url", "")})
@@ -6329,8 +6440,13 @@ def demands(arc):
         # Never for a branch whose MR already merged or closed. 11 of 17 of these claims
         # were false for exactly that reason: squash-merge hides the landing from ancestry,
         # so UL-1835 was told to open the merge request it had already merged as !10449.
+        # And never about a branch that holds no commit of yours. `UL-1816` is 25 of
+        # Logan's commits sitting in a local checkout so they could be read; telling you to
+        # open a merge request for them is an instruction to file somebody else's work
+        # under your name. This is the demand that made every review checkout on the corpus
+        # read as an unproposed workstream of yours.
         if (b and b.get("pushed") and b.get("commits_ahead", 0) > 0
-                and not b.get("mr_fate")):
+                and not b.get("mr_fate") and own_branch(b)):
             # No number at all, where the two above carry a scale. Nothing is at risk here
             # -- the branch is pushed -- so the size of it changes nothing about what to do,
             # and the only number available was a commit count, which is the unit this page
@@ -6375,10 +6491,26 @@ def finalize(arc, repo=None, main_ref="origin/main"):
     # touch says "is this live"; the median says "how much of this has gone cold".
     # Min alone made every large arc look active: one commit today in a 17-branch
     # cluster is not the same as the cluster being worked on.
+    #
+    # Over branches that are work of yours, plus every session. A branch you checked out to
+    # read is dated by its author's last push, and letting that date the workstream is the
+    # same error `own_activity` was making one field over: it made a review look freshly
+    # worked, and -- once the author stopped -- made it look abandoned by you. Sessions stay
+    # unfiltered on purpose, including sessions held ON a checkout: sitting in someone's
+    # branch reading it is your own touch and it is the only one a pure review leaves in
+    # git at all.
+    own_bs = [b for b in arc["branches"] if own_branch(b)]
     ages = sorted(
-        [b["age_days"] for b in arc["branches"]]
+        [b["age_days"] for b in own_bs]
         + [s["age_days"] for s in arc["sessions"]]
     )
+    # An arc that is nothing but other people's branches, with no session on any of them,
+    # has no age of yours to report. Reporting 999 would be as false as reporting their
+    # commit -- one buries it, the other claims it as your work -- so the ref dates stand in
+    # and the row says whose they are. Consumers that care can read it; nothing here has to.
+    arc["age_is_foreign"] = not ages and bool(arc["branches"])
+    if arc["age_is_foreign"]:
+        ages = sorted([b["age_days"] for b in arc["branches"]])
     # ...and the newest touch is asked of the work itself, not of everything clustered
     # with it. File overlap puts foreign branches in an arc and the split pass does not
     # catch every one, so `min` over all members let a stranger date the arc: the thor
@@ -6395,7 +6527,8 @@ def finalize(arc, repo=None, main_ref="origin/main"):
             if not grew:
                 break
             lineage |= grew
-        own = ([b["age_days"] for b in arc["branches"] if b["name"] in lineage]
+        own = ([b["age_days"] for b in arc["branches"]
+                if b["name"] in lineage and own_branch(b)]
                + [s["age_days"] for s in arc["sessions"] if s.get("via") in lineage])
         arc["age_days"] = min(own) if own else (ages[0] if ages else 999)
     else:
@@ -6547,6 +6680,17 @@ def finalize(arc, repo=None, main_ref="origin/main"):
     if (arc.get("ticket_authority") or {}).get("key"):
         arc["ticket"] = arc["ticket_authority"]["key"]
     arc["historical_branches"] = sum(1 for b in arc["branches"] if b.get("historical"))
+    # Whose work this workstream IS, aggregated from the branches. "review" only when
+    # nothing here is yours: one commit of your own anywhere in the arc, or one merge
+    # request of your own joined to it, and it is a workstream you are working on that
+    # happens to contain a colleague's branch. The mixed case is the common one and it is
+    # deliberately NOT relabelled -- `UB-6802` is 22 commits of yours and 17 of Ella's, and
+    # calling that a review would lose the work. What makes reviewing first-class is the
+    # review row itself, which joins to the arc from `reviews[]` rather than renaming it.
+    arc["role"] = ("review"
+                   if arc["branches"] and not arc["mrs"]
+                   and not any(own_branch(b) for b in arc["branches"])
+                   else "authored")
 
     # Which merge requests are out being qualified, joined per MR through its own ticket.
     # Empty on the first pass, when no Jira call has happened yet -- like everything else
@@ -6606,6 +6750,16 @@ def finalize(arc, repo=None, main_ref="origin/main"):
         n, d = arc.get("residue_commits", 0), arc.get("residue_days", 0)
         arc["state"] = ("residue — " + (work_scale(d, n)[0] if n else "nothing")
                         + " not counted")
+    elif arc["role"] == "review":
+        # Its own rung, because every other one on the ladder is a claim about work of
+        # yours and none of them is true here. Left to the fallback this arc reported
+        # "pushed, no merge request" -- an accusation about a colleague's branch -- and
+        # where the checkout carried local commits it reported days of YOUR work sitting
+        # only on this laptop. The honest sentence is small and it is upgraded in
+        # `attach_reviews` the moment a merge request can be joined to it, which is where
+        # the round count and whose turn it is come from.
+        arc["stage"] = "reviewing"
+        arc["state"] = "checkout of someone's branch"
     elif stale_draft:
         arc["stage"] = "pre-landing"
         ref = next(b["predates_landing"] for b in live_b if b.get("predates_landing"))
