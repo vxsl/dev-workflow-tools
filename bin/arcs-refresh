@@ -135,6 +135,7 @@
 #   arcs-refresh --install-cron     the crontab line instead -- no catch-up, see above
 #   arcs-refresh --uninstall-cron   remove it, leave every other crontab line alone
 #   arcs-refresh --ingest           read the published page back and adopt what it recorded
+#   arcs-refresh --read-page FILE   write the page the artifact is currently serving
 #   arcs-refresh --capabilities     what the artifact may do, and on what runtime contract
 #   arcs-refresh --hook             print the arc-record Stop hook block for settings.json
 #   arcs-refresh --publish          upload the page already on disk, without rebuilding it
@@ -916,9 +917,29 @@ frame_record() {
     FRAME_TITLE="$(printf '%s' "$rec" | jq -r '.title // empty')"
     FRAME_FAVICON="$(printf '%s' "$rec" | jq -r '.favicon // empty')"
     FRAME_DESCRIPTION="$(printf '%s' "$rec" | jq -r '.description // empty')"
-    # Tolerated as absent: the field is the server's, and a publish without a precondition
-    # is worse than a publish with one but much better than no publish at all.
+    # Tolerated as absent HERE, because it is not the only place to get it: the boot route
+    # carries `ver` and frame_version reads it. What used to be tolerated was going WITHOUT
+    # a precondition, which stopped being an option the moment this artifact declared that
+    # it publishes itself -- the control plane then refuses a publish that does not say
+    # which version it edited from, and it is right to.
     FRAME_VERSION="$(printf '%s' "$rec" | jq -r '.version // .current_version // empty')"
+    return 0
+}
+
+# The version that is live right now. Read from the boot route rather than the listing,
+# because the listing does not carry one for this artifact and the boot route always does.
+# Called once before a publish and again after a rejected precondition -- the second call is
+# what makes a conflict recoverable without a blind overwrite.
+frame_version() {
+    local slug="$1"
+    if ! frame_call_authed GET "/api/frame/$slug?via=model_read"; then
+        return 1
+    fi
+    [ "$FRAME_HTTP_CODE" != "200" ] && return 1
+    local v
+    v="$(jq -r '.ver // empty' "$FRAME_BODY" 2>/dev/null || true)"
+    [ -z "$v" ] && return 1
+    FRAME_VERSION="$v"
     return 0
 }
 
@@ -1148,6 +1169,9 @@ publish_page() {
         log "publish: the artifact reports no title or favicon, and deploy requires both"
         return 1
     fi
+    if [ -z "$FRAME_VERSION" ]; then
+        frame_version "$slug" || true
+    fi
 
     label="$(publish_label)"
     req="$(mktemp)"
@@ -1225,13 +1249,23 @@ publish_page() {
                     continue
                 fi
                 # The precondition failed: something published a different version between
-                # the read above and this write. Nothing of that version survives in what
-                # we are sending anyway -- the page is rebuilt whole from local state every
-                # run -- so the default is to supersede it and say so.
-                if [ "$PUBLISH_SUPERSEDE" = 1 ] && jq -e 'has("baseVersion")' "$req" >/dev/null 2>&1; then
-                    log "publish: the artifact moved since this run read it — superseding with the fresh rebuild"
-                    jq 'del(.baseVersion) + {force: true}' "$req" >"$req.tmp" 2>/dev/null \
-                        && mv "$req.tmp" "$req" || rm -f "$req.tmp"
+                # the read above and this write. Nothing of that version survives in what we
+                # are sending anyway -- the page is rebuilt whole from local state every run,
+                # and anything acknowledged on the live page reached those stores before the
+                # rebuild started (see ingest_acks and where do_run calls it) -- so the
+                # default is to supersede it and say so.
+                #
+                # Superseding means REREADING the version and publishing on top of it, not
+                # dropping the precondition. A page that publishes itself is refused a blind
+                # overwrite outright ("this artifact self-publishes — provide the baseVersion
+                # you edited from"), which is the control plane protecting exactly the thing
+                # this feature depends on: a version somebody's click made. So the retry
+                # takes the winner's version and states it.
+                if [ "$PUBLISH_SUPERSEDE" = 1 ] && [ "$tries" -lt "$max_tries" ] \
+                   && frame_version "$slug"; then
+                    log "publish: the artifact moved since this run read it — superseding on top of version $FRAME_VERSION"
+                    jq --arg v "$FRAME_VERSION" 'del(.force) + {baseVersion: $v}' \
+                        "$req" >"$req.tmp" 2>/dev/null && mv "$req.tmp" "$req" || rm -f "$req.tmp"
                     continue
                 fi
                 log "publish: refused with HTTP $FRAME_HTTP_CODE — $(frame_message)"
@@ -1445,6 +1479,19 @@ case "${1:-}" in
     --ingest)
         if ingest_acks; then echo "ok — $INGEST_NOTE"; exit 0; fi
         echo "failed — $INGEST_NOTE" >&2
+        exit 1 ;;
+    # The published page itself, written where it was asked for. The page is not on disk
+    # anywhere after a publish -- what is in $STATE is what was BUILT, and the two differ
+    # the moment anybody acknowledges a row on the live one. This is how to look at what is
+    # actually being served without a browser.
+    --read-page)
+        [ -n "${2:-}" ] || { echo "arcs-refresh: --read-page wants a file to write" >&2; exit 2; }
+        if slug="$(artifact_slug)" && frame_page "$slug"; then
+            mv "$FRAME_PAGE" "$2"
+            echo "$2 ($(stat -c %s "$2") bytes)"
+            exit 0
+        fi
+        echo "failed — ${FRAME_ERROR:-WORK_ARCS_ARTIFACT_URL is not an artifact link}" >&2
         exit 1 ;;
     # What the artifact is allowed to do. One line, no page, and the only way to check the
     # declaration the whole save-back rests on without opening a browser.

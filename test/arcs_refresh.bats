@@ -1128,6 +1128,30 @@ EOF
     [ "$(deploy_request | jq -r '.content')" = "<h1>arcs</h1>" ]
 }
 
+# A page that publishes itself is refused a blind overwrite outright: "this artifact
+# self-publishes — provide the baseVersion you edited from". So the precondition is not
+# optional any more, and where the listing does not carry a version the boot route does.
+@test "a publish with no version in the listing reads one from the boot route" {
+    publishing_on
+    echo '{"frames":[{"slug":"'"$STUB_SLUG"'","title":"Work Arcs","favicon":"X"}]}' \
+        >"$STUB_FRAMES"
+    run "$REFRESH"
+    [ "$(jq -r '.baseVersion' "$STUB_DIR/deploy-request-1.json")" = "1787706300-d2fa" ]
+}
+
+# Superseding means rereading the version and publishing ON TOP of it, never dropping the
+# precondition -- which the control plane refuses for a self-publishing page, and is right
+# to: the version it is protecting is one somebody's click made.
+@test "an artifact that moved is superseded on top of the winner's version" {
+    publishing_on
+    echo '{"ver":"newer-1","assetToken":"tok.1.2.3"}' >"$STUB_BOOT"
+    STUB_DEPLOY_CODES="409 200" run "$REFRESH"
+    [ "$(deploy_calls)" = 2 ]
+    [ "$(jq -r '.baseVersion' "$STUB_DIR/deploy-request-2.json")" = "newer-1" ]
+    [ "$(jq -r 'has("force")' "$STUB_DIR/deploy-request-2.json")" = "false" ]
+    grep -q "superseding on top of version newer-1" "$LOG"
+}
+
 @test "the publish sends the artifact's version as the precondition" {
     publishing_on
     run "$REFRESH"
@@ -1250,18 +1274,24 @@ EOF
 }
 
 # Something else published between this run's read and its write. Nothing of that version
-# survives in what we are sending -- the page is rebuilt whole every run -- so the default
-# is to supersede it, and to say so.
+# survives in what we are sending -- the page is rebuilt whole every run, and anything
+# acknowledged on the live one reached the stores before the rebuild started -- so the
+# default is to supersede it, and to say so.
+#
+# The second attempt used to drop the precondition and force. It cannot any more, and the
+# reason is a good one: a page that publishes itself is refused a blind overwrite outright,
+# because the version being overwritten is one somebody's click made. So superseding is
+# rereading the winner's version and publishing on top of it.
 @test "an artifact that moved underneath the run is superseded" {
     publishing_on
+    echo '{"ver":"v-newer","assetToken":"tok.1.2.3"}' >"$STUB_BOOT"
     STUB_DEPLOY_CODES="409 200" run "$REFRESH"
     [ "$status" -eq 0 ]
     [ "$(deploy_calls)" = 2 ]
     grep -q "moved since this run read it" "$LOG"
-    # The first attempt carried the precondition, the second dropped it and forced.
     [ "$(deploy_request 1 | jq -r '.baseVersion')" = "v-old" ]
-    [ "$(deploy_request 2 | jq -r 'has("baseVersion")')" = "false" ]
-    [ "$(deploy_request 2 | jq -r '.force')" = "true" ]
+    [ "$(deploy_request 2 | jq -r '.baseVersion')" = "v-newer" ]
+    [ "$(deploy_request 2 | jq -r 'has("force")')" = "false" ]
 }
 
 @test "superseding can be turned off, and then a conflict is a failure" {
