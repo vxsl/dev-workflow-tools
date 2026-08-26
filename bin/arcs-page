@@ -782,6 +782,11 @@ td .dis{vertical-align:middle}
   border-radius:4px;background:var(--surface);font-size:.85rem;
   box-shadow:0 -2px 12px rgba(0,0,0,.08)}
 #interactbar.on{display:flex}
+/* A save that failed. Loud, because a lost acknowledgement teaches distrust faster than no
+   acknowledgement system does -- and because this is the one bar state a person has to act
+   on, by using the buttons that reappear beside it. */
+#interactbar.failed{border-color:var(--hot)}
+#interactbar.failed #intmsg{color:var(--hot);font-weight:600}
 #interactbar button{font:inherit;padding:.3rem .7rem;border-radius:3px;cursor:pointer;
   border:1px solid var(--accent);background:var(--accent);color:var(--surface)}
 #interactbar .muted{color:var(--ink-soft);font-size:.8rem}
@@ -1319,15 +1324,57 @@ INTERACT_JS = r"""
 (function(){
   function read(key){ try{ return JSON.parse(localStorage.getItem(key)||'{}')||{}; }
                       catch(e){ return {}; } }
+  // Downloading is reached through `claude.use` like every other capability. It used to be
+  // read off `window.claude.downloads`, which the current runtime does not promise a
+  // member for -- and the moment this artifact declared a capability of its own, the
+  // runtime serving it was no longer the one that happened to have that member. The old
+  // spelling is still tried, so a page opened out of an older published version keeps its
+  // buttons.
   function saveFile(filename, data, msg, done){
-    var dl=window.claude&&window.claude.downloads;
-    if(!dl){ msg.textContent='Saving is not available in this view.'; return; }
-    dl.save({filename:filename,data:data}).then(function(){
-      msg.textContent='Saved. Move it to ~/.local/state/work-arcs/'+filename;
-      done();
-    }).catch(function(e){
-      msg.textContent=(e&&e.code==='declined')?'Not saved.'
-        :('Could not save: '+((e&&e.code)||'unknown'));
+    useCap('downloads').then(function(dl){
+      if(!dl||typeof dl.save!=='function'){
+        msg.textContent='Saving is not available in this view.'; return; }
+      dl.save({filename:filename,data:data}).then(function(){
+        msg.textContent='Saved. Move it to ~/.local/state/work-arcs/'+filename;
+        done();
+      }).catch(function(e){
+        msg.textContent=(e&&e.code==='declined')?'Not saved.'
+          :('Could not save: '+((e&&e.code)||'unknown'));
+      });
+    });
+  }
+
+  function useCap(name){
+    // `claude.use` is the feature test on every runtime that has one. A view that cannot
+    // run the capability -- not granted, opened from a file, a thumbnail being captured --
+    // resolves null rather than throwing. Absence is SILENT: this page is opened locally
+    // and out of the artifact all the time, and a banner about a capability nobody asked
+    // for on every one of those is noise. A failed SAVE is not absence and is never
+    // silent.
+    //
+    // The member form is the fallback and not a preference. Older runtimes hung the
+    // namespace off `window.claude` directly and had no `use` at all, and this page is
+    // published to an artifact whose runtime moves under it -- a version published today
+    // is still being read next week. Nothing here may assume which one it woke up on.
+    try{
+      var c=window.claude;
+      if(!c) return Promise.resolve(null);
+      if(typeof c.use==='function')
+        return c.use(name).then(function(got){ return got||c[name]||null; })
+                          .catch(function(){ return c[name]||null; });
+      return Promise.resolve(c[name]||null);
+    }catch(e){ return Promise.resolve(null); }
+  }
+
+  // The capability that lets this page write itself, under either name it has had. `self`
+  // is `artifact`'s former spelling and both resolve the same namespace, so trying the
+  // current one first costs one extra round trip on an old runtime and nothing on a
+  // current one.
+  function useArtifact(){
+    return useCap('artifact').then(function(got){
+      if(got&&typeof got.publish==='function') return got;
+      return useCap('self').then(function(alt){
+        return (alt&&typeof alt.publish==='function')?alt:null; });
     });
   }
   var bar=document.getElementById('interactbar'),
@@ -1594,17 +1641,30 @@ INTERACT_JS = r"""
   // Six stores now, and the count has to name all six. It said three when there were
   // four once, which is the small kind of lie that costs a page its credit for every
   // other figure on it.
+  // What the save-back has to say, when it has anything. It outranks the tally below,
+  // because the tally is a standing fact and this is news about an attempt just made --
+  // and one of the things it says is that a save FAILED, which must not be quietly
+  // overwritten by a count two clicks later.
+  var pubMsg='', pubFailed=false;
   function setBar(){
     if(!bar) return;
-    var any=ddirty||tdirty||cdirty||fdirty||idirty||rdirty;
-    bar.classList.toggle('on', any);
-    if(saveDis) saveDis.hidden=!ddirty;
-    if(saveDet) saveDet.hidden=!tdirty;
-    if(saveCur) saveCur.hidden=!cdirty;
-    if(saveFil) saveFil.hidden=!fdirty;
-    if(saveInt) saveInt.hidden=!idirty;
-    if(saveRes) saveRes.hidden=!rdirty;
-    if(msg&&any)
+    var any=ddirty||tdirty||cdirty||fdirty||idirty||rdirty||adirty;
+    // The manual route is offered only where the automatic one is absent or has just
+    // failed. Where the page can publish itself there is nothing for anyone to do, and a
+    // row of buttons that are never how anything actually gets saved is the old chore
+    // wearing the face of a feature.
+    var manual=!art||pubFailed;
+    bar.classList.toggle('on', any||!!pubMsg);
+    bar.classList.toggle('failed', pubFailed);
+    if(saveDis) saveDis.hidden=!(ddirty&&manual);
+    if(saveDet) saveDet.hidden=!(tdirty&&manual);
+    if(saveCur) saveCur.hidden=!(cdirty&&manual);
+    if(saveFil) saveFil.hidden=!(fdirty&&manual);
+    if(saveInt) saveInt.hidden=!(idirty&&manual);
+    if(saveRes) saveRes.hidden=!(rdirty&&manual);
+    if(!msg) return;
+    if(pubMsg){ msg.textContent=pubMsg; return; }
+    if(any)
       msg.textContent=Object.keys(dstore).length+' acknowledged, '
         +Object.keys(tstore).length+' detached, '
         +Object.keys(cstore).length+' confirmed, '
@@ -1612,6 +1672,7 @@ INTERACT_JS = r"""
         +Object.keys(istore).length+' intended, '
         +Object.keys(rstore).length+' residue in this browser';
   }
+  function say(text, failed){ pubMsg=text; pubFailed=!!failed; setBar(); }
 
   function apply(){
     rows.forEach(function(el){
@@ -1862,7 +1923,162 @@ INTERACT_JS = r"""
     saveFile('residue.json', JSON.stringify(rstore,null,1), msg,
              function(){ rdirty=false; setBar(); });
   });
+
+  // --- the loop, closed ------------------------------------------------------
+  // Everything above this line has always worked and has always been useless in the one
+  // place it matters. A ✕ is recorded in this browser's localStorage, where nothing in the
+  // pipeline can see it, and reaches the stores only through a download the reader then
+  // moves into ~/.local/state/work-arcs by hand -- which has never once been done. So the
+  // brief, the lede, the counts and the queue go on repeating what has already been dealt
+  // with, which is the exact opposite of what a ✕ is for.
+  //
+  // The page can write itself. It publishes a new version of THIS artifact with one block
+  // replaced -- the seed the pipeline reads back on its next rebuild -- and nothing else
+  // about the document touched.
+  //
+  // Never by serialising the DOM: what is in the document right now carries this viewer's
+  // open disclosures, the runtime the shell injected and every class the client has
+  // toggled. The page's own source is fetched back from where it is served and the seed is
+  // cut out of THAT, so what is published is the document the pipeline built plus one line
+  // of JSON.
+  var SEEDRE=/(<script type="application\/json" id="ackseed">)([\s\S]*?)(<\/script>)/;
+  var art=null, pubTimer=null, pubBusy=false, pubAgain=false;
+  var seedDis={};                        // the acknowledgements this page arrived carrying
+  var PUBLISH_QUIET=4000;                // ms of stillness before a save
+
+  function ackPayload(){
+    var now=Math.floor(Date.now()/1000), dis={};
+    Object.keys(dstore).forEach(function(k){
+      var v=dstore[k];
+      dis[k]={ref:(present[k]||{}).ref||'', at:(v&&v.at)||now, note:dnote(k)};
+    });
+    // The acknowledgements this page was handed and no longer holds. A union at the other
+    // end can only ever add, so this is the only way a ✕ clicked a second time reaches the
+    // pipeline -- and it is named outright rather than inferred from an absence, because
+    // "not in this seed" is also what a store the page never rendered looks like.
+    var undis=[];
+    Object.keys(seedDis).forEach(function(k){ if(!(k in dstore)) undis.push(k); });
+    return {dismissed:dis, detached:tstore, confirmed:cstore, intended:istore,
+            residue:rstore, filed:fstore, answers:astore, undismissed:undis};
+  }
+
+  function schedulePublish(){
+    if(!art) return;
+    if(pubTimer) clearTimeout(pubTimer);
+    // Batched on a short quiet period rather than sent per click. Every publish mints a
+    // version and reloads every open view of this page, so a save per ✕ would make
+    // clearing eight rows eight reloads -- the opposite of comfortable, and being
+    // comfortable is the whole reason this section exists. Twenty clicks are one version.
+    pubTimer=setTimeout(publishAcks, PUBLISH_QUIET);
+    say('Saving to the published page in a moment…');
+  }
+
+  function publishAcks(){
+    pubTimer=null;
+    if(!art) return;
+    if(pubBusy){ pubAgain=true; return; }
+    pubBusy=true;
+    say('Saving to the published page…');
+    fetch(location.href.split('#')[0],{cache:'no-store',credentials:'same-origin'})
+      .then(function(r){
+        if(!r.ok) throw {code:'read_back_'+r.status};
+        return r.text(); })
+      .then(function(src){
+        // Two checks before anything is sent, and both are about not publishing something
+        // that is not this page. A publish replaces the artifact WHOLE, so a redirect to a
+        // login page or an error document would replace the dashboard with it -- there is
+        // no partial update to fall back on.
+        if(!/^\s*<!doctype html/i.test(src)) throw {code:'not_a_page'};
+        if(!SEEDRE.test(src)) throw {code:'no_seed'};
+        var body=JSON.stringify(ackPayload()).replace(/<\//g,'<\\/');
+        return art.publish(src.replace(SEEDRE,function(_,open,was,close){
+          return open+body+close; }));
+      })
+      .then(function(){
+        // The view reloads to what was just published, so little after this runs for long.
+        // The message is set anyway: a publish that succeeds and reloads slowly must not
+        // look like one that hung.
+        ddirty=tdirty=cdirty=fdirty=idirty=rdirty=adirty=false;
+        pubBusy=false;
+        say('Saved to the published page.');
+      })
+      .catch(function(e){
+        pubBusy=false;
+        var code=(e&&e.code)||'unknown',
+            ro=(code==='not_granted'||code==='not_writer'||code==='not_declared'
+                ||code==='capability_disabled'||code==='capability_removed');
+        // `conflict` is routine and is not a failure: somebody published first and the
+        // shell is already reloading every view to the winner. Retrying would be fighting
+        // a version this page has not seen.
+        //
+        // Everything else is LOUD, where an absent capability is silent. That difference
+        // is the discipline: nothing was promised where there is no capability, and a lost
+        // acknowledgement teaches distrust faster than no acknowledgement system does. The
+        // manual save buttons come straight back out — see setBar.
+        if(ro) art=null;
+        say(code==='conflict'
+              ? 'Someone else published first — reloading to their version.'
+              : ro
+                ? 'This view can read the page but not write it — use the save buttons.'
+                : 'NOT SAVED to the published page ('+code+'). Your clicks are still '
+                  +'here, and the save buttons are back.',
+            code!=='conflict');
+      });
+    if(pubAgain){ pubAgain=false; schedulePublish(); }
+  }
+
   apply();
+
+  // Adopting the pipeline's own copy. After the first apply() and before the writers are
+  // wrapped, so nothing about adopting schedules a save: a page that published itself the
+  // moment it opened would mint a version every morning for no judgement at all, and would
+  // race the rebuild that had just made it.
+  (function(){
+    var seed=document.getElementById('ackseed'), on={};
+    try{ on=JSON.parse((seed&&seed.textContent)||'{}')||{}; }catch(e){ on={}; }
+    var pairs=[['dismissed',dstore],['detached',tstore],['confirmed',cstore],
+               ['intended',istore],['residue',rstore],['filed',fstore]];
+    var moved=false;
+    pairs.forEach(function(pair){
+      var got=on[pair[0]];
+      if(!got||typeof got!=='object') return;
+      Object.keys(got).forEach(function(k){
+        if(pair[0]==='dismissed') seedDis[k]=1;
+        // Only what this browser has not got. The store here is the in-page authority
+        // after load and may hold a click made since the page was built; the file's copy
+        // of the same key is the older answer to the same question.
+        if(!(k in pair[1])){ pair[1][k]=got[k]; moved=true; }
+      });
+    });
+    if(moved){ dwrite(); twrite(); cwrite(); iwrite(); rwrite(); fwrite(); apply(); }
+  })();
+
+  // One place where every write is also a save. The writers are wrapped rather than
+  // schedulePublish being called from each of the dozen click handlers, because a handler
+  // added later that forgets the call is an acknowledgement that silently never leaves the
+  // browser -- the exact failure this section exists to end. schedulePublish is a no-op
+  // until a capability turns up, so this costs nothing where there is none.
+  (function(){
+    var d=dwrite, t=twrite, c=cwrite, f=fwrite, i=iwrite, r=rwrite, aw=awrite;
+    dwrite=function(){ d(); schedulePublish(); };
+    twrite=function(){ t(); schedulePublish(); };
+    cwrite=function(){ c(); schedulePublish(); };
+    fwrite=function(){ f(); schedulePublish(); };
+    iwrite=function(){ i(); schedulePublish(); };
+    rwrite=function(){ r(); schedulePublish(); };
+    awrite=function(){ aw(); schedulePublish(); };
+  })();
+
+  useArtifact().then(function(got){
+    if(!got) return;
+    art=got;
+    setBar();
+    // Anything clicked while the capability was still resolving. `use()` never settles
+    // within this script's first run, so on a fast reader the first ✕ of the morning lands
+    // before there is anything to publish with -- and would then wait for a second click
+    // that may never come.
+    if(ddirty||tdirty||cdirty||fdirty||idirty||rdirty||adirty) schedulePublish();
+  });
 })();
 """
 
@@ -4856,6 +5072,22 @@ def render(data, lede, focus_days, limit, cost=None):
     # than only what happens to be inside the focus window — see the note on FKEY.
     a('<script type="application/json" id="filedseed">'
       + json.dumps(data.get("filings") or {}) + "</script>")
+    # The other half of the round trip. `filedseed` has always carried what work-arcs read,
+    # so a browser's copy of the filings is whole rather than only what the focus window
+    # rendered; this carries the same for every other judgement a person can make here, and
+    # unlike that one it is written BACK. The client seeds its stores from it, merges what
+    # has been clicked since, and republishes this page with this block replaced — which is
+    # the only thing about a published page that ever changes between rebuilds.
+    #
+    # `answers` is the eval set's page-side half and starts empty from the server: the
+    # pipeline has already appended every answer it has seen to curation-labels.jsonl, and
+    # sending them back would ask the ingest to recognise its own writing. `undismissed`
+    # likewise — it is the client naming which of the fingerprints it was seeded with it no
+    # longer holds, so it can only ever be computed there.
+    acks = dict(data.get("acks") or {})
+    acks.setdefault("filed", data.get("filings") or {})
+    a('<script type="application/json" id="ackseed">'
+      + json.dumps({**acks, "answers": [], "undismissed": []}) + "</script>")
     a('<div id="interactbar"><span id="intmsg"></span>'
       '<button type="button" id="savedis" hidden>Save acknowledgements</button>'
       '<button type="button" id="savedet" hidden>Save detachments</button>'
@@ -4863,14 +5095,16 @@ def render(data, lede, focus_days, limit, cost=None):
       '<button type="button" id="savefil" hidden>Save filings</button>'
       '<button type="button" id="saveint" hidden>Save intended</button>'
       '<button type="button" id="saveres" hidden>Save residue</button>'
-      '<span class="muted">All of these apply here and survive reloads. Saving writes '
-      '<code>dismissed.json</code> / <code>detached.json</code> / '
+      '<span class="muted">All of these apply here and survive reloads. On the published '
+      'page they also save themselves: a few seconds after you stop clicking, this page '
+      'publishes a new version of itself carrying them, and the next rebuild reads them '
+      'back before it renders anything — so an acknowledgement made here is out of '
+      'tomorrow&rsquo;s brief, counts and questions with nothing else to do. Where that is '
+      'not available — a local copy, a read-only view — the buttons appear instead and '
+      'write <code>dismissed.json</code> / <code>detached.json</code> / '
       '<code>confirmed.json</code> / <code>authoritative-ticket.json</code> / '
       '<code>intended.json</code> / <code>residue.json</code> into '
-      '<code>~/.local/state/work-arcs/</code> — acknowledgements keep the CLI in '
-      'agreement, while a detachment, a confirmation, a filing or an answer about '
-      'intent takes full effect when <code>work-arcs</code> next builds the '
-      'page.</span></div>')
+      '<code>~/.local/state/work-arcs/</code> by hand.</span></div>')
     a(f"<script>{PARK_JS}</script>")
     a(f"<script>{INTERACT_JS}</script>")
     a(f"<script>{STANDUP_JS}</script>")
