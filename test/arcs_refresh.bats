@@ -71,9 +71,15 @@ setup() {
     # Both default to the quiet answer -- a page whose seed holds nothing new -- so the
     # many tests that are not about the read-back are not about it.
     export STUB_PAGE="$TEST_TMPDIR/published.html"
+    export STUB_BOOT="$TEST_TMPDIR/boot.json"
     export STUB_CAPS="$TEST_TMPDIR/caps.json"
-    printf '<!doctype html><html><body><script type="application/json" id="ackseed">%s</script></body></html>\n' \
+    # As the content host serves it: the runtime's preamble, then the stored bytes. What
+    # is stored is the page's own markup with no document around it, so there is no
+    # doctype here and there never was one -- a fixture with one would let a doctype test
+    # pass that the real service would fail.
+    printf '<!-- frame-runtime --><head></head><!-- /frame-runtime --><title>Work Arcs</title><script type="application/json" id="ackseed">%s</script>\n' \
         '{"dismissed":{},"answers":[],"undismissed":[]}' >"$STUB_PAGE"
+    echo '{"ver":"1787706300-d2fa","assetToken":"tok.1.2.3","title":"Work Arcs"}' >"$STUB_BOOT"
     echo '{"contract":"0.2.23","capabilities":{"artifact":{},"downloads":{}}}' >"$STUB_CAPS"
     # Exported here so a test can override them with a bare assignment, which is how the
     # rest of this file already reads.
@@ -81,6 +87,7 @@ setup() {
     export STUB_TOKEN_CODE=200
     export STUB_FRAMES_CODE=200
     export STUB_PAGE_CODE=200
+    export STUB_BOOT_CODE=200
     export STUB_CAPS_CODE=200
     export STUB_DEPLOY_CODES=200
     export STUB_DEPLOY_MSG=refused
@@ -156,8 +163,18 @@ case "$url" in
     [ -n "$out" ] && cp "$STUB_CAPS" "$out"
     printf '%s' "${STUB_CAPS_CODE:-200}"
     ;;
+# Reading the page takes two calls to two hosts, which is not an implementation detail
+# worth hiding here: the boot response says which version is live and hands out a
+# short-lived token, and the page itself is on the content host with that token in the
+# query string. A stub that answered the page from the boot route would pass a test the
+# real service fails.
 */api/frame/*)
-    echo "pageread $auth" >>"$STUB_DIR/calls"
+    echo "bootread $auth" >>"$STUB_DIR/calls"
+    [ -n "$out" ] && cp "$STUB_BOOT" "$out"
+    printf '%s' "${STUB_BOOT_CODE:-200}"
+    ;;
+*claudeusercontent.com*|*/_f/*)
+    echo "pageread $url" >>"$STUB_DIR/calls"
     [ -n "$out" ] && cp "$STUB_PAGE" "$out"
     printf '%s' "${STUB_PAGE_CODE:-200}"
     ;;
@@ -1298,7 +1315,7 @@ seed_of() { cat "$STUB_DIR/seed.json" 2>/dev/null; }
 ingest_calls() { grep -c '^work-arcs --ingest-acks' "$STUB_DIR/calls" 2>/dev/null || true; }
 
 published_page_with() {
-    printf '<!doctype html><html><body><script type="application/json" id="ackseed">%s</script></body></html>\n' \
+    printf '<!-- frame-runtime --><head></head><!-- /frame-runtime --><title>Work Arcs</title><script type="application/json" id="ackseed">%s</script>\n' \
         "$1" >"$STUB_PAGE"
 }
 
@@ -1355,7 +1372,7 @@ published_page_with() {
 # A page published before any of this existed carries no such block, and the rebuild this
 # run is about to do puts one there. Not a failure, and it must not read as one.
 @test "a page with no seed block yet is not a failure" {
-    printf '<!doctype html><html><body>nothing here</body></html>\n' >"$STUB_PAGE"
+    printf '<!-- frame-runtime --><head></head><!-- /frame-runtime --><title>Work Arcs</title>nothing here\n' >"$STUB_PAGE"
     run "$REFRESH"
     [ "$status" -eq 0 ]
     [ "$(ingest_calls)" = 0 ]
@@ -1381,12 +1398,31 @@ published_page_with() {
     grep -q "no artifact link to read back" "$LOG"
 }
 
-# The read is the model-read route and not the capability one. They answer different
-# questions -- what the artifact may DO against what it currently SAYS -- and asking the
-# wrong one returns a body with no page in it at all, which cost a round of debugging.
-@test "the page is read from the model-read route" {
+# Three routes answer three different questions, and picking the wrong one costs a round of
+# debugging: the capability route says what the artifact may DO, the boot route says which
+# version is live and hands out a token, and only the content host has the page.
+@test "the page is read from the content host, with the boot token" {
     run "$REFRESH"
-    grep -q '^pageread' "$STUB_DIR/calls"
+    grep -q '^bootread' "$STUB_DIR/calls"
+    grep -q '^pageread .*claudeusercontent.com' "$STUB_DIR/calls"
+    grep -q '^pageread .*/_f/1787706300-d2fa/index.html' "$STUB_DIR/calls"
+}
+
+# The OAuth bearer is not sent to the content host: different host, would not be accepted,
+# and a credential does not go anywhere it is not needed.
+@test "the content fetch carries the token and not the login" {
+    run "$REFRESH"
+    ! grep '^pageread' "$STUB_DIR/calls" | grep -q "Bearer"
+}
+
+# A public (non-member) serve gets no token, and the page is not readable that way. Not a
+# transient failure, and no number of retries changes it.
+@test "a boot response with no token is named rather than retried" {
+    echo '{"ver":"1787706300-d2fa"}' >"$STUB_BOOT"
+    run "$REFRESH"
+    [ "$status" -eq 0 ]
+    grep -q "ingest: could not read the published page" "$LOG"
+    ! grep -q '^pageread' "$STUB_DIR/calls"
 }
 
 # --- what the published page is allowed to do -------------------------------------------
