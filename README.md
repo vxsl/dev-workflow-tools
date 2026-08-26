@@ -506,6 +506,24 @@ workstream under *Landed*. The test is `settled`, which is the one place that de
 whether every branch of an arc has landed or been abandoned, plus the `pre-landing` rung
 where the work shipped as a reshape and the survivors are drafts from before it.
 
+**Both gap folds can now be answered, not merely read.** The ledger rows, the demands, the
+Slack blocks and the Jira-mismatch rows all carried a `✕`; `unticketed_work` and
+`tickets_without_work` carried none — no fingerprint on the row and neither list in
+`apply_dismissals`' universes — so the two folds stating the most repetitive facts on the
+page were the two with no way to say *I know*. And they are not quiet: the page's fallback
+lede opens on the unticketed count.
+
+Both are fingerprinted now, on the same self-expiring contract as everything else here. The
+no-ticket row carries the arc's tips, so another day's commits revive it — *“I know, and it
+is fine”* was said about a half-day experiment, not about the week it has since become. The
+empty-ticket row carries the status, so correcting the ticket revives it. The other two ways
+either row stops being true — it gains a ticket, or the ticket gains work — delete the row
+outright and the prune takes the acknowledgement with it. The mark is `gap_dismissed` and
+not `dismissed`, because these rows **are** the arc and the issue, the same objects the
+workstream cards render: a workstream carrying `dismissed` would read as the workstream
+having been acknowledged rather than the one sentence about its missing ticket, so
+`apply_dismissals` carries a word per universe.
+
 `--jira-ify` files the ticket using what the arc already knows — branches, unpushed
 count, session count, recent commit subjects — then drops into `create-jira-ticket`'s
 board picker, because UL vs UB is a judgment call. Add `--dry-run` to see it first.
@@ -554,26 +572,106 @@ from: per merge request, whose turn it is, how many **rounds** of yours it is de
 maximal run of your notes — six comments in one sitting are one round), how long it has been
 running, how long it has been quiet, and the workstream it joins to where one exists. The
 join is by fact and never by guess: the source branch checked out locally, or a ticket key
-both sides name. Ranked yours-first then longest-running; the CLI prints it under
-`── reviewing ──`; a workstream that is *only* a checkout gets its own rung rather than a
-claim about work of yours, reading `reviewing !10475 for logan, round 5, your turn`.
-`reviews_known` says whether that list is all of them, because "you are reviewing nothing"
-and "GitLab was not asked" are opposite sentences.
+both sides name. Ranked yours-first then longest-running with the iid as a total tiebreak; the CLI prints it
+under `── reviewing ──`. `reviews_known` says whether that list is all of them, because "you
+are reviewing nothing" and "GitLab was not asked" are opposite sentences.
+
+**Approving is not the moment it becomes your turn.** *"most of the reviews seem like BS, in
+particular it's reporting on things i've already approved."* Twenty-one of twenty-three rows
+read *your turn*, and two defects were doing it, the first hiding the second. Approving moves
+a merge request's `updated_at` and writes no human note, so the whose-turn proxy read **his
+own approval as their push** and flipped the row to *your turn* at the exact instant his end
+of it finished. The proxy now asks whether `updated_at` outruns anything *he* can explain,
+approval included — narrowly that, because a push is what the proxy exists to catch and an
+approval is the one event of his known to be mistaken for one.
+
+Then the question nobody was asking: an approval that postdates every move of theirs settles
+the engagement. Those rows leave `reviews[]` for a returned **`reviews_approved[]`** with a
+count, because 23 ongoing quietly becoming 19 is a list that has started editing itself. An
+*overtaken* approval covers nothing — they pushed or spoke about a state of the branch the
+approval was never given about — and the row comes back with the turn honestly his. The
+approval instant comes off the system note already in the `discussions` call; `/approvals`
+cannot answer this at all, its `approved_by[]` entries being bare user objects with no
+instant on them, so no call was added, and a page too short to hold the note fails safe by
+leaving the row on the list. The run-over-run snapshot keeps both maps, so approving reads
+as movement (*"off the reviewing list until they move"*) rather than as *gone*, which stays
+reserved for a merge request that left the universe; a row coming back is `revived`, not
+`appeared`. Both lists register in the dismissal store, so an acknowledgement is not pruned
+by the row changing lists. Real corpus: 23 → 19 ongoing, four approved away, four approvals
+correctly overtaken and still on the list.
+
+**A directory holding somebody else's branch was never a piece of work of yours.** *"if
+there's a checkout-only arc with none of my own work, doesn't that mean that it's not an arc
+at all?"* It does. An arc is work of yours; a branch of Logan's you fetched to read is
+evidence that you were reading it, and evidence belongs on the review rather than on a
+workstream invented to hold the directory. `demote_checkouts` runs right after the review
+join and before anything that ranks or diffs an arc. Where a review joined, the branch and
+the sittings spent on it become that review's own evidence (`checked_out`,
+`checkout_branches`, `checkout_sessions`, `checkout_age_days`) and its `arc` pointer goes to
+`null` with the arc; where none did, the branch leaves as a top-level **`checkouts[]`** row —
+branch, age, owner, worktree, sessions, and what it used to be filed under.
+
+Nothing is deleted in silence, because a local head this tool stops mentioning is a head
+nobody remembers to delete, and a test proves every demoted branch lands in one list or the
+other. **The promotion boundary is the working tree and not the commit**, which is Kyle's
+own line: *"what if i check something out and start to make changes on it but havent
+committed yet. that would be an arc... right?"* It is. A dirty worktree or a stash on a
+foreign checkout keeps it a workstream with an honest state (*"uncommitted changes on ella's
+branch"*); a clean one is a checkout however many sittings were spent reading it, because
+reading is what reviewing looks like. A worktree git will not answer for is kept and
+announced — a workstream dropped on a failed subprocess is dropped on no evidence. It costs
+11 `git status` calls and 0.3s rather than 248 and 31s, because only a checkout with a
+worktree can be dirty. With it, `arc.role` is deleted rather than left as a field with one
+value, and the `reviewing` stage goes with it; `diff_runs` says once why the count fell.
+Real corpus: 174 → 170 arcs, three checkouts listed, one become evidence on `!10475`, and
+`UB-6888` still a workstream on a stash of his sitting on Ella's branch. A park is a
+declaration and outranks anything derived, so a *parked* checkout-only arc stays a
+workstream — demoting it would strand the store entry with no live row to expire it — and a
+membership question whose arc the demotion is about to remove is dropped rather than asked,
+because the queue's own rule is that a skipped question comes back next build and this one
+never should.
 
 On the page that is a **Reviewing zone**, with a fixed place directly under the ledger.
 Those two are the only registers here with somebody else in the loop and they read as a
 pair — what is owed, then what is under way — and everything below them is about work of
-your own. One row per review, in the order the wire ranked them, and nothing is truncated:
-the review Kyle named out loud sits at the *far end* of that order, because it is the one
-of the twenty-three whose ball is in somebody else's court, so any cap tuned to the head of
-the list would have hidden exactly the row the section exists for. Each row carries the
-merge request, its title, its author, the days the engagement has run, the rounds, whose
+your own. Wire order, untouched — a second ranking written here would be a second author
+for *which review matters most*, the same law the ledger's sides and the forgotten list are
+already held to. Each row carries the merge request, its title, its author, the days the engagement has run, the rounds, whose
 turn it is, how long it has been quiet, and the workstream it joins to — linked where that
 workstream has a row on this page and stated plainly where the focus window hides it, with
 the join's own reason as its tooltip. `✕` acknowledges a row through the same store every
 other `✕` on the page writes to, so `apply_dismissals` registers reviews as a universe of
 its own: a fingerprint the store does not know is live is one the next prune deletes while
 announcing that a fact nobody touched has moved.
+
+**Five rows stand and the rest are one line away** — the ledger's cut, exactly. Twenty-three
+rows rendered whole in the middle of the page is a wall, which is the one complaint this page
+keeps being rebuilt to answer, arriving through the one section that had not learned that
+lesson yet. Nothing is dropped and nothing is capped silently: the disclosure states its own
+size, every row is in the document, and a `✕`, a mirror and an anchor all still find the ones
+in the fold.
+
+*Which* five stand is the other half, and it is a selection rather than a sort. The wire is
+longest-running first, so reading the first five off it put a merge request nobody had said a
+word on for 126 days at the top of the section and yesterday's movement below the fold — the
+ranking inverted by accident. The window takes the first five that are **still moving**, in
+the wire's own order, and a review silent for longer than half its own life (and for at least
+a week, because a ratio says nothing about a merge request opened yesterday) is set faint and
+waits in the disclosure. `gone_quiet()` reads two fields the row was handed; no row is moved
+past another and no score is composed.
+
+**Whose turn it is is said once per group, not once per row.** It is the one figure the zone
+gives emphasis to, and on this corpus twenty-one of twenty-three rows carried it: a majority
+state printed twenty-one times stops carrying information, and it buries the two rows that
+are the exception — which are the rows Kyle asked this section for in the first place. The
+boundary is already on the wire, so rendering it as two headings is not a second ranking and
+nothing about the order changes. Where the wire does *not* partition — an older graph, a
+ranking that moves — no headings are drawn at all and every row keeps its own label, because
+a heading over a group that is not a group is worse than the repetition. The counts on the
+headings are recounted by the client the way the ledger's aggregate rows are, so a `✕` cannot
+leave one stale, and a group emptied by acknowledgement hides with its rows. The one thing a
+heading cannot carry — that a turn was read off a push rather than a note — stays on the row
+it belongs to.
 
 **Exactly one thing on that row is allowed a colour**, and the first version got it wrong in
 an instructive way. The clock took the ledger's fortnight threshold, which on a debt means a
@@ -681,11 +779,21 @@ work-arcs --curate    # y yes · n no · s skip · esc done
 ```
 
 One keystroke each, a preview pane showing both sides of the tie, and the same rows on the
-page with **yes** / **no** buttons. The rules are all about the asking, because a queue
-that is unpleasant to open is a queue that stays full: never more than five, one per arc
-(two branches propping each other up is one question, not two), **skip is free and leaves
-no record**, silence when there is nothing to ask, and nothing anywhere that notifies,
-badges or counts up at you.
+page as cards you answer with a click. The rules are all about the asking, because a queue
+that is unpleasant to open is a queue that stays full: one question per arc (two branches
+propping each other up is one question, not two), **skip is free and leaves no record**,
+silence when there is nothing to ask, and nothing anywhere that notifies, badges or counts
+up at you.
+
+**Five was a cap and is now a window.** It was set when answering meant an fzf round-trip
+or a fresh build, so five painless questions beat a checklist grind — and it cut the queue
+at *emission*, in `work-arcs`, which is the one place that cannot know how many questions a
+person is willing to answer this morning. The page closed that loop: answering is a click,
+applied in place, saved by the page itself. So the queues emit everything they have and
+`ARC_CURATION_CAP` moves to `arcs-page` as the size of the window shown at once — one card
+open, the next few as a ranked strip, the remainder announced and one click behind a
+disclosure. A truncation made where the rendering is can be un-truncated; one made on the
+wire never can.
 
 Four kinds of membership are never asked about, because each is a fact rather than a
 guess: a branch cut from another, the same commit under a second name, a superseded copy
@@ -736,12 +844,37 @@ changes the part of the list a person actually reads. Ranked by how cold it is i
 queue opened on a two-day scratch branch 92 days quiet in sixteenth place, ahead of seven
 days of chart work in fourth.
 
-**Membership still leads, and intent holds one seat of the five.** Strict priority sounded
-right and measured out as silence: 56 memberships sit under the confidence line on this
-repo and five are offered every build, against 29 workstreams eligible for an intent
-question — so the intent half would never have been asked at all until every grouping doubt
-in the repo was answered. Four of five is the priority; nought of five was the priority
-collapsing.
+**Does this need a ticket?** The third kind, and the one Kyle asked for out loud: *“real
+work with no ticket has some items that i need to be able to dismiss easily. i should find
+it very comfortable to continually clean up noise, which is one of the biggest levers in
+terms of making the dashboard meaningful.”* Giving those rows a `✕` is the passive half of
+that — you still have to go to the fold and read it. So the queue asks per unticketed
+workstream, ranked by days of work at stake, because the size of what Jira cannot see is the
+size of the fold's whole claim.
+
+It honestly has three answers rather than two. **y** wants a ticket and writes nothing: the
+row stays, still counted, which is what wanting a ticket looks like. **n** is fine without
+one and **x** is noise; both write the same acknowledgement the fold's own `✕` writes, so
+answering here empties the row out of the fold, out of the lede and out of this queue at
+once. They differ only in the label, and the label is the point — an eval set that cannot
+tell real work from noise cannot score any change to what `unticketed_work` selects.
+
+**The three kinds take turns rather than being ranked against each other.** Strict priority
+sounded right and measured out as silence: 56 memberships sit under the confidence line on
+this repo against 29 workstreams eligible for an intent question, so under a cut the intent
+half would never have been asked until every grouping doubt in the repo was answered — and
+the no-ticket kind, the one whose rows Kyle asked to be able to clear, was reached on the
+order of never. The kinds are also not comparable: a confidence of 0.12 and six days of
+unpublished work are not two readings of one scale, and any arithmetic pretending otherwise
+would be a fourth ranking nobody could account for.
+
+So `CURATION_WEAVE` is a rota rather than a reservation — `membership, membership, residue,
+membership, unticketed` — and a kind that has run out yields its turn to priority rather
+than holding a seat empty. Each kind arrives in a total order of its own (least confident,
+worst distortion, most days at stake) and the weave position is the only cross-kind key, so
+two builds of one graph produce the same sequence. That matters more than it sounds:
+`arc-brief` caches on evidence text, and a queue that reshuffled between builds would re-ask
+the same questions in a different order every morning.
 
 **And every answer is a labelled example.** They append to `curation-labels.jsonl`, both
 verdicts and not only the corrections — scored on corrections alone, a clusterer that split
