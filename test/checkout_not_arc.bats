@@ -373,3 +373,20 @@ print("then", wa.diff_runs(new, after, [], None)["checkouts_first_seen"])'
     [[ "$output" == *"first True"* ]]
     [[ "$output" == *"then False"* ]]
 }
+
+@test "a workstream somebody set aside by hand is not demoted out from under the park" {
+    # A park is a declaration and outranks anything derived. Demoting one would leave the
+    # declaration pointing at nothing, which is how a store starts holding entries no run
+    # can expire.
+    theirs UL-1816 2026-08-01
+    pushed UL-1816
+    run wa '
+arcs = build()
+arcs[0]["parked"] = {"at": "2026-08-01", "note": "waiting on ella"}
+print("why", wa.checkout_promoted(arcs[0]))
+kept, checkouts = wa.demote_checkouts(arcs)
+print("after", [a["id"] for a in kept], "checkouts", [c["branch"] for c in checkouts])'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"why parked"* ]]
+    [[ "$output" == *"after ['UL-1816'] checkouts []"* ]]
+}

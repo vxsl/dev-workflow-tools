@@ -371,8 +371,13 @@ def checkout_promoted(arc):
     checkout straight back where it was.
 
     An unreadable working tree promotes too. A workstream deleted because a subprocess
-    failed is a workstream deleted on no evidence at all.
+    failed is a workstream deleted on no evidence at all. So does a park, for the reason
+    every pass here defers to one: a park is a declaration and outranks anything derived.
+    Demoting a workstream somebody set aside by hand would leave the declaration pointing
+    at nothing, which is how a store starts holding entries no run can ever expire.
     """
+    if arc.get("parked"):
+        return "parked"
     if arc.get("stashes"):
         return "stash"
     if any(b.get("dirty") is True for b in arc.get("branches", [])):
@@ -7540,6 +7545,11 @@ def finalize(arc, repo=None, main_ref="origin/main"):
             "dirty": f"uncommitted changes on {whose}",
             "stash": f"stashed changes on {whose}",
             "unreadable": f"{whose} — git would not say if the tree is clean",
+            # A parked arc never reaches here: apply_parked writes its own stage and
+            # state, and this branch is only taken when nothing has. Listed anyway so the
+            # mapping is the same shape as checkout_promoted and cannot fall out of step
+            # with it in silence.
+            "parked": f"set aside — {whose}",
         }.get(why, f"checkout of {whose}")
     elif stale_draft:
         arc["stage"] = "pre-landing"
@@ -8941,6 +8951,14 @@ def main():
     was_arcs = len(arcs)
     arcs, checkouts = demote_checkouts(arcs)
     checkouts_left = was_arcs - len(arcs)
+    # Membership questions are built where their inputs are freshest, which is ~170 lines
+    # above this and therefore before the demotion. A question about a workstream that no
+    # longer exists is a question whose only answer is wrong either way, so it is dropped
+    # here rather than asked -- one of the queue's own rules is that a skipped question
+    # comes back next build, and this one never should.
+    if checkouts_left:
+        alive = {a.get("id") for a in arcs}
+        curation = [q for q in curation if q.get("arc_id") in alive]
 
     # Both of its exclusions -- parked, and whose clock is running -- are only settled by
     # now: apply_parked has just run, and `stage` came from the finalize pass after
