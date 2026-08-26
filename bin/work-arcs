@@ -2852,6 +2852,18 @@ def apply_dismissals(ledger, arcs=None, gap=None, prune=False):
     live, field = {}, {}
     for e in (ledger["they_owe"] + ledger["you_owe"]) if ledger else []:
         live[e["fp"]] = e
+    # The ongoing reviews, a universe of their own for the same reason they are a section
+    # of their own: they are not ledger rows and most of them join to no arc, so neither
+    # loop above would ever reach one. Registering them here is what makes their ✕ the same
+    # ✕ as everything else -- without it the store would hold a fingerprint no live row
+    # claims, and the prune below would delete the acknowledgement on the very next run
+    # while announcing that a fact nobody touched had moved. No extra gate: the prune
+    # already requires `ledger["complete"]`, which is a conjunction over `you_whole`, and
+    # `reviews_known` is `you_whole` and a known author -- so a run allowed to prune is by
+    # construction one that read every review.
+    for r in (ledger or {}).get("reviews") or []:
+        if r.get("fp"):
+            live[r["fp"]] = r
     for arc in arcs or []:
         for d in arc.get("demands", []):
             if d.get("fp"):

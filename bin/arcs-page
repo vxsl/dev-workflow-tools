@@ -311,6 +311,11 @@ body{margin:0;background:var(--ground);color:var(--ink);font-family:var(--sans);
 .cockpit .door:hover{background:var(--surface-2)}
 .cockpit .door[data-door="standup"]{--edge:var(--calm)}
 .cockpit .door[data-door="ledger"]{--edge:var(--warm)}
+/* The reviewing door takes the ledger's warm edge because it is the ledger's register:
+   two doors into loops with somebody else in them, standing next to each other. The edge
+   groups them on purpose -- it is the one thing on this strip that says which doors are
+   about people and which are about work of his own. */
+.cockpit .door[data-door="reviewing"]{--edge:var(--warm)}
 .cockpit .door[data-door="play"]{--edge:var(--accent)}
 .cockpit .dk{font-family:var(--sans);font-weight:600;font-size:.68rem;
   letter-spacing:.1em;color:var(--ink-faint)}
@@ -663,6 +668,50 @@ a:hover{text-decoration-color:currentColor}
   margin-top:.2rem}
 .ledger .fade{opacity:.85}
 
+/* The reviewing zone: somebody else's merge requests you are in the middle of.
+
+   Deliberately built out of the ledger's own parts -- the same clock column, the same
+   reference-then-title row, the same grey sub-line of facts -- because it sits directly
+   under it and the two are the same register: a loop with a person on the other end. What
+   makes it a section rather than a third ledger side is that it is one list and not two,
+   and that its rows are ranked by an engagement's age rather than by a debt's.
+
+   One colour, in one place. Twenty-three rows all carrying a warm figure would be a page
+   that has said nothing about any of them, so the days, the rounds and the quiet are all
+   the same ink and only whose turn it is is allowed to speak. */
+.reviewing{list-style:none;margin:0;padding:0;background:var(--surface);border-radius:6px;
+  display:flex;flex-direction:column}
+.reviewing li{display:flex;gap:.65rem;align-items:baseline;font-size:.85rem;min-width:0;
+  padding:.55rem .9rem;border-top:1px solid var(--hairline)}
+.reviewing li:first-child{border-top:0}
+.reviewing .clk{font-family:var(--mono);font-size:.78rem;color:var(--ink-soft);flex:none;
+  min-width:2.8rem;text-align:right;font-variant-numeric:tabular-nums}
+.reviewing .clk.hot{color:var(--hot);font-weight:700}
+.reviewing .what{min-width:0;flex:1 1 auto}
+.reviewing .ref{font-family:var(--mono);font-size:.78rem}
+/* A line of running text and deliberately not a flex row: the separators are written into
+   the sentence, and as flex items they become boxes of their own that a wrap can orphan a
+   middot onto. Inline flow keeps every one of them attached to the fact in front of it. */
+.reviewing .who{display:block;font-size:.74rem;color:var(--ink-faint);margin-top:.1rem}
+.reviewing .who .av{margin-right:.25rem;vertical-align:-.28rem}
+/* Every number on the row, and no emphasis on any of them: a count is an input to a
+   judgement, not the judgement. Mono because it is data, and that is the whole of it. */
+.reviewing .rn{font-family:var(--mono);font-variant-numeric:tabular-nums;
+  color:var(--ink-soft)}
+/* The one thing on the row worth acting on. Warm when it is yours, because that is the
+   register the rest of this page already uses for "this wants an answer"; the other
+   direction is left in the row's own grey, since a review sitting with its author asks
+   nothing of you and colouring it would say otherwise. */
+.reviewing .turn.mine{color:var(--warm);font-weight:600}
+.reviewing .turn[title]{cursor:help}
+.reviewing .arcl{color:var(--ink-soft)}
+.reviewing .arcl[title]{cursor:help}
+.reviewing li .dis{margin-left:auto;align-self:center}
+.reviewing+.showdis{margin-left:.2rem}
+/* `.quiet` already carries the surface, the radius and the padding this needs, so the
+   empty state is styled by the same rule the ledger's own is. */
+section#reviewing .covered{margin:.55rem 0 0;font-size:.76rem;color:var(--ink-faint)}
+
 /* The rest of a side, and the silent review requests as one row.
 
    Both are the same argument in two places: the ledger's job is to name the open loops,
@@ -809,6 +858,12 @@ td .dis{vertical-align:middle}
 .ws .st{font-family:var(--sans);font-size:.78rem;color:var(--ink-soft);
   white-space:nowrap;font-variant-numeric:tabular-nums}
 .ws .ag{font-family:var(--mono);font-size:.7rem;color:var(--ink-faint);white-space:nowrap}
+/* An age that is not yours. On a workstream holding no commit of yours the date is the
+   last push on somebody else's branch, and printed like every other age it reads as a
+   claim about your week. Marked rather than dropped -- it is still the only thing on the
+   row that answers "is this moving" -- and marked quietly, because the fact it carries is
+   about provenance and not about urgency. */
+.ag.foreign{opacity:.6;font-style:italic;cursor:help}
 
 /* Out for review with nothing outstanding, and somebody actually asked to read it: pushed,
    proposed, handed over, nothing more to do from here for now. Every other row on this page
@@ -911,6 +966,21 @@ td .dis{vertical-align:middle}
 .lb .cl[data-k="merged"]::before,.lb .cl[data-k="mergeable"]::before,
 .lb .cl[data-k="unconflict"]::before,
 .lb .cl[data-k="pipeline-green"]::before{background:var(--calm)}
+/* What a review can have done in the interval, in the vocabulary the rest of this strip
+   already speaks: warm is something that now wants an answer from you, calm is the
+   engagement advancing under its own steam, and a review that has left the list keeps the
+   default grey because nothing is being asked about it. */
+.lb .cl[data-k="turned_mine"]::before,.lb .cl[data-k="appeared"]::before{
+  background:var(--warm)}
+.lb .cl[data-k="answered"]::before,.lb .cl[data-k="turned_theirs"]::before{
+  background:var(--calm)}
+/* The second list in the fold, hung under the first rather than beside it: same grid, same
+   columns, one hairline where they meet so the change of subject is visible without a
+   heading claiming it is a separate section. */
+.lb.rv{border-radius:0 0 6px 6px}
+.lb:has(+.lb.rv){border-radius:6px 6px 0 0}
+.lb+.lb.rv{border-top:1px solid var(--hairline)}
+.lb.rv li:first-child{border-top:0}
 @media(max-width:640px){.lb li{grid-template-columns:3.4rem 1fr}
   .lb .cls{grid-column:1/-1}}
 
@@ -2099,7 +2169,7 @@ INTERACT_JS = r"""
 """
 
 
-EVIDENCE_ID = {"ledger": "lg-", "forgotten": "fg-", "gap": "gp-"}
+EVIDENCE_ID = {"ledger": "lg-", "forgotten": "fg-", "gap": "gp-", "review": "rv-"}
 
 # How many Jira-mismatch rows the table shows. The only truncation on the page, and it is
 # named rather than inlined because the morning brief has to know where the list stops in
@@ -2289,7 +2359,7 @@ def cockpit(a, doors):
     """
     if not doors:
         return
-    a('<nav class="cockpit" aria-label="the three places this page is opened for">')
+    a('<nav class="cockpit" aria-label="the places this page is opened for">')
     for d in doors:
         a(f'<a class="door" data-door="{d["id"]}" href="#{d["href"]}">'
           f'<span class="dk">{d["kick"]}</span>'
@@ -3223,6 +3293,139 @@ def fold(a, title, count, lead="", sid="", attrs=""):
       + "</summary>")
 
 
+
+def reviewing(a, reviews, drafts, here, by_id):
+    """The reviews you are in the middle of, as work with a clock rather than as debts.
+
+    Kyle: "me actively reviewing someone's MR is in its own category, e.x. i have 6802
+    which is a long ongoing review and various logan MRs which are long ongoing reviews.
+    it would be cool to see these as first-class things." Nothing on this page could hold
+    one. The ledger drops a merge request the moment you first speak on it -- correctly,
+    because you no longer owe a first read -- and that is precisely the instant the review
+    starts, so a twelve-round engagement running since the fifth of August was invisible
+    everywhere except as an absence.
+
+    Its place in the standing order is fixed and it is next to the ledger deliberately:
+    both are loops with a person on the other end, and both close by somebody moving rather
+    than by anyone ticking anything off. What separates them is which way the obligation
+    runs, which is why they are two sections and not one list.
+
+    Wire order, untouched. work-arcs ranks these yours-first then longest-running with the
+    iid as a total tiebreak, and a second ranking written here would be a second author for
+    "which review matters most" -- the same law the ledger's sides and the forgotten list
+    are already held to. Nothing is truncated either: the row Kyle named out loud sits at
+    the far end of that order, because it is the one review of the twenty-three whose ball
+    is in somebody else's court, and a cap tuned to the top of the list would have hidden
+    exactly the row the section was asked for.
+
+    The only thing given emphasis is whose turn it is. Everything else on the row -- the
+    days, the rounds, the quiet -- is a figure, and a page that colours every figure has
+    said nothing about any of them.
+    """
+    n = undismissed(reviews)
+    a('<section id="reviewing">')
+    a('<div class="rung"><h2>Reviewing</h2>'
+      f'<span class="n"><span id="rv-n" data-count>{n}</span> merge request'
+      + ("" if n == 1 else "s") + " of theirs</span></div>")
+    a('<p class="note">Somebody else&rsquo;s merge requests you are engaged in, yours '
+      "first and then longest-running &mdash; the order work-arcs ranked them in, not a "
+      "second one composed here. This is not the ledger and not a workstream of yours: a "
+      "ledger row is a debt that closes the moment the other person moves, and a review "
+      "carries on after they do. Every figure is derived. The clock is how long the "
+      "engagement has run since you were asked; <b>rounds</b> counts batches of your own "
+      "comments, so six notes in one sitting are one round and not six; whose turn it is "
+      "is read off the notes where they answer it, and off the merge request&rsquo;s own "
+      "last update where a push is all there is to go on &mdash; a row says which of the "
+      "two it is. A workstream is named on a row only where the join is a fact: its "
+      "source branch is checked out here, or both sides name the same ticket. Most of "
+      "these join to nothing, which is normal rather than a failure &mdash; most of what "
+      "you review was never checked out on this laptop. <strong>&#x2715; acknowledges a "
+      "row</strong>: it leaves the list but stays counted, and it comes back on its own "
+      "the moment the engagement moves &mdash; a round lands, or the turn "
+      "flips.</p>")
+    if not reviews:
+        # Present and saying so, rather than absent. GitLab was asked and answered
+        # nothing, which is a real and good state; the absent section is what an
+        # unconsulted GitLab gets, and the two must not look alike.
+        a('<div class="quiet">No merge request of anybody else&rsquo;s is waiting on '
+          "you or open under your review.</div>")
+        a("</section>")
+        return
+    a('<ul class="reviewing" data-disgroup data-countfor="#rv-n">')
+    for r in reviews:
+        fp = r.get("fp", "")
+        turn_mine = r.get("whose_turn") == "mine"
+        # The one figure allowed a colour, and the only one anybody acts on. The proxy
+        # note rides in the title rather than in the sentence: whether the turn was read
+        # off a note or off a push is the sort of provenance a reader goes looking for
+        # once, not something to print on twenty-three rows.
+        turn = ('<b class="turn mine"' if turn_mine else '<span class="turn"') + (
+            ' title="no note is newer than the merge request&rsquo;s own last update, '
+            'so a push is standing in for a word"'
+            if r.get("their_last_is_proxy") else "") + ">" + (
+            "your turn" if turn_mine else "their turn") + (
+            "</b>" if turn_mine else "</span>")
+        facts = [f'{face(r.get("author") or "")}{esc(r.get("author") or "?")}']
+        rounds = r.get("rounds") or 0
+        if rounds:
+            facts.append(f'<span class="rn">{rounds}</span> round'
+                         + ("" if rounds == 1 else "s"))
+        else:
+            # Said rather than left as an absent figure: nothing of yours in the thread is
+            # what makes this row a first read rather than an engagement, and a blank where
+            # every other row carries a count reads as a number that failed to render. In
+            # words and not in mono, because "none yet" is a sentence and mono on this page
+            # is data and only data.
+            facts.append("no round yet")
+        facts.append(turn)
+        quiet = r.get("quiet_days")
+        if isinstance(quiet, int) and quiet > 0:
+            facts.append(f'quiet <span class="rn">{quiet}</span>d')
+        arc = r.get("arc")
+        if arc:
+            label = esc(str(((by_id.get(arc) or {}).get("brief") or {}).get("name")
+                            or (by_id.get(arc) or {}).get("label") or arc))
+            via = f' title="{esc(r.get("arc_via") or "")}"' if r.get("arc_via") else ""
+            # An anchor to a row the focus window never rendered is the same lie as a
+            # link to a 404 -- the rule the run-over-run strip and the sprint strip
+            # already follow -- so outside the window the join is stated and not linked.
+            facts.append(f'<a class="arcl" href="#{anchor(arc)}"{via}>{label}</a>'
+                         if arc in here else
+                         f'<span class="arcl"{via}>{label}</span>')
+        clk = r.get("days")
+        # Its own clock, and the same hot threshold the ledger uses on its own: a
+        # fortnight of a loop is a loop that has demonstrably failed to close.
+        hot = " hot" if isinstance(clk, int) and clk >= 14 else ""
+        asked = (f' title="from the merge request&rsquo;s creation — no note records '
+                 f'when you were asked"' if r.get("asked_is_proxy")
+                 else f' title="asked {esc(r.get("asked") or "")}"'
+                 if r.get("asked") else "")
+        a(f'<li data-fp="{esc(fp)}"'
+          + (f' id="rv-{esc(fp)}"' if fp else "")
+          + f' data-dismissed="{1 if r.get("dismissed") else 0}">'
+          + f'<span class="clk{hot}"{asked}>'
+          + (f"{clk}d" if isinstance(clk, int) else "&mdash;") + "</span>"
+          + '<div class="what">'
+          + link(r.get("url", ""), esc(r.get("ref", "")), "ref")
+          + f' {esc(r.get("title", ""))}'
+          + f'<span class="who">{" &middot; ".join(facts)}</span></div>'
+          + ('<button class="dis" type="button" aria-label="acknowledge this review — '
+             'it returns on its own when the engagement moves" title="acknowledge — '
+             'returns on its own when the engagement moves">&#x2715;</button>'
+             if fp else "")
+          + "</li>")
+    a("</ul>")
+    if drafts:
+        # Announced with its real count, like every other cut on this page. A draft is
+        # not a review you are in the middle of, and leaving one out silently would make
+        # a list that claims to be all of them into one that is not.
+        a(f'<p class="covered">{drafts} draft'
+          + ("" if drafts == 1 else "s")
+          + " of theirs left out &mdash; a merge request nobody has finished writing is "
+            "not a review you are in the middle of.</p>")
+    a("</section>")
+
+
 def render_cost(a, cost):
     """What the pipeline that builds this page spent to build it.
 
@@ -3417,11 +3620,25 @@ def render(data, lede, focus_days, limit, cost=None):
             and ((by_id[i].get("activity") or {}).get("forgotten") or {}).get("verdict")]
     mism = (gap.get("status_mismatch") or [])[:MISMATCH_ROWS]
     ledger = data.get("ledger")
+    # The reviews, and whether that list is all of them. Two separate facts and the second
+    # is the one that decides whether the section exists at all: "you are reviewing
+    # nothing" and "GitLab was not asked" support opposite sentences, so an unconsulted run
+    # gets no section, no door and no stop rather than an empty one. Read whole -- nothing
+    # here truncates -- and never re-ranked; see reviewing().
+    reviews_known = bool(data.get("reviews_known"))
+    reviews = list(data.get("reviews") or []) if reviews_known else []
+    # The drafts the sweep left out, counted where work-arcs counted them. It rides on the
+    # ledger because that is the queue both views come off, and a count re-derived here
+    # would be a second author for how many rows were dropped.
+    review_drafts = (ledger or {}).get("reviews_drafts_skipped") or 0
     evidence_fps = {
         "ledger": {e.get("fp") for e in ((ledger or {}).get("they_owe") or [])
                    + ((ledger or {}).get("you_owe") or []) if e.get("fp")},
         "forgotten": {(x["activity"]["forgotten"]).get("fp") for x in fell},
         "gap": {m.get("fp") for m in mism if m.get("fp")},
+        # So a standup line naming a review lands on the row it is a projection of, the
+        # same way a ledger sentence lands on its ledger row.
+        "review": {r.get("fp") for r in reviews if r.get("fp")},
     }
 
     try:
@@ -3546,6 +3763,24 @@ def render(data, lede, focus_days, limit, cost=None):
                               + " they owe"),
                       "lead": (esc(heads[0][0] + " · ") + lead_of(heads[0][1])
                                if heads else "")})
+    if reviews_known:
+        # The fourth door, and it sits where its section does -- between the ledger and
+        # what is in play, because the strip reads in page order and a door that jumps
+        # backwards past the one after it teaches the strip is arbitrary. Absent entirely
+        # when GitLab was not asked, like every other door whose section is absent; present
+        # at nought when it was, because "no ongoing reviews" is a real state and a good
+        # one, and it is the ledger's rule rather than the tidy chip's -- a review is not
+        # a chore invented for somebody who has none.
+        #
+        # The figure is the section's own, mirrored, and the lead is the first row on the
+        # wire. Not "the worst": the ranking came down from work-arcs and naming its head
+        # is reading it, whereas choosing one here would be writing a second one.
+        doors.append({"id": "reviewing", "href": "reviewing", "kick": "Reviewing",
+                      "fig": (mirrored(undismissed(reviews), "#rv-n")
+                              + " ongoing"),
+                      "lead": (esc((reviews[0].get("ref") or "") + " "
+                                   + (reviews[0].get("title") or "")).strip()
+                               if reviews else "")})
     doors.append({"id": "play", "href": "play", "kick": "In play",
                   "fig": (mirrored(len(live), "#play-n") + " workstream"
                           + ("" if len(live) == 1 else "s")),
@@ -3583,6 +3818,8 @@ def render(data, lede, focus_days, limit, cost=None):
           mirrored(undismissed(l_you), "#lg-you-n", "q") + "/"
           + mirrored(undismissed(l_they), "#lg-they-n", "q"))
          if ledger is not None else None),
+        (("reviewing", "Reviewing", mirrored(undismissed(reviews), "#rv-n", "q"))
+         if reviews_known else None),
         ("play", "In play", mirrored(len(live), "#play-n", "q")),
         ("only-here", "Only here", str(len(by_rung.get("local-only", []))))
         if by_rung.get("local-only") else None,
@@ -3756,6 +3993,31 @@ def render(data, lede, focus_days, limit, cost=None):
     def plural(n, word):
         return f"{n} {word}" + ("" if n == 1 else "s")
 
+    def age_mark(arc):
+        """Whether this row's age is a clock of Kyle's, and how to say so when it is not.
+
+        work-arcs sets `age_is_foreign` on a workstream that holds no commit of his and no
+        session on any of its branches -- a branch checked out to read, and nothing else.
+        There is no age of his own to report there, so the branch tip's date stands in, and
+        it belongs to whoever pushed it. Rendered like every other age, `4d ago` on such a
+        row is a claim that he worked on it four days ago, which is exactly the error the
+        `%ae` walk was added to stop making one field over.
+
+        So it is de-emphasised and it says whose clock it is. De-emphasis and not removal:
+        the date is the only thing on the row that answers "is this still moving", and a
+        row with no age at all would be worse than one with somebody else's. The wording is
+        derived -- from `age_is_foreign` itself, plus the author of a joined review where
+        there is one to name -- and invents nothing.
+        """
+        if not arc.get("age_is_foreign"):
+            return "", ""
+        rs = arc.get("reviews") or []
+        who = rs[0].get("author") if rs else ""
+        return " foreign", (
+            ' title="not your clock — nothing in this workstream is a commit of yours, so '
+            "this is the last push on somebody else&rsquo;s branch"
+            + (f", {esc(who)}&rsquo;s" if who else "") + '"')
+
     def heading(arc, brief):
         """The ticket belongs in the title, linked — it is half the name of the work.
 
@@ -3836,7 +4098,8 @@ def render(data, lede, focus_days, limit, cost=None):
               + (link(i.get("url", ""), esc(tkt), "key") + " " if tkt else "")
               + f'{nm}</span>'
               f'<span class="mr">{ref or "&mdash;"}</span>'
-              f'<span class="ag">{arc.get("age_days","?")}d</span>')
+              + '<span class="ag{}"{}>{}d</span>'.format(
+                  *age_mark(arc), arc.get("age_days", "?")))
             bits = []
             if arc.get("authoritative") and arc["authoritative"] != tkt:
                 bits.append(esc(arc["authoritative"]))
@@ -3890,7 +4153,7 @@ def render(data, lede, focus_days, limit, cost=None):
           + sprint_chip(arc) + (" " + filed if filed else "")
           + "</span>")
         a(f'<span class="st">{esc(arc.get("state",""))}</span>')
-        a(f'<span class="ag">{esc(when)}</span>')
+        a('<span class="ag{}"{}>{}</span>'.format(*age_mark(arc), esc(when)))
         a('<button class="park" type="button" '
           'aria-label="set this workstream aside as backlog">park</button>')
         a("</summary>")
@@ -4119,7 +4382,14 @@ def render(data, lede, focus_days, limit, cost=None):
     # expire against -- only rows in the store that could never be pruned.
     since = data.get("since_last_run") or {}
     diffs = since.get("changes") or []
-    if diffs:
+    # The reviews that moved in the same interval, on the same clock and in the same fold.
+    # Their own list on the wire rather than clauses on the arc rows, because most reviews
+    # join to no workstream at all -- filed per-arc, exactly those would have been the ones
+    # that could never be reported. Empty whenever `reviews` was not a universe both runs
+    # saw, which work-arcs decides and says in `skipped_universes`; nothing here re-derives
+    # that gate.
+    rvdiffs = since.get("reviews") or []
+    if diffs or rvdiffs:
         shown = {x.get("id") for x in arcs}
         bg = sum(1 for c in diffs if c.get("id") not in shown)
         ago = fmt_interval(since.get("interval_seconds"))
@@ -4128,15 +4398,20 @@ def render(data, lede, focus_days, limit, cost=None):
         # before the fold existed. What the header adds is which workstream moved and what
         # moved on it; the interval and the ratio stay in the stamp, where facts about the
         # build live.
-        lead = by_id.get((diffs[0].get("id"))) or {}
-        what = next((e.get("what") for e in diffs[0].get("evidence") or []
-                     if e.get("what")), "")
-        fold(a, "Since the last build",
-             f"{len(diffs)} moved",
-             esc("including " + (one_line(lead) if lead
-                                 else str(diffs[0].get("label") or "?"))
-                 + (f" — {what}" if what else "")),
-             sid="sincebuild")
+        if diffs:
+            lead = by_id.get((diffs[0].get("id"))) or {}
+            what = next((e.get("what") for e in diffs[0].get("evidence") or []
+                         if e.get("what")), "")
+            named = esc("including " + (one_line(lead) if lead
+                                        else str(diffs[0].get("label") or "?"))
+                        + (f" — {what}" if what else ""))
+        else:
+            # A build where only reviews moved. The header still names something rather
+            # than standing over a count alone -- and it names the first review change on
+            # the wire, which work-arcs already ranked worst-first.
+            named = esc("including " + (rvdiffs[0].get("what") or ""))
+        moved = len(diffs) + len(rvdiffs)
+        fold(a, "Since the last build", f"{moved} moved", named, sid="sincebuild")
         note = ["What moved on its own in the "
                 + (f"{esc(ago)} " if ago else "") + "since this page was last built — "
                 "a different clock from the section above, which is measured against "
@@ -4152,8 +4427,20 @@ def render(data, lede, focus_days, limit, cost=None):
                         + ("has" if bg == 1 else "have")
                         + " no row below — the age is marked on "
                         + ("it" if bg == 1 else "each") + ".")
+        if rvdiffs:
+            # Said, because the second list has no age column and a reader who has learnt
+            # what the first column means on the lines above would otherwise read a row of
+            # em-dashes as a derivation that failed.
+            note.append(f"The last {'line' if len(rvdiffs) == 1 else 'lines'} "
+                        + ("is" if len(rvdiffs) == 1 else "are")
+                        + ' about <a href="#reviewing">a review you have going</a> rather '
+                        "than about a workstream of yours — a turn that flipped, or a "
+                        "round that landed — so there is no age of yours to put in front "
+                        "of "
+                        + ("it" if len(rvdiffs) == 1 else "them") + ".")
         a(f'<p class="note">{" ".join(note)}</p>')
-        a('<ul class="lb">')
+        if diffs:
+            a('<ul class="lb">')
         for c in diffs:
             here = c.get("id") in shown
             arc = by_id.get(c.get("id")) or {}
@@ -4183,7 +4470,36 @@ def render(data, lede, focus_days, limit, cost=None):
                     # itself -- at full length four of them make the section a transcript.
                     a(say(q, e.get("url", ""), clip=140))
             a("</span></li>")
-        a("</ul></details>")
+        if diffs:
+            a("</ul>")
+        if rvdiffs:
+            # The same three columns as the workstream lines above, so the fold reads as
+            # one strip and not as two. What fills them differs by one substitution: a
+            # review has no age of its own in this universe -- the interval IS the fold --
+            # so the clock column stands empty, and the name column carries the workstream
+            # it joined to where it joined to one and the merge request itself where it did
+            # not, which is the same "link it only where the row exists" rule the lines
+            # above follow.
+            a('<ul class="lb rv">')
+            for c in rvdiffs:
+                arc = c.get("arc")
+                here_arc = arc in shown
+                nm = esc(str(((by_id.get(arc) or {}).get("brief") or {}).get("name")
+                             or (by_id.get(arc) or {}).get("label") or arc)) if arc else ""
+                a('<li data-bg="0">')
+                a('<span class="ag" title="a review moved in this interval — it has no '
+                  'age of its own here">&mdash;</span>')
+                a('<span class="nm">'
+                  + (f'<a href="#{anchor(arc)}">{nm}</a>' if arc and here_arc
+                     else nm if arc
+                     else link(c.get("url", ""), esc(c.get("ref", "")), "ref"))
+                  + "</span>")
+                a('<span class="cls">'
+                  + f'<span class="cl" data-k="{esc(c.get("kind",""))}">'
+                  + link(c.get("url", ""), esc(c.get("what", "")))
+                  + "</span></span></li>")
+            a("</ul>")
+        a("</details>")
 
     # --- the waiting-on ledger ----------------------------------------------
     # Both directions of "who is waiting on whom", which is what todo.md was for and
@@ -4434,6 +4750,18 @@ def render(data, lede, focus_days, limit, cost=None):
         a("</div>")
 
         a("</div></section>")
+
+    # --- the reviews you are in the middle of -------------------------------
+    # Its fixed place, and it is here rather than anywhere else on purpose. The ledger
+    # above it and this are the two registers on the page with somebody else in the loop,
+    # and they read as a pair: what is owed, then what is under way. Everything below is
+    # about work of Kyle's own.
+    #
+    # Absent entirely when GitLab was not asked, which is the only state that must not be
+    # rendered as "none" -- see reviewing(). Its door and its rail stop are gated on the
+    # same fact, so the strip never points at a section this run did not emit.
+    if reviews_known:
+        reviewing(a, reviews, review_drafts, here, by_id)
 
     # --- the conditions, as peers ------------------------------------------
     # Still peers, still no hero figure and no severity hue: there is no honest exchange
