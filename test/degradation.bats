@@ -243,8 +243,10 @@ def glab(repo, path, **k):
                  "author": {"username": "someone"}, "created_at": "2026-08-01"}]
     return None                      # discussions refuse
 wa.glab = glab
-rows, covered, whole = wa.ledger_you_owe(Path("/nonexistent"), "kyle")
-print("rows", len(rows), "covered", covered, "complete", whole)'
+wa.shutil.which = lambda name: "/usr/bin/" + name
+rows, covered, whole, reviews, drafts = wa.ledger_you_owe(Path("/nonexistent"), "kyle")
+print("rows", len(rows), "covered", covered, "complete", whole)
+print("reviews", len(reviews))'
     [ "$status" -eq 0 ]
     [[ "$output" == *"rows 0 covered 0 complete False"* ]]
 }

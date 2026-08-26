@@ -533,6 +533,33 @@ order. Inside a recency group, the same rule: what is waiting on you, worst firs
 size of the pile as the tiebreak rather than the sort. Nothing is hidden and no count moves.
 A loop with somebody else in it compounds while it waits; a commit on this disk does not.
 
+**Reviewing is work, and it is not yours.** Two separate claims, and the tool used to get
+both of them wrong in the same breath. Nothing read who wrote a commit, so every clock was
+built on the tip's committerdate — which on a branch checked out to read belongs to its
+author. Measured on this corpus: 15 of 442 local branches carry no commit of Kyle's at all,
+and `UB-6974` was dated 26 days by a checkout of Ella's while its own newest work was 48
+days old. `collect_branches` now reads `%ae` on the walk it was already making (the author,
+never the committer — a rebase rewrites the committer to whoever ran it), so every branch
+carries `own_commits`, `foreign_commits` and a `role`, and the arc's age, its `own_activity`
+and its demands are derived from work that is actually yours. A branch that holds nothing of
+yours no longer produces *"UL-1816 is pushed and has no merge request"*, which was an
+instruction to file 25 of Logan's commits under your name.
+
+The other half is the category that did not exist: *"me actively reviewing someone's MR is
+in its own category ... i have 6802 which is a long ongoing review and various logan MRs
+which are long ongoing reviews"*. The ledger cannot hold those, correctly — it drops a merge
+request the moment you first speak on it, and that is exactly when the review begins. So
+`--json` carries a top-level `reviews[]` off the same sweep the ledger's own queue comes
+from: per merge request, whose turn it is, how many **rounds** of yours it is deep (a
+maximal run of your notes — six comments in one sitting are one round), how long it has been
+running, how long it has been quiet, and the workstream it joins to where one exists. The
+join is by fact and never by guess: the source branch checked out locally, or a ticket key
+both sides name. Ranked yours-first then longest-running; the CLI prints it under
+`── reviewing ──`; a workstream that is *only* a checkout gets its own rung rather than a
+claim about work of yours, reading `reviewing !10475 for logan, round 5, your turn`.
+`reviews_known` says whether that list is all of them, because "you are reviewing nothing"
+and "GitLab was not asked" are opposite sentences.
+
 **The Jira-mismatch rows are ranked on that same principle** — *longest uncorrected first*,
 which is how long the ticket has gone without anyone touching any field on it, and therefore
 the least time the wrong status can have been standing. Days of work is the tiebreak, not the

@@ -844,6 +844,91 @@ def ledger_they_owe(repo, mrs, me):
     return [e for e in seen if e and e is not UNKNOWN], not missed
 
 
+# How far past the newest note the merge request's own `updated_at` has to sit before it
+# is read as activity a note cannot explain. GitLab moves `updated_at` when it stores a
+# note, at essentially the note's own instant, so a zero tolerance would read the write of
+# your own review as a reply to it -- and flip whose turn it is the moment you spoke, which
+# is the one reading this feature exists to get right. Ten minutes is far above the latency
+# of storing a note and far below the gap before anybody pushes.
+REVIEW_PROXY_TOLERANCE = 600
+
+
+def _review_row(m, discussions, me):
+    """One ongoing review of somebody else's merge request, as a thing with a clock.
+
+    Not a debt, which is what the ledger holds and what every earlier version of this tool
+    could see. A review that has been going for two months with six rounds on it is not
+    waiting on anybody in particular -- it is a piece of work you are doing, and the only
+    reason it was invisible is that the ledger drops an MR the moment you have spoken on it
+    (correctly: you no longer owe a first read). Kyle: "me actively reviewing someone's MR
+    is in its own category ... it would be cool to see these as first-class things."
+
+    Whose turn it is, in the only terms the API can answer honestly. Your last word and
+    theirs are read off the notes; the hard case is a push, which moves nothing but the
+    merge request's `updated_at`. That stands in when it postdates every note by more than
+    a note's own write latency, and the row says it is standing in -- their_last_is_proxy
+    is on the row for exactly the reader who wants to know whether "their turn" was
+    measured or inferred.
+
+    `rounds` counts your note-batches: a maximal run of notes of yours uninterrupted by
+    anybody else. Six comments in one sitting are one round of review, and counting them as
+    six would make a thorough first pass look like a two-month argument.
+    """
+    iid = m.get("iid")
+    notes = sorted((n for d in discussions for n in (d.get("notes") or [])),
+                   key=lambda n: n.get("created_at") or "")
+    human = [n for n in notes if not n.get("system")]
+
+    def by_me(n):
+        return (n.get("author") or {}).get("username") == me
+
+    my_last = max((_iso_epoch(n.get("created_at")) for n in human if by_me(n)), default=0)
+    their_last = max((_iso_epoch(n.get("created_at")) for n in human if not by_me(n)),
+                     default=0)
+    rounds, in_run = 0, False
+    for n in human:
+        if by_me(n):
+            rounds += 1 if not in_run else 0
+            in_run = True
+        else:
+            in_run = False
+    updated = _iso_epoch(m.get("updated_at"))
+    proxy = updated > max(my_last, their_last) + REVIEW_PROXY_TOLERANCE
+    if proxy:
+        their_last = updated
+    # When you were asked, through the same system note ledger_they_owe reads, and with the
+    # same fallback labelled the same way: reviewers named at creation write no request
+    # note, so the merge request's birth is the honest clock and it says it is a proxy.
+    asked = _asked_at(notes, who=me)
+    asked_is_proxy = not asked
+    if asked_is_proxy:
+        asked = (m.get("created_at") or "")[:10]
+    last = max(my_last, their_last)
+    row = {"iid": iid, "ref": f"!{iid}", "title": m.get("title", ""),
+           "url": m.get("web_url", ""),
+           "author": (m.get("author") or {}).get("username", "?"),
+           "source_branch": m.get("source_branch", ""),
+           "target_branch": m.get("target_branch", ""),
+           "asked": asked, "asked_is_proxy": asked_is_proxy,
+           "days": _days_since(asked),
+           "my_last": my_last, "their_last": their_last,
+           "their_last_is_proxy": proxy,
+           # Never reviewed at all reads as yours, which is the same thing the ledger says
+           # about it one row over -- the two views agree because they are derived from the
+           # same instant, not because either copies the other.
+           "whose_turn": "mine" if (not my_last or their_last > my_last) else "theirs",
+           "rounds": rounds,
+           "quiet_days": days_ago(last) if last else None,
+           # Filled by attach_reviews, which is the only place that knows what the arcs are.
+           "arc": None}
+    # Content-fingerprinted like every other acknowledgeable row: what changes when the
+    # engagement moves, and nothing that changes on its own. `days` and `quiet_days` tick
+    # daily and are deliberately out; the instants they are computed from are in.
+    row["fp"] = _dfp("review", row["ref"], row["url"], row["asked"],
+                     row["whose_turn"], row["rounds"], my_last, their_last)
+    return row
+
+
 def ledger_you_owe(repo, me):
     """Their merge requests waiting on something of yours, and how long they have waited.
 
@@ -859,7 +944,21 @@ def ledger_you_owe(repo, me):
     a merge. Bounded to MRs that name you a reviewer -- a thread you opened on an MR you
     were never a reviewer of is invisible here, and saying so beats sweeping every open
     MR in the project for your name.
+
+    The same sweep answers a second question, and it is the reason the bound above is worth
+    restating rather than widening. Every merge request here is somebody else's that names
+    you a reviewer, which is precisely the population of "reviews you are engaged in" -- so
+    `reviews` comes off this one fetch rather than a second pass over the project. Its
+    boundary is therefore the ledger's boundary: a review you are giving on a merge request
+    that never named you a reviewer does not appear, and that is said out loud rather than
+    left for a reader to discover as a silence.
     """
+    if not shutil.which("glab"):
+        # Gated like collect_mrs. glab() would survive its absence -- the OSError is caught
+        # -- but every call would still be spawned and every caller would wait on it, which
+        # is what makes an ungated source hang a test that only wanted the rest of the
+        # ledger.
+        return [], 0, False, [], 0
     raw = glab(repo, "projects/:id/merge_requests?state=opened&per_page=100"
                      f"&reviewer_username={urllib.parse.quote(me, safe='')}")
     if raw is None or not isinstance(raw, list):
@@ -867,11 +966,13 @@ def ledger_you_owe(repo, me):
         # queue would let a prune delete every acknowledgement on it.
         print("  ledger: GitLab would not list the merge requests awaiting you — that "
               "side of the ledger is absent this run, not empty", file=sys.stderr)
-        return [], 0, False
-    queue = [m for m in raw
-             if not (m.get("draft") or m.get("work_in_progress"))
-             and (m.get("author") or {}).get("username") != me]
-    out, covered = [], 0
+        return [], 0, False, [], 0
+    foreign = [m for m in raw if (m.get("author") or {}).get("username") != me]
+    queue = [m for m in foreign if not (m.get("draft") or m.get("work_in_progress"))]
+    # Drafts are out of both views, and the count is reported rather than the row silently
+    # dropped: a list claiming to be your ongoing reviews has to say when it left one out.
+    drafts = len(foreign) - len(queue)
+    out, covered, reviews = [], 0, []
     UNKNOWN = object()          # this MR could not be read, as distinct from "attended"
 
     def one(m):
@@ -881,7 +982,12 @@ def ledger_you_owe(repo, me):
         discussions = glab(repo,
                            f"projects/:id/merge_requests/{iid}/discussions?per_page=100")
         if discussions is None or not isinstance(discussions, list):
-            return UNKNOWN
+            return UNKNOWN, None
+        # Both views off the one call. The review row is built for every merge request in
+        # the queue, including the ones the ledger drops -- an MR somebody else approved,
+        # or one you have already spoken on, is exactly an ongoing review and exactly what
+        # the ledger is right to stop demanding anything about.
+        review = _review_row(m, discussions, me)
         notes = [n for d in discussions for n in (d.get("notes") or [])]
         i_spoke = any((n.get("author") or {}).get("username") == me
                       for n in notes if not n.get("system"))
@@ -890,13 +996,18 @@ def ledger_you_owe(repo, me):
         if not i_spoke:
             approvers = _approved_by(repo, iid)
             if approvers is None:
-                return UNKNOWN
+                # The ledger cannot say; the review row still can. Whose turn it is and how
+                # long it has been going are read off the notes, which arrived -- only the
+                # "somebody else already approved, so you are off the hook" test needed the
+                # call that failed. Returning UNKNOWN for both would lose a first-class row
+                # to a question it does not ask.
+                return UNKNOWN, review
             if approvers:
-                return None
+                return None, review
             asked = _asked_at(notes, who=me) or (m.get("created_at") or "")[:10]
             return {**base, "kind": "review-owed",
                     "who": (m.get("author") or {}).get("username", "?"),
-                    "asked": asked, "days": _days_since(asked)}
+                    "asked": asked, "days": _days_since(asked)}, review
         for d in discussions:
             ns = [n for n in (d.get("notes") or []) if not n.get("system")]
             if not ns or not any((n.get("author") or {}).get("username") == me
@@ -914,12 +1025,14 @@ def ledger_you_owe(repo, me):
             # is the fact; the quote is its evidence.
             return {**base, "kind": "reply-owed", "who": who,
                     "asked": at, "days": _days_since(at),
-                    "quote": _clean_note(last.get("body"))}
-        return None
+                    "quote": _clean_note(last.get("body"))}, review
+        return None, review
 
     missed = 0
     with futures.ThreadPoolExecutor(max_workers=16) as pool:
-        for entry in pool.map(one, queue):
+        for entry, review in pool.map(one, queue):
+            if review:
+                reviews.append(review)
             if entry is UNKNOWN:
                 missed += 1
             elif entry:
@@ -933,7 +1046,14 @@ def ledger_you_owe(repo, me):
         print(f"  ledger: GitLab would not discuss {missed} merge request(s) awaiting "
               "you — left off rather than guessed at, and nothing is pruned on their "
               "absence", file=sys.stderr)
-    return out, covered, not missed
+    # One total order with a total tiebreak, decided here so no consumer re-derives it into
+    # a second one. Yours first, because a review waiting on you is the only kind you can do
+    # anything about this minute; then longest-running, because that is what compounds; then
+    # the iid, which is unique and so makes the order total -- arc-brief fingerprints the
+    # evidence text it is handed, and a sort that ties differently between two runs re-buys
+    # the cache for nothing.
+    reviews.sort(key=lambda r: (r["whose_turn"] != "mine", -(r["days"] or 0), r["iid"]))
+    return out, covered, not missed, reviews, drafts
 
 
 def ledger_jira_stalled(days_min=None):
@@ -2836,7 +2956,8 @@ def build_ledger(repo, mrs, meetings=True):
         # meeting row's acknowledgement would then be pruned on a run that never looked.
         f_meet = pool.submit(ledger_meetings) if meetings else None
         they, they_whole = f_they.result() if f_they else ([], False)
-        you, covered, you_whole = f_you.result() if f_you else ([], 0, False)
+        you, covered, you_whole, reviews, review_drafts = (
+            f_you.result() if f_you else ([], 0, False, [], 0))
         jira_rows, jira_whole = f_jira.result()
         they += jira_rows
         slack_they, slack_you, slack_seen, slack_whole = f_slack.result()
@@ -2863,7 +2984,23 @@ def build_ledger(repo, mrs, meetings=True):
     you.sort(key=lambda e: (-(e.get("days") or 0), e["ref"]))
     for e in they + you:
         e["fp"] = _ledger_fp(e)
+    if review_drafts:
+        print(f"  reviewing: {review_drafts} draft merge request(s) naming you a reviewer "
+              "are left off the reviewing list — a draft is not out for review yet",
+              file=sys.stderr)
     return {"they_owe": they, "you_owe": you, "you_owe_covered": covered,
+            # The workstream facet of the same merge requests the `you_owe` rows are a debt
+            # facet of. Deliberately NOT merged with them: a review you have been giving for
+            # two months is not a debt -- it is a thing you are doing -- and the ledger is
+            # right to drop it the moment you first speak. Cross-referenced by iid, so a
+            # consumer that wants both can join them and neither has to know the other's
+            # rules.
+            "reviews": reviews,
+            # Whether that list is all of them, on the same "absent is not empty" contract
+            # every other source here reports under. False means GitLab was not asked or
+            # would not answer, never that you are reviewing nothing.
+            "reviews_known": bool(me) and you_whole,
+            "reviews_drafts_skipped": review_drafts,
             # Always present when the ledger is, empty or not, because a --json consumer
             # cannot tell a missing key from "nothing closed" and would have to guess.
             # close_commitments fills it; see there for why it cannot be filled here.
@@ -5818,15 +5955,25 @@ def own_activity(arc):
     news. Derived, so it self-heals -- and it expires in the only direction that matters.
 
     Three kinds of touch, and the third is why reviewing is first-class. Commits of your
-    own, sessions held on the arc's branches, and a word you said on a merge request that
-    joins here: writing a review IS doing something on this workstream, and leaving it out
-    made every arc you were only reviewing look untouched by you since the day you cloned
-    it. `reviews` is attached after the ledger and is simply absent on every path that has
-    no GitLab, which costs nothing -- the other two answer on their own.
+    own, sessions held on the arc's branches, and -- on an arc that IS a review -- a word
+    you said on the merge request it is about. Writing a review is doing something here,
+    and without it an arc you were only ever reviewing had no own-touch at all: no commit
+    of yours exists on it by definition, so its clock read zero and nothing on it could
+    ever stop being news.
+
+    Bounded to review arcs, and the bound is the point. On a workstream of your own that
+    happens to contain a colleague's merge request, a comment you left over there is not
+    engagement with a conflict over here -- folding it in would let a note on Ella's branch
+    silence the news that your own branch stopped merging. The narrow rule is the one that
+    cannot suppress anything it did not earn.
+
+    `reviews` is attached after the ledger and is simply absent on every path that has no
+    GitLab, which costs nothing -- the other two answer on their own.
     """
     ts = [_own_touch(b) for b in arc.get("branches", [])]
     ts += [s.get("last", 0) for s in arc.get("sessions", [])]
-    ts += [r.get("my_last", 0) for r in arc.get("reviews", [])]
+    if arc.get("role") == "review":
+        ts += [r.get("my_last", 0) for r in arc.get("reviews", [])]
     return max(ts) if ts else 0
 
 
@@ -6840,6 +6987,75 @@ def finalize(arc, repo=None, main_ref="origin/main"):
     arc["sessions"].sort(key=lambda s: (-s["last"], s["id"]))
 
 
+def attach_reviews(arcs, reviews):
+    """Join every ongoing review to the workstream it is about, where one exists.
+
+    The join snapshot_of's docstring said did not exist, and it was right about the ledger
+    and wrong about this. A ledger row is a debt to a person and attaches to no workstream
+    of yours by design; a review is a piece of work, and the workstream it belongs to is
+    frequently one you already have on the page -- the branch is checked out locally, or
+    both sides name the same ticket.
+
+    Two keys, strongest first, and the weaker one is recorded rather than implied. A local
+    branch whose name IS the merge request's source branch is the same branch, full stop.
+    Failing that, the ticket key both sides name: `UL-1816` the merge request and `UL-1816`
+    the checkout are the same work even where the branch was never fetched under that
+    name. Nothing else -- a title match or a file overlap would be a guess, and a review
+    filed under the wrong workstream is worse than one filed under none.
+
+    Ties are broken by arc id, which is total, so two workstreams naming one ticket cannot
+    make this run's answer depend on dictionary order.
+
+    Reviews that join to nothing keep `arc: None` and stay in the top-level list, which is
+    the normal case rather than a failure: most of the merge requests you review were never
+    checked out here at all.
+    """
+    for a in arcs:
+        a["reviews"] = []
+    by_branch, by_ticket = {}, {}
+    for a in sorted(arcs, key=lambda x: str(x.get("id") or "")):
+        keys = {a.get("ticket")} | {i.get("key") for i in a.get("issues") or []}
+        for b in a.get("branches", []):
+            by_branch.setdefault(b["name"], a)
+            m = TICKET_RE.search(b["name"].upper())
+            if m:
+                keys.add(m.group(0))
+        for k in keys:
+            if k:
+                by_ticket.setdefault(k, a)
+
+    for r in reviews:
+        arc, via = by_branch.get(r.get("source_branch")), "its source branch is checked out here"
+        if arc is None:
+            m = TICKET_RE.search((r.get("source_branch") or "").upper())
+            if m:
+                arc, via = by_ticket.get(m.group(0)), f"both name {m.group(0)}"
+        if arc is None:
+            continue
+        r["arc"], r["arc_via"] = arc.get("id"), via
+        arc["reviews"].append(r)
+
+    for a in arcs:
+        # After the join, because on a review arc the last word you said on the merge
+        # request is the only touch of yours that exists -- see own_activity.
+        a["own_activity"] = own_activity(a)
+        # `notify` is deliberately not recomputed. It is the came-back demands that
+        # postdate your last touch, and a review arc holds no came-back demand at all: it
+        # has no merge request of yours for one to hang off, and the branch-pipeline demand
+        # no longer fires on a branch that is not yours. There is nothing here for a raised
+        # clock to suppress, so nothing has to be re-derived to keep the two agreeing.
+        if a.get("stage") != "reviewing" or not a["reviews"]:
+            continue
+        # The honest sentence, upgraded from "checkout of someone's branch" now that there
+        # is a merge request to name. Only where the stage is still `reviewing`: a park is
+        # a declaration and outranks anything derived, and finalize has already had its say
+        # about everything else.
+        r = a["reviews"][0]
+        turn = "your turn" if r["whose_turn"] == "mine" else "their turn"
+        rounds = f", round {r['rounds']}" if r["rounds"] else ""
+        a["state"] = f"reviewing {r['ref']} for {r['author']}{rounds}, {turn}"
+
+
 # ── what moved since the last build ────────────────────────────────────────────
 #
 # The plan's load-bearing rule for the background layer: it is silent unless something
@@ -6866,11 +7082,12 @@ SNAPSHOT = (Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
 # because it produces confident sentences about changes that never happened.
 #
 # Deliberately NOT bumped when a whole new universe is *added* -- the Slack lens arrived
-# after v1 and this still reads v1. `known` is what makes that safe and is the reason it
-# exists: a v1 snapshot carries no `known["slack"]`, so the gate reads false and the lens
-# is silent for exactly one run while every other comparison goes on working. Bumping
-# would have thrown a morning's whole diff away to protect against a field that already
-# protects itself.
+# after v1 and this still reads v1, and so does the reviewing lens. `known` is what makes
+# that safe and is the reason it exists: a v1 snapshot carries no `known["slack"]` and no
+# `known["reviews"]`, so those gates read false and each lens is silent for exactly one run
+# while every other comparison goes on working. Bumping would have thrown a morning's whole
+# diff away to protect against a field that already protects itself -- which is why the
+# reviewing todo's instruction to bump is not followed here.
 SNAPSHOT_V = 1
 
 # Merge-status values that mean "GitLab has not worked it out yet". They must never be
@@ -7003,7 +7220,7 @@ def _mr_ref(ref):
     return int(m.group(1)) if m else None
 
 
-def snapshot_of(arcs, ledger, known, repo, generated):
+def snapshot_of(arcs, ledger, known, repo, generated, reviews=()):
     """The smallest per-arc state the next run needs to say what moved, and no more.
 
     Everything here is either an identity (the branch set), a fact that can move on its
@@ -7013,10 +7230,19 @@ def snapshot_of(arcs, ledger, known, repo, generated):
     and storing them would guarantee a snapshot that always differs from the next one.
 
     Ledger rows are attributed to an arc through its merge requests, which is the only
-    join that exists -- the ledger is a by-person view and an arc is a by-work one, and
+    join the ledger has -- the ledger is a by-person view and an arc is a by-work one, and
     `!10438` is the single ref they share. Rows about other people's merge requests
-    therefore attach to no arc at all, correctly: reviewing someone else's branch is not
-    a development on any workstream of yours.
+    therefore attach to no arc, correctly: a debt row is a claim about a person, and
+    nothing about a workstream of yours moves when it is paid.
+
+    That reasoning was extended one step too far and this is where it stopped. "Reviewing
+    someone else's branch is not a development on any workstream of yours" was the old
+    version of this paragraph, and it is false: reviewing IS work, and `attach_reviews`
+    joins each review to a workstream by the two keys that are facts rather than guesses --
+    the source branch checked out locally, or a ticket key both sides name. Those joins
+    ride on the review rows themselves, which is why the reviews below are keyed by iid at
+    the top level rather than scattered across the arc rows: most reviews join to no arc
+    at all, and a per-arc home would have made those the ones that could never be diffed.
 
     The Slack lens is the one universe here that needs no such join, because it arrives
     already attached: a thread is matched to a workstream by the branch names, ticket keys
@@ -7061,7 +7287,21 @@ def snapshot_of(arcs, ledger, known, repo, generated):
                        for i in arc.get("issues", []) if i.get("key")},
         })
     rows.sort(key=lambda r: (r["label"] or "", r["id"] or ""))
+    # Keyed by iid and not by arc, because the arc is optional and the iid never is. Only
+    # what can move on its own: whose turn it is, how many rounds deep it is, and the two
+    # instants those are computed from. `days` and `quiet_days` tick by themselves and are
+    # out, like every other counter here.
+    review_rows = {str(r["iid"]): {"whose_turn": r.get("whose_turn"),
+                                   "rounds": r.get("rounds", 0),
+                                   "my_last": r.get("my_last", 0),
+                                   "their_last": r.get("their_last", 0),
+                                   "arc": r.get("arc"),
+                                   "ref": r.get("ref"), "url": r.get("url", ""),
+                                   "author": r.get("author", ""),
+                                   "title": r.get("title", "")}
+                   for r in reviews or [] if r.get("iid") is not None}
     return {"v": SNAPSHOT_V, "generated": generated, "repo": repo,
+            "reviews": review_rows,
             # Which universes this run actually consulted. A --no-mr run knows nothing
             # about merge requests, and the difference between "no MRs" and "nobody
             # looked" is the difference between a fact and a fabrication -- so the diff
@@ -7227,6 +7467,7 @@ def diff_runs(prev, cur, arcs, ledger):
     cmp_issues = bool(pk.get("issues")) and bool(ck.get("issues"))
     cmp_ledger = bool(pk.get("ledger")) and bool(ck.get("ledger"))
     cmp_slack = bool(pk.get("slack")) and bool(ck.get("slack"))
+    cmp_reviews = bool(pk.get("reviews")) and bool(ck.get("reviews"))
 
     live = {a.get("id"): a for a in arcs}
     demand_by_rfp = {d["rfp"]: d for a in arcs for d in a.get("demands", [])
@@ -7385,9 +7626,67 @@ def diff_runs(prev, cur, arcs, ledger):
         },
         "skipped_universes": sorted(
             k for k, ok in (("mrs", cmp_mrs), ("issues", cmp_issues),
-                            ("ledger", cmp_ledger), ("slack", cmp_slack)) if not ok),
+                            ("ledger", cmp_ledger), ("slack", cmp_slack),
+                            ("reviews", cmp_reviews)) if not ok),
         "changes": changes,
+        # Its own list rather than clauses on the arc entries above, because a review is
+        # not a development on a workstream of yours in the way everything else here is --
+        # and because most of them join to no arc at all, so a per-arc home would have made
+        # exactly those the ones that could never be reported. Each row names the arc it
+        # joined to when it did, which is all a renderer needs to put it in either place.
+        "reviews": _review_changes(prev, cur) if cmp_reviews else [],
     }
+
+
+# What a review can do between two runs, worst first. "Yours" leads because it is the only
+# one that asks anything of you; a review that merely got longer asks nothing today.
+REVIEW_CHANGE_RANK = {"turned_mine": 0, "appeared": 1, "answered": 2,
+                      "turned_theirs": 3, "gone": 4}
+
+
+def _review_changes(prev, cur):
+    """Which ongoing reviews moved since the last build, and how.
+
+    Compared only where both runs saw the merge request, the same rule every other
+    comparison here follows: a review whose iid the previous snapshot never held arrived
+    because you were added as a reviewer, which is news of a different kind and is reported
+    as `appeared` rather than as a turn that flipped.
+
+    Two facts move on their own and both are worth a sentence. Whose turn it is flipping to
+    yours is somebody waiting on you who was not this morning. A round landing -- your
+    batch count going up -- is the review advancing, which is the thing a long engagement
+    otherwise shows no sign of at all: `!10530` looked identical for six weeks while four
+    rounds went through it.
+    """
+    old, new = prev.get("reviews") or {}, cur.get("reviews") or {}
+    out = []
+    for iid in sorted(set(old) | set(new), key=lambda k: int(k) if k.isdigit() else 0):
+        o, n = old.get(iid), new.get(iid)
+        if n is None:
+            out.append({"iid": iid, "kind": "gone", "ref": o.get("ref") or f"!{iid}",
+                        "url": o.get("url", ""), "arc": o.get("arc"),
+                        "what": f"{o.get('ref') or '!' + iid} is no longer waiting on you"})
+            continue
+        ref, who = n.get("ref") or f"!{iid}", n.get("author") or "someone"
+        if o is None:
+            out.append({"iid": iid, "kind": "appeared", "ref": ref, "url": n.get("url", ""),
+                        "arc": n.get("arc"),
+                        "what": f"{who} asked you to review {ref}"})
+            continue
+        if o.get("whose_turn") != n.get("whose_turn"):
+            mine = n.get("whose_turn") == "mine"
+            out.append({"iid": iid,
+                        "kind": "turned_mine" if mine else "turned_theirs",
+                        "ref": ref, "url": n.get("url", ""), "arc": n.get("arc"),
+                        "what": (f"{who} moved on {ref} — your turn" if mine
+                                 else f"you answered on {ref} — their turn")})
+        elif (n.get("rounds") or 0) > (o.get("rounds") or 0):
+            out.append({"iid": iid, "kind": "answered", "ref": ref,
+                        "url": n.get("url", ""), "arc": n.get("arc"),
+                        "what": f"another round on {ref} — {n.get('rounds')} so far"})
+    # Total order, tiebroken on the iid, for the reason every sort in this file has one.
+    out.sort(key=lambda c: (REVIEW_CHANGE_RANK.get(c["kind"], 9), c["iid"]))
+    return out
 
 
 def _interval(a, b):
@@ -7818,6 +8117,15 @@ def main():
         print(f"⚠ ignoring authoritative={s['branch']} for {s['label']}: {s['why']}",
               file=sys.stderr)
 
+    # Here and not earlier, for the reason apply_parked is here: this is the last thing
+    # that touches `state`, and every pass above it re-runs finalize, which would recompute
+    # the sentence away. Called unconditionally so that `arc["reviews"]` exists on every
+    # arc on every path -- a --no-mr run has no reviews and says so with an empty list
+    # rather than with a missing key nobody can tell from a missing review.
+    reviews = (ledger or {}).get("reviews") or []
+    reviews_known = bool(ledger) and bool((ledger or {}).get("reviews_known"))
+    attach_reviews(arcs, reviews)
+
     # Both of its exclusions -- parked, and whose clock is running -- are only settled by
     # now: apply_parked has just run, and `stage` came from the finalize pass after
     # reconcile. Before apply_dismissals, which needs the verdicts to know what is
@@ -7897,14 +8205,18 @@ def main():
     snap = snapshot_of(arcs, ledger, {"mrs": mrs_known, "ledger": ledger is not None,
                                       "issues": gap is not None,
                                       "slack": bool(slack_lens.get("consulted")
-                                                    and slack_lens.get("complete"))},
-                       args.repo.name, generated)
+                                                    and slack_lens.get("complete")),
+                                      # Completeness, not presence, like the ledger: a
+                                      # sweep that half-answered would report every review
+                                      # it missed as having vanished.
+                                      "reviews": reviews_known},
+                       args.repo.name, generated, reviews)
     prev, no_prev = load_snapshot(args.repo.name)
     if prev is None:
         since = {"v": SNAPSHOT_V, "previous_generated": None, "interval_seconds": None,
                  "compared": 0, "changed": 0, "why": no_prev,
                  "not_compared": {"arcs": 0, "how": {}, "detail": {}},
-                 "skipped_universes": [], "changes": []}
+                 "skipped_universes": [], "changes": [], "reviews": []}
     else:
         since = diff_runs(prev, snap, arcs, ledger)
     if args.snapshot:
@@ -8024,6 +8336,17 @@ def main():
             "only_here": only_here_ids,
             "arcs": arcs,
             "ledger": ledger,
+            # The reviews you have going, whole and ranked, top-level beside the ledger
+            # rather than inside it. They come off the ledger's own sweep and share its
+            # boundary, but they are not ledger rows: a ledger row is a debt that vanishes
+            # when the other person moves, and a review is a piece of work that carries on
+            # after they do. Each row names the arc it joined to, or null where the merge
+            # request was never checked out here -- which is most of them.
+            "reviews": reviews,
+            # Whether that list is all of them. Never omitted and never silently empty: a
+            # consumer cannot tell "you are reviewing nothing" from "GitLab was not asked",
+            # and the two support opposite sentences.
+            "reviews_known": reviews_known,
             # What the Slack thread lens saw and what it could not, top-level because it is
             # a fact about the run rather than about any one workstream -- and because the
             # page's boundary note is read off it. `denied` is the two scopes this token
@@ -8126,6 +8449,24 @@ def main():
         if dismissed:
             print(f"  (+{dismissed} acknowledged — `work-arcs --undismiss REF` brings "
                   "one back; any change brings it back on its own)")
+        print()
+    if reviews:
+        print("── reviewing ────────────────────────────────────────────")
+        for r in reviews:
+            turn = "your turn" if r["whose_turn"] == "mine" else "their turn"
+            rounds = (f"{r['rounds']} round{'' if r['rounds'] == 1 else 's'}"
+                      if r["rounds"] else "not yet read")
+            print(f"  {r['ref']:<9} {r.get('days', '?'):>4}d  for {r['author']}"
+                  f" — {rounds}, {turn}")
+            print(f"                          └ {r['title'][:58]}")
+            if r.get("arc"):
+                print(f"                          ↳ {r['arc']} ({r.get('arc_via', '')})")
+        print()
+    elif reviews_known is False:
+        # Said out loud, because an absent section and an empty one look identical and
+        # mean opposite things.
+        print("── reviewing ────────────────────────────────────────────")
+        print("  GitLab was not asked, so what you are reviewing is unknown this run")
         print()
     for a in arcs:
         c = a["counts"]
