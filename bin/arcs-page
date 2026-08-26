@@ -126,6 +126,7 @@ import argparse
 import hashlib
 import html
 import json
+import os
 import re
 import sys
 import urllib.parse
@@ -548,6 +549,14 @@ blockquote b{font-weight:600;color:var(--ink)}
 .tree .c.dup{fill:var(--ink-faint);opacity:.8}
 .tree .edge{stroke:var(--hairline);fill:none;stroke-width:1.5}
 .tree .edge.copy{stroke-dasharray:2 2.5}
+/* The third edge, and it had to be a third. Solid means "cut from" and dashed means "the
+   same commits again"; the file overlap a curation question is about is neither, and
+   borrowing either treatment would have the claim inherit a meaning it does not have. So:
+   dotted, in the accent, and named in the legend beside it. */
+.tree .edge.prop{stroke:var(--accent);stroke-dasharray:1 3;stroke-width:1.4;opacity:.85}
+.tree .askring{fill:none;stroke:var(--accent);stroke-width:1.2;opacity:.55}
+.tree .n.ask{fill:var(--ink);font-weight:700}
+.tree .c.tie{fill:var(--accent);opacity:.9}
 .tree .dot{fill:var(--ink-faint)}
 .tree .dot.risk{fill:var(--hot)}
 .tree .dot.head{stroke:var(--accent);stroke-width:1.5;fill:var(--surface)}
@@ -764,57 +773,116 @@ section#reviewing .covered{margin:.55rem 0 0;font-size:.76rem;color:var(--ink-fa
 .news .item{position:relative;padding-right:2rem}
 .news .item .dis{position:absolute;top:0;right:0}
 td .dis{vertical-align:middle}
-/* Curation: the memberships this build is least sure of, one row each. Two controls and
-   no third — a question you cannot answer is answered by leaving it alone, and it comes
-   back next build. Sized down deliberately: this is a list of doubts, not of facts, and
-   it must not read louder than the work it is doubting. */
-.cur{border-radius:6px;background:var(--surface);overflow:hidden}
-.cur .q{display:grid;grid-template-columns:auto 1fr;gap:.6rem;align-items:baseline;
-  padding:.55rem .8rem;border-top:1px solid var(--hairline)}
-.cur .q:first-child{border-top:0}
-.cur .q[data-answer="keep"]{background:var(--calm-wash)}
-.cur .q[data-answer="pry"]{background:var(--hot-wash)}
-.cur .yn{display:flex;gap:.3rem;white-space:nowrap}
-.cur .yn button{font:inherit;font-size:.76rem;font-weight:600;cursor:pointer;
-  padding:.1rem .45rem;border-radius:2px;border:1px solid var(--hairline);
-  background:transparent;color:var(--ink-faint)}
-.cur .yn button:hover{color:var(--ink)}
-.cur .yn button.on[data-a="keep"]{border-color:var(--calm);color:var(--calm);
-  font-weight:700}
-.cur .yn button.on[data-a="pry"]{border-color:var(--hot);color:var(--hot);
-  font-weight:700}
-.cur .q[data-answer="intended"]{background:var(--calm-wash)}
-.cur .q[data-answer="residue"]{background:var(--hot-wash)}
-/* The no-ticket question's three answers. `needs one` is the derivation being right and
-   wears the same calm the other two kinds' `yes` does; `fine` and `noise` are both
-   acknowledgements rather than corrections, so neither takes the hot hue that means "the
-   tool got this wrong" -- an acknowledged row is the tool having been right and dealt
-   with. */
-.cur .q[data-answer="ticket"]{background:var(--calm-wash)}
-.cur .q[data-answer="fine"],.cur .q[data-answer="noise"]{background:var(--parked-wash)}
-.cur .yn button.on[data-a="intended"],.cur .yn button.on[data-a="ticket"]{
-  border-color:var(--calm);color:var(--calm);font-weight:700}
-.cur .yn button.on[data-a="residue"]{border-color:var(--hot);color:var(--hot);
-  font-weight:700}
+/* Curation: the questions this build would like answered, as cards rather than as a list.
+
+   The list was the problem. Three question types under one omnibus paragraph, every row a
+   sentence, and the whole thing read as prose you had to parse before you could act --
+   Kyle: "the questions section just looks like a wall of text ... some more graphical
+   and/or semantic way to show it so i can understand what it's proposing at a glance".
+
+   So one card is open at a time and the rest are a ranked strip under it. The queue is
+   server-rendered, its order is fixed, and nothing here reorders or removes anything: what
+   changes is only how much of each card is on the screen, which makes stepping through the
+   queue presentation and never judgement. Sized down deliberately all the same -- this is
+   a list of doubts, not of facts, and it must not read louder than the work it doubts. */
+.cur{display:flex;flex-direction:column;gap:.5rem}
+.cur .q{border-radius:6px;background:var(--surface);padding:.5rem .75rem;
+  display:flex;flex-direction:column;gap:.55rem}
+.cur .q[hidden]{display:none}
+/* The head is the whole of a queued card and the top line of an open one, so it carries
+   the question, the subject and the rank in one row that reads the same in both states. */
+.cur .qh{display:flex;align-items:baseline;gap:.5rem;flex-wrap:wrap}
+.cur .qn{font-family:var(--mono);font-size:.68rem;color:var(--ink-faint);
+  min-width:1.4em;text-align:right;flex:none}
+.cur .ask,.cur .tag{font-family:var(--sans);font-size:.7rem;font-weight:600;
+  letter-spacing:.05em;text-transform:uppercase;color:var(--ink-faint);flex:none}
+/* A queued card says which of the three kinds it is; an open or answered one says the
+   whole question. Four queued cards each repeating the same sentence is the wall of text
+   coming back by a different door. */
+.cur .q:not(.open):not(.done) .ask,.cur .q.open .tag,.cur .q.done .tag{display:none}
+.cur .qi{font-family:var(--sans);font-size:.74rem;color:var(--ink-faint)}
+/* The subject is set as a title, because on a card that is what it is. The exact ref is
+   never far -- a membership card draws the branch in mono in its own picture, an
+   inch below -- so the display face here costs the reader nothing it does not give back
+   in being findable at a glance. */
+.cur .subj{font-family:var(--display);font-size:1.02rem;color:var(--ink);line-height:1.2}
+.cur .qh .key{font-family:var(--mono);font-size:.72rem;color:var(--ink-faint)}
+.cur .qbody{display:flex;flex-direction:column;gap:.5rem}
+.cur .q:not(.open) .qbody{display:none}
+/* Evidence: a picture where the question has structure, chips where it has facts, and
+   nothing where it has neither. */
+.cur .qev{display:flex;gap:.9rem;align-items:flex-start;flex-wrap:wrap}
+.cur .qev .tree{border-top:0;padding-top:0;flex:1 1 20rem;min-width:0}
+.cur .facts{display:flex;flex-direction:column;gap:.4rem;flex:0 1 15rem;min-width:9rem}
+.cur .chips{display:flex;gap:.3rem;flex-wrap:wrap}
+.cur .chips .chip{color:var(--ink-faint);font-weight:500;letter-spacing:.03em}
+.cur .chips .chip.f{font-family:var(--mono);text-transform:none;letter-spacing:0}
+.cur .chips .chip.warn{color:var(--warm)}
+/* The figure the whole card is about, set big enough to be the thing you read first.
+   Sentence face and not mono: "6 days of work" is a scale, not a value to be copied. */
+.cur .big{font-family:var(--display);font-size:1.3rem;line-height:1.1;color:var(--ink);
+  flex:0 1 11rem;min-width:7rem}
+.cur .big small{font-family:var(--sans);font-size:.72rem;color:var(--ink-faint);
+  display:block;margin-top:.2rem;letter-spacing:.02em}
+/* How sure the grouping is, as a bar and as the number. The bar is for the glance and the
+   number is the fact -- a meter with no scale printed beside it is decoration. */
+.cur .meter{display:flex;align-items:center;gap:.4rem;font-family:var(--sans);
+  font-size:.68rem;color:var(--ink-faint)}
+.cur .meter .track{flex:1 1 auto;height:4px;border-radius:2px;background:var(--surface-2);
+  overflow:hidden;min-width:3rem}
+.cur .meter .fill{display:block;height:100%;background:var(--warm);border-radius:2px}
+.cur .meter .mv{font-family:var(--mono);color:var(--ink-soft)}
+.cur .qev .spark rect{fill:var(--ink-soft)}
+.cur .qev .spark .base{stroke:var(--hairline);stroke-width:1}
+.cur .qev .spark .now{stroke:var(--parked);stroke-width:1.2}
+/* The cliff itself, which is the one thing the sparkline in this section has to say that
+   the one in the fell-off-a-cliff list does not: where the work stopped, and how much of
+   the picture is the silence after it. */
+.cur .qev .spark .gap{fill:var(--hot);opacity:.09}
+.cur .qev .spark .stop{stroke:var(--hot);stroke-width:1.2;opacity:.7}
+.cur .qsay{font-family:var(--sans);font-size:.78rem;color:var(--ink-soft);
+  text-wrap:pretty;margin:0}
+.cur .qsay a{color:var(--accent)}
+.cur .qsay code{font-family:var(--mono);font-size:.72rem;color:var(--ink-faint)}
+/* Real buttons, each carrying its own consequence. The consequence is inside the button
+   rather than under it so the two cannot come apart -- and so a reader on a screen reader
+   is told what the answer does as part of being told what the answer is. */
+.cur .yn{display:flex;gap:.4rem;flex-wrap:wrap}
+.cur .yn button{font:inherit;font-family:var(--sans);cursor:pointer;text-align:left;
+  padding:.35rem .55rem;border-radius:4px;border:1px solid var(--hairline);
+  background:transparent;color:var(--ink-soft);flex:1 1 12rem;max-width:22rem;
+  display:flex;flex-direction:column;gap:.15rem;line-height:1.3}
+.cur .yn button:hover{border-color:var(--ink-faint);color:var(--ink)}
+.cur .yn button .lb{font-size:.8rem;font-weight:700;color:var(--ink)}
+.cur .yn button .cq{font-size:.7rem;color:var(--ink-faint)}
+.cur .yn button.on{border-width:1px}
+.cur .yn button.on[data-a="keep"],.cur .yn button.on[data-a="intended"],
+.cur .yn button.on[data-a="ticket"]{border-color:var(--calm);background:var(--calm-wash)}
+.cur .yn button.on[data-a="keep"] .lb,.cur .yn button.on[data-a="intended"] .lb,
+.cur .yn button.on[data-a="ticket"] .lb{color:var(--calm)}
+.cur .yn button.on[data-a="pry"],.cur .yn button.on[data-a="residue"]{
+  border-color:var(--hot);background:var(--hot-wash)}
+.cur .yn button.on[data-a="pry"] .lb,.cur .yn button.on[data-a="residue"] .lb{
+  color:var(--hot)}
+/* `fine` and `noise` are acknowledgements rather than corrections, so neither takes the
+   hot hue that means "the tool got this wrong" -- an acknowledged row is the tool having
+   been right and dealt with. */
 .cur .yn button.on[data-a="fine"],.cur .yn button.on[data-a="noise"]{
-  border-color:var(--parked);color:var(--ink-soft);font-weight:700}
-/* An answered question shrinks rather than vanishing, which is what "reveals the next"
-   means here: the queue's order is fixed and nothing is reordered or removed, the rows
-   already given an answer simply stop taking a screenful, and the next unanswered one is
-   where the eye already was. Reversible in place -- clicking the answer again restores
-   the row -- so nothing about answering is a commitment made at speed. */
-/* Answering a no-ticket question IS acknowledging the row it is about, and the two share
-   one fingerprint on purpose -- so the generic rule that hides an acknowledged `[data-fp]`
-   would hide the question itself, leaving no way to take the answer back. The row it
-   acknowledges is elsewhere on the page and fades there; this one shrinks and stays. */
-.cur .q[data-dismissed="1"]{display:grid}
-.cur .q.done{padding:.3rem .8rem;opacity:.5}
-.cur .q.done .ev{font-size:.75rem;white-space:nowrap;overflow:hidden;
-  text-overflow:ellipsis}
-.cur .q.done .ev br,.cur .q.done .ev code{display:none}
-.cur .q b{font-family:var(--mono);font-size:.8rem;font-weight:600}
-.cur .q .ev{color:var(--ink-soft);font-size:.8rem}
-.cur .q .ev code{font-family:var(--mono);font-size:.74rem;color:var(--ink-faint)}
+  border-color:var(--parked);background:var(--parked-wash)}
+/* An answered card shrinks to its head and its buttons rather than vanishing. The answer
+   has to stay one click from being taken back, which means the buttons stay; everything
+   that was evidence for a question already answered does not. */
+.cur .q[data-dismissed="1"]{display:flex}
+.cur .q.done{opacity:.62;padding:.35rem .75rem}
+.cur .q.done .qbody{display:flex;flex-direction:row;gap:.3rem}
+.cur .q.done .qev,.cur .q.done .qsay{display:none}
+.cur .q.done .yn button{flex:0 0 auto;padding:.15rem .4rem;flex-direction:row;gap:.35rem}
+.cur .q.done .yn button .cq{display:none}
+.cur .q.done .subj{font-size:.86rem}
+.cur .q.open{background:var(--surface);box-shadow:0 1px 0 var(--hairline)}
+.cur .q:not(.open):not(.done){padding:.3rem .75rem;cursor:default}
+.cur .q:not(.open):not(.done) .subj{font-size:.88rem;color:var(--ink-soft)}
+.cur .qmore{font-family:var(--sans);font-size:.75rem;color:var(--ink-faint);margin:0}
 
 /* The detach rail: ✕ per branch, an intent recorded now and applied on the next build.
    The struck name says the intent took; the legend says when it takes effect. */
@@ -1890,15 +1958,38 @@ INTERACT_JS = r"""
       row.querySelectorAll('.yn button').forEach(function(btn){
         btn.classList.toggle('on', btn.dataset.a===row.dataset.answer); });
     });
-    // An answered question shrinks and the next one comes up under it -- the queue is
+    // An answered card shrinks and the next one opens under it -- the queue is
     // server-rendered and its order is fixed, so stepping through it is presentation and
     // never judgement. Nothing is reordered, nothing is removed, and clicking the answer
-    // again brings the row back to full size.
-    var unanswered=0;
+    // again brings the card back to full size.
+    //
+    // One card open at a time, and a window on the rest. work-arcs sends every question it
+    // has now rather than a rationed five, which is the right thing for a queue and the
+    // wrong thing for a screen: twenty-three cards all open is the wall of text this
+    // section was rebuilt out of. So the open one is the first unanswered, the next few
+    // are a ranked strip under it, and everything past the window is in the document,
+    // hidden, and announced by count. Answered cards stay exactly where they are: taking
+    // an answer back has to be one click, which means the card has to still be there.
+    var win=(function(){
+      var el=document.querySelector('.cur');
+      var n=el&&parseInt(el.dataset.window||'5',10);
+      return (n&&n>0)?n:5;
+    })();
+    var unanswered=0, shown=0, hiddenq=0;
     document.querySelectorAll('.cur .q').forEach(function(row){
       var done=!!row.dataset.answer;
       row.classList.toggle('done', done);
-      if(!done) unanswered++;
+      row.classList.remove('open');
+      if(done){ row.hidden=false; return; }
+      unanswered++;
+      if(shown===0){ row.classList.add('open'); shown++; row.hidden=false; return; }
+      if(shown<win){ shown++; row.hidden=false; return; }
+      row.hidden=true; hiddenq++;
+    });
+    document.querySelectorAll('.cur .qmore').forEach(function(el){
+      el.hidden=(hiddenq===0);
+      el.textContent='\u2026and '+hiddenq+' more behind these, in the same order — '
+                     +'each comes up as the one above it is answered.';
     });
     // The queue's own size, which the rail and the strip mirror. It is the count of what
     // is still worth a person's attention, so it falls as questions are answered and the
@@ -2853,7 +2944,7 @@ def spawn_forest(branches):
     return rows, parent, kind
 
 
-def spawn_svg(arc, limit=12, base="", detachable=False):
+def spawn_svg(arc, limit=12, base="", detachable=False, proposed=None, pinned=()):
     """Draw the arc's stacking tree, or nothing when there is no structure to show.
 
     Build the forest over every branch and prune afterwards, never the other way round.
@@ -2864,7 +2955,15 @@ def spawn_svg(arc, limit=12, base="", detachable=False):
 
     The authoritative branch is always kept, whatever the cut. It is the one row that has
     to be there: a tree of an arc's variants that omits the branch under review is worse
-    than no tree.
+    than no tree. `pinned` names any others a caller cannot afford to lose -- the curation
+    card's questioned branch and the neighbour it is being asked about, which would
+    otherwise be exactly the pair a cut could drop.
+
+    `proposed` draws the one edge ancestry cannot: `{"branch", "with", "label"}` marks a
+    membership the file overlap asserts and git has no record of. It is a THIRD edge
+    treatment on purpose. Solid already means "cut from" and dashed already means "the same
+    commits again", and borrowing either would have this claim inherit a meaning it does not
+    have -- so it is dotted and drawn in the accent, and it says so in the legend.
     """
     branches = arc.get("branches", [])
     if len(branches) < 2:
@@ -2873,11 +2972,14 @@ def spawn_svg(arc, limit=12, base="", detachable=False):
     if not rows:
         return ""
     auth = arc.get("authoritative")
+    must = {x for x in pinned if x}
+    if auth:
+        must.add(auth)
 
     if len(rows) > limit:
         keep = set()
-        head = [b for b in branches if b["name"] == auth]
-        for b in head + [x for x in branches[:limit] if x["name"] != auth]:
+        head = [b for b in branches if b["name"] in must]
+        for b in head + [x for x in branches[:limit] if x["name"] not in must]:
             cur, guard = b["name"], 0
             while cur is not None and cur not in keep and guard < 40:
                 keep.add(cur)
@@ -2893,13 +2995,24 @@ def spawn_svg(arc, limit=12, base="", detachable=False):
     at = {b["name"]: i for i, (b, _) in enumerate(rows)}
     depth_of = {b["name"]: d for b, d in rows}
 
+    # A left gutter where a proposed edge has to be drawn, and only there. Two branches
+    # the file overlap ties together are usually both forest roots -- neither was cut from
+    # the other, which is the whole reason the tie is in doubt -- so the edge between them
+    # runs straight down the leftmost column and needs somewhere to bow out into.
+    left = PAD + (12 if proposed and proposed.get("with") else 0)
+
     def x_of(d):
-        return PAD + d * INDENT
+        return left + d * INDENT
 
     def y_of(i):
         return PAD + i * ROW + ROW // 2
 
+    ask = (proposed or {}).get("branch")
+    tie = (proposed or {}).get("label") or ""
+
     def tail_len(b):
+        if b["name"] == ask and tie:
+            return len(tie) + 4
         if b["name"] == auth:
             return 11
         if b.get("historical"):
@@ -2916,7 +3029,9 @@ def spawn_svg(arc, limit=12, base="", detachable=False):
     svg = [f'<svg width="{w}" height="{height}" '
            f'viewBox="0 0 {w} {height}" role="img" '
            f'aria-label="how this arc&rsquo;s branches relate: solid edges were cut from '
-           f'the branch above, dashed edges are copies of it">']
+           f'the branch above, dashed edges are copies of it'
+           + (', and the dotted edge is the file overlap this question is about'
+              if proposed else "") + '">']
 
     # Elbows first so the dots sit on top of them.
     for b, d in rows:
@@ -2927,6 +3042,25 @@ def spawn_svg(arc, limit=12, base="", detachable=False):
         cx, cy = x_of(d), y_of(at[b["name"]])
         copy = " copy" if kind.get(b["name"]) == "copy" else ""
         svg.append(f'<path class="edge{copy}" d="M{px} {py + 5} V{cy} H{cx - 3}"/>')
+
+    # The claim the question is about, drawn in the same elbow so it reads as an edge of
+    # this tree rather than as an annotation on it. Only where both ends survived the cut:
+    # an edge with one end off the picture is a line pointing at nothing.
+    if proposed and proposed.get("with"):
+        c, par = proposed["branch"], proposed["with"]
+        if c in at and par in at and c != par:
+            px, py = x_of(depth_of[par]), y_of(at[par])
+            cx, cy = x_of(depth_of[c]), y_of(at[c])
+            if depth_of[par] == depth_of[c]:
+                # Same column, so an elbow would degenerate into a vertical line ending
+                # beside the dot rather than at it. A bracket out into the gutter joins the
+                # two nodes and reads as one edge instead of as a spine.
+                b = px - 11
+                svg.append(f'<path class="edge prop" d="M{px - 4} {py} '
+                           f'C{b} {py}, {b} {cy}, {cx - 4} {cy}"/>')
+            else:
+                svg.append(f'<path class="edge prop" '
+                           f'd="M{px} {py + 5} V{cy} H{cx - 3}"/>')
 
     for b, d in rows:
         cx, cy = x_of(d), y_of(at[b["name"]])
@@ -2941,11 +3075,22 @@ def spawn_svg(arc, limit=12, base="", detachable=False):
                (" dup" if dup else (" auth" if b["name"] == auth
                                     else (" risk" if b.get("unpushed") else ""))))
         head = " head" if b.get("worktree") else ""
+        # The node the question is about, ringed. The same gesture the checked-out branch
+        # already wears, one size out: the reader has to be able to find the subject of the
+        # card in its own picture before reading a word of it.
+        if b["name"] == ask:
+            svg.append(f'<circle class="askring" cx="{cx}" cy="{cy}" r="6.5"/>')
         svg.append(f'<circle class="dot{cls}{head}" cx="{cx}" cy="{cy}" r="3.2"/>')
         # The tail rides in the same <text> as a dx-offset tspan. Positioning it with
         # its own x means guessing the font's advance width, and the guess ran short
         # often enough to jam `+13` against the branch name.
-        if hist:
+        # The tie the question rests on, said on the row it is about. It takes the tail
+        # slot rather than sharing it: the shared-file count is the whole of what holds
+        # this branch here, and the unpushed figure it displaces is a chip beside the
+        # picture already.
+        if b["name"] == ask and tie:
+            tail = f'<tspan class="c tie" dx="7">&larr; {esc(tie)}</tspan>'
+        elif hist:
             tail = f'<tspan class="c hist" dx="7">history · {esc(hist)}</tspan>'
         elif dup:
             tail = (f'<tspan class="c dup" dx="7">= {esc(dup)}</tspan>')
@@ -2955,7 +3100,8 @@ def spawn_svg(arc, limit=12, base="", detachable=False):
             tail = f'<tspan class="c" dx="7">+{b["unpushed"]}</tspan>'
         else:
             tail = ""
-        label = (f'<text class="n{cls}" data-branch="{esc(b["name"])}" '
+        label = (f'<text class="n{cls}{" ask" if b["name"] == ask else ""}" '
+                 f'data-branch="{esc(b["name"])}" '
                  f'x="{cx + 8}" y="{cy + 4}">'
                  f'{esc(b["name"])}{tail}</text>')
         if base and b.get("pushed"):
@@ -2971,6 +3117,9 @@ def spawn_svg(arc, limit=12, base="", detachable=False):
 
     svg.append("</svg>")
     legend = []
+    if proposed and proposed.get("with"):
+        legend.append("dotted = the files these two share, which is the whole of why "
+                      "they are grouped — the question")
     if any(kind.get(b["name"]) == "copy" for b, _ in rows):
         legend.append("dashed = the same commits again, not separate work")
     if any(b.get("historical") for b, _ in rows):
@@ -3175,7 +3324,7 @@ def fmt_day(epoch):
 SPARK_W, SPARK_H = 96, 18
 
 
-def cliff_spark(act, span):
+def cliff_spark(act, span, mark=False):
     """One tick per active day, on a real time axis shared by the whole section, ending
     at today.
 
@@ -3207,6 +3356,12 @@ def cliff_spark(act, span):
 
     aria-hidden, deliberately: every fact in it is in that sentence already, and announcing
     it twice is worse for a screen reader than not drawing it at all.
+
+    `mark` adds the one thing the cliff list does not need and a question about intent does:
+    the moment the work stopped, and the silence since it drawn as an area rather than left
+    as blank paper. On the list the blank is read against twenty other rows on the same
+    axis and means something by comparison; on a card there is nothing to compare it to, so
+    the picture has to say by itself which part of it is the cliff.
     """
     series = act.get("series") or []
     if not series or span <= 0:
@@ -3222,6 +3377,12 @@ def cliff_spark(act, span):
         x = max(0.0, (span - min(ago, span)) / span * (w - bar))
         out.append(f'<rect x="{x:.1f}" y="{pad}" width="{bar:.1f}" '
                    f'height="{h - pad * 2:.1f}" rx="0.6"/>')
+    if mark:
+        last = min(ago for ago, _ in series)
+        x = max(0.0, (span - min(last, span)) / span * (w - bar)) + bar
+        out.append(f'<rect class="gap" x="{x:.1f}" y="0" '
+                   f'width="{max(0.0, w - x):.1f}" height="{h}"/>')
+        out.append(f'<line class="stop" x1="{x:.1f}" y1="0" x2="{x:.1f}" y2="{h}"/>')
     out.append(f'<line class="base" x1="0" y1="{h - pad:.1f}" x2="{w}" '
                f'y2="{h - pad:.1f}"/>')
     out.append(f'<line class="now" x1="{w - 0.6}" y1="0" x2="{w - 0.6}" y2="{h}"/>')
@@ -3382,6 +3543,322 @@ def fold(a, title, count, lead="", sid="", attrs=""):
       + (f'<span class="fl">{lead}</span>' if lead else "")
       + "</summary>")
 
+
+
+# ── the queue, as cards ───────────────────────────────────────────────────────
+#
+# How many unanswered questions are on the screen at once: one card open and the rest of
+# the window as a ranked strip under it. This is `ARC_CURATION_CAP`, and it used to cut
+# the queue at emission in work-arcs -- back when answering meant an fzf round-trip or a
+# rebuild and five painless questions beat a checklist grind. The loop closed, the pacing
+# became presentation, and presentation belongs where the rendering is: what is outside
+# the window is announced and one answer away, which a truncation at emission could never
+# be.
+CURATION_WINDOW = max(1, int(os.environ.get("ARC_CURATION_CAP", "5")))
+
+# The number of nodes a card's tree may draw. Smaller than a workstream card's, because a
+# question is a thing you answer in a glance and a fifteen-row tree is a thing you read.
+CURATION_TREE = 8
+
+# What each kind is actually asking, as a question. Fixed page copy, and that is the whole
+# licence this section has to author anything: the phrasing is a fact about the queue,
+# every other word on a card is a fact about the work and comes down the wire.
+CURATION_ASK = {
+    "membership": "Do these belong together?",
+    "residue": "Was this ever meant to land?",
+    "unticketed": "Does this need a ticket?",
+}
+
+# What each answer does, said under the answer that does it. This is where the omnibus
+# paragraph went. It explained three question types and six outcomes in one ~180-word
+# block above the queue, which meant a reader had to hold all six in their head to act on
+# one -- and a consequence belongs on the control that causes it, not in a preamble three
+# inches above three controls sharing a page.
+# The same three kinds in one word each, for a card waiting its turn. The full question
+# on four queued cards in a row is four identical lines of shouting, which is the wall of
+# text arriving by a different door -- what a strip row has to say is which of the three
+# this one is, and the open card says the rest.
+CURATION_TAG = {"membership": "grouping", "residue": "intent", "unticketed": "no ticket"}
+
+CURATION_ANSWERS = {
+    "membership": (
+        ("keep", "Yes, same work",
+         "pins this grouping — it stops being asked while the branch keeps this company"),
+        ("pry", "No, different work",
+         "pries it out; it falls back to what its own name declares, from the next build"),
+    ),
+    "residue": (
+        ("intended", "Yes, meant to land", "keeps it counted as work you still owe"),
+        ("residue", "No, never meant to",
+         "every commit stays exactly where it is; it stops counting as debt"),
+    ),
+    "unticketed": (
+        ("ticket", "Yes, needs one",
+         "writes nothing — the row stays where it is, still counted, which is what "
+         "wanting a ticket looks like"),
+        ("fine", "Fine without one",
+         "acknowledges the row in its fold — it comes back on its own if the work grows"),
+        ("noise", "Not work at all",
+         "acknowledges it the same way, recorded as a different judgement from fine"),
+    ),
+}
+
+
+def curation_subject(q):
+    """What a card is about, in one phrase: the branch for a membership, the workstream
+    for the other two. Never composed here beyond choosing which field it is -- a page
+    that reworded a name would be a second author for it."""
+    if q.get("kind") in ("residue", "unticketed"):
+        return str(q.get("arc") or q.get("arc_id") or "?")
+    return str(q.get("branch") or q.get("arc") or "?")
+
+
+def curation_answers(a, q):
+    """The answers, as buttons, each carrying what it does.
+
+    Buttons and not links, because every one of them is an action taken here: nothing
+    navigates, nothing submits, and a control that looks like a link and behaves like a
+    switch is the one shape a reader cannot predict.
+    """
+    a('<span class="yn">')
+    for key, label, says in CURATION_ANSWERS[q.get("kind") or "membership"]:
+        a(f'<button type="button" data-a="{key}">'
+          f'<span class="lb">{esc(label)}</span>'
+          f'<span class="cq">{esc(says)}</span></button>')
+    a("</span>")
+
+
+def membership_card(a, q, arc):
+    """A grouping question, drawn where it has structure and said where it has facts.
+
+    The question IS structural -- "does this branch hang here?" -- so the evidence is the
+    arc's own spawn tree with the branch ringed at the place the file overlap puts it, on
+    the dotted edge that means exactly that claim and nothing else. The reader should see
+    WHERE the branch would hang before reading a word, which is the difference between
+    this and the sentence it replaces.
+
+    The tree is the page's existing one, not a second drawing of the same fact. It gets a
+    smaller node budget and two branches it may not drop -- the one under question and the
+    neighbour it is tied to, which are precisely the pair a truncation would otherwise be
+    free to cut.
+    """
+    shared = q.get("shared") or 0
+    tie = (f"{shared} shared file" + ("" if shared == 1 else "s")) if shared else ""
+    tree = spawn_svg(arc, limit=CURATION_TREE,
+                     proposed={"branch": q.get("branch"), "with": q.get("with"),
+                               "label": tie},
+                     pinned=[q.get("branch"), q.get("with")]) if arc else ""
+    a('<div class="qev">')
+    if tree:
+        a(tree)
+    a('<div class="facts">')
+    conf = q.get("confidence")
+    if isinstance(conf, (int, float)):
+        pct = max(0, min(100, int(round(float(conf) * 100))))
+        a('<span class="meter">how sure<span class="track">'
+          f'<span class="fill" style="width:{pct}%"></span></span>'
+          f'<span class="mv">{conf:g}</span></span>')
+    a('<span class="chips">')
+    if tie:
+        a(f'<span class="chip">{esc(tie)}</span>')
+    for f in (q.get("files") or [])[:4]:
+        short = str(f).rsplit("/", 1)[-1]
+        a(f'<span class="chip f" title="{esc(f)}">{esc(short)}</span>')
+    over = len(q.get("files") or []) - 4
+    if over > 0:
+        a(f'<span class="chip">+{over} more</span>')
+    links = q.get("links") or 0
+    if links:
+        a(f'<span class="chip">{links} link' + ("" if links == 1 else "s") + "</span>")
+    peers = q.get("peers") or 0
+    if peers:
+        a(f'<span class="chip">{peers} other branch'
+          + ("" if peers == 1 else "es") + " here</span>")
+    if q.get("authoritative"):
+        a('<span class="chip warn">carries the arc&rsquo;s merge request</span>')
+    a("</span></div></div>")
+    say = esc(q.get("why") or "")
+    if q.get("authoritative"):
+        # A fact about the answer rather than about the doubt, and the one thing a person
+        # has to be told before pressing no: this branch is where the arc's merge request,
+        # its ticket and its subject come from.
+        say += (". Prying it out takes the arc&rsquo;s merge request, its ticket and its "
+                "subject with it")
+    if say:
+        a(f'<p class="qsay">{say}.</p>')
+
+
+def residue_card(a, q, arc, span, linked):
+    """An intent question, drawn on the axis that is the whole of the claim.
+
+    Temporal structure, so the picture is the cliff: the ticks are the days work happened,
+    the shaded tail is the silence since, and the two together say "this stopped" before a
+    figure is read. Same sparkline the fell-off-a-cliff list draws, with its cliff marked
+    -- on that list the blank is read against twenty rows on a shared axis and means
+    something by comparison, and a card has nothing to compare itself to.
+    """
+    act = (arc or {}).get("activity") or {}
+    a('<div class="qev">')
+    a(f'<div class="big">{esc(q.get("scale") or "unpushed work")}'
+      "<small>and no remote has any of it</small></div>")
+    a('<div class="facts">')
+    if act.get("series") and span > 0:
+        a(cliff_spark(act, span, mark=True))
+    a('<span class="chips">')
+    k, gapd = q.get("cliff_days"), q.get("gap_days")
+    if isinstance(k, int):
+        a(f'<span class="chip">quiet {k}d</span>')
+    if gapd:
+        a(f'<span class="chip">its own rhythm is {gapd}d</span>')
+    if q.get("beats"):
+        a(f'<span class="chip warn">{q["beats"]}&times; its rhythm</span>')
+    n = len(q.get("branches") or [])
+    if n:
+        a(f'<span class="chip">{n} branch' + ("" if n == 1 else "es") + "</span>")
+    if q.get("stage"):
+        a(f'<span class="chip">{esc(q["stage"])}</span>')
+    if q.get("at_risk_place"):
+        a(f'<span class="chip">#{q["at_risk_place"]} at risk</span>')
+    a("</span></div></div>")
+    a('<p class="qsay">No merge request exists and none ever did, no sprint carries it, '
+      "and no promise names it"
+      + (f' &mdash; <a href="#{anchor(q.get("arc_id"))}">its card</a>' if linked else "")
+      + ".</p>")
+
+
+def unticketed_card(a, q, linked):
+    """A no-ticket question, and the one kind that gets no picture.
+
+    The fact here is an ABSENCE -- Jira has never heard of any of this -- and there is
+    nothing to draw an absence with that is not decoration. What can be shown is the size
+    of what is invisible, which is the whole claim the fold makes, so that goes big and
+    the rest are chips.
+    """
+    a('<div class="qev">')
+    a(f'<div class="big">{esc(q.get("scale") or "unpushed work")}'
+      "<small>that no ticket names</small></div>")
+    a('<div class="facts"><span class="chips">')
+    n = len(q.get("branches") or [])
+    if n:
+        a(f'<span class="chip">{n} branch' + ("" if n == 1 else "es") + "</span>")
+    if isinstance(q.get("age_days"), int):
+        a(f'<span class="chip">last touched {q["age_days"]}d ago</span>')
+    if q.get("commits"):
+        a(f'<span class="chip">{q["commits"]} unpushed</span>')
+    if q.get("stage"):
+        a(f'<span class="chip">{esc(q["stage"])}</span>')
+    for o in (q.get("file_as") or [])[:3]:
+        a(f'<span class="chip f" title="a key it could take instead">'
+          f'{esc(o.get("key",""))}</span>')
+    a("</span></div></div>")
+    # The one answer whose consequence happens somewhere else, so the way to carry it out
+    # is printed with the question rather than left for the reader to go and find.
+    a('<p class="qsay">To file it: <code>work-arcs --jira-ify '
+      f"&#39;{esc(q.get('arc') or '')}&#39;</code>"
+      + (f' &mdash; <a href="#un-{esc(q.get("fp") or "")}">the row it came from</a>'
+         if linked else "")
+      + ".</p>")
+
+
+def curation_cards(a, queue, by_id, gap, here):
+    """The whole queue, one card at a time.
+
+    Every question is rendered. What the window decides is how many are OPEN or waiting in
+    the strip; the rest are in the document, hidden, and announced by count -- so answering
+    one brings the next up with no rebuild and no round trip, and the section can never
+    claim a size it is not holding.
+
+    Nothing is reordered and nothing is removed by anything that happens here, including
+    by an answer: the order came down the wire and the page is not a second author for it.
+    """
+    n = len(queue)
+    first = queue[0]
+    fold(a, "Did the derivation get this right?",
+         f'<span class="n" data-count="curation">{n}</span> unanswered',
+         esc("first: " + curation_subject(first) + " — "
+             + CURATION_ASK.get(first.get("kind") or "membership", "").lower()),
+         sid="curation", attrs=" data-cur")
+    a('<p class="note">Where the tool is least sure of itself, one card at a time and in '
+      "the order it is least sure. Each answer says underneath itself what it does; "
+      "nothing is deleted and nothing is hidden by any of them, and leaving a card alone "
+      "records nothing and asks again next build. Three kinds share the queue and take "
+      "turns rather than competing, so a screenful is one of each rather than five of "
+      "whichever kind the tool happens to doubt most today. The command line walks the "
+      "same queue one keystroke at a time: <code>work-arcs --curate</code>.</p>")
+    # The rows the gap fold actually rendered, so a card only ever links at an anchor that
+    # exists -- the same law the run-over-run strip and the cliff list already keep, and
+    # the reason is the same: an anchor into nothing is a dead link in the one block whose
+    # whole claim is that its sentences are checkable.
+    linkable = {x.get("gap_fp") for x
+                in ((gap or {}).get("unticketed_work") or [])[:UNTICKETED_ROWS]}
+    # One axis for every sparkline in the section, so the cards are readable against each
+    # other rather than only against themselves -- the cliff list's rule, applied to the
+    # cliff list's picture.
+    span = max((d for q in queue
+                for d, _ in ((by_id.get(q.get("arc_id")) or {}).get("activity")
+                             or {}).get("series") or ()), default=0)
+    a(f'<div class="cur" data-window="{CURATION_WINDOW}">')
+    for i, q in enumerate(queue):
+        kind = q.get("kind") or "membership"
+        arc = by_id.get(q.get("arc_id")) or {}
+        # Open, queued or beyond the window, decided here so the page arrives in the
+        # shape it will keep. The client re-decides it against the answers this browser
+        # already holds; without one, the first card is still open and the strip is
+        # still a strip.
+        cls = " open" if i == 0 else ""
+        hid = " hidden" if i >= CURATION_WINDOW else ""
+        if kind == "residue":
+            # Keyed on the arc and its tips rather than on a branch and its company,
+            # because that is what the answer is about -- and it is what the store expires
+            # against, so the page has to record the same referent the CLI would or the
+            # two would expire at different times over one event.
+            a(f'<div class="q{cls}" data-kind="residue" '
+              f'data-arcid="{esc(q["arc_id"])}" data-arc="{esc(q["arc"])}" '
+              f'data-fp="{esc(q["fp"])}" '
+              f'data-fingerprint="{esc(q.get("fingerprint") or "")}" '
+              f'data-answer=""{hid}>')
+        elif kind == "unticketed":
+            # Keyed on the fold's own row fingerprint, not a second one of its own:
+            # answering `fine` or `noise` here IS the ✕ down there, so the two must carry
+            # one identity or the page could show a row acknowledged in one place and
+            # still being asked about in the other.
+            a(f'<div class="q{cls}" data-kind="unticketed" '
+              f'data-arcid="{esc(q["arc_id"])}" data-arc="{esc(q["arc"])}" '
+              f'data-fp="{esc(q["fp"])}" '
+              f'data-fingerprint="{esc(q.get("fingerprint") or "")}" '
+              f'data-ref="{esc(q["arc"])}" data-answer=""{hid}>')
+        else:
+            peers = json.dumps(sorted(q.get("co_members") or []))
+            a(f'<div class="q{cls}" data-kind="membership" '
+              f'data-branch="{esc(q["branch"])}" '
+              f'data-arc="{esc(q["arc"])}" data-fp="{esc(q["fp"])}" '
+              f"data-peers='{esc(peers)}' data-answer=\"\"{hid}>")
+        a('<span class="qh">'
+          f'<span class="qn">{i + 1}</span>'
+          f'<span class="ask">{esc(CURATION_ASK.get(kind, ""))}</span>'
+          f'<span class="tag">{esc(CURATION_TAG.get(kind, kind))}</span>'
+          f'<span class="subj">{esc(curation_subject(q))}</span>'
+          + (f'<span class="qi">in</span><span class="key">{esc(q.get("arc") or "")}'
+             "</span>" if kind == "membership" and q.get("arc") else "")
+          + "</span>")
+        a('<div class="qbody">')
+        if kind == "residue":
+            residue_card(a, q, arc, span, q.get("arc_id") in here)
+        elif kind == "unticketed":
+            unticketed_card(a, q, q.get("fp") in linkable)
+        else:
+            membership_card(a, q, arc)
+        curation_answers(a, q)
+        a("</div></div>")
+    # Said out loud, because the header states how many questions there are and a queue
+    # quietly holding fewer on screen than its own heading claims is the one thing a
+    # collapsed section must never do. The client rewrites this as the window moves.
+    rest = max(0, n - CURATION_WINDOW)
+    a(f'<p class="qmore"{"" if rest else " hidden"}>&hellip;and {rest} more behind '
+      "these, in the same order &mdash; each comes up as the one above it is "
+      "answered.</p>")
+    a("</div>")
+    a("</details>")
 
 
 def reviewing(a, reviews, drafts, here, by_id):
@@ -5365,128 +5842,7 @@ def render(data, lede, focus_days, limit, cost=None):
     # the place the next one will appear.
     curation = data.get("curation") or []
     if curation:
-        # Two question types under one heading, and deliberately not two sections. They
-        # share a budget of five, a keystroke vocabulary and a place on the screen, and
-        # splitting them would turn one short list a person answers into two lists they
-        # scroll past. The heading asks the question both kinds have in common.
-        # Folded like every other question queue on the page, and for the reason that is
-        # load-bearing rather than aesthetic: nothing here notifies, badges or counts up
-        # anywhere else, because the taskmaster shape is what makes a prompt get skipped.
-        # A closed header stating how many questions are waiting is the quietest form that
-        # still says the queue exists -- and the command line asks the same ones.
-        first = curation[0]
-        fold(a, "Did the derivation get this right?",
-             f'<span class="n" data-count="curation">{len(curation)}</span> unanswered',
-             esc("first: " + str(first.get("arc")
-                                 if first.get("kind") in ("residue", "unticketed")
-                                 else first.get("branch") or first.get("arc") or "?")),
-             sid="curation", attrs=" data-cur")
-        a('<p class="note">Where the tool is least sure of itself, in the three ways it '
-          "can be. <b>Grouping</b>: branches are grouped by the files they touch, and "
-          "two tickets editing the same module look identical by files however the "
-          "weights are set — <b>yes</b> pins the membership and stops it being asked "
-          "while the branch keeps this company; <b>no</b> pries it out, and it falls "
-          "back to what its own name declares. <b>Intent</b>: a count of unpublished "
-          "work assumes the work was meant to land, and much of what accumulates "
-          "locally never was — <b>yes</b> keeps it counted; <b>no</b> leaves every "
-          "commit exactly where it is and stops calling it debt. <b>No ticket</b>: work "
-          "Jira has never heard of is invisible to every rollup, but not all of it wants "
-          "paperwork — <b>needs one</b> writes nothing and leaves the row where it is, "
-          "<b>fine</b> and <b>noise</b> both acknowledge the row in "
-          '<a href="#unticketed">the fold it came from</a> and differ only in what they '
-          "record. Nothing is deleted and nothing is hidden by any answer, and a commit "
-          "on the work undoes an intent or a no-ticket answer by itself. Leaving a row "
-          "alone records nothing and asks again next time. The command line asks the "
-          "same questions one keystroke at a time: <code>work-arcs --curate</code>.</p>")
-        a('<div class="cur">')
-        for q in curation:
-            if q.get("kind") == "residue":
-                # Keyed on the arc and its tips rather than on a branch and its company,
-                # because that is what the answer is about -- and it is what the store
-                # expires against, so the page has to record the same referent the CLI
-                # would or the two would expire at different times over one event.
-                a(f'<div class="q" data-kind="residue" '
-                  f'data-arcid="{esc(q["arc_id"])}" data-arc="{esc(q["arc"])}" '
-                  f'data-fp="{esc(q["fp"])}" '
-                  f'data-fingerprint="{esc(q.get("fingerprint") or "")}" '
-                  f'data-answer="">')
-                a('<span class="yn">'
-                  '<button type="button" data-a="intended" title="real work — keep '
-                  'counting it">yes</button>'
-                  '<button type="button" data-a="residue" title="never meant to land — '
-                  'the commits stay, they stop counting as debt">no</button></span>')
-                a('<span class="ev"><b>' + esc(q["arc"]) + "</b> — still intended "
-                  "work? <br>" + esc(q.get("scale") or "") + " on no remote across "
-                  + str(len(q.get("branches") or [])) + " branch"
-                  + ("" if len(q.get("branches") or []) == 1 else "es")
-                  + f', quiet {q.get("cliff_days", "?")} days against its own '
-                  + f'{q.get("gap_days", "?")}-day rhythm.'
-                  + "<br>No merge request exists and none ever did, no sprint carries "
-                    "it, and no promise names it.</span>")
-                a("</div>")
-                continue
-            if q.get("kind") == "unticketed":
-                # Keyed on the fold's own row fingerprint, not a second one of its own:
-                # answering `fine` or `noise` here IS the ✕ down there, so the two must
-                # carry one identity or the page could show a row acknowledged in one
-                # place and still being asked about in the other.
-                a(f'<div class="q" data-kind="unticketed" '
-                  f'data-arcid="{esc(q["arc_id"])}" data-arc="{esc(q["arc"])}" '
-                  f'data-fp="{esc(q["fp"])}" '
-                  f'data-fingerprint="{esc(q.get("fingerprint") or "")}" '
-                  f'data-ref="{esc(q["arc"])}" data-answer="">')
-                a('<span class="yn"><button type="button" data-a="ticket" '
-                  'title="real work that wants a ticket — nothing is written and the row '
-                  'stays">needs one</button>'
-                  '<button type="button" data-a="fine" title="real work, no paperwork '
-                  'wanted — the row is acknowledged">fine</button>'
-                  '<button type="button" data-a="noise" title="not work worth a row — '
-                  'acknowledged, and recorded as a different judgement from fine">'
-                  "noise</button></span>")
-                nbr = len(q.get("branches") or [])
-                a('<span class="ev"><b>' + esc(q["arc"]) + "</b> — real work that needs "
-                  "a ticket? <br>" + esc(q.get("scale") or "") + " across "
-                  + str(nbr) + " branch" + ("" if nbr == 1 else "es")
-                  + f', last touched {q.get("age_days", "?")} days ago, and nothing in '
-                    "Jira names any of it."
-                  # The one-step command, printed with the question rather than left for
-                  # the reader to go and find in the fold. This is the only answer here
-                  # whose consequence happens somewhere else, and a question offering an
-                  # outcome it cannot carry out owes the reader the way to carry it out.
-                  + "<br>To file it: <code>work-arcs --jira-ify "
-                  + f"&#39;{esc(q['arc'])}&#39;</code>"
-                  + ("<br>A key it could take instead: "
-                     + ", ".join("<code>" + esc(o["key"]) + "</code>"
-                                 for o in q["file_as"])
-                     + " — the workstream&rsquo;s own filing control is on its card."
-                     if q.get("file_as") else "")
-                  + "</span>")
-                a("</div>")
-                continue
-            peers = json.dumps(sorted(q.get("co_members") or []))
-            a(f'<div class="q" data-kind="membership" data-branch="{esc(q["branch"])}" '
-              f'data-arc="{esc(q["arc"])}" data-fp="{esc(q["fp"])}" '
-              f"data-peers='{esc(peers)}' data-answer=\"\">")
-            a('<span class="yn">'
-              '<button type="button" data-a="keep" title="same work — pin this '
-              'membership">yes</button>'
-              '<button type="button" data-a="pry" title="different work — pry this '
-              'branch out of the arc">no</button></span>')
-            files = ", ".join(q.get("files") or [])
-            a('<span class="ev"><b>' + esc(q["branch"]) + "</b> — same work as "
-              + esc(q["arc"]) + "? <br>" + esc(q.get("why") or "")
-              + (f'.<br>Its strongest tie here is <code>{esc(q["with"])}</code>'
-                 + (f", on {esc(files)}" if files else "") if q.get("with") else "")
-              # Said with the question because it is a fact about the answer, not about
-              # the doubt: this branch carries the arc's merge request, so prying it
-              # out moves the arc's subject and its ticket too.
-              + ("<br>This is the branch the arc&rsquo;s merge request points at — "
-                 "prying it out takes the arc&rsquo;s subject with it."
-                 if q.get("authoritative") else "")
-              + "</span>")
-            a("</div>")
-        a("</div>")
-        a("</details>")
+        curation_cards(a, curation, by_id, gap, here)
 
     # --- what this assistant costs -------------------------------------------
     # Absent unless `arcs` wrote a cost sidecar for this run. A stale figure here would
