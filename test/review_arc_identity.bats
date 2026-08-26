@@ -315,6 +315,30 @@ ZZTRAVEL
     [ "${lines[5]}" = "settled True 1" ]
 }
 
+@test "a folded section naming a review arc as its worst says whose ticket that is" {
+    page "$(doc)" > "$TEST_TMPDIR/p.html"
+    run python3 - "$TEST_TMPDIR/p.html" <<'ZZFOLD'
+import re, sys
+html = open(sys.argv[1]).read()
+for m in re.finditer(r'<summary><h2[^>]*>([^<]*)</h2>(.*?)</summary>', html, re.S):
+    lead = re.search(r'<span class="fl">(.*?)</span>', m.group(2), re.S)
+    if not lead:
+        continue
+    print("%s %d" % (m.group(1), lead.group(1).count('class="revchip"')))
+ZZFOLD
+    # Every folded section names one row inside it -- the worst, the freshest, an example --
+    # and where that row is somebody else's ticket the header says so. A closed section
+    # naming a workstream is making the same claim as an open one naming it, and it is read
+    # by more people, because on a folded section it is the only line there is.
+    [ "${lines[0]}" = "Since the last build 1" ]
+    # And a bucket whose named row is his own work carries nothing.
+    [ "${lines[1]}" = "Last week 0" ]
+    [ "${lines[2]}" = "Earlier 1" ]
+    [ "${lines[3]}" = "Fell off a cliff 1" ]
+    [ "${lines[4]}" = "Landed or abandoned 1" ]
+    [ "${#lines[@]}" -eq 5 ]
+}
+
 @test "the chip follows the name into the derived sentences at the top of the page" {
     page "$(doc)" > "$TEST_TMPDIR/p.html"
     run python3 - "$TEST_TMPDIR/p.html" <<'ZZSENT'

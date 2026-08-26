@@ -5802,9 +5802,10 @@ def render(data, lede, focus_days, limit, cost=None):
             lead = by_id.get((diffs[0].get("id"))) or {}
             what = next((e.get("what") for e in diffs[0].get("evidence") or []
                          if e.get("what")), "")
-            named = esc("including " + (one_line(lead) if lead
-                                        else str(diffs[0].get("label") or "?"))
-                        + (f" — {what}" if what else ""))
+            named = (esc("including " + (one_line(lead) if lead
+                                         else str(diffs[0].get("label") or "?"))
+                         + (f" — {what}" if what else ""))
+                     + review_chip(lead))
         else:
             # A build where only reviews moved. The header still names something rather
             # than standing over a count alone -- and it names the first review change on
@@ -6349,7 +6350,8 @@ def render(data, lede, focus_days, limit, cost=None):
                  f'<span data-count="{key}">{len(got)}</span> workstream'
                  + ("" if len(got) == 1 else "s"),
                  esc("worst: " + one_line(got[0])
-                     + (f" — {got[0].get('state')}" if got[0].get("state") else "")),
+                     + (f" — {got[0].get('state')}" if got[0].get("state") else ""))
+                 + review_chip(got[0]),
                  sid=key, attrs=f' data-bucket="{key}"')
         else:
             a(f'<div class="rung" data-bucket="{key}">'
@@ -6401,7 +6403,8 @@ def render(data, lede, focus_days, limit, cost=None):
         fold(a, "Fell off a cliff",
              f'<span class="n" data-count="cliff">{len(fell)}</span> dropped',
              esc("most recent: " + one_line(fell[0]) + " — "
-                 + str((fell[0]["activity"].get("cliff_days")) or "?") + "d quiet"),
+                 + str((fell[0]["activity"].get("cliff_days")) or "?") + "d quiet")
+             + review_chip(fell[0]),
              sid="cliff")
         a('<p class="note">Not the old work — <em>the dropped</em> work. Each of these '
           "took real investment and then stopped dead, and nothing closed it: no merge, "
@@ -6452,7 +6455,8 @@ def render(data, lede, focus_days, limit, cost=None):
     # click and reappears nowhere visible reads as a deletion.
     fold(a, "Parked",
          f'<span class="n" data-count="parked">{len(parked)}</span> set aside',
-         esc("including " + one_line(parked[0])) if parked else "",
+         (esc("including " + one_line(parked[0])) + review_chip(parked[0])
+          if parked else ""),
          sid="parked",
          attrs=f' id="parkedsec"{"" if parked else " hidden"}')
     a('<p class="note">Set aside on purpose. Still counted, still here — the difference '
@@ -6490,7 +6494,8 @@ def render(data, lede, focus_days, limit, cost=None):
         # so it is clear they were retired rather than lost -- which a one-line header
         # carrying the count does exactly as well as twenty rows did.
         fold(a, "Landed or abandoned", f"{len(done)} retired",
-             esc("including " + one_line(done[0])), sid="settled")
+             esc("including " + one_line(done[0])) + review_chip(done[0]),
+             sid="settled")
         a('<p class="note">Finished, and shown once so it is clear they were retired '
           "rather than lost. These stayed on the page for as long as this tool existed: "
           "every merge request here squash-merges, and a squash leaves the branch "
@@ -6597,7 +6602,8 @@ def render(data, lede, focus_days, limit, cost=None):
             live_unt = unacked(unt)
             fold(a, "Real work with no ticket",
                  f'<span class="n" data-count="unticketed">{len(live_unt)}</span> unfiled',
-                 esc("including " + one_line((live_unt or unt)[0])), sid="unticketed")
+                 esc("including " + one_line((live_unt or unt)[0]))
+                 + review_chip((live_unt or unt)[0]), sid="unticketed")
             a('<p class="note">Invisible to Jira, and therefore to Trellis — absent '
               "from capacity, burndown and every initiative rollup. Each has a one-step "
               "command to file it. <strong>&#x2715; acknowledges a row</strong> — it is "

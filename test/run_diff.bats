@@ -69,7 +69,8 @@ def smr(state="opened", merge_state="not_approved", conflicts=False,
             "pipeline": pipeline, "url": url, "at": at}
 
 def snap(arcs, gen="2026-08-14T01:00:00-0700", **known):
-    k = {"mrs": True, "ledger": True, "issues": True, "slack": True, "reviews": True}
+    k = {"mrs": True, "ledger": True, "issues": True, "slack": True, "reviews": True,
+         "orch": True}
     k.update(known)
     return {"v": 1, "generated": gen, "repo": "ul", "known": k, "arcs": arcs}
 
@@ -105,7 +106,8 @@ def slarc(label, branches, blocks=(), **kw):
     return a
 
 def srow(arcs, gen, **known):
-    k = {"mrs": True, "ledger": False, "issues": True, "slack": True, "reviews": True}
+    k = {"mrs": True, "ledger": False, "issues": True, "slack": True, "reviews": True,
+         "orch": True}
     k.update(known)
     return wa.snapshot_of(list(arcs), None, k, "ul", gen)
 

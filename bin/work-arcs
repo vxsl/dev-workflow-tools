@@ -81,6 +81,7 @@ import os
 import re
 import shlex
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -222,8 +223,8 @@ def days_ago(epoch):
 
 
 def session_index(projects_dir):
-    """branch -> {"paths": set, "last": epoch, "entries": int, "days": {...}}, from one
-    rg pass over every project.
+    """branch -> {"paths": set, "last": epoch, "entries": int, "sess": {id: epoch},
+    "days": {...}}, from one rg pass over every project.
 
     Sessions run from $HOME record gitBranch=HEAD and land in a project dir named
     after $HOME rather than the repo, so scanning every dir is the only way to see
@@ -246,6 +247,7 @@ def session_index(projects_dir):
     worked on a handful of days and hammered on each of them.
     """
     idx = defaultdict(lambda: {"paths": set(), "last": 0, "entries": 0,
+                               "sess": {},
                                "days": defaultdict(lambda: {"entries": 0,
                                                             "paths": set()})})
     if not projects_dir.is_dir() or not shutil.which("rg"):
@@ -261,6 +263,12 @@ def session_index(projects_dir):
         stamp, _, branch = rest.partition("\t")
         if not branch or branch == "HEAD":
             continue
+        # The transcript's stem IS the session id -- the same uuid orch's own database
+        # and Claude Code's own status files are keyed by. Sliced rather than handed to
+        # Path(), because this loop runs 76,060 times and constructing a Path per line
+        # to read one field off it costs more than the whole rest of the pass.
+        base = path.rpartition("/")[2]
+        stem = base[:-6] if base.endswith(".jsonl") else base
         entry = idx[branch]
         entry["paths"].add(path)
         # How many entries mention the branch, not just whether one did. A branch
@@ -276,6 +284,15 @@ def session_index(projects_dir):
         bucket = entry["days"][day_no(epoch)]
         bucket["entries"] += 1
         bucket["paths"].add(path)
+        # The same instant kept a third way: per SESSION, not per branch and not per day.
+        # `last` above is the branch's newest turn whoever made it, and `days` is the
+        # shape of the branch's history -- neither can answer "which branch was THIS
+        # session last working on", which is the only honest way to attribute a live
+        # session to one workstream. A session touches a handful of branches and is
+        # named on each of them hundreds of times, so this collapses to one int per
+        # (branch, session) pair: measured, 76,060 entries make 341 of them.
+        if epoch > entry["sess"].get(stem, 0):
+            entry["sess"][stem] = epoch
     return idx
 
 
@@ -7779,6 +7796,551 @@ def demote_checkouts(arcs):
     return kept, checkouts
 
 
+# ── orch: the sessions that did the work ───────────────────────────────────────
+#
+# Kyle: "if my brain is one my brain is in the other" -- the orchestrator already holds
+# the two richest facts about a piece of work in progress and this tool held neither:
+# which sessions are running RIGHT NOW, and the one-line summary each idle one left
+# behind. Both are quoted from whoever owns them. Nothing here is written.
+#
+# THE JOIN UNIT IS THE SESSION, NEVER THE WORKSTREAM. Kyle again: "currently a workstream
+# in orch _is_ a worktree, which is not necessarily the right mapping. a session often
+# ends up doing its work in a different worktree." So an orch workstream is a LABEL on a
+# session -- "via dev-workflow-tools", provenance, what spawned it -- and it is never the
+# attribution. What a session was working ON is derived here, from this tool's own turn
+# evidence: `session_index` knows every branch each session named and when it last named
+# it, and a session attributes to the arc owning the branch of its most recent turn.
+#
+# That is why the DB's own `project_dir` / `project_path` are never read. Those are a
+# directory name with every "/" and "." flattened to "-", and orch's own decoder
+# (_decode_project_dir) guesses the joiners back by testing which candidate paths exist --
+# it mis-handles dotted worktree dirs like `ul.UL-1852`, and a wrong path would attribute
+# a session to the wrong workstream while looking exactly as confident as a right one.
+# The session id is the only key both sides agree on, and it is the only one used.
+#
+# Four sources, all read-only, each gated on its own and each announced when it fails. An
+# unreadable source is UNKNOWN and never silently empty: "no sessions are running" and
+# "nobody could tell us" support opposite sentences, and the second one must not be able
+# to wear the first's clothes.
+#
+#   1. orch's sqlite session database -- the summaries, and is_live as a fallback.
+#   2. Claude Code's own per-process status files -- busy/idle, tmux, cwd. This is the
+#      realtime truth and it outranks anything derived: a session with a file here is
+#      live, and one without is not.
+#   3. orch's data.json -- workstream names, and which sessions a running auto-mode loop
+#      spawned. Labels only.
+#   4. orch's notification log -- the Stop-hook one-liner, for a session whose database
+#      row has no assistant text yet.
+#
+# One author each, which is the discipline the rest of this file already keeps for
+# GitLab, Jira and Slack. Claude Code owns busy/idle. orch owns workstream names and
+# summaries. This tool owns -- and derives -- the arc a session attributes to, and
+# nothing else.
+_ORCH_CACHE = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
+ORCH_DB = Path(os.environ.get("WORK_ARCS_ORCH_DB",
+                              _ORCH_CACHE / "claude-orchestrator" / "orch-sessions.db"))
+CLAUDE_SESSIONS = Path(os.environ.get("WORK_ARCS_CLAUDE_SESSIONS_DIR",
+                                      Path.home() / ".claude" / "sessions"))
+ORCH_DATA = Path(os.environ.get("WORK_ARCS_ORCH_DATA",
+                                Path.home() / "dev/claude-orchestrator/data.json"))
+ORCH_NOTIFICATIONS = Path(os.environ.get(
+    "WORK_ARCS_ORCH_NOTIFICATIONS",
+    _ORCH_CACHE / "claude-orchestrator" / "notifications.jsonl"))
+
+# Long enough to carry a sentence, short enough that a card is not a transcript. The
+# summaries orch stores are whole assistant turns; the useful part is the opening claim.
+ORCH_SUMMARY_CHARS = 200
+# How many sessions an arc names. Live first, newest next; the remainder is counted on the
+# arc rather than dropped, like every other cap in this file.
+ORCH_PER_ARC = 3
+# How many sessions the CLI's own section prints.
+ORCH_CLI_ROWS = 8
+# A backstop on the notification scan, which walks the log backwards and stops as soon as
+# every session it wants has been answered. The log is append-only and unbounded; this is
+# what keeps a year of it from being parsed to answer a question about this morning.
+ORCH_NOTIFY_SCAN = 20000
+# What the columns this reads are called, so a database that predates any of them is read
+# for the rest rather than refused whole.
+ORCH_DB_COLUMNS = ("session_id", "git_branch", "is_live", "last_activity",
+                   "message_count", "title", "last_assistant_message_text",
+                   "files_mutated", "jsonl_path", "started_at")
+
+
+def _orch_live(directory=None):
+    """{session_id: status file} -- Claude Code's own realtime view, or why not.
+
+    One file per live process, written by the process itself: status ("busy"/"idle"),
+    when that last changed, its tmux address, its cwd, and the name orch gave it. This
+    is the source of record for liveness. The database's `is_live` is a derivation off a
+    file mtime and lags; a file here is a process that was alive when it wrote it.
+
+    Keyed by sessionId and not by pid, because a resumed session keeps its id and gets a
+    new pid -- so two files can name one session, and the newer write wins.
+    """
+    directory = directory or CLAUDE_SESSIONS
+    if not directory.is_dir():
+        return {}, f"{directory} is not a directory, so no session is known to be live"
+    try:
+        files = sorted(directory.glob("*.json"))
+    except OSError as e:
+        return {}, f"Claude Code's session directory could not be read ({e})"
+    out = {}
+    for f in files:
+        try:
+            row = json.loads(f.read_text())
+        except (OSError, ValueError):
+            # One unreadable file is a process mid-write, not an outage. Skipped in
+            # silence on purpose: announcing it would put a line on the page every time
+            # a session happened to be starting.
+            continue
+        sid = row.get("sessionId")
+        if not sid:
+            continue
+        seen = out.get(sid)
+        if seen and (seen.get("updatedAt") or 0) >= (row.get("updatedAt") or 0):
+            continue
+        out[sid] = row
+    return out, ""
+
+
+def _orch_db(path=None):
+    """{session_id: row} from orch's sqlite session database, or why not.
+
+    Opened read-only through a URI, so this can never create the file, never take a
+    write lock, and never block the daemon that owns it. WAL means a reader sees a
+    consistent snapshot without coordinating with the writer at all, which is the whole
+    reason this can be a plain read.
+
+    Columns are intersected with what the table actually has. A database written by an
+    older orch is missing `last_assistant_message_text` -- the summary this exists for --
+    and refusing the whole read over one absent column would lose the liveness and the
+    titles too, which are the parts that would still have worked.
+    """
+    path = path or ORCH_DB
+    if not path.exists():
+        return {}, f"orch's session database is not at {path}"
+    try:
+        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=0.5)
+    except sqlite3.Error as e:
+        return {}, f"orch's session database could not be opened ({e})"
+    try:
+        have = {r[1] for r in con.execute("PRAGMA table_info(sessions)")}
+        cols = [c for c in ORCH_DB_COLUMNS if c in have]
+        if "session_id" not in cols:
+            return {}, f"{path} has no sessions table this can read"
+        rows = con.execute(f"select {', '.join(cols)} from sessions").fetchall()
+    except sqlite3.Error as e:
+        return {}, f"orch's session database could not be read ({e})"
+    finally:
+        con.close()
+    return {r[0]: dict(zip(cols, r)) for r in rows if r[0]}, ""
+
+
+def _orch_workstreams(path=None):
+    """(auto_sids, by_path) from orch's data.json -- provenance labels and nothing else.
+
+    `auto_sids` maps a session id to the running auto-mode loop that spawned it, so a
+    session can say it is one iteration of a loop rather than something a person started.
+    Only workstreams with `auto_running` are in it: a stale sid list on a loop that
+    finished is history, and reporting it would claim a loop is running that is not.
+
+    `by_path` is a workstream name per repo path, the LAST-RESORT label for a session
+    whose live file names no workstream. Read as a plain file: orch writes it by atomic
+    rename, so an uncoordinated read gets one whole version or the previous one, never
+    half of either. Never written here -- this tool has no business in orch's state.
+    """
+    path = path or ORCH_DATA
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError) as e:
+        return {}, {}, f"orch's workstream file could not be read ({e})"
+    auto_sids, by_path = {}, {}
+    for ws in (data or {}).get("workstreams") or []:
+        name = ws.get("name") or ""
+        repo = ws.get("repo_path") or ""
+        if repo and name and repo not in by_path:
+            by_path[repo] = name
+        if not ws.get("auto_running"):
+            continue
+        todo = ws.get("auto_current_todo_id") or ""
+        for sid in list(ws.get("auto_impl_sids") or []) + [ws.get("auto_coord_sid")]:
+            if sid:
+                auto_sids[sid] = {"via": name, "todo": todo}
+    return auto_sids, by_path, ""
+
+
+def _orch_notifications(wanted, path=None, cap=ORCH_NOTIFY_SCAN):
+    """{session_id: one-liner} for the sessions asked about, walking the log backwards.
+
+    The last line a session wrote is its Stop-hook summary -- the first line of its final
+    response -- and it is the fallback for a session whose database row carries no
+    assistant text. Backwards, because the last line per session is the one wanted and
+    the first hit from the end IS the last line. Stops as soon as every wanted session
+    has an answer, which on a live machine is a few hundred lines of an eight-thousand
+    line log.
+    """
+    path = path or ORCH_NOTIFICATIONS
+    if not wanted:
+        return {}, ""
+    try:
+        lines = path.read_text(errors="replace").splitlines()
+    except OSError as e:
+        return {}, f"orch's notification log could not be read ({e})"
+    out, left, scanned = {}, set(wanted), 0
+    for line in reversed(lines):
+        if not left or scanned >= cap:
+            break
+        scanned += 1
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        sid = row.get("session_id")
+        if sid in left:
+            left.discard(sid)
+            msg = (row.get("message") or "").strip()
+            if msg:
+                out[sid] = msg
+    why = ""
+    if left and scanned >= cap:
+        why = (f"the last {cap} lines of orch's notification log did not reach "
+               f"{len(left)} session(s), so those carry no summary")
+    return out, why
+
+
+def _encoded_dir(path):
+    """A filesystem path as Claude Code names its transcript directory for it.
+
+    Both "/" and "." become "-": `/home/kyle/work/repos/ul.6919-review` is stored under
+    `-home-kyle-work-repos-ul-6919-review`, and `/home/kyle/.dotfiles` under
+    `-home-kyle--dotfiles`.
+
+    Encoding forward, never decoding back. The reverse direction is lossy -- it is the
+    trap orch's own `_decode_project_dir` fights, guessing which dashes were slashes by
+    testing which candidate paths happen to exist -- and it mis-handles exactly this
+    machine's dotted worktree names. Going this way there is nothing to guess: a path
+    this tool already holds is encoded once and compared as a string.
+    """
+    return re.sub(r"[/.]", "-", str(path).rstrip("/"))
+
+
+def _orch_repo_dirs(repo):
+    """The transcript-directory prefixes that mean "this session ran in THIS repo".
+
+    The repo root and every worktree of it, encoded. A session's transcript sits in a
+    directory named after its cwd, so a prefix match (on a "-" boundary, so that
+    `repos-ul` does not swallow `repos-ultimate`) says the session ran in the repo, in a
+    worktree of it, or in a subdirectory of either.
+
+    This exists because `session_index` is repo-blind and has to be: a session started
+    from $HOME records gitBranch=HEAD and lands in a directory named after $HOME, so the
+    only way to see one at all is to scan every project. The cost of that is branch-name
+    collision across repos -- `main` is a branch in every repo on the machine, and on this
+    one there are 52 sessions live at once in half a dozen of them. Without this test,
+    fourteen sessions working on dev-workflow-tools' `main` would attribute to a
+    workstream in the work repo that happened to hold a branch of the same name, and the
+    page would say a workstream was being worked on right now when nothing was.
+
+    Applied to the orch join only, deliberately. `arc["sessions"]` and `engagement` have
+    always been computed without it and are a different, looser claim -- "a session
+    mentioned this branch name" -- and tightening them here would move every arc's
+    ranking as a side effect of a feature about liveness.
+    """
+    dirs = {_encoded_dir(repo)}
+    for line in lines(git(repo, "worktree", "list", "--porcelain")):
+        if line.startswith("worktree "):
+            dirs.add(_encoded_dir(line[len("worktree "):]))
+    return tuple(sorted(dirs))
+
+
+def _in_repo(directory, prefixes):
+    """Whether a transcript directory names a path inside one of those prefixes."""
+    return any(directory == p or directory.startswith(p + "-") for p in prefixes)
+
+
+def _orch_attribution(arcs, sessions, repo_dirs=()):
+    """{session_id: {"arc": id, "branch": name, "at": epoch, "also": n}} -- derived here.
+
+    THE one thing this file derives about a session rather than quoting. A session
+    attributes to the arc owning the branch of its MOST RECENT turn, from this tool's own
+    turn evidence and from nothing orch says. `also` is how many OTHER arcs the same
+    session also touched, which is the honest way to show a session that swept three
+    workstreams without claiming it belongs to all three.
+
+    Branch-to-arc is taken off the finished arcs, so it is the post-split, post-detach,
+    post-demotion assignment -- the one the page actually shows. A session whose every
+    branch belongs to a demoted checkout therefore attributes to nothing, correctly:
+    reading somebody else's branch is not work on a workstream of yours.
+
+    Total tiebreaks on both maxima, on the arc id and then the branch name. Ties are the
+    common case, not the corner: a session that named two branches in the same second of
+    the same turn is one `rg` line apart, and a coin-flip there would move a session
+    between two arcs between runs -- which would re-brief both of them for nothing. Same
+    lesson as arc-brief's evidence fingerprint.
+    """
+    branch_arc = {}
+    for a in arcs:
+        for b in a.get("branches") or []:
+            branch_arc.setdefault(b.get("name"), a.get("id"))
+    touched = defaultdict(dict)
+    for branch, info in sessions.items():
+        aid = branch_arc.get(branch)
+        if not aid:
+            continue
+        # Which project directory each of this branch's sessions ran in, off the
+        # transcript paths the index already holds. See _orch_repo_dirs for why a session
+        # that named this branch from a different repo must not be attributed to it.
+        where = {}
+        for pth in info.get("paths") or ():
+            head, _, base = pth.rpartition("/")
+            where[base[:-6] if base.endswith(".jsonl") else base] = \
+                head.rpartition("/")[2]
+        for sid, epoch in (info.get("sess") or {}).items():
+            if repo_dirs and not _in_repo(where.get(sid, ""), repo_dirs):
+                continue
+            was = touched[sid].get(aid)
+            if was is None or (epoch, branch) > was:
+                touched[sid][aid] = (epoch, branch)
+    out = {}
+    for sid, per_arc in touched.items():
+        aid, (epoch, branch) = max(per_arc.items(), key=lambda kv: (kv[1][0], kv[0]))
+        out[sid] = {"arc": aid, "branch": branch, "at": epoch,
+                    "also": len(per_arc) - 1}
+    return out
+
+
+def _orch_summary(row, notified):
+    """(summary, where it came from) for one session, best source first.
+
+    Clipped rather than whole: these are entire assistant turns, and an arc card is not a
+    transcript. `src` is emitted beside it because the two sources mean different things
+    -- an assistant message is what the session is doing now, and a Stop-hook line is
+    what it said when it finished -- and a reader who cannot tell them apart will read a
+    finished session's sign-off as a running one's progress.
+    """
+    text = (row.get("last_assistant_message_text") or "").strip()
+    if text:
+        return _clip(" ".join(text.split()), ORCH_SUMMARY_CHARS), "assistant"
+    if notified:
+        return _clip(" ".join(notified.split()), ORCH_SUMMARY_CHARS), "notification"
+    return None, None
+
+
+def _orch_via(live_row, db_row, by_path):
+    """The workstream label on a session: orch's own name for it, never derived.
+
+    Three sources, and all three are orch quoting itself. The live file's `name` is what
+    orch set when it spawned the session and is the freshest. The database's `title` is
+    the same string persisted, and is the only one an idle session with no live file has.
+    The repo path is the last resort and needs a cwd, which only the live file has -- the
+    database's decoded project path is exactly the field this must not trust.
+
+    A label and not an attribution. It says what spawned the session; `_orch_attribution`
+    says what the session was working on, and on a machine where a session routinely
+    works in a different worktree than the one it was launched from, those two disagree
+    constantly and both are right.
+    """
+    for name in ((live_row or {}).get("name"), (db_row or {}).get("title")):
+        name = (name or "").strip()
+        if name.startswith("orch:"):
+            return name[len("orch:"):].strip() or None
+    cwd = ((live_row or {}).get("cwd") or "").rstrip("/")
+    return by_path.get(cwd) or None
+
+
+def _orch_state_at(live_row):
+    """When busy/idle last changed, as an offset-aware stamp like `generated`.
+
+    Claude Code writes milliseconds since the epoch; every other instant this file emits
+    is a local ISO stamp, and handing a page two time formats to tell apart is how a
+    renderer ends up dividing by 1000 in one place and not another.
+    """
+    ms = (live_row or {}).get("statusUpdatedAt") or (live_row or {}).get("updatedAt")
+    if not isinstance(ms, (int, float)) or ms <= 0:
+        return ""
+    return time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(ms / 1000))
+
+
+def orch_join(arcs, sessions, repo=None):
+    """Put orch's live sessions and idle summaries on the arcs, and on their own bench.
+
+    Sets `arc["orch"]` on every arc -- always, so an arc with nothing running says so
+    with a zero rather than with a missing key nobody can tell from a source that failed.
+    Returns (bench, known, why): the bench is every LIVE session with the arc it lands on
+    or null, which is the question the per-arc lists structurally cannot answer -- most
+    live sessions at any moment are working on something that is not a workstream in this
+    repo at all, and those are exactly the ones a per-arc home would hide.
+
+    `known` is false only when NOTHING could be read. A partial read is still knowledge:
+    with the database gone the live files still say who is running, so `known` stays true
+    and `why` names what is missing. The alternative -- one flag for four sources -- would
+    throw away the three that answered to report the one that did not.
+
+    Recency is deliberately not a filter. A session whose last turn on an arc predates
+    the focus window is still listed on that arc: how much history a card shows is a
+    rendering decision and belongs where the rendering is. Live sessions always reach the
+    bench, whatever window the arcs list is under.
+    """
+    live, why_live = _orch_live()
+    db, why_db = _orch_db()
+    auto_sids, by_path, why_ws = _orch_workstreams()
+    attribution = _orch_attribution(arcs, sessions,
+                                    _orch_repo_dirs(repo) if repo else ())
+    label_of = {a.get("id"): a.get("label") for a in arcs}
+
+    # Only the sessions something is going to be said about: every live one, plus every
+    # one this tool's own turn evidence puts on an arc. The database holds every session
+    # ever seen in every repo on the machine, and a bench of 319 of those is not a bench.
+    wanted = set(live) | set(attribution)
+    need_note = {sid for sid in wanted
+                 if not (db.get(sid) or {}).get("last_assistant_message_text")}
+    notified, why_note = _orch_notifications(need_note)
+
+    # False only when neither source that can answer "what is running" could be read. A
+    # missing workstream file costs the labels and a missing notification log costs a few
+    # fallback sentences; neither makes the sessions themselves unknown.
+    known = not (why_live and why_db)
+    why = "; ".join(w for w in (why_live, why_db, why_ws, why_note) if w)
+
+    def entry(sid):
+        lf, row = live.get(sid) or {}, db.get(sid) or {}
+        att = attribution.get(sid) or {}
+        summary, src = _orch_summary(row, notified.get(sid))
+        auto = auto_sids.get(sid) or {}
+        # Quoted verbatim, whatever it says. "busy" and "idle" are the two this file
+        # acts on -- they are what the bench orders by and what the run-over-run diff
+        # reports a transition between -- but Claude Code owns this vocabulary and has
+        # more words in it than those two: a session at a shell prompt writes "shell".
+        # Narrowing it to a known pair would report that as unknown, which is a claim
+        # about our own ignorance dressed up as a fact about the session. Null means the
+        # field was absent, and nothing else.
+        state = (lf.get("status") or "").strip() or None
+        return {
+            "id": sid,
+            # The file, not the column. `is_live` is orch's derivation off a transcript
+            # mtime and lags a process by minutes; a status file is the process itself
+            # saying so. The column is the fallback for when the directory is unreadable,
+            # which is the one case where a lagging answer beats no answer.
+            "live": (sid in live) if not why_live else bool(row.get("is_live")),
+            "state": state,
+            "state_at": _orch_state_at(lf),
+            "last_activity": row.get("last_activity") or "",
+            "messages": row.get("message_count") or 0,
+            "summary": summary,
+            # Which of the two sources the sentence came from, or null when there is no
+            # sentence. See _orch_summary: they mean different things.
+            "summary_src": src,
+            "via": _orch_via(lf, row, by_path),
+            "auto": bool(auto),
+            # The todo the loop is on, when there is one, so a session that is one
+            # iteration of an auto-mode loop can be traced back to what it was given.
+            "auto_todo": auto.get("todo") or "",
+            "tmux": lf.get("tmux") or None,
+            # The derived half, and the only half. Which branch of this arc the session
+            # last named, how long ago that was, and how many OTHER arcs it also touched.
+            "branch": att.get("branch") or None,
+            "age_days": days_ago(att["at"]) if att.get("at") else None,
+            "also_touched": att.get("also", 0),
+            # Named on every entry, including the ones already sitting on that arc. The
+            # bench needs it and cannot derive it, and a per-arc entry that carries it
+            # too is how a reader tells "this session's most recent turn was here" from
+            # "this session also passed through here" -- see also_touched.
+            "arc": att.get("arc"),
+            "arc_label": label_of.get(att.get("arc")) or "",
+        }
+
+    rows = {sid: entry(sid) for sid in sorted(wanted)}
+    per_arc = defaultdict(list)
+    for sid, row in rows.items():
+        aid = (attribution.get(sid) or {}).get("arc")
+        # Only a session orch knows something about. A transcript this tool indexed whose
+        # session left no database row and no status file carries no orch signal at all,
+        # and a row of nulls on a card is worse than no row.
+        if aid and (sid in live or sid in db):
+            per_arc[aid].append(row)
+    for a in arcs:
+        got = per_arc.get(a.get("id")) or []
+        # Live first, then newest turn, then the id. Live first because a session running
+        # right now is the whole point of this; the id last because the first two tie.
+        got.sort(key=lambda r: (0 if r["live"] else 1,
+                                -((attribution.get(r["id"]) or {}).get("at") or 0),
+                                r["id"]))
+        a["orch"] = {"sessions": got[:ORCH_PER_ARC], "n": len(got),
+                     # Announced, never silent: the count is the whole list and the cap
+                     # is a rendering decision, so a reader can always tell that there
+                     # are more than the three shown.
+                     "more": max(0, len(got) - ORCH_PER_ARC),
+                     "live": sum(1 for r in got if r["live"])}
+    bench = [rows[sid] for sid in sorted(rows) if rows[sid]["live"]]
+    # Four stable passes, weakest key first. The strongest is whether the session lands on
+    # a workstream in THIS repo, and that is a judgement worth stating: this is a report
+    # about one repo, so a session working on something it can name is news about the
+    # subject and a session working elsewhere is context. Busy next, because a session
+    # mid-turn is doing something and an idle one is waiting. Then the most recent state
+    # change, then the id -- which is what makes the order total, and the reason for the
+    # passes rather than one key: the stamp sorts descending, and a stable sort keeps ties
+    # in the order the pass below left them, so the id still breaks every tie.
+    bench.sort(key=lambda r: r["id"])
+    bench.sort(key=lambda r: r["state_at"] or "", reverse=True)
+    bench.sort(key=lambda r: 0 if r["state"] == "busy" else 1)
+    bench.sort(key=lambda r: 0 if r["arc"] else 1)
+    return bench, known, why
+
+
+def _orch_snapshot(bench):
+    """{session_id: what the next run compares against} -- state, and enough to say it.
+
+    State alone would be cheaper and would leave the diff unable to write a sentence: a
+    session that went idle has to be named as the workstream it was working on, and the
+    label lives on the arcs, which the snapshot does not carry. So the label rides along,
+    like the review rows' `ref` and `title` do and for the same reason. Live sessions
+    only -- an idle process that has exited has no state to move.
+    """
+    return {r["id"]: {"state": r["state"] or "", "arc": r.get("arc"),
+                      "label": r.get("arc_label") or "", "via": r.get("via") or ""}
+            for r in bench or []}
+
+
+SESSION_CHANGE_RANK = {"went_idle": 0, "appeared": 1, "went_busy": 2}
+
+
+def _session_changes(prev, cur):
+    """Which live sessions started, went quiet, or picked work back up since last build.
+
+    `went_idle` leads because it is the only one that asks anything: a session that has
+    stopped is a session whose work is sitting there waiting to be read. `appeared` is a
+    session that started under you, and `went_busy` is one that picked up again.
+
+    A session that VANISHED is silent, and that is a judgement rather than an oversight.
+    A status file disappears when the process exits, and the process exits every time a
+    session is closed -- on this machine, fifty-odd times a day. The interesting half of
+    that event is the summary it left behind, which lands on the arc through the database
+    and does not need a diff line to be seen. A line per exit would make this section
+    almost entirely a list of windows Kyle closed.
+    """
+    old, new = prev.get("sessions") or {}, cur.get("sessions") or {}
+    out = []
+    for sid in sorted(set(old) | set(new)):
+        o, n = old.get(sid), new.get(sid)
+        if n is None:
+            continue
+        where = n.get("label") or n.get("via") or "no workstream of yours"
+        if o is None:
+            out.append({"id": sid, "kind": "appeared", "arc": n.get("arc"),
+                        "what": f"a session started on {where}"})
+            continue
+        if (o.get("state") or "") == (n.get("state") or ""):
+            continue
+        if n.get("state") == "idle":
+            out.append({"id": sid, "kind": "went_idle", "arc": n.get("arc"),
+                        "what": f"a session on {where} went idle"})
+        elif n.get("state") == "busy":
+            out.append({"id": sid, "kind": "went_busy", "arc": n.get("arc"),
+                        "what": f"a session on {where} picked up again"})
+    out.sort(key=lambda c: (SESSION_CHANGE_RANK.get(c["kind"], 9), c["id"]))
+    return out
+
+
 # ── what moved since the last build ────────────────────────────────────────────
 #
 # The plan's load-bearing rule for the background layer: it is silent unless something
@@ -7944,7 +8506,7 @@ def _mr_ref(ref):
 
 
 def snapshot_of(arcs, ledger, known, repo, generated, reviews=(), approved=(),
-                checkouts=()):
+                checkouts=(), sessions=None):
     """The smallest per-arc state the next run needs to say what moved, and no more.
 
     Everything here is either an identity (the branch set), a fact that can move on its
@@ -8039,6 +8601,11 @@ def snapshot_of(arcs, ledger, known, repo, generated, reviews=(), approved=(),
             # all, and that absence is how the next run knows the arc count fell because
             # these left rather than because fifteen workstreams were regrouped overnight.
             "checkouts": sorted(c["branch"] for c in checkouts or []),
+            # The live sessions, by id, with the state that can move and the label needed
+            # to say so. Keyed at the top level and not per arc for the reason the reviews
+            # are: most live sessions at any moment attribute to no arc in this repo, and a
+            # per-arc home would have made exactly those undiffable.
+            "sessions": sessions or {},
             # Which universes this run actually consulted. A --no-mr run knows nothing
             # about merge requests, and the difference between "no MRs" and "nobody
             # looked" is the difference between a fact and a fabrication -- so the diff
@@ -8205,6 +8772,7 @@ def diff_runs(prev, cur, arcs, ledger):
     cmp_ledger = bool(pk.get("ledger")) and bool(ck.get("ledger"))
     cmp_slack = bool(pk.get("slack")) and bool(ck.get("slack"))
     cmp_reviews = bool(pk.get("reviews")) and bool(ck.get("reviews"))
+    cmp_orch = bool(pk.get("orch")) and bool(ck.get("orch"))
 
     live = {a.get("id"): a for a in arcs}
     demand_by_rfp = {d["rfp"]: d for a in arcs for d in a.get("demands", [])
@@ -8364,7 +8932,7 @@ def diff_runs(prev, cur, arcs, ledger):
         "skipped_universes": sorted(
             k for k, ok in (("mrs", cmp_mrs), ("issues", cmp_issues),
                             ("ledger", cmp_ledger), ("slack", cmp_slack),
-                            ("reviews", cmp_reviews)) if not ok),
+                            ("reviews", cmp_reviews), ("orch", cmp_orch)) if not ok),
         "changes": changes,
         # Its own list rather than clauses on the arc entries above, because a review is
         # not a development on a workstream of yours in the way everything else here is --
@@ -8372,6 +8940,14 @@ def diff_runs(prev, cur, arcs, ledger):
         # exactly those the ones that could never be reported. Each row names the arc it
         # joined to when it did, which is all a renderer needs to put it in either place.
         "reviews": _review_changes(prev, cur) if cmp_reviews else [],
+        # Its own list, beside the reviews and for the same reason: a session is not a
+        # development on a workstream in the way a pipeline or a review comment is, and
+        # most live sessions join to no arc here at all. Each row names the arc it landed
+        # on when it landed on one, which is all a renderer needs to put it in either
+        # place. Gated on both runs having read orch: a snapshot taken before this
+        # existed carries no `known["orch"]`, so this is silent for exactly one run
+        # rather than reporting every session on the machine as having just appeared.
+        "sessions": _session_changes(prev, cur) if cmp_orch else [],
         # True once and then never again. The run that first stops emitting checkout-only
         # workstreams drops several arcs, and without a word about it the diff reports them
         # as rows regrouped or gone -- a fact about the work, which it is not. A flag rather
@@ -8967,6 +9543,21 @@ def main():
     for arc in arcs:
         mark_forgotten(arc)
 
+    # orch's own view of the same work, joined here because the join is by branch and
+    # this is the first line at which the branch-to-arc assignment is final: the split,
+    # the detachments and the demotion have all had their say. Read-only against every
+    # one of its four sources, and it writes nothing anywhere -- orch owns that state.
+    # Cheap enough to be unconditional: one sqlite read of a 319-row table, a glob of
+    # fifty small json files, one workstream file and a backwards walk of a log that
+    # stops as soon as it has answered. Measured at 21ms on the real corpus, against a
+    # pipeline whose git work alone is tens of seconds.
+    orch_bench, orch_known, orch_why = orch_join(arcs, sessions, args.repo)
+    if not orch_known:
+        print(f"  orch is unreadable, so what is running is unknown this run — "
+              f"{orch_why}", file=sys.stderr)
+    elif orch_why:
+        print(f"  orch: {orch_why}", file=sys.stderr)
+
     # The Slack lens, after every other derivation, because the join reads a settled arc: a
     # thread attaches through the arc's branch names, ticket keys and MR iids, and the second
     # finalize pass, the split and the hand-set authoritative branch have all had their say
@@ -9043,14 +9634,21 @@ def main():
                                       # Completeness, not presence, like the ledger: a
                                       # sweep that half-answered would report every review
                                       # it missed as having vanished.
-                                      "reviews": reviews_known},
-                       args.repo.name, generated, reviews, reviews_approved, checkouts)
+                                      "reviews": reviews_known,
+                                      # Presence, not completeness. Every other universe
+                                      # here can half-answer; this one cannot -- the
+                                      # status files ARE the population, so a run that
+                                      # read them read all of them.
+                                      "orch": orch_known},
+                       args.repo.name, generated, reviews, reviews_approved, checkouts,
+                       _orch_snapshot(orch_bench))
     prev, no_prev = load_snapshot(args.repo.name)
     if prev is None:
         since = {"v": SNAPSHOT_V, "previous_generated": None, "interval_seconds": None,
                  "compared": 0, "changed": 0, "why": no_prev,
                  "not_compared": {"arcs": 0, "how": {}, "detail": {}},
-                 "skipped_universes": [], "changes": [], "reviews": []}
+                 "skipped_universes": [], "changes": [], "reviews": [],
+                 "sessions": []}
     else:
         since = diff_runs(prev, snap, arcs, ledger)
     if args.snapshot:
@@ -9196,6 +9794,30 @@ def main():
             # rather than merely being smaller. Same row shape, with `approved_at` on it.
             "reviews_approved": reviews_approved,
             "reviews_approved_n": len(reviews_approved),
+            # Every Claude session running right now, with the arc its most recent turn
+            # lands on or null. The bench view: what is going on at this moment and where
+            # it will show up. Top-level rather than only on the arcs, because the answer
+            # is null for most of them -- a session working in a different repo entirely,
+            # or on a branch this repo has never seen -- and a per-arc home would have
+            # made exactly those invisible. The per-arc lists are `arc.orch`.
+            #
+            # Never the workstream as the unit. Kyle: "currently a workstream in orch _is_
+            # a worktree, which is not necessarily the right mapping. a session often ends
+            # up doing its work in a different worktree." So `via` is provenance -- what
+            # spawned this session -- and `arc` is what it is actually working on, derived
+            # here from this tool's own turn evidence. They disagree constantly, and both
+            # of them are right.
+            "orch_sessions": orch_bench,
+            "orch_sessions_n": len(orch_bench),
+            "orch_busy_n": sum(1 for r in orch_bench if r["state"] == "busy"),
+            # Whether anything above is knowledge. A machine with no orchestrator, an
+            # unreadable database and "nothing is running" are three different facts and
+            # a consumer cannot tell them apart from an empty list. `orch_why` is also set
+            # on a PARTIAL read -- the sessions are known but their workstream labels are
+            # not, say -- so it is a note whenever it is non-empty, and only a refusal
+            # when `orch_known` is false.
+            "orch_known": orch_known,
+            "orch_why": orch_why,
             # Somebody else's branches sitting in this repo with no work of yours on them
             # and no review of yours joined to them. They used to be workstreams, which was
             # a claim -- "you have 167 pieces of work on the go" counted fifteen directories
@@ -9371,6 +9993,44 @@ def main():
         print(f"  {len(checkouts)} checkout(s) of other people's branches, no work of "
               f"yours on them — {oldest}{rest}")
         print()
+    if not orch_known:
+        # Said out loud, because an absent section and an empty one look identical and
+        # mean opposite things -- the same rule the reviewing section above follows.
+        print("── sessions ─────────────────────────────────────────────")
+        print(f"  orch could not be read, so what is running is unknown — {orch_why}")
+        print()
+    elif orch_bench:
+        print("── sessions ─────────────────────────────────────────────")
+        for r in orch_bench[:ORCH_CLI_ROWS]:
+            # ● mid-turn, ○ waiting. The workstream it LANDS on leads, because that is
+            # the question -- `via` is only what launched it, and on this machine the two
+            # differ often enough that leading with the launcher would be misleading.
+            mark = "●" if r["state"] == "busy" else "○"
+            # The workstream it LANDS on, and an em dash when that is none of them --
+            # which is most of them, and is why the count line below says how many. `via`
+            # is only what launched the session; leading with it would read as the answer
+            # to a question it does not answer.
+            where = r["arc_label"] or "—"
+            via = f"via {r['via']}" if r["via"] else ""
+            auto = " ⟳" if r["auto"] else ""
+            print(f"  {mark} {(r['state'] or '?'):<5} {where[:30]:<30} {via[:26]}{auto}")
+            if r["summary"]:
+                print(f"        └ {r['summary'][:64]}")
+        cut = orch_bench[ORCH_CLI_ROWS:]
+        if cut:
+            # The remainder accounted for rather than merely counted. Ordering puts the
+            # sessions that land on a workstream here first, so what falls off the bottom
+            # is mostly work in other repos -- and a plain "+44 more" would hide the one
+            # thing about them worth knowing, which is that some are mid-turn right now.
+            mid = sum(1 for r in cut if r["state"] == "busy")
+            more = f"  (+{len(cut)} more live session(s)"
+            print(more + (f", {mid} mid-turn elsewhere)" if mid else ")"))
+        busy = sum(1 for r in orch_bench if r["state"] == "busy")
+        landed = sum(1 for r in orch_bench if r["arc"])
+        print(f"  {len(orch_bench)} live, {busy} mid-turn, {landed} on a workstream here")
+        if orch_why:
+            print(f"  ⚠ {orch_why}")
+        print()
     for a in arcs:
         c = a["counts"]
         bits = [f"{c['branches']}b"]
@@ -9391,6 +10051,15 @@ def main():
               f"{','.join(bits):<28}{risk}")
         for d in a["demands"][:2]:
             print(f"        └ {d['what']}")
+        # Under the demands, because a session running on this arc right now is the
+        # freshest thing about it and the one thing no other line here can say. Only the
+        # live ones, and only their summary: the idle ones are on the page, and a CLI
+        # summary that listed every session an arc ever had would bury the arcs.
+        for r in (a.get("orch") or {}).get("sessions") or []:
+            if not r["live"]:
+                continue
+            mark = "●" if r["state"] == "busy" else "○"
+            print(f"        {mark} {r['summary'] or 'no summary yet'}"[:74])
         for s in a.get("slack") or []:
             if s.get("dismissed"):
                 continue
