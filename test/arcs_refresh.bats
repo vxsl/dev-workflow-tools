@@ -1439,18 +1439,36 @@ published_page_with() {
     [ "$(jq -r '.capabilities.downloads | type' "$STUB_DIR/deploy-request-1.json")" = "object" ]
 }
 
-# Moving a live page's runtime is a decision, not a side effect of editing it. Omitted by
-# default so the artifact keeps whatever it has.
-@test "the contract is left alone unless a run is asked to move it" {
+# The two travel together or neither travels: the artifact API answers a declaration with
+# no contract "capabilities requires contract". Since the page's ability to save itself
+# rests on the declaration, the contract is part of the declaration.
+@test "a declaration always carries the contract it needs" {
     publishing_on
     run "$REFRESH"
-    [ "$(jq -r 'has("contract")' "$STUB_DIR/deploy-request-1.json")" = "false" ]
+    [ "$(jq -r '.contract' "$STUB_DIR/deploy-request-1.json")" = "0.2.23" ]
 }
 
-@test "a run can be asked to move the contract" {
+# A version and never `latest`: `latest` would move the runtime under a live page whenever
+# the platform released one, and the page's code is written against a contract it can name.
+@test "the contract is a version, and a run can be asked for another" {
     publishing_on
-    WORK_ARCS_PUBLISH_CONTRACT=latest run "$REFRESH"
-    [ "$(jq -r '.contract' "$STUB_DIR/deploy-request-1.json")" = "latest" ]
+    WORK_ARCS_PUBLISH_CONTRACT=0.3.0 run "$REFRESH"
+    [ "$(jq -r '.contract' "$STUB_DIR/deploy-request-1.json")" = "0.3.0" ]
+}
+
+@test "the contract can be left off entirely along with the declaration" {
+    publishing_on
+    WORK_ARCS_PUBLISH_CAPABILITIES= WORK_ARCS_PUBLISH_CONTRACT= run "$REFRESH"
+    [ "$(jq -r 'has("contract")' "$STUB_DIR/deploy-request-1.json")" = "false" ]
+    [ "$(jq -r 'has("capabilities")' "$STUB_DIR/deploy-request-1.json")" = "false" ]
+}
+
+# A request that never reaches the host answers 000, and `HTTP 000 —` with nothing after it
+# is a log line that ends an investigation rather than starting one.
+@test "a request that never reached the host says what curl said" {
+    publishing_on
+    STUB_DEPLOY_CODES=000 run "$REFRESH"
+    grep -q "never reached the host" "$LOG"
 }
 
 # A control plane that does not know the field must not cost the publish: a page nobody can

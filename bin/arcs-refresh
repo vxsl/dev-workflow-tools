@@ -259,11 +259,20 @@ INGEST="${WORK_ARCS_INGEST:-1}"
 #   downloads  the save buttons, which are the degradation where `artifact` is not granted
 PUBLISH_CAPABILITIES="${WORK_ARCS_PUBLISH_CAPABILITIES-artifact,downloads}"
 
-# The runtime contract the page runs on. EMPTY by default, and deliberately: omitting it
-# keeps whatever the artifact already has, and moving a live page's runtime is a decision
-# rather than a side effect of editing it. Set it to `latest` for the one publish that
-# performs an upgrade -- `artifact` needs a runtime that has it, and 0.1.x does not.
-PUBLISH_CONTRACT="${WORK_ARCS_PUBLISH_CONTRACT:-}"
+# The runtime contract the page runs on. PINNED, and not omitted, because the artifact API
+# refuses a declaration without one: "capabilities requires contract". So the two travel
+# together or neither travels, and since the page's ability to save itself rests on the
+# declaration, the contract is part of the declaration.
+#
+# A version and never `latest`, for the reason the rest of this file pins things: `latest`
+# would move the runtime under a live page whenever the platform released one, and the
+# page's code is written against a contract it can name -- `claude.use`, the `artifact`
+# namespace, `publish` taking the page whole. Moving it is an edit to this line, made
+# deliberately, and the page is written to survive either side of it anyway (see useCap in
+# arcs-page: it tries `use`, then the member the older runtimes hung the namespace off).
+#
+# 0.1.x, which is where this artifact sat until now, has no `artifact` capability at all.
+PUBLISH_CONTRACT="${WORK_ARCS_PUBLISH_CONTRACT-0.2.23}"
 FRAME_CLIENT_VERSION="${WORK_ARCS_FRAME_CLIENT_VERSION:-2.1.245}"
 FRAME_TIMEOUT="${WORK_ARCS_FRAME_TIMEOUT:-60}"
 NOTIFY="$HOME/bin/notification/claude-notify.sh"
@@ -790,7 +799,7 @@ hook_installed() {
 # route. The CLI publishes over ordinary HTTP, so this does too, and the last manual step
 # in a job that is otherwise unattended is gone.
 
-FRAME_HTTP_CODE=""; FRAME_BODY=""; FRAME_ERROR=""
+FRAME_HTTP_CODE=""; FRAME_BODY=""; FRAME_ERROR=""; FRAME_TRANSPORT=""
 
 # The slug is the last path segment of the artifact link. Anything that does not look like
 # one is a mis-set WORK_ARCS_ARTIFACT_URL, which is worth naming rather than sending: a
@@ -835,7 +844,15 @@ frame_call() {
     if [ -n "$body_file" ]; then
         args+=( -H 'Content-Type: application/json' --data-binary @"$body_file" )
     fi
-    FRAME_HTTP_CODE="$(curl "${args[@]}" "$FRAME_BASE$path" 2>/dev/null || true)"
+    # curl's own diagnosis, kept. A request that never reaches the host answers 000, and
+    # `HTTP 000 —` with nothing after it is a log line that ends the investigation rather
+    # than starting it: a DNS failure, a refused connection and a proxy that ate the body
+    # all look identical from the status alone.
+    local err
+    err="$(mktemp)"
+    FRAME_HTTP_CODE="$(curl "${args[@]}" "$FRAME_BASE$path" 2>"$err" || true)"
+    FRAME_TRANSPORT="$(tr '\n' ' ' <"$err" | sed 's/  */ /g; s/^ //; s/ $//')"
+    rm -f "$err"
     FRAME_HTTP_CODE="$(http_code_or_000 "$FRAME_HTTP_CODE")"
 }
 
@@ -1004,7 +1021,11 @@ extract_ackseed() {
         match($0, /<script type="application\/json" id="ackseed">/) {
             rest = substr($0, RSTART + RLENGTH)
             end = index(rest, "</script>")
-            if (end > 0) { print substr(rest, 1, end - 1); exit }
+            # The opening brace as well as the marker. The page also carries the marker
+            # inside the script that rewrites the block, and while that copy is emitted
+            # after this one and would never be reached, a cut that depends on the order
+            # two unrelated sections happen to be written in is a cut waiting to be wrong.
+            if (end > 0 && substr(rest, 1, 1) == "{") { print substr(rest, 1, end - 1); exit }
         }
     ' "$1"
 }
@@ -1214,6 +1235,10 @@ publish_page() {
                     continue
                 fi
                 log "publish: refused with HTTP $FRAME_HTTP_CODE — $(frame_message)"
+                rm -f "$req"
+                return 1 ;;
+            000)
+                log "publish: the request never reached the host — ${FRAME_TRANSPORT:-curl said nothing}"
                 rm -f "$req"
                 return 1 ;;
             *)
