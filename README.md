@@ -732,10 +732,12 @@ ladder that eventually disagrees with this one. Only keys that change something 
 at most three, the one the derivation already chose first.
 
 Like parking and detaching, it applies in the page and survives reloads (the artifact's own
-`localStorage`), and **Save filings** writes `authoritative-ticket.json` for
-`~/.local/state/work-arcs/` so `work-arcs`' own counts agree with what you are looking at.
-The store the page keeps is seeded from the file `work-arcs` read, not from the rows on
-screen — a workstream outside the focus window has no row, and a store built from rows alone
+`localStorage`), and it reaches `~/.local/state/work-arcs/authoritative-ticket.json` on its
+own now — [the page publishes its stores back into itself](#arcs-page) and `arcs-refresh`
+adopts them before the next rebuild, so `work-arcs`' counts agree with what you are looking
+at without anybody moving a file. **Save filings** stays as the manual route for a page that
+could not save itself, which is what the bar offers when a publish has failed. The store the
+page keeps is seeded from the file `work-arcs` read, not from the rows on screen — a workstream outside the focus window has no row, and a store built from rows alone
 would drop its filing the first time the page saved one.
 
 There is a command-line twin, as there is for every control on the page:
@@ -772,11 +774,18 @@ because by every signal it has, they are the same.
 So the doubt is published instead of tuned away. Every clustered membership carries a
 confidence — how much evidence holds this branch in this arc, discounted by how close the
 call was and by whether the branch's own name is filed under a different ticket — and the
-five least confident become questions:
+least confident become questions:
 
 ```bash
-work-arcs --curate    # y yes · n no · s skip · esc done
+work-arcs --curate    # y yes · n no · x third answer or skip · esc done
 ```
+
+One keystroke vocabulary across all three kinds, so a mixed queue is answered without
+holding three mappings in your head: `y` always means *the derivation is right* and `n`
+always means *it is not*, and which question you are on is said by the row and spelled out
+by its preview. `x` is the one key that is not universal — the no-ticket question has three
+honest answers rather than two, and where a question has no third answer `x` is a skip,
+because pressing an unoffered key must never record something.
 
 One keystroke each, a preview pane showing both sides of the tie, and the same rows on the
 page as cards you answer with a click. The rules are all about the asking, because a queue
@@ -1079,6 +1088,12 @@ was touched in a fortnight, so the defaults have to be the selection and the con
 override. A remembered fold would walk the page back to fifteen expanded sections one morning
 at a time, and unlike a dismissal or a filing there is no fingerprint under it for anything
 to expire against.
+
+The same argument took the condition tiles down to lines. Four display figures at 2rem across
+the middle of the page, each already printed on the rail or on a door three inches to its
+left, is repetition wearing emphasis' clothes — so every count, subtitle and anchor came
+through in the shape of the disclosure directly underneath them, and the strip and its one
+openable member read as one stack.
 
 **It opened on its own title, which is the one thing on it that is never news.** *Work Arcs*
 set at 2.4rem was the largest type on a page whose entire claim is that it leads with the
