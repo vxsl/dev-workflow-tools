@@ -1,0 +1,62 @@
+# work-arcs-serve.service -- the local cockpit. The same page the artifact shows, served
+# at 127.0.0.1 where its buttons can reach tmux.
+#
+# THIS UNIT IS NOT ENABLED BY ANYTHING IN THIS REPO, and that is deliberate. Every other
+# unit here is a timer that reads state and writes a file; this one accepts HTTP requests
+# and turns them into commands on your machine. A program with that shape should start
+# because a person decided it should, not because they cloned a checkout. To decide:
+#
+#   cp systemd/work-arcs-serve.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now work-arcs-serve.service
+#   curl -s http://127.0.0.1:7379/health          # then open http://127.0.0.1:7379/
+#
+# and `systemctl --user disable --now work-arcs-serve.service` undoes all of it. The path
+# below is where this checkout actually lives, so a hand-copied unit works as it stands.
+#
+# A *user* unit, not a system one, for the same reason the refresh timer is: the job is a
+# user's the whole way down. It reads a user's state directory, it opens windows in a
+# user's tmux, and the sessions it resumes are a user's Claude sessions. A system unit
+# would have to be punched through on all three counts to buy nothing.
+#
+# There is no EnvironmentFile= for the repo's .env, matching work-arcs-standup.service:
+# systemd's parser is not a shell and does not understand `export` or shell quoting, and
+# a half-read port is worse than a default one. Set knobs here with Environment= instead,
+# where systemd's own rules apply and you can see what they will be.
+
+[Unit]
+Description=Serve the work-arcs page locally, with act verbs
+Documentation=file:%h/bin/dev-workflow-tools/bin/arcs-serve
+
+# Ordering only, not a dependency: the page is a file on disk that arcs-refresh rewrites
+# in place, and this daemon reads it per request rather than at startup. Serving before
+# the morning rebuild is correct -- it serves yesterday's page, which is the truth about
+# what has been built.
+After=work-arcs-refresh.service
+
+[Service]
+Type=simple
+
+ExecStart=%h/bin/dev-workflow-tools/bin/arcs-serve
+
+# The port, spelled out here rather than left implicit, because the one thing anybody
+# will want to change about this unit is which port it is on and the answer should be
+# visible in the file they are already reading.
+Environment=WORK_ARCS_SERVE_PORT=7379
+
+# A cockpit that died at 3am and stayed dead is a page that silently stops answering, and
+# the symptom -- a browser tab that will not load -- looks identical to a laptop being
+# asleep. Restarting is cheap: the process holds no state that matters, only a 30s health
+# cache and whatever ttyds were open.
+Restart=on-failure
+RestartSec=5s
+
+# The daemon binds loopback and refuses cross-origin acts by header; these narrow what it
+# could do if that were ever wrong. NoNewPrivileges and PrivateTmp cost nothing here.
+# There is deliberately no ProtectHome= or ReadOnlyPaths=: opening a shell in a worktree
+# and resuming a Claude session are the entire point, and both need $HOME writable.
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target
