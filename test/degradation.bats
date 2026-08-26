@@ -244,7 +244,7 @@ def glab(repo, path, **k):
     return None                      # discussions refuse
 wa.glab = glab
 wa.shutil.which = lambda name: "/usr/bin/" + name
-rows, covered, whole, reviews, drafts = wa.ledger_you_owe(Path("/nonexistent"), "kyle")
+rows, covered, whole, reviews, drafts, ok_ap = wa.ledger_you_owe(Path("/nonexistent"), "kyle")
 print("rows", len(rows), "covered", covered, "complete", whole)
 print("reviews", len(reviews))'
     [ "$status" -eq 0 ]

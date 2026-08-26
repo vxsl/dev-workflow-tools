@@ -721,6 +721,13 @@ def branch_pipelines(repo):
 
 
 REVIEW_REQ_RE = re.compile(r"^requested review from", re.I)
+# The other half of the same conversation, and the only place GitLab records WHEN an
+# approval happened. /approvals answers who approves and nothing else -- its
+# `approved_by[]` entries are bare user objects with no instant on them -- so it cannot
+# be asked whether an approval predates or postdates the author's last push, which is
+# the entire question below. The system note can, it is already in the discussions call
+# every review row is built from, and it costs nothing.
+APPROVAL_RE = re.compile(r"^(un)?approved this merge request", re.I)
 
 
 def _clean_note(body):
@@ -873,6 +880,28 @@ def _review_row(m, discussions, me):
     `rounds` counts your note-batches: a maximal run of notes of yours uninterrupted by
     anybody else. Six comments in one sitting are one round of review, and counting them as
     six would make a thorough first pass look like a two-month argument.
+
+    Your own approval is read here too, and it does two things. Kyle: "most of the reviews
+    seem like BS, in particular it's reporting on things i've already approved."
+
+    The first is a bug fix the rest of the row needed anyway. Approving moves the merge
+    request's `updated_at` and writes no human note, so the proxy above read YOUR approval
+    as THEIR push and flipped the row to "your turn" at the exact moment your end of it
+    finished. That is most of what put 21 of 23 rows on "your turn". So the proxy asks
+    whether `updated_at` outruns anything YOU can explain, approval included -- narrowly
+    that, and not every system note of yours, because a push is what the proxy exists to
+    catch and an approval is the one event of yours known to be mistaken for one.
+
+    The second is `approved_covers`: your approval postdates every move of theirs, so there
+    is nothing here for you to do and the clock is the author's. ledger_you_owe drops those
+    rows from the ongoing list and reports the count rather than quietly shrinking it. An
+    approval that has been overtaken -- they pushed or spoke after it -- covers nothing,
+    because it was given about a state of the branch that no longer exists, and the row
+    comes back with the turn honestly yours.
+
+    Truncation fails safe and so needs no guard: the discussions call is capped at a page,
+    and a page short enough to hide an approval note leaves the row on the list, which is
+    the direction that keeps a claim off the page rather than putting a wrong one on it.
     """
     iid = m.get("iid")
     notes = sorted((n for d in discussions for n in (d.get("notes") or [])),
@@ -881,6 +910,16 @@ def _review_row(m, discussions, me):
 
     def by_me(n):
         return (n.get("author") or {}).get("username") == me
+
+    # Last approval of yours that still stands. Ascending order, so the last verdict in the
+    # list wins and an un-approval takes the instant away rather than leaving a stale one.
+    approved_at = 0
+    for n in notes:
+        if not n.get("system") or not by_me(n):
+            continue
+        verdict = APPROVAL_RE.match((n.get("body") or "").strip())
+        if verdict:
+            approved_at = 0 if verdict.group(1) else _iso_epoch(n.get("created_at"))
 
     my_last = max((_iso_epoch(n.get("created_at")) for n in human if by_me(n)), default=0)
     their_last = max((_iso_epoch(n.get("created_at")) for n in human if not by_me(n)),
@@ -893,7 +932,11 @@ def _review_row(m, discussions, me):
         else:
             in_run = False
     updated = _iso_epoch(m.get("updated_at"))
-    proxy = updated > max(my_last, their_last) + REVIEW_PROXY_TOLERANCE
+    # Your approval counts as your own activity HERE and nowhere else: `my_last` stays what
+    # it has always been -- your last word -- because whose_turn, rounds and the diff are
+    # all about the conversation, and clicking Approve is not a word in it. What it is, is
+    # an explanation for `updated_at` moving, which is the only thing the proxy asks.
+    proxy = updated > max(my_last, approved_at, their_last) + REVIEW_PROXY_TOLERANCE
     if proxy:
         their_last = updated
     # When you were asked, through the same system note ledger_they_owe reads, and with the
@@ -913,6 +956,7 @@ def _review_row(m, discussions, me):
            "days": _days_since(asked),
            "my_last": my_last, "their_last": their_last,
            "their_last_is_proxy": proxy,
+           "approved_at": approved_at,
            # Never reviewed at all reads as yours, which is the same thing the ledger says
            # about it one row over -- the two views agree because they are derived from the
            # same instant, not because either copies the other.
@@ -924,8 +968,17 @@ def _review_row(m, discussions, me):
     # Content-fingerprinted like every other acknowledgeable row: what changes when the
     # engagement moves, and nothing that changes on its own. `days` and `quiet_days` tick
     # daily and are deliberately out; the instants they are computed from are in.
+    # Your approval postdating every move of theirs is the whole of it. Not "you approved",
+    # which is true of a merge request they have pushed to forty times since -- and not a
+    # comparison against your last WORD either: approving and then asking a question leaves
+    # the ball with them, which is exactly the state this is meant to stop reporting as
+    # yours. `>=` and not `>` because a same-second stamp is a tie the approval wins.
+    row["approved_covers"] = bool(approved_at) and approved_at >= their_last
+    # `approved_at` is in the fingerprint for the same reason every other instant here is:
+    # approving is the engagement moving, and a dismissal taken before it was approved was
+    # taken about a different state.
     row["fp"] = _dfp("review", row["ref"], row["url"], row["asked"],
-                     row["whose_turn"], row["rounds"], my_last, their_last)
+                     row["whose_turn"], row["rounds"], my_last, their_last, approved_at)
     return row
 
 
@@ -952,13 +1005,24 @@ def ledger_you_owe(repo, me):
     boundary is therefore the ledger's boundary: a review you are giving on a merge request
     that never named you a reviewer does not appear, and that is said out loud rather than
     left for a reader to discover as a silence.
+
+    Returned in two lists, because there are two states and only one of them is ongoing.
+    The second is the merge requests you have approved and nothing has moved on since --
+    your end of those is finished and the clock belongs to the author -- and it is RETURNED
+    rather than dropped: a list that went from 23 to 19 with no account of the four is a
+    list that has started editing itself. See _review_row for how "since" is decided and
+    why an overtaken approval covers nothing.
+
+    Deliberately not folded into `covered`, which counts review REQUESTS the ledger stopped
+    demanding anything about. These were never ledger rows; they are finished reviews. The
+    two numbers answer different questions and adding them would make both unanswerable.
     """
     if not shutil.which("glab"):
         # Gated like collect_mrs. glab() would survive its absence -- the OSError is caught
         # -- but every call would still be spawned and every caller would wait on it, which
         # is what makes an ungated source hang a test that only wanted the rest of the
         # ledger.
-        return [], 0, False, [], 0
+        return [], 0, False, [], 0, []
     raw = glab(repo, "projects/:id/merge_requests?state=opened&per_page=100"
                      f"&reviewer_username={urllib.parse.quote(me, safe='')}")
     if raw is None or not isinstance(raw, list):
@@ -966,7 +1030,7 @@ def ledger_you_owe(repo, me):
         # queue would let a prune delete every acknowledgement on it.
         print("  ledger: GitLab would not list the merge requests awaiting you — that "
               "side of the ledger is absent this run, not empty", file=sys.stderr)
-        return [], 0, False, [], 0
+        return [], 0, False, [], 0, []
     foreign = [m for m in raw if (m.get("author") or {}).get("username") != me]
     queue = [m for m in foreign if not (m.get("draft") or m.get("work_in_progress"))]
     # Drafts are out of both views, and the count is reported rather than the row silently
@@ -1053,7 +1117,17 @@ def ledger_you_owe(repo, me):
     # evidence text it is handed, and a sort that ties differently between two runs re-buys
     # the cache for nothing.
     reviews.sort(key=lambda r: (r["whose_turn"] != "mine", -(r["days"] or 0), r["iid"]))
-    return out, covered, not missed, reviews, drafts
+    # Split after the sort, so both lists carry the one total order rather than two orders
+    # that agree today. Same key, same tiebreak, no second sort to drift out of step.
+    approved = [r for r in reviews if r.get("approved_covers")]
+    reviews = [r for r in reviews if not r.get("approved_covers")]
+    if approved:
+        named = ", ".join(r["ref"] for r in approved[:3])
+        rest = f" and {len(approved) - 3} more" if len(approved) > 3 else ""
+        print(f"  reviewing: {len(approved)} merge request(s) you approved and nobody has "
+              f"moved on since are off the ongoing list ({named}{rest}) — they are "
+              "reported as approved rather than dropped", file=sys.stderr)
+    return out, covered, not missed, reviews, drafts, approved
 
 
 def ledger_jira_stalled(days_min=None):
@@ -2861,7 +2935,13 @@ def apply_dismissals(ledger, arcs=None, gap=None, prune=False):
     # already requires `ledger["complete"]`, which is a conjunction over `you_whole`, and
     # `reviews_known` is `you_whole` and a known author -- so a run allowed to prune is by
     # construction one that read every review.
-    for r in (ledger or {}).get("reviews") or []:
+    # Both lists, and the approved one is not an afterthought: a row that left the ongoing
+    # list because you approved it is still a row this run read and can still come back if
+    # they push. Registering only the live half would prune the acknowledgement on every
+    # approval, and the revived row would then arrive un-dismissed on the strength of a
+    # click the reader had already made.
+    for r in ((ledger or {}).get("reviews") or []) + (
+            (ledger or {}).get("reviews_approved") or []):
         if r.get("fp"):
             live[r["fp"]] = r
     for arc in arcs or []:
@@ -3143,8 +3223,8 @@ def build_ledger(repo, mrs, meetings=True):
         # meeting row's acknowledgement would then be pruned on a run that never looked.
         f_meet = pool.submit(ledger_meetings) if meetings else None
         they, they_whole = f_they.result() if f_they else ([], False)
-        you, covered, you_whole, reviews, review_drafts = (
-            f_you.result() if f_you else ([], 0, False, [], 0))
+        you, covered, you_whole, reviews, review_drafts, reviews_approved = (
+            f_you.result() if f_you else ([], 0, False, [], 0, []))
         jira_rows, jira_whole = f_jira.result()
         they += jira_rows
         slack_they, slack_you, slack_seen, slack_whole = f_slack.result()
@@ -3183,9 +3263,18 @@ def build_ledger(repo, mrs, meetings=True):
             # consumer that wants both can join them and neither has to know the other's
             # rules.
             "reviews": reviews,
+            # The ones that left it, and why. A merge request you approved and nobody has
+            # moved on since is finished work of yours, not ongoing work of yours -- and it
+            # is carried here rather than dropped so that "23 ongoing" becoming "19" has an
+            # account of the other four instead of being a number that quietly changed.
+            # Same row shape as `reviews`, so a renderer that wants to name two of them
+            # needs no second vocabulary; `approved_at` says when.
+            "reviews_approved": reviews_approved,
+            "reviews_approved_n": len(reviews_approved),
             # Whether that list is all of them, on the same "absent is not empty" contract
             # every other source here reports under. False means GitLab was not asked or
-            # would not answer, never that you are reviewing nothing.
+            # would not answer, never that you are reviewing nothing. Covers both lists:
+            # they come off one sweep and a sweep that half-answered half-answered for both.
             "reviews_known": bool(me) and you_whole,
             "reviews_drafts_skipped": review_drafts,
             # Always present when the ledger is, empty or not, because a --json consumer
@@ -7627,7 +7716,7 @@ def _mr_ref(ref):
     return int(m.group(1)) if m else None
 
 
-def snapshot_of(arcs, ledger, known, repo, generated, reviews=()):
+def snapshot_of(arcs, ledger, known, repo, generated, reviews=(), approved=()):
     """The smallest per-arc state the next run needs to say what moved, and no more.
 
     Everything here is either an identity (the branch set), a fact that can move on its
@@ -7698,17 +7787,24 @@ def snapshot_of(arcs, ledger, known, repo, generated, reviews=()):
     # what can move on its own: whose turn it is, how many rounds deep it is, and the two
     # instants those are computed from. `days` and `quiet_days` tick by themselves and are
     # out, like every other counter here.
-    review_rows = {str(r["iid"]): {"whose_turn": r.get("whose_turn"),
-                                   "rounds": r.get("rounds", 0),
-                                   "my_last": r.get("my_last", 0),
-                                   "their_last": r.get("their_last", 0),
-                                   "arc": r.get("arc"),
-                                   "ref": r.get("ref"), "url": r.get("url", ""),
-                                   "author": r.get("author", ""),
-                                   "title": r.get("title", "")}
+    def review_row(r):
+        return {"whose_turn": r.get("whose_turn"), "rounds": r.get("rounds", 0),
+                "my_last": r.get("my_last", 0), "their_last": r.get("their_last", 0),
+                "arc": r.get("arc"), "ref": r.get("ref"), "url": r.get("url", ""),
+                "author": r.get("author", ""), "title": r.get("title", "")}
+
+    review_rows = {str(r["iid"]): review_row(r)
                    for r in reviews or [] if r.get("iid") is not None}
+    # The approved-away ones in their own map rather than a flag on the one above, so that
+    # "which reviews are ongoing" stays answerable by reading one key. Kept at all because
+    # a row that merely changed lists must not read as a row that vanished: without this,
+    # approving something would be reported to the next run as "!9758 is no longer waiting
+    # on you", which is true of a merge that landed and of nothing else.
+    approved_rows = {str(r["iid"]): review_row(r)
+                     for r in approved or [] if r.get("iid") is not None}
     return {"v": SNAPSHOT_V, "generated": generated, "repo": repo,
             "reviews": review_rows,
+            "reviews_approved": approved_rows,
             # Which universes this run actually consulted. A --no-mr run knows nothing
             # about merge requests, and the difference between "no MRs" and "nobody
             # looked" is the difference between a fact and a fabrication -- so the diff
@@ -8047,8 +8143,8 @@ def diff_runs(prev, cur, arcs, ledger):
 
 # What a review can do between two runs, worst first. "Yours" leads because it is the only
 # one that asks anything of you; a review that merely got longer asks nothing today.
-REVIEW_CHANGE_RANK = {"turned_mine": 0, "appeared": 1, "answered": 2,
-                      "turned_theirs": 3, "gone": 4}
+REVIEW_CHANGE_RANK = {"turned_mine": 0, "revived": 1, "appeared": 2, "answered": 3,
+                      "turned_theirs": 4, "approved": 5, "gone": 6}
 
 
 def _review_changes(prev, cur):
@@ -8064,18 +8160,49 @@ def _review_changes(prev, cur):
     batch count going up -- is the review advancing, which is the thing a long engagement
     otherwise shows no sign of at all: `!10530` looked identical for six weeks while four
     rounds went through it.
+
+    Leaving the ongoing list on your own approval is the third, and it is reported for the
+    reason the list keeps the approved rows at all: it is movement, not absence. `gone` is
+    reserved for a merge request that left this run's universe entirely -- merged, closed,
+    or you were taken off it -- and using it for an approval would say "no longer waiting on
+    you" about something you finished, which reads as the author having given up. A row that
+    comes back the other way is `revived`, because an approval overtaken by a push is not
+    the same news as being asked to review something for the first time.
+
+    A merge request first SEEN in the approved list is silent: nothing moved between two
+    runs, this run simply looked and found finished work. Announcing it would put a line in
+    the diff for every review you approved before this feature existed.
     """
     old, new = prev.get("reviews") or {}, cur.get("reviews") or {}
+    old_ap = prev.get("reviews_approved") or {}
+    new_ap = cur.get("reviews_approved") or {}
     out = []
-    for iid in sorted(set(old) | set(new), key=lambda k: int(k) if k.isdigit() else 0):
+    for iid in sorted(set(old) | set(new) | set(old_ap) | set(new_ap),
+                      key=lambda k: int(k) if k.isdigit() else 0):
         o, n = old.get(iid), new.get(iid)
         if n is None:
+            a = new_ap.get(iid)
+            if a is not None:
+                if o is not None:
+                    out.append({"iid": iid, "kind": "approved",
+                                "ref": a.get("ref") or f"!{iid}", "url": a.get("url", ""),
+                                "arc": a.get("arc"),
+                                "what": f"you approved {a.get('ref') or '!' + iid} — off "
+                                        "the reviewing list until they move"})
+                continue
+            o = o or old_ap.get(iid)
             out.append({"iid": iid, "kind": "gone", "ref": o.get("ref") or f"!{iid}",
                         "url": o.get("url", ""), "arc": o.get("arc"),
                         "what": f"{o.get('ref') or '!' + iid} is no longer waiting on you"})
             continue
         ref, who = n.get("ref") or f"!{iid}", n.get("author") or "someone"
         if o is None:
+            if iid in old_ap:
+                out.append({"iid": iid, "kind": "revived", "ref": ref,
+                            "url": n.get("url", ""), "arc": n.get("arc"),
+                            "what": f"{who} moved on {ref} after your approval — "
+                                    "your turn again"})
+                continue
             out.append({"iid": iid, "kind": "appeared", "ref": ref, "url": n.get("url", ""),
                         "arc": n.get("arc"),
                         "what": f"{who} asked you to review {ref}"})
@@ -8568,6 +8695,10 @@ def main():
     # arc on every path -- a --no-mr run has no reviews and says so with an empty list
     # rather than with a missing key nobody can tell from a missing review.
     reviews = (ledger or {}).get("reviews") or []
+    # The finished half, carried alongside rather than merged in. Not put through
+    # attach_reviews: the join exists so an ongoing review can be read as work on a
+    # workstream, and a review you have finished is not work in progress on anything.
+    reviews_approved = (ledger or {}).get("reviews_approved") or []
     reviews_known = bool(ledger) and bool((ledger or {}).get("reviews_known"))
     attach_reviews(arcs, reviews)
 
@@ -8655,7 +8786,7 @@ def main():
                                       # sweep that half-answered would report every review
                                       # it missed as having vanished.
                                       "reviews": reviews_known},
-                       args.repo.name, generated, reviews)
+                       args.repo.name, generated, reviews, reviews_approved)
     prev, no_prev = load_snapshot(args.repo.name)
     if prev is None:
         since = {"v": SNAPSHOT_V, "previous_generated": None, "interval_seconds": None,
@@ -8798,6 +8929,11 @@ def main():
             # consumer cannot tell "you are reviewing nothing" from "GitLab was not asked",
             # and the two support opposite sentences.
             "reviews_known": reviews_known,
+            # The reviews you finished: approved, and nothing has moved on them since. Off
+            # the list above and named here, so the count that changed can be accounted for
+            # rather than merely being smaller. Same row shape, with `approved_at` on it.
+            "reviews_approved": reviews_approved,
+            "reviews_approved_n": len(reviews_approved),
             # What the Slack thread lens saw and what it could not, top-level because it is
             # a fact about the run rather than about any one workstream -- and because the
             # page's boundary note is read off it. `denied` is the two scopes this token
@@ -8934,6 +9070,22 @@ def main():
             print(f"                          └ {r['title'][:58]}")
             if r.get("arc"):
                 print(f"                          ↳ {r['arc']} ({r.get('arc_via', '')})")
+        if reviews_approved:
+            named = ", ".join(r["ref"] for r in reviews_approved[:3])
+            rest = (f" and {len(reviews_approved) - 3} more"
+                    if len(reviews_approved) > 3 else "")
+            print(f"  (+{len(reviews_approved)} you approved and nobody has moved on "
+                  f"since — {named}{rest})")
+        print()
+    elif reviews_approved:
+        # Everything you are reviewing is finished. Still a section, because an empty one
+        # here and a section that says why it is empty mean different things.
+        print("── reviewing ────────────────────────────────────────────")
+        named = ", ".join(r["ref"] for r in reviews_approved[:3])
+        rest = (f" and {len(reviews_approved) - 3} more"
+                if len(reviews_approved) > 3 else "")
+        print(f"  nothing ongoing — {len(reviews_approved)} you approved and nobody has "
+              f"moved on since ({named}{rest})")
         print()
     elif reviews_known is False:
         # Said out loud, because an absent section and an empty one look identical and

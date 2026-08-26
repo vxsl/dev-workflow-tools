@@ -322,7 +322,7 @@ disc = {10530: [{"notes": [note("logan", "2026-06-01T09:00:00.000Z"),
                            note("kyle", "2026-06-02T09:00:00.000Z")]}]}
 wa.glab = fake_glab(mrs, disc)
 wa.shutil.which = lambda n: "/usr/bin/" + n
-rows, covered, whole, reviews, drafts = wa.ledger_you_owe("repo", "kyle")
+rows, covered, whole, reviews, drafts, approved = wa.ledger_you_owe("repo", "kyle")
 print("n", len(reviews), "known", whole, "drafts", drafts)
 r = reviews[0]
 print("iid", r["iid"], "author", r["author"], "branch", r["source_branch"])
@@ -343,7 +343,7 @@ mrs = [mr(10530, author="logan")]
 disc = {10530: [{"notes": [note("kyle", "2026-06-02T09:00:00.000Z")]}]}
 wa.glab = fake_glab(mrs, disc)
 wa.shutil.which = lambda n: "/usr/bin/" + n
-rows, covered, whole, reviews, drafts = wa.ledger_you_owe("repo", "kyle")
+rows, covered, whole, reviews, drafts, approved = wa.ledger_you_owe("repo", "kyle")
 print("ledger_rows", len(rows), "covered", covered)
 print("reviews", len(reviews))'
     [ "$status" -eq 0 ]
@@ -357,7 +357,7 @@ mrs = [mr(1, author="kyle"), mr(2, author="logan")]
 disc = {1: [], 2: []}
 wa.glab = fake_glab(mrs, disc)
 wa.shutil.which = lambda n: "/usr/bin/" + n
-rows, covered, whole, reviews, drafts = wa.ledger_you_owe("repo", "kyle")
+rows, covered, whole, reviews, drafts, approved = wa.ledger_you_owe("repo", "kyle")
 print("iids", [r["iid"] for r in reviews])'
     [ "$status" -eq 0 ]
     [[ "$output" == *"iids [2]"* ]]
@@ -369,7 +369,7 @@ mrs = [mr(3, author="logan", draft=True), mr(4, author="logan")]
 disc = {3: [], 4: []}
 wa.glab = fake_glab(mrs, disc)
 wa.shutil.which = lambda n: "/usr/bin/" + n
-rows, covered, whole, reviews, drafts = wa.ledger_you_owe("repo", "kyle")
+rows, covered, whole, reviews, drafts, approved = wa.ledger_you_owe("repo", "kyle")
 print("iids", [r["iid"] for r in reviews], "drafts", drafts)'
     [ "$status" -eq 0 ]
     [[ "$output" == *"iids [4] drafts 1"* ]]
@@ -458,7 +458,7 @@ print("order", [(r["iid"], r["whose_turn"]) for r in reviews])'
 @test "no glab means the reviewing list is unknown, never empty" {
     run wa '
 wa.shutil.which = lambda n: None
-rows, covered, whole, reviews, drafts = wa.ledger_you_owe("repo", "kyle")
+rows, covered, whole, reviews, drafts, approved = wa.ledger_you_owe("repo", "kyle")
 print("reviews", len(reviews), "whole", whole)'
     [ "$status" -eq 0 ]
     [[ "$output" == *"reviews 0 whole False"* ]]
@@ -587,4 +587,253 @@ d = wa.diff_runs(old, new, [], None)
 print("reviews", d["reviews"], "skipped", "reviews" in d["skipped_universes"])'
     [ "$status" -eq 0 ]
     [[ "$output" == *"reviews [] skipped True"* ]]
+}
+
+# ── R6: an MR you already approved is not an ongoing review ───────────────────
+#
+# Kyle: "most of the reviews seem like BS, in particular it's reporting on things i've
+# already approved." On the real corpus 21 of 23 rows read "your turn" and four of them
+# were merge requests he had approved and nobody had touched since.
+#
+# Two defects, and the first is what made the second invisible. Approving moves the merge
+# request's updated_at and writes no human note, so the whose-turn proxy read HIS OWN
+# approval as THEIR push. Then nothing anywhere asked whether an approval had settled the
+# engagement at all.
+
+@test "an approval of yours is not read as a push of theirs" {
+    # The proxy bug on its own. updated_at moves when you approve, and reading that as
+    # their activity flips the row to your turn at the moment your end of it finished.
+    run wa '
+disc = {30: [{"notes": [note("logan", "2026-06-01T09:00:00.000Z"),
+                        note("kyle", "2026-06-10T09:00:00.000Z",
+                             "approved this merge request", system=True)]}]}
+wa.glab = fake_glab([mr(30, author="logan", updated="2026-06-10T09:00:05.000Z")], disc)
+wa.shutil.which = lambda n: "/usr/bin/" + n
+r = wa._review_row(mr(30, author="logan", updated="2026-06-10T09:00:05.000Z"),
+                   disc[30], "kyle")
+print("proxy", r["their_last_is_proxy"], "covers", r["approved_covers"])
+print("approved_at_set", bool(r["approved_at"]))'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"proxy False covers True"* ]]
+    [[ "$output" == *"approved_at_set True"* ]]
+}
+
+@test "you approved it and nobody has moved since, so it leaves the ongoing list" {
+    run wa '
+disc = {31: [{"notes": [note("logan", "2026-06-01T09:00:00.000Z"),
+                        note("kyle", "2026-06-02T09:00:00.000Z"),
+                        note("kyle", "2026-06-10T09:00:00.000Z",
+                             "approved this merge request", system=True)]}]}
+wa.glab = fake_glab([mr(31, author="logan", updated="2026-06-10T09:00:00.000Z")], disc)
+wa.shutil.which = lambda n: "/usr/bin/" + n
+rows, covered, whole, reviews, drafts, approved = wa.ledger_you_owe("repo", "kyle")
+print("ongoing", [r["iid"] for r in reviews])
+print("approved", [r["iid"] for r in approved])
+print("covers", approved[0]["approved_covers"], "rounds", approved[0]["rounds"])'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"ongoing []"* ]]
+    [[ "$output" == *"approved [31]"* ]]
+    [[ "$output" == *"covers True rounds 1"* ]]
+}
+
+@test "a push after your approval revives the review and the turn is yours" {
+    run wa '
+disc = {32: [{"notes": [note("kyle", "2026-06-02T09:00:00.000Z"),
+                        note("kyle", "2026-06-10T09:00:00.000Z",
+                             "approved this merge request", system=True)]}]}
+wa.glab = fake_glab([mr(32, author="logan", updated="2026-06-20T09:00:00.000Z")], disc)
+wa.shutil.which = lambda n: "/usr/bin/" + n
+rows, covered, whole, reviews, drafts, approved = wa.ledger_you_owe("repo", "kyle")
+print("ongoing", [(r["iid"], r["whose_turn"]) for r in reviews])
+print("approved", [r["iid"] for r in approved])
+print("still_approved", bool(reviews[0]["approved_at"]), "proxy",
+      reviews[0]["their_last_is_proxy"])'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"ongoing [(32, 'mine')]"* ]]
+    [[ "$output" == *"approved []"* ]]
+    # The approval is still on the row -- it was overtaken, not withdrawn.
+    [[ "$output" == *"still_approved True proxy True"* ]]
+}
+
+@test "a word after your approval revives it just as a push does" {
+    run wa '
+disc = {33: [{"notes": [note("kyle", "2026-06-02T09:00:00.000Z"),
+                        note("kyle", "2026-06-10T09:00:00.000Z",
+                             "approved this merge request", system=True),
+                        note("logan", "2026-06-12T09:00:00.000Z")]}]}
+wa.glab = fake_glab([mr(33, author="logan", updated="2026-06-12T09:00:00.000Z")], disc)
+wa.shutil.which = lambda n: "/usr/bin/" + n
+rows, covered, whole, reviews, drafts, approved = wa.ledger_you_owe("repo", "kyle")
+print("ongoing", [(r["iid"], r["whose_turn"]) for r in reviews], "approved",
+      [r["iid"] for r in approved])'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"ongoing [(33, 'mine')] approved []"* ]]
+}
+
+@test "a review you never approved stays exactly where it was" {
+    run wa '
+disc = {34: [{"notes": [note("logan", "2026-06-01T09:00:00.000Z"),
+                        note("kyle", "2026-06-02T09:00:00.000Z")]}]}
+wa.glab = fake_glab([mr(34, author="logan", updated="2026-06-02T09:00:00.000Z")], disc)
+wa.shutil.which = lambda n: "/usr/bin/" + n
+rows, covered, whole, reviews, drafts, approved = wa.ledger_you_owe("repo", "kyle")
+print("ongoing", [(r["iid"], r["whose_turn"]) for r in reviews], "approved",
+      [r["iid"] for r in approved])
+print("approved_at", reviews[0]["approved_at"], "covers",
+      reviews[0]["approved_covers"])'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"ongoing [(34, 'theirs')] approved []"* ]]
+    [[ "$output" == *"approved_at 0 covers False"* ]]
+}
+
+@test "taking your approval back puts the review back on the list" {
+    run wa '
+disc = {35: [{"notes": [note("kyle", "2026-06-10T09:00:00.000Z",
+                             "approved this merge request", system=True),
+                        note("kyle", "2026-06-11T09:00:00.000Z",
+                             "unapproved this merge request", system=True)]}]}
+wa.glab = fake_glab([mr(35, author="logan", updated="2026-06-11T09:00:00.000Z")], disc)
+wa.shutil.which = lambda n: "/usr/bin/" + n
+rows, covered, whole, reviews, drafts, approved = wa.ledger_you_owe("repo", "kyle")
+print("ongoing", [r["iid"] for r in reviews], "approved", [r["iid"] for r in approved])
+print("approved_at", reviews[0]["approved_at"])'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"ongoing [35] approved []"* ]]
+    [[ "$output" == *"approved_at 0"* ]]
+}
+
+@test "somebody else approving is not you approving" {
+    run wa '
+disc = {36: [{"notes": [note("irene", "2026-06-10T09:00:00.000Z",
+                             "approved this merge request", system=True)]}]}
+wa.glab = fake_glab([mr(36, author="logan", updated="2026-06-10T09:00:00.000Z")], disc)
+wa.shutil.which = lambda n: "/usr/bin/" + n
+rows, covered, whole, reviews, drafts, approved = wa.ledger_you_owe("repo", "kyle")
+print("ongoing", [r["iid"] for r in reviews], "approved", [r["iid"] for r in approved])'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"ongoing [36] approved []"* ]]
+}
+
+@test "the approved list carries the same total order as the ongoing one" {
+    run wa '
+def approval(when):
+    return note("kyle", when, "approved this merge request", system=True)
+mrs = [mr(41, author="a", updated="2026-06-10T09:00:00.000Z"),
+       mr(42, author="b", updated="2026-06-10T09:00:00.000Z"),
+       mr(43, author="c", updated="2026-06-10T09:00:00.000Z")]
+disc = {41: [{"notes": [approval("2026-06-10T09:00:00.000Z")]}],
+        42: [{"notes": [approval("2026-06-10T09:00:00.000Z")]}],
+        43: [{"notes": [approval("2026-06-10T09:00:00.000Z")]}]}
+wa.glab = fake_glab(mrs, disc)
+wa.shutil.which = lambda n: "/usr/bin/" + n
+approved = wa.ledger_you_owe("repo", "kyle")[5]
+print("order", [r["iid"] for r in approved])'
+    [ "$status" -eq 0 ]
+    # Same age and same turn, so only the iid can separate them -- the tiebreak the
+    # brief cache depends on holds on this list too.
+    [[ "$output" == *"order [41, 42, 43]"* ]]
+}
+
+@test "approving does not inflate the count of requests the ledger stopped demanding" {
+    # covered is a claim about review REQUESTS the ledger dropped. A finished review is a
+    # different fact and adding it here would make both numbers unreadable.
+    run wa '
+disc = {44: [{"notes": [note("kyle", "2026-06-02T09:00:00.000Z"),
+                        note("kyle", "2026-06-10T09:00:00.000Z",
+                             "approved this merge request", system=True)]}]}
+wa.glab = fake_glab([mr(44, author="logan", updated="2026-06-10T09:00:00.000Z")], disc)
+wa.shutil.which = lambda n: "/usr/bin/" + n
+rows, covered, whole, reviews, drafts, approved = wa.ledger_you_owe("repo", "kyle")
+print("covered", covered, "approved", len(approved), "ledger_rows", len(rows))'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"covered 1 approved 1 ledger_rows 0"* ]]
+}
+
+@test "the ledger carries both lists and counts the finished one" {
+    run wa '
+disc = {45: [{"notes": [note("kyle", "2026-06-10T09:00:00.000Z",
+                             "approved this merge request", system=True)]}],
+        46: [{"notes": [note("logan", "2026-06-01T09:00:00.000Z")]}]}
+mrs = [mr(45, author="logan", updated="2026-06-10T09:00:00.000Z"),
+       mr(46, author="logan", updated="2026-06-01T09:00:00.000Z")]
+wa.glab = fake_glab(mrs, disc)
+wa.shutil.which = lambda n: "/usr/bin/" + n
+wa.ledger_they_owe = lambda r, m, me: ([], True)
+wa.ledger_jira_stalled = lambda: ([], True)
+wa.ledger_slack = lambda: ([], [], True, True)
+wa.ledger_meetings = lambda: ([], True)
+led = wa.build_ledger("repo", [])
+print("ongoing", [r["iid"] for r in led["reviews"]])
+print("approved", [r["iid"] for r in led["reviews_approved"]],
+      "n", led["reviews_approved_n"])
+print("known", led["reviews_known"])'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"ongoing [46]"* ]]
+    [[ "$output" == *"approved [45] n 1"* ]]
+    [[ "$output" == *"known True"* ]]
+}
+
+@test "an acknowledgement survives the row being approved away" {
+    # The prune deletes a dismissal whose row no longer exists. A row that merely changed
+    # lists still exists, and pruning it would un-acknowledge the revived row later.
+    run wa '
+r = {"iid": 47, "ref": "!47", "fp": "deadbeefdeadbeef", "url": "u", "author": "logan",
+     "title": "t", "whose_turn": "theirs", "rounds": 1, "approved_covers": True}
+led = {"they_owe": [], "you_owe": [], "reviews": [], "reviews_approved": [r],
+       "complete": True}
+import json, pathlib
+store = pathlib.Path(wa.DISMISSED)
+store.parent.mkdir(parents=True, exist_ok=True)
+store.write_text(json.dumps({"deadbeefdeadbeef": {"at": "2026-06-01", "ref": "!47"}}))
+kept = wa.apply_dismissals(led, [], None, prune=True)
+print("kept", sorted(kept), "on_disk", sorted(json.loads(store.read_text())))
+print("marked", led["reviews_approved"][0].get("dismissed"))'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"kept ['deadbeefdeadbeef'] on_disk ['deadbeefdeadbeef']"* ]]
+    [[ "$output" == *"marked True"* ]]
+}
+
+# ── R7: what the run-over-run diff says about an approval ─────────────────────
+
+@test "approving reads as movement off the list and never as the merge request vanishing" {
+    run wa '
+def snap(live, ap, gen):
+    def row(iid, turn):
+        return {"iid": iid, "ref": "!%d" % iid, "url": "u", "author": "logan",
+                "title": "t", "whose_turn": turn, "rounds": 1, "my_last": 1,
+                "their_last": 2, "arc": None}
+    return wa.snapshot_of([], None, {"mrs": True, "ledger": True, "issues": True,
+                                     "reviews": True}, "ul", gen,
+                          [row(i, "mine") for i in live], [row(i, "theirs") for i in ap])
+a = snap([50], [], "2026-08-01T09:00:00+0000")
+b = snap([], [50], "2026-08-02T09:00:00+0000")
+c = snap([50], [], "2026-08-03T09:00:00+0000")
+d = snap([], [], "2026-08-04T09:00:00+0000")
+print("approved", [(x["kind"], x["ref"]) for x in wa.diff_runs(a, b, [], None)["reviews"]])
+print("revived", [x["kind"] for x in wa.diff_runs(b, c, [], None)["reviews"]])
+print("still_approved", [x["kind"] for x in wa.diff_runs(b, b, [], None)["reviews"]])
+print("gone", [x["kind"] for x in wa.diff_runs(b, d, [], None)["reviews"]])'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"approved [('approved', '!50')]"* ]]
+    [[ "$output" == *"revived ['revived']"* ]]
+    [[ "$output" == *"still_approved []"* ]]
+    [[ "$output" == *"gone ['gone']"* ]]
+}
+
+@test "a merge request first seen already approved is not news" {
+    # Nothing moved between the two runs; this one simply looked and found finished work.
+    # Announcing it would put a line in the diff for every review approved before the
+    # feature that reads approvals existed.
+    run wa '
+def snap(ap, gen):
+    rows = [{"iid": i, "ref": "!%d" % i, "url": "u", "author": "logan", "title": "t",
+             "whose_turn": "theirs", "rounds": 1, "my_last": 1, "their_last": 2,
+             "arc": None} for i in ap]
+    return wa.snapshot_of([], None, {"mrs": True, "ledger": True, "issues": True,
+                                     "reviews": True}, "ul", gen, [], rows)
+a = snap([], "2026-08-01T09:00:00+0000")
+b = snap([51], "2026-08-02T09:00:00+0000")
+print("changes", wa.diff_runs(a, b, [], None)["reviews"])'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"changes []"* ]]
 }
