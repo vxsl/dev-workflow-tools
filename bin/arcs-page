@@ -159,6 +159,11 @@ CSS = """
   --hairline:#E3DCD1;--accent:#3D48B8;
   --hot:#B3361F;--warm:#A36A0E;--calm:#3E7050;--parked:#7A7368;
   --hot-wash:#FAEBE6;--warm-wash:#FAF2E1;--calm-wash:#EBF3EC;
+  /* The fourth wash, for a row that has been dealt with rather than corrected. It reads
+     as neutral against the surface on purpose: acknowledging is not a verdict on the
+     work, and colouring it hot or calm would say the tool was wrong or right when all
+     that happened is that somebody has seen it. */
+  --parked-wash:#F2EFE9;
   --quote:#F1ECE2;
   --display:"Fraunces",Charter,"Bitstream Charter",Georgia,serif;
   --serif:var(--display);
@@ -171,6 +176,7 @@ CSS = """
   --hairline:#302B25;--accent:#A5B0FF;
   --hot:#F27D5C;--warm:#E8AC4E;--calm:#86C79A;--parked:#8A8275;
   --hot-wash:#2A1B15;--warm-wash:#291F10;--calm-wash:#18241A;
+  --parked-wash:#232019;
   --quote:#221E18;}}
 :root[data-theme="dark"]{
   --ground:#171511;--surface:#1F1C17;--surface-2:#282420;
@@ -178,6 +184,7 @@ CSS = """
   --hairline:#302B25;--accent:#A5B0FF;
   --hot:#F27D5C;--warm:#E8AC4E;--calm:#86C79A;--parked:#8A8275;
   --hot-wash:#2A1B15;--warm-wash:#291F10;--calm-wash:#18241A;
+  --parked-wash:#232019;
   --quote:#221E18;}
 
 *,*::before,*::after{box-sizing:border-box}
@@ -689,6 +696,12 @@ a:hover{text-decoration-color:currentColor}
   line-height:1.3;border:1px solid var(--hairline);background:transparent;
   color:var(--ink-faint);border-radius:2px;cursor:pointer;padding:.05rem .32rem}
 .dis:hover{border-color:var(--parked);color:var(--ink-soft)}
+/* The ✕ column on a table. A control that moves from row to row cannot be aimed at, so it
+   gets a column of its own at a fixed width rather than trailing the last cell's text --
+   the same rail the cliff list gives it, expressed as a table column. */
+.scroll td:last-child:has(>.dis),.scroll th:last-child{width:1.6rem;text-align:right;
+  padding-right:.55rem}
+.scroll [data-dismissed="1"] .dis{border-color:var(--parked);color:var(--ink-soft)}
 .ledger li .dis,.needs .row .dis{margin-left:auto}
 [data-fp][data-dismissed="1"]{display:none}
 .ledger .side[data-show="1"] li[data-dismissed="1"]{display:flex;opacity:.55}
@@ -719,6 +732,35 @@ td .dis{vertical-align:middle}
   font-weight:700}
 .cur .yn button.on[data-a="pry"]{border-color:var(--hot);color:var(--hot);
   font-weight:700}
+.cur .q[data-answer="intended"]{background:var(--calm-wash)}
+.cur .q[data-answer="residue"]{background:var(--hot-wash)}
+/* The no-ticket question's three answers. `needs one` is the derivation being right and
+   wears the same calm the other two kinds' `yes` does; `fine` and `noise` are both
+   acknowledgements rather than corrections, so neither takes the hot hue that means "the
+   tool got this wrong" -- an acknowledged row is the tool having been right and dealt
+   with. */
+.cur .q[data-answer="ticket"]{background:var(--calm-wash)}
+.cur .q[data-answer="fine"],.cur .q[data-answer="noise"]{background:var(--parked-wash)}
+.cur .yn button.on[data-a="intended"],.cur .yn button.on[data-a="ticket"]{
+  border-color:var(--calm);color:var(--calm);font-weight:700}
+.cur .yn button.on[data-a="residue"]{border-color:var(--hot);color:var(--hot);
+  font-weight:700}
+.cur .yn button.on[data-a="fine"],.cur .yn button.on[data-a="noise"]{
+  border-color:var(--parked);color:var(--ink-soft);font-weight:700}
+/* An answered question shrinks rather than vanishing, which is what "reveals the next"
+   means here: the queue's order is fixed and nothing is reordered or removed, the rows
+   already given an answer simply stop taking a screenful, and the next unanswered one is
+   where the eye already was. Reversible in place -- clicking the answer again restores
+   the row -- so nothing about answering is a commitment made at speed. */
+/* Answering a no-ticket question IS acknowledging the row it is about, and the two share
+   one fingerprint on purpose -- so the generic rule that hides an acknowledged `[data-fp]`
+   would hide the question itself, leaving no way to take the answer back. The row it
+   acknowledges is elsewhere on the page and fades there; this one shrinks and stays. */
+.cur .q[data-dismissed="1"]{display:grid}
+.cur .q.done{padding:.3rem .8rem;opacity:.5}
+.cur .q.done .ev{font-size:.75rem;white-space:nowrap;overflow:hidden;
+  text-overflow:ellipsis}
+.cur .q.done .ev br,.cur .q.done .ev code{display:none}
 .cur .q b{font-family:var(--mono);font-size:.8rem;font-weight:600}
 .cur .q .ev{color:var(--ink-soft);font-size:.8rem}
 .cur .q .ev code{font-family:var(--mono);font-size:.74rem;color:var(--ink-faint)}
@@ -1297,14 +1339,47 @@ INTERACT_JS = r"""
       saveInt=document.getElementById('saveint'),
       saveRes=document.getElementById('saveres');
 
+  // --- the eval set --------------------------------------------------------
+  // Every answer given here, in the order it was given, mirroring what `--curate` appends
+  // to curation-labels.jsonl. The stores say what is currently believed and this says what
+  // was answered and when, which is the only shape an eval set can take: a question
+  // answered and then unanswered leaves a store looking exactly like one nobody touched,
+  // and "nobody touched it" is not a judgement anything can be scored against.
+  //
+  // Only the no-ticket kind is recorded here. The other two write stores that carry their
+  // own answer and their own timestamp, and work-arcs catches the eval set up from those
+  // (see log_from_stores) -- a second record of the same answer would be counted twice.
+  //
+  // Bounded, because this rides in the published page and the artifact has a size limit:
+  // the newest 500 answers, which at five questions a build is a hundred builds. The
+  // pipeline has appended every one it has already seen to a file with no limit at all.
+  var AKEY='work-arcs:answers:v1', astore=[], adirty=false;
+  try{ astore=JSON.parse(localStorage.getItem(AKEY)||'[]')||[]; }catch(e){ astore=[]; }
+  if(!Object.prototype.toString.call(astore).match(/Array/)) astore=[];
+  function awrite(){
+    try{ astore=astore.slice(-500); localStorage.setItem(AKEY,JSON.stringify(astore)); }
+    catch(e){}
+  }
+  function logAnswer(row){
+    row.at=Math.floor(Date.now()/1000); row.via='page';
+    astore.push(row); adirty=true; awrite();
+  }
+
   // --- acknowledgements ----------------------------------------------------
+  // An entry is `1` for a plain ✕ and an object for one that carries a judgement -- the
+  // no-ticket question's `fine` and `noise` acknowledge the same row the fold's ✕ does and
+  // are not the same answer, and the note is the only place that difference survives. Both
+  // shapes are truthy and every test here is `in dstore`, so the older shape keeps working
+  // untouched; only what is saved reads the value.
   var DKEY='work-arcs:dismissed:v1', dstore=read(DKEY), ddirty=false;
   function dwrite(){ try{ localStorage.setItem(DKEY,JSON.stringify(dstore)); }catch(e){} }
+  function dnote(fp){ var v=dstore[fp]; return (v&&v.note)||''; }
   var rows=[].slice.call(document.querySelectorAll('[data-fp]')), present={};
   rows.forEach(function(el){
     if(!el.dataset.fp) return;
     if(!(el.dataset.fp in present))
-      present[el.dataset.fp]={ref:(el.querySelector('.ref')||{}).textContent||''};
+      present[el.dataset.fp]={ref:el.dataset.ref
+        ||(el.querySelector('.ref')||{}).textContent||''};
     if(el.dataset.dismissed==='1' && !(el.dataset.fp in dstore))
       dstore[el.dataset.fp]=1;                    // adopt what the file already said
   });
@@ -1336,7 +1411,10 @@ INTERACT_JS = r"""
   // complaints.
   var CKEY='work-arcs:confirmed:v1', cstore=read(CKEY), cdirty=false;
   function cwrite(){ try{ localStorage.setItem(CKEY,JSON.stringify(cstore)); }catch(e){} }
-  var qs=[].slice.call(document.querySelectorAll('.cur .q')), qby={};
+  var uqs=[].slice.call(
+    document.querySelectorAll('.cur .q[data-kind="unticketed"]'));
+  var qs=[].slice.call(
+    document.querySelectorAll('.cur .q[data-kind="membership"]')), qby={};
   qs.forEach(function(el){ qby[el.dataset.branch]=el; });
   function qpeers(el){ try{ return JSON.parse(el.dataset.peers||'[]')||[]; }
                        catch(e){ return []; } }
@@ -1566,9 +1644,14 @@ INTERACT_JS = r"""
       // A group whose heading carries its own count keeps the two honest: a section
       // reading 6 above a list showing 2 is the sort of small lie that costs a page its
       // credit for everything else on it.
-      var cf=g.dataset.countfor&&document.querySelector(g.dataset.countfor);
+      // Plus whatever the section states it did not render. A truncated list's visible
+      // rows are not its size, and a header that shrank to the truncation the first time
+      // anything was acknowledged would be wrong about the one number a closed fold is
+      // trusted for. Absent means nought, which is every list that shows all of itself.
+      var cf=g.dataset.countfor&&document.querySelector(g.dataset.countfor),
+          plus=parseInt(g.dataset.countplus||'0',10)||0;
       if(cf) cf.textContent=g.querySelectorAll(
-        '[data-fp]:not([data-filed-out="1"])').length-hid;
+        '[data-fp]:not([data-filed-out="1"])').length-hid+plus;
       if(!t){ t=document.createElement('button'); t.type='button';
         t.className='showdis'; g.__tog=t; g.insertAdjacentElement('afterend',t);
         t.addEventListener('click',function(){
@@ -1599,6 +1682,41 @@ INTERACT_JS = r"""
       row.querySelectorAll('.yn button').forEach(function(btn){
         btn.classList.toggle('on', btn.dataset.a===row.dataset.answer); });
     });
+    // The no-ticket rows read their answer off the acknowledgement store, because two of
+    // the three answers ARE an acknowledgement of the row in the fold below -- there is no
+    // second state to keep in step, which is the point. `needs one` writes nothing there
+    // and so is remembered only for this page's life: it is an answer about what should
+    // happen next, and nothing has happened yet.
+    uqs.forEach(function(row){
+      var fp=row.dataset.fp, note=dnote(fp);
+      if(fp in dstore) row.dataset.answer=note||'fine';
+      else if(row.dataset.answer!=='ticket') row.dataset.answer='';
+      row.querySelectorAll('.yn button').forEach(function(btn){
+        btn.classList.toggle('on', btn.dataset.a===row.dataset.answer); });
+    });
+    // An answered question shrinks and the next one comes up under it -- the queue is
+    // server-rendered and its order is fixed, so stepping through it is presentation and
+    // never judgement. Nothing is reordered, nothing is removed, and clicking the answer
+    // again brings the row back to full size.
+    var unanswered=0;
+    document.querySelectorAll('.cur .q').forEach(function(row){
+      var done=!!row.dataset.answer;
+      row.classList.toggle('done', done);
+      if(!done) unanswered++;
+    });
+    // The queue's own size, which the rail and the strip mirror. It is the count of what
+    // is still worth a person's attention, so it falls as questions are answered and the
+    // chip empties as the queue does.
+    document.querySelectorAll('[data-count="curation"]').forEach(function(el){
+      el.textContent=unanswered; });
+    // At zero the door and the stop have nothing to point at. Hidden rather than removed,
+    // because taking an answer back is one click and the chip has to be able to come back
+    // with it -- and hiding is what the rest of this page does with a section that has
+    // emptied since it was built.
+    document.querySelectorAll('.cockpit .door[data-door="curation"]').forEach(
+      function(el){ el.hidden=(unanswered===0); });
+    document.querySelectorAll('.minimap a[href="#curation"]').forEach(
+      function(el){ el.hidden=(unanswered===0); });
     dets.forEach(function(el){
       var on=el.dataset.branch in tstore;
       el.classList.toggle('on', on);
@@ -1636,6 +1754,30 @@ INTERACT_JS = r"""
         fdirty=true; fwrite(); apply();
       }
       return; }
+    var uy=t.closest?t.closest('.cur .q[data-kind="unticketed"] .yn button'):null;
+    if(uy){ ev.preventDefault();
+      var urow=uy.closest('.q'), ufp=urow.dataset.fp, uwant=uy.dataset.a,
+          uwas=urow.dataset.answer;
+      // Three answers over one store. `ticket` writes nothing: wanting a ticket leaves the
+      // row exactly where it was, still counted, which is what wanting one looks like --
+      // it is remembered only for the page's own life, so the section still says it has a
+      // question here until the pipeline has seen the answer. `fine` and `noise` write the
+      // same acknowledgement the ✕ on the fold's row writes, under the same fingerprint,
+      // so answering here empties the row out of the fold and its count at once.
+      if(ufp in dstore){ delete dstore[ufp]; ddirty=true; }
+      urow.dataset.answer='';
+      if(uwas!==uwant){
+        urow.dataset.answer=uwant;
+        if(uwant!=='ticket'){
+          dstore[ufp]={note:uwant, at:Math.floor(Date.now()/1000)}; ddirty=true; }
+      }
+      // Recorded whichever way it went, because an eval set of corrections alone would
+      // score a detector that called everything unfiled as perfect. Taking an answer back
+      // records the taking back, so the log is what happened rather than what is left.
+      logAnswer({kind:'unticketed', answer:urow.dataset.answer||'unanswered',
+                 arc:urow.dataset.arc, arc_id:urow.dataset.arcid, fp:ufp,
+                 fingerprint:urow.dataset.fingerprint});
+      dwrite(); apply(); return; }
     var iy=t.closest?t.closest('.cur .q[data-kind="residue"] .yn button'):null;
     if(iy){ ev.preventDefault();
       var irow=iy.closest('.q'), ik=irow.dataset.arcid, iwant=iy.dataset.a;
@@ -1695,7 +1837,8 @@ INTERACT_JS = r"""
   if(saveDis) saveDis.addEventListener('click',function(){
     var out={}, now=Math.floor(Date.now()/1000);
     Object.keys(dstore).forEach(function(k){
-      out[k]={ref:(present[k]||{}).ref||'', at:now, note:''}; });
+      var v=dstore[k];
+      out[k]={ref:(present[k]||{}).ref||'', at:(v&&v.at)||now, note:dnote(k)}; });
     saveFile('dismissed.json', JSON.stringify(out,null,1), msg,
              function(){ ddirty=false; setBar(); });
   });
@@ -1845,6 +1988,17 @@ def standup_notes(data):
     beats = [b for b in (data.get("standup") or {}).get("beats") or []
              if b.get("items")]
     return beats, sum(len(b["items"]) for b in beats)
+
+
+def unacked(rows):
+    """The rows of a gap fold a reader has not already dealt with.
+
+    `undismissed`'s twin for the two folds whose rows are the arc and the issue rather
+    than a wrapper around them -- see reconcile for why the mark needs its own word there.
+    Same law: a count that includes acknowledged rows disagrees with the table it points
+    at, and a ✕ that changes no figure anywhere does nothing.
+    """
+    return [r for r in rows or [] if not r.get("gap_dismissed")]
 
 
 def undismissed(entries):
@@ -2193,7 +2347,13 @@ def derive_lede(data, focus_days):
             f'Jira believes <em>{esc(k.get("key",""))}</em> is '
             f'&ldquo;{esc(k.get("status",""))}&rdquo;, but {real}{tail}.')
 
-    unt = gap.get("unticketed_work") or []
+    # Acknowledged rows out of the count as well as out of the choice, the same rule the
+    # mismatch clause above follows. This clause is the one Kyle pointed at -- some of
+    # these rows are work that is genuinely fine unfiled -- and an opening sentence that
+    # goes on counting a row he has already dealt with is the page arguing with its own
+    # ✕. `gap_dismissed` and not `dismissed`: the row here IS the workstream, and the
+    # word has to say which of the two was acknowledged.
+    unt = [a for a in gap.get("unticketed_work") or [] if not a.get("gap_dismissed")]
     if unt:
         # Unioned rather than summed. Two arcs worked on the same Tuesday are one Tuesday
         # of work, and adding their day counts would report a fortnight of hidden work out
@@ -3165,6 +3325,20 @@ def render(data, lede, focus_days, limit, cost=None):
                                + (f" — {buckets[0][2][0].get('state')}"
                                   if buckets[0][2][0].get("state") else ""))
                            if buckets else "")})
+    # The queue's own door, last on the strip and always last -- nothing here is ordered by
+    # what the day looks like, and this is not a fourth thing the page is opened FOR. It is
+    # the one that makes the other three worth trusting: the strip is the first thing read
+    # every morning, and a queue that is never seen is a queue nobody answers. Absent
+    # entirely at zero, which is the only state that must never be announced -- a chip
+    # reading "tidy · 0" is a chore invented for a person who has none.
+    if data.get("curation"):
+        n = len(data["curation"])
+        first = data["curation"][0]
+        doors.append({"id": "curation", "href": "curation", "kick": "Tidy",
+                      "fig": (mirrored(n, '[data-count="curation"]') + " question"
+                              + ("" if n == 1 else "s")),
+                      "lead": esc(str(first.get("arc")
+                                      or first.get("branch") or "?"))})
     cockpit(a, doors)
 
     stops = [x for x in (
@@ -3189,9 +3363,27 @@ def render(data, lede, focus_days, limit, cost=None):
                                    + len(by_rung.get("abandoned", []))))
         if by_rung.get("landed") or by_rung.get("abandoned") else None,
         ("jira", "Jira", str(len(gap.get("status_mismatch") or []))) if mism else None,
-        ("unticketed", "No ticket", str(len(gap.get("unticketed_work") or [])))
+        # A mirror rather than a second count, now that these two folds have a ✕: the
+        # section is the author of its own size and this copies what it printed, so
+        # acknowledging a row three screens down cannot leave the rail claiming the
+        # figure the table stopped showing.
+        ("unticketed", "No ticket",
+         mirrored(len(unacked(gap.get("unticketed_work"))),
+                  '[data-count="unticketed"]', "q"))
         if gap.get("unticketed_work") else None,
-        ("curation", "Unsure", str(len(data.get("curation") or [])))
+        ("noworkfor", "Empty tickets",
+         mirrored(len(unacked(gap.get("tickets_without_work"))),
+                  '[data-count="noworkfor"]', "q"))
+        if gap.get("tickets_without_work") else None,
+        # The queue, given a fixed place in the rail rather than left at the bottom of the
+        # page. Kyle's verdict was that continually cleaning up noise is one of the biggest
+        # levers there is, and the one guided flow on this page lived as the second-to-last
+        # fold -- which is a place you reach by having already scrolled past everything the
+        # cleaning is for. It moves nothing and reorders nothing: it is a stop in the same
+        # list as every other section, in the same position every morning, and it is absent
+        # entirely at zero, which is the fold's own law applied to a link at it.
+        ("curation", "Tidy",
+         mirrored(len(data.get("curation") or []), '[data-count="curation"]', "q"))
         if data.get("curation") else None,
         ("cost", "Cost", "") if cost else None,
     ) if x]
@@ -4388,18 +4580,47 @@ def render(data, lede, focus_days, limit, cost=None):
             # Folded. The count is the whole claim -- work Jira cannot see is invisible to
             # Trellis, capacity and every rollup whether it is one workstream or eight --
             # and the header carries it along with one of them by name.
-            fold(a, "Real work with no ticket", f"{len(unt)} unfiled",
-                 esc("including " + one_line(unt[0])), sid="unticketed")
+            #
+            # The figure is the unacknowledged count and the lead is the first
+            # unacknowledged row, because a closed fold reading 8 over a table where six
+            # are faded is the one lie a collapse must never tell. `unt` itself stays the
+            # whole list: de-emphasis is not hiding, and every acknowledged row is still
+            # rendered, still counted behind the disclosure, still one click from coming
+            # back.
+            live_unt = unacked(unt)
+            fold(a, "Real work with no ticket",
+                 f'<span class="n" data-count="unticketed">{len(live_unt)}</span> unfiled',
+                 esc("including " + one_line((live_unt or unt)[0])), sid="unticketed")
             a('<p class="note">Invisible to Jira, and therefore to Trellis — absent '
               "from capacity, burndown and every initiative rollup. Each has a one-step "
-              "command to file it.</p>")
-            a('<div class="scroll"><table><thead><tr>'
+              "command to file it. <strong>&#x2715; acknowledges a row</strong> — it is "
+              "keyed to the work as it stands, so another day&rsquo;s commits bring it "
+              "back by itself, and filing a ticket removes it outright.</p>")
+            # `countplus` is the tail this table does not render. The recount in the
+            # client counts the rows it can see, and on a truncated list that is not the
+            # section's size -- the twelve shown plus "and 6 more" is eighteen, and a
+            # header that dropped to twelve the first time anything was acknowledged
+            # would be wrong about a figure the fold is trusted for.
+            # `show="1"`: an acknowledged row here fades in place instead of
+            # disappearing behind the disclosure. Everywhere else on this page a ✕ is
+            # a thing you do once to a row you have dealt with; here it is the gesture
+            # of the whole section -- "i should find it very comfortable to continually
+            # clean up noise" -- and a row that vanishes the instant it is clicked
+            # cannot be un-clicked without first finding a toggle to bring it back. The
+            # toggle still hides them all, and the count still excludes them.
+            a('<div class="scroll" data-disgroup data-show="1" '
+              'data-countfor="[data-count=unticketed]" '
+              f'data-countplus="{max(0, len(unt) - UNTICKETED_ROWS)}"><table><thead><tr>'
               "<th>What it is</th><th>Branches</th><th>Sessions</th><th>Unpushed</th>"
-              "<th>File it</th></tr></thead><tbody>")
+              "<th>File it</th><th></th></tr></thead><tbody>")
             for x in unt[:UNTICKETED_ROWS]:
                 cc = x.get("counts", {})
                 nm = (x.get("brief") or {}).get("name") or x.get("label", "?")
-                a(f'<tr><td class="d">{esc(nm)}</td>'
+                a(f'<tr data-fp="{esc(x.get("gap_fp",""))}"'
+                  + (f' id="un-{esc(x["gap_fp"])}"' if x.get("gap_fp") else "")
+                  + f' data-ref="{esc(x.get("label",""))}"'
+                  + f' data-dismissed="{1 if x.get("gap_dismissed") else 0}">'
+                  + f'<td class="d">{esc(nm)}</td>'
                   f'<td class="d">{cc.get("branches",0)}</td>'
                   f'<td class="d">{cc.get("sessions",0)}</td>'
                   f'<td class="n">{x.get("unpushed_live",0) or ""}</td>'
@@ -4417,13 +4638,16 @@ def render(data, lede, focus_days, limit, cost=None):
                   # that name can be improved is the prompt that derives it.
                   f"<td><code>work-arcs --jira-ify "
                   f"'{esc(x.get('label','?'))}'</code></td>"
+                  '<td><button class="dis" type="button" aria-label="acknowledge — '
+                  'returns on its own when the work moves" title="acknowledge — returns '
+                  'on its own when the work moves">&#x2715;</button></td>'
                   "</tr>")
             # Said out loud, because the header above now states how many there are and a
             # table quietly holding fewer than its own heading claims is the one thing a
             # collapsed section must never do -- the count is the whole contract the fold
             # is trusted on.
             if len(unt) > UNTICKETED_ROWS:
-                a(f'<tr><td class="d" colspan="5">&hellip;and '
+                a(f'<tr><td class="d" colspan="6">&hellip;and '
                   f"{len(unt) - UNTICKETED_ROWS} more, in the order work-arcs found "
                   "them. Each has a row of its own above.</td></tr>")
             a("</tbody></table></div></details>")
@@ -4433,28 +4657,54 @@ def render(data, lede, focus_days, limit, cost=None):
             # Folded. The one section here nobody has ever had to act on in a hurry: a
             # ticket with no work behind it is either not started or already done, and
             # neither is news at 10:15.
-            fold(a, "Tickets with nothing behind them", f"{len(empty)} empty",
-                 esc("including " + str(empty[0].get("key", "?")) + " "
-                     + str(empty[0].get("status", ""))), sid="noworkfor")
+            #
+            # Which is exactly why it needed a ✕ more than the urgent folds did. Nothing
+            # here ever gets acted on in the moment, so without a way to say "I know about
+            # this one" the list is a standing eighteen rows that reads the same every
+            # morning until somebody closes a ticket in Jira -- and a section that never
+            # changes is a section the eye learns to skip.
+            live_empty = unacked(empty)
+            fold(a, "Tickets with nothing behind them",
+                 f'<span class="n" data-count="noworkfor">{len(live_empty)}</span> empty',
+                 esc("including " + str((live_empty or empty)[0].get("key", "?")) + " "
+                     + str((live_empty or empty)[0].get("status", ""))), sid="noworkfor")
             a('<p class="note">Assigned and open, with no branch or session against '
               "them. Either they have not started, or they are done and nobody closed "
-              "them.</p>")
-            a('<div class="scroll"><table><thead><tr>'
-              "<th>Ticket</th><th>Status</th><th>Summary</th><th>Initiative</th>"
+              "them. <strong>&#x2715; acknowledges a row</strong> — it is keyed to the "
+              "status, so a move in Jira brings it back, and a branch or session against "
+              "the key removes it outright.</p>")
+            # `show="1"`: an acknowledged row here fades in place instead of
+            # disappearing behind the disclosure. Everywhere else on this page a ✕ is
+            # a thing you do once to a row you have dealt with; here it is the gesture
+            # of the whole section -- "i should find it very comfortable to continually
+            # clean up noise" -- and a row that vanishes the instant it is clicked
+            # cannot be un-clicked without first finding a toggle to bring it back. The
+            # toggle still hides them all, and the count still excludes them.
+            a('<div class="scroll" data-disgroup data-show="1" '
+              'data-countfor="[data-count=noworkfor]" '
+              f'data-countplus="{max(0, len(empty) - NOWORK_ROWS)}"><table><thead><tr>'
+              "<th>Ticket</th><th>Status</th><th>Summary</th><th>Initiative</th><th></th>"
               "</tr></thead><tbody>")
             for i in empty[:NOWORK_ROWS]:
                 init = ", ".join(i.get("initiatives") or []) or "—"
-                a('<tr><td class="k">'
+                a(f'<tr data-fp="{esc(i.get("gap_fp",""))}"'
+                  + (f' id="nw-{esc(i["gap_fp"])}"' if i.get("gap_fp") else "")
+                  + f' data-ref="{esc(i.get("key",""))}"'
+                  + f' data-dismissed="{1 if i.get("gap_dismissed") else 0}">'
+                  + '<td class="k">'
                   + link(i.get("url", ""), esc(i.get("key", "")))
                   + f'</td><td class="d">{esc(i.get("status",""))}</td>'
                   f'<td class="d">{esc(i.get("summary",""))}</td>'
-                  f'<td class="d">{esc(init)}</td></tr>')
+                  f'<td class="d">{esc(init)}</td>'
+                  '<td><button class="dis" type="button" aria-label="acknowledge — '
+                  'returns on its own if the status moves" title="acknowledge — returns '
+                  'on its own if the status moves">&#x2715;</button></td></tr>')
             # The cut this table has always made, said out loud now that the header states
             # the full figure. It was silent while nothing above it made a claim about the
             # size; a header reading 18 over fourteen rows is a lie about the one number a
             # closed section is trusted for.
             if len(empty) > NOWORK_ROWS:
-                a(f'<tr><td class="d" colspan="4">&hellip;and '
+                a(f'<tr><td class="d" colspan="5">&hellip;and '
                   f"{len(empty) - NOWORK_ROWS} more, as Jira listed them.</td></tr>")
             a("</tbody></table></div></details>")
 
@@ -4478,11 +4728,12 @@ def render(data, lede, focus_days, limit, cost=None):
         # still says the queue exists -- and the command line asks the same ones.
         first = curation[0]
         fold(a, "Did the derivation get this right?",
-             f"{len(curation)} unsure",
-             esc("first: " + str(first.get("arc") if first.get("kind") == "residue"
+             f'<span class="n" data-count="curation">{len(curation)}</span> unanswered',
+             esc("first: " + str(first.get("arc")
+                                 if first.get("kind") in ("residue", "unticketed")
                                  else first.get("branch") or first.get("arc") or "?")),
-             sid="curation")
-        a('<p class="note">Where the tool is least sure of itself, in the two ways it '
+             sid="curation", attrs=" data-cur")
+        a('<p class="note">Where the tool is least sure of itself, in the three ways it '
           "can be. <b>Grouping</b>: branches are grouped by the files they touch, and "
           "two tickets editing the same module look identical by files however the "
           "weights are set — <b>yes</b> pins the membership and stops it being asked "
@@ -4490,11 +4741,15 @@ def render(data, lede, focus_days, limit, cost=None):
           "back to what its own name declares. <b>Intent</b>: a count of unpublished "
           "work assumes the work was meant to land, and much of what accumulates "
           "locally never was — <b>yes</b> keeps it counted; <b>no</b> leaves every "
-          "commit exactly where it is and stops calling it debt. Nothing is deleted and "
-          "nothing is hidden either way, and a commit on the work undoes an intent "
-          "answer by itself. Leaving a row alone records nothing and asks again next "
-          "time. The command line asks the same questions one keystroke at a time: "
-          "<code>work-arcs --curate</code>.</p>")
+          "commit exactly where it is and stops calling it debt. <b>No ticket</b>: work "
+          "Jira has never heard of is invisible to every rollup, but not all of it wants "
+          "paperwork — <b>needs one</b> writes nothing and leaves the row where it is, "
+          "<b>fine</b> and <b>noise</b> both acknowledge the row in "
+          '<a href="#unticketed">the fold it came from</a> and differ only in what they '
+          "record. Nothing is deleted and nothing is hidden by any answer, and a commit "
+          "on the work undoes an intent or a no-ticket answer by itself. Leaving a row "
+          "alone records nothing and asks again next time. The command line asks the "
+          "same questions one keystroke at a time: <code>work-arcs --curate</code>.</p>")
         a('<div class="cur">')
         for q in curation:
             if q.get("kind") == "residue":
@@ -4520,6 +4775,44 @@ def render(data, lede, focus_days, limit, cost=None):
                   + f'{q.get("gap_days", "?")}-day rhythm.'
                   + "<br>No merge request exists and none ever did, no sprint carries "
                     "it, and no promise names it.</span>")
+                a("</div>")
+                continue
+            if q.get("kind") == "unticketed":
+                # Keyed on the fold's own row fingerprint, not a second one of its own:
+                # answering `fine` or `noise` here IS the ✕ down there, so the two must
+                # carry one identity or the page could show a row acknowledged in one
+                # place and still being asked about in the other.
+                a(f'<div class="q" data-kind="unticketed" '
+                  f'data-arcid="{esc(q["arc_id"])}" data-arc="{esc(q["arc"])}" '
+                  f'data-fp="{esc(q["fp"])}" '
+                  f'data-fingerprint="{esc(q.get("fingerprint") or "")}" '
+                  f'data-ref="{esc(q["arc"])}" data-answer="">')
+                a('<span class="yn"><button type="button" data-a="ticket" '
+                  'title="real work that wants a ticket — nothing is written and the row '
+                  'stays">needs one</button>'
+                  '<button type="button" data-a="fine" title="real work, no paperwork '
+                  'wanted — the row is acknowledged">fine</button>'
+                  '<button type="button" data-a="noise" title="not work worth a row — '
+                  'acknowledged, and recorded as a different judgement from fine">'
+                  "noise</button></span>")
+                nbr = len(q.get("branches") or [])
+                a('<span class="ev"><b>' + esc(q["arc"]) + "</b> — real work that needs "
+                  "a ticket? <br>" + esc(q.get("scale") or "") + " across "
+                  + str(nbr) + " branch" + ("" if nbr == 1 else "es")
+                  + f', last touched {q.get("age_days", "?")} days ago, and nothing in '
+                    "Jira names any of it."
+                  # The one-step command, printed with the question rather than left for
+                  # the reader to go and find in the fold. This is the only answer here
+                  # whose consequence happens somewhere else, and a question offering an
+                  # outcome it cannot carry out owes the reader the way to carry it out.
+                  + "<br>To file it: <code>work-arcs --jira-ify "
+                  + f"&#39;{esc(q['arc'])}&#39;</code>"
+                  + ("<br>A key it could take instead: "
+                     + ", ".join("<code>" + esc(o["key"]) + "</code>"
+                                 for o in q["file_as"])
+                     + " — the workstream&rsquo;s own filing control is on its card."
+                     if q.get("file_as") else "")
+                  + "</span>")
                 a("</div>")
                 continue
             peers = json.dumps(sorted(q.get("co_members") or []))
