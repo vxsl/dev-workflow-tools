@@ -560,6 +560,50 @@ claim about work of yours, reading `reviewing !10475 for logan, round 5, your tu
 `reviews_known` says whether that list is all of them, because "you are reviewing nothing"
 and "GitLab was not asked" are opposite sentences.
 
+On the page that is a **Reviewing zone**, with a fixed place directly under the ledger.
+Those two are the only registers here with somebody else in the loop and they read as a
+pair — what is owed, then what is under way — and everything below them is about work of
+your own. One row per review, in the order the wire ranked them, and nothing is truncated:
+the review Kyle named out loud sits at the *far end* of that order, because it is the one
+of the twenty-three whose ball is in somebody else's court, so any cap tuned to the head of
+the list would have hidden exactly the row the section exists for. Each row carries the
+merge request, its title, its author, the days the engagement has run, the rounds, whose
+turn it is, how long it has been quiet, and the workstream it joins to — linked where that
+workstream has a row on this page and stated plainly where the focus window hides it, with
+the join's own reason as its tooltip. `✕` acknowledges a row through the same store every
+other `✕` on the page writes to, so `apply_dismissals` registers reviews as a universe of
+its own: a fingerprint the store does not know is live is one the next prune deletes while
+announcing that a fact nobody touched has moved.
+
+**Exactly one thing on that row is allowed a colour**, and the first version got it wrong in
+an instructive way. The clock took the ledger's fortnight threshold, which on a debt means a
+loop that has demonstrably failed to close — and on an engagement means only that it is a
+long one. Eighteen of twenty-three rows came out red, in the column beside the one figure
+anybody can act on. So the clock is the row's own ink and whose turn it is is the only thing
+that speaks: warm when it is yours, the row's grey when it is theirs, since a review sitting
+with its author asks nothing of you. Where the turn was inferred from a push rather than
+read off a note the row says so in a tooltip — provenance is what you go looking for once,
+not what you print twenty-three times.
+
+**A foreign clock is never rendered as yours.** `age_is_foreign` marks a workstream holding
+no commit of yours and no session on any of its branches, where the branch tip's date is the
+only one there is and it belongs to whoever pushed it. In play sets that age in faint italic
+with a tooltip naming whose clock it is — de-emphasised and not dropped, because the date is
+still the only thing on the row answering "is this moving". And the run-over-run fold gained
+the review half of the diff — turn flips and rounds landing, in the same three columns as
+the workstream lines, with an empty clock column because the interval *is* the fold.
+
+**The standup says the ones that moved and the ones sitting on you**, in the beat where
+other people's waiting already lives. Two lines at the outside, because twenty-one of the
+twenty-three are your move and "every review waiting on you" is the whole list read aloud.
+So each line is a partition rather than a ranking: movement first, since it is the only
+thing here that is news rather than weather, and then what is left of the ball-in-your-court
+once the ledger's own clause has had its say — a test on `rounds > 0`, which is exactly what
+drops a merge request out of `you_owe` read from the other side. The window is measured on
+the review's own `my_last` and `their_last` and never on `since_last_run`: that diff's clock
+is the previous *build*, twenty minutes ago on a good morning, and reporting its changes as
+"since Monday" is a standup's worst kind of wrong.
+
 **The Jira-mismatch rows are ranked on that same principle** — *longest uncorrected first*,
 which is how long the ticket has gone without anyone touching any field on it, and therefore
 the least time the wrong status can have been standing. Days of work is the tiebreak, not the
