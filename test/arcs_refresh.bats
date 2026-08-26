@@ -67,11 +67,21 @@ setup() {
     export STUB_USAGE="$TEST_TMPDIR/usage.json"
     export STUB_TOKEN_RESP="$TEST_TMPDIR/token-response.json"
     export STUB_FRAMES="$TEST_TMPDIR/frames.json"
+    # The published page as the read-back sees it, and what the artifact says it may do.
+    # Both default to the quiet answer -- a page whose seed holds nothing new -- so the
+    # many tests that are not about the read-back are not about it.
+    export STUB_PAGE="$TEST_TMPDIR/published.html"
+    export STUB_CAPS="$TEST_TMPDIR/caps.json"
+    printf '<!doctype html><html><body><script type="application/json" id="ackseed">%s</script></body></html>\n' \
+        '{"dismissed":{},"answers":[],"undismissed":[]}' >"$STUB_PAGE"
+    echo '{"contract":"0.2.23","capabilities":{"artifact":{},"downloads":{}}}' >"$STUB_CAPS"
     # Exported here so a test can override them with a bare assignment, which is how the
     # rest of this file already reads.
     export STUB_USAGE_CODES=200
     export STUB_TOKEN_CODE=200
     export STUB_FRAMES_CODE=200
+    export STUB_PAGE_CODE=200
+    export STUB_CAPS_CODE=200
     export STUB_DEPLOY_CODES=200
     export STUB_DEPLOY_MSG=refused
     export CRONTAB_FILE="$TEST_TMPDIR/crontab"
@@ -141,6 +151,16 @@ case "$url" in
     fi
     printf '%s' "$code"
     ;;
+*/api/frame/read/*)
+    echo "capread $auth" >>"$STUB_DIR/calls"
+    [ -n "$out" ] && cp "$STUB_CAPS" "$out"
+    printf '%s' "${STUB_CAPS_CODE:-200}"
+    ;;
+*/api/frame/*)
+    echo "pageread $auth" >>"$STUB_DIR/calls"
+    [ -n "$out" ] && cp "$STUB_PAGE" "$out"
+    printf '%s' "${STUB_PAGE_CODE:-200}"
+    ;;
 *)
     echo "usage $auth" >>"$STUB_DIR/calls"
     n=$(grep -c '^usage' "$STUB_DIR/calls")
@@ -194,8 +214,21 @@ case "$1" in
 esac
 EOF
 
+    # The one thing arcs-refresh shells to that is not the pipeline. A stub, because what
+    # is under test here is the moving of bytes -- which seed reached which writer, and
+    # what the log said when one did not -- and never what a dismissal means. That belongs
+    # to work-arcs and to work-arcs' own tests.
+    cat >"$HOME/bin/work-arcs" <<'EOF'
+#!/bin/sh
+echo "work-arcs $*" >>"$STUB_DIR/calls"
+[ "$1" = "--ingest-acks" ] && cp "$2" "$STUB_DIR/seed.json"
+[ -n "${STUB_INGEST_MSG:-}" ] && echo "$STUB_INGEST_MSG" >&2
+exit "${STUB_INGEST_EXIT:-0}"
+EOF
+
     chmod +x "$HOME/bin/notification/claude-notify.sh" "$HOME/bin/curl" \
-             "$HOME/bin/claude" "$HOME/bin/crontab" "$HOME/bin/systemctl"
+             "$HOME/bin/claude" "$HOME/bin/crontab" "$HOME/bin/systemctl" \
+             "$HOME/bin/work-arcs"
 
     # Off unless a test asks for it, so the many tests that never reach a 401 do not
     # quietly depend on a session being able to rescue them.
@@ -1247,4 +1280,178 @@ EOF
     printf '<h1>arcs</h1>' >"$STATE/page.html"
     STUB_DEPLOY_CODES=500 run "$REFRESH" --publish
     [ "$status" -eq 1 ]
+}
+
+# --- reading the published page back ---------------------------------------------------
+#
+# THE LOOP THIS SECTION EXISTS FOR. Every ✕ and every answer on the published page was
+# recorded honestly in the browser's localStorage, where nothing in this pipeline could
+# see it, and reached the stores only through a download the reader then moved into
+# ~/.local/state/work-arcs by hand -- which has never once been done. So the brief, the
+# lede, the counts and the queue went on repeating what had already been dealt with.
+#
+# What follows pins the two rules the read-back is held to, and they are the same rule
+# looked at from either end: a lost acknowledgement must never be quiet, and a read-back
+# that fails must never cost the morning its page.
+
+seed_of() { cat "$STUB_DIR/seed.json" 2>/dev/null; }
+ingest_calls() { grep -c '^work-arcs --ingest-acks' "$STUB_DIR/calls" 2>/dev/null || true; }
+
+published_page_with() {
+    printf '<!doctype html><html><body><script type="application/json" id="ackseed">%s</script></body></html>\n' \
+        "$1" >"$STUB_PAGE"
+}
+
+@test "the page is read back and its seed handed to work-arcs" {
+    published_page_with '{"dismissed":{"abc123":{"ref":"UL-1","at":9,"note":"fine"}}}'
+    run "$REFRESH"
+    [ "$status" -eq 0 ]
+    [ "$(ingest_calls)" = 1 ]
+    seed_of | grep -q '"abc123"'
+}
+
+# The order is the whole feature. work-arcs prunes, counts and asks its questions off these
+# stores, so a judgement adopted after the build would be adopted into a page that had
+# already ignored it and would first show up a day late.
+@test "the read-back happens before the rebuild, not after" {
+    run "$REFRESH"
+    [ "$status" -eq 0 ]
+    ran_pipeline
+    local ingest build
+    ingest="$(grep -n 'ingest:' "$LOG" | head -1 | cut -d: -f1)"
+    build="$(grep -n 'refreshed in' "$LOG" | head -1 | cut -d: -f1)"
+    [ -n "$ingest" ]
+    [ -n "$build" ]
+    [ "$ingest" -lt "$build" ]
+}
+
+@test "a read-back that fails is loud and does not cost the page" {
+    STUB_PAGE_CODE=500 run "$REFRESH"
+    [ "$status" -eq 0 ]
+    ran_pipeline
+    grep -q "ingest: could not read the published page" "$LOG"
+    [ "$(jq -r '.ingest_ok' "$STATE_JSON")" = "false" ]
+    [ "$(jq -r '.ingest' "$STATE_JSON")" != "null" ]
+}
+
+# Loud in the log and in the state file, and deliberately NOT a notification. The
+# notification budget is the whole reason a notification means anything, and this is a step
+# that fails on any morning the network is slow -- costing that morning's clicks and
+# nothing else, because the page still holds them for the next run.
+@test "a failed read-back is not worth waking anybody for" {
+    STUB_PAGE_CODE=500 run "$REFRESH"
+    [ "$status" -eq 0 ]
+    ! notified
+}
+
+@test "work-arcs refusing the seed is reported, and the build still runs" {
+    STUB_INGEST_EXIT=1 STUB_INGEST_MSG="the page's confirmed is a list" run "$REFRESH"
+    [ "$status" -eq 0 ]
+    ran_pipeline
+    grep -q "the page's confirmed is a list" "$LOG"
+    [ "$(jq -r '.ingest_ok' "$STATE_JSON")" = "false" ]
+}
+
+# A page published before any of this existed carries no such block, and the rebuild this
+# run is about to do puts one there. Not a failure, and it must not read as one.
+@test "a page with no seed block yet is not a failure" {
+    printf '<!doctype html><html><body>nothing here</body></html>\n' >"$STUB_PAGE"
+    run "$REFRESH"
+    [ "$status" -eq 0 ]
+    [ "$(ingest_calls)" = 0 ]
+    grep -q "carries no seed block yet" "$LOG"
+    [ "$(jq -r '.ingest_ok' "$STATE_JSON")" = "true" ]
+}
+
+# The read-back is off for a machine that is not the one Kyle acknowledges rows on -- a
+# second checkout, a test run -- where adopting whatever somebody else is clicking into
+# these stores would be worse than adopting nothing.
+@test "the read-back can be turned off, and says so" {
+    WORK_ARCS_INGEST=0 run "$REFRESH"
+    [ "$status" -eq 0 ]
+    [ "$(ingest_calls)" = 0 ]
+    grep -q "ingest: off" "$LOG"
+}
+
+@test "with no artifact link there is nothing to read back" {
+    : >"$FAKE_REPO/.env"
+    run "$REFRESH"
+    [ "$status" -eq 0 ]
+    [ "$(ingest_calls)" = 0 ]
+    grep -q "no artifact link to read back" "$LOG"
+}
+
+# The read is the model-read route and not the capability one. They answer different
+# questions -- what the artifact may DO against what it currently SAYS -- and asking the
+# wrong one returns a body with no page in it at all, which cost a round of debugging.
+@test "the page is read from the model-read route" {
+    run "$REFRESH"
+    grep -q '^pageread' "$STUB_DIR/calls"
+}
+
+# --- what the published page is allowed to do -------------------------------------------
+#
+# A declaration is a FULL SET: anything stored and not restated is revoked. So a republish
+# that quietly omitted this would leave every ✕ on the page local again -- the exact
+# failure the loop above was built to end, wearing the face of a feature that works.
+
+@test "every publish restates what the page may do" {
+    publishing_on
+    run "$REFRESH"
+    [ "$(deploy_calls)" = 1 ]
+    [ "$(jq -r '.capabilities.artifact | type' "$STUB_DIR/deploy-request-1.json")" = "object" ]
+    [ "$(jq -r '.capabilities.downloads | type' "$STUB_DIR/deploy-request-1.json")" = "object" ]
+}
+
+# Moving a live page's runtime is a decision, not a side effect of editing it. Omitted by
+# default so the artifact keeps whatever it has.
+@test "the contract is left alone unless a run is asked to move it" {
+    publishing_on
+    run "$REFRESH"
+    [ "$(jq -r 'has("contract")' "$STUB_DIR/deploy-request-1.json")" = "false" ]
+}
+
+@test "a run can be asked to move the contract" {
+    publishing_on
+    WORK_ARCS_PUBLISH_CONTRACT=latest run "$REFRESH"
+    [ "$(jq -r '.contract' "$STUB_DIR/deploy-request-1.json")" = "latest" ]
+}
+
+# A control plane that does not know the field must not cost the publish: a page nobody can
+# see is worse than a page that cannot save itself. Said out loud either way.
+@test "a control plane that refuses the declaration still gets the page" {
+    publishing_on
+    STUB_DEPLOY_CODES="400 200" STUB_DEPLOY_MSG="unknown field capabilities" run "$REFRESH"
+    [ "$(deploy_calls)" = 2 ]
+    [ "$(jq -r 'has("capabilities")' "$STUB_DIR/deploy-request-2.json")" = "false" ]
+    grep -q "refused the capability declaration" "$LOG"
+    grep -q "will not be able to save itself" "$LOG"
+}
+
+@test "the declaration can be cleared entirely" {
+    publishing_on
+    WORK_ARCS_PUBLISH_CAPABILITIES= run "$REFRESH"
+    [ "$(jq -r 'has("capabilities")' "$STUB_DIR/deploy-request-1.json")" = "false" ]
+}
+
+# --- --ingest and --capabilities ---------------------------------------------------------
+
+@test "--ingest reads the page back without rebuilding it" {
+    published_page_with '{"dismissed":{"zzz999":1}}'
+    run "$REFRESH" --ingest
+    [ "$status" -eq 0 ]
+    ! ran_pipeline
+    seed_of | grep -q 'zzz999'
+}
+
+@test "--ingest reports a failure in its exit status" {
+    STUB_PAGE_CODE=500 run "$REFRESH" --ingest
+    [ "$status" -eq 1 ]
+}
+
+@test "--capabilities says what the artifact may do and on what contract" {
+    run "$REFRESH" --capabilities
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"0.2.23"* ]]
+    [[ "$output" == *"artifact"* ]]
 }

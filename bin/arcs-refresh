@@ -1043,9 +1043,17 @@ ingest_acks() {
         rc=1; INGEST_OK=0
         INGEST_NOTE="work-arcs refused the seed: $(tr '\n' ';' <"$out" | sed 's/;$//')"
     fi
-    while IFS= read -r line; do
-        [ -n "$line" ] && log "ingest: $line"
-    done <"$out"
+    # Every line work-arcs had to say, and one of our own where it had none. A step that
+    # logs nothing at all on the ordinary morning cannot be told apart in the log from a
+    # step that never ran -- and "did yesterday's clicks reach this build?" is exactly the
+    # question a person opens this file to answer.
+    if [ -s "$out" ]; then
+        while IFS= read -r line; do
+            [ -n "$line" ] && log "ingest: $line"
+        done <"$out"
+    else
+        log "ingest: read the published page back"
+    fi
     rm -f "$seed" "$out"
     return "$rc"
 }
