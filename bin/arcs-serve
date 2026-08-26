@@ -152,18 +152,31 @@ HEALTH_TTL = 30       # seconds the health answer is reused for
 # --- saying what happened ---------------------------------------------------------------
 
 _log_lock = threading.Lock()
+_log_writes = 0
+TRIM_EVERY = 200
 
 
 def log(msg):
     """Append one line, and never let the log be the thing that kills the serve loop."""
+    global _log_writes
     line = "%s  %s\n" % (datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S%z"), msg)
+    due = False
     try:
         with _log_lock:
             LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
             with LOG_FILE.open("a", encoding="utf-8") as fh:
                 fh.write(line)
+            _log_writes += 1
+            if _log_writes >= TRIM_EVERY:
+                _log_writes, due = 0, True
     except OSError:
         pass
+    # Trimming only at start and stop would be enough for a program that runs once, which
+    # this is not: a daemon left up for a fortnight with something failing in a loop would
+    # sail past the cap and never come back under it until somebody restarted it. Outside
+    # the lock, because trim_log takes the same one and it is not reentrant.
+    if due:
+        trim_log()
     if sys.stderr.isatty():
         try:
             sys.stderr.write(line)
