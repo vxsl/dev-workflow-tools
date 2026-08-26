@@ -928,6 +928,121 @@ def milestone_line(rows, since):
     return line(parts)
 
 
+# How many ongoing reviews each of the two review lines names before it starts counting.
+# Two and not FEW: these lines sit *after* the ledger's own clause in the same beat, and a
+# beat that already said "I owe 8 reviews" and then reads out three more references has
+# turned an ask into an inventory. Truncation is announced, like every other cap here.
+REVIEW_FEW = int(os.environ.get("STANDUP_REVIEW_MAX", "2"))
+
+
+def review_span(r):
+    """A review's reference, pointed at its row in the page's Reviewing section.
+
+    `of="review"` is the same mechanism a ledger reference uses to reach its ledger row --
+    arcs-page resolves the pair against what it actually rendered and falls back to the
+    merge request itself where the row is absent, so this can never be an anchor to
+    nothing.
+    """
+    ref = r.get("ref") or (f"!{r['iid']}" if r.get("iid") else "")
+    return span(ref, of="review", fp=r.get("fp"), url=r.get("url")) if ref else ""
+
+
+def review_clause(r):
+    """How a review is described in one breath: who, how deep, whose move."""
+    rounds = r.get("rounds") or 0
+    return (" (" + str(r.get("author") or "?")
+            + (f", round {rounds}" if rounds else "")
+            + (", my move" if r.get("whose_turn") == "mine" else ", their move")
+            + ")")
+
+
+def named_refs(ln):
+    """The references a composed line actually printed, so the next one does not repeat them.
+
+    `said` carries fingerprints and workstream ids between beats; this is the same idea one
+    scale down, inside a single beat. `self_debt_line` names the lead group and counts the
+    rest, and which rows fell into "the rest" is decided by its own templates -- so the only
+    honest way to ask what it named is to read what it produced. Reading the composed line
+    keeps that answer in one place: change the templates and this still agrees with them.
+    """
+    return {p.get("t") for p in (ln or {}).get("parts") or []
+            if isinstance(p, dict) and p.get("t")}
+
+
+def review_lines(data, since, said=None, spoken=()):
+    """The reviews you are in the middle of, in the beat where other people's work lives.
+
+    Kyle says these out loud -- "i have 6802" -- and until `reviews[]` existed there was
+    nothing in this file that could. The ledger half of this beat covers a review he has
+    never spoken on, and drops it the instant he does; a twelve-round engagement was
+    therefore invisible to a standup for exactly as long as it had been going.
+
+    Two lines at the outside and usually one, because the risk here is not omission. There
+    are twenty-three of these and twenty-one of them are his move, so "every review waiting
+    on you" is the whole list read aloud, which is the failure `capped` and `group_line`
+    exist to prevent everywhere else in this file.
+
+    So each line is a partition and neither is a ranking. The first is **movement**: a
+    review either side touched inside the window, which is the only thing here that is news
+    rather than weather. The second is what is left of **the ball in his court** once the
+    ledger's clause has had its say -- reviews he is already some rounds into, which is
+    precisely the set `you_owe` drops, because `rounds > 0` and "he has spoken on it" are
+    the same test read from two sides.
+
+    The window is tested against the review's own instants and not against
+    `since_last_run`. Both describe movement and they are not the same movement: the
+    run-over-run diff's clock is the previous *build*, which on a good morning is twenty
+    minutes ago, and reporting that interval's changes as "since Monday" would be a
+    standup's worst kind of wrong. The page renders that half in its own fold, on its own
+    clock, and says which clock it is. `my_last` and `their_last` are real instants, so
+    "did this move since the last standup" is answerable here exactly.
+    """
+    reviews = data.get("reviews") or []
+    if not reviews:
+        return []
+    # Said once, and in two different senses. `spoken` is what the ledger's own clause has
+    # already read out a few words earlier in this same beat -- a reference printed twice in
+    # eight lines reads as two problems, whatever the two lines are claiming about it.
+    # `owed` is the wider set the ledger *holds*, which the standing-state line below is the
+    # complement of by construction; the movement line is not filtered by it, because "this
+    # moved since Monday" is a claim about the window and the ledger makes no claim about
+    # any window at all.
+    owed = {r.get("ref") for r in (data.get("ledger") or {}).get("you_owe") or []
+            if r.get("ref")}
+    spoken = set(spoken or ())
+
+    def fill(rows, lead):
+        parts = [lead]
+        for i, r in enumerate(rows[:REVIEW_FEW]):
+            if i:
+                parts.append(", ")
+            parts += [review_span(r), review_clause(r)]
+        if len(rows) > REVIEW_FEW:
+            parts.append(f", +{len(rows) - REVIEW_FEW} more")
+        return line(parts)
+
+    out = []
+    moved = [r for r in reviews
+             if r.get("ref") not in spoken
+             and (in_window(r.get("my_last"), since)
+                  or in_window(r.get("their_last"), since))]
+    if moved:
+        out.append(fill(moved, "reviews that moved: "))
+    stirred = {id(r) for r in moved}
+    # Underway and waiting on him. `rounds` rather than a second reading of the ledger:
+    # a row with rounds on it is one he has spoken on, which is the exact complement of
+    # what `you_owe` holds, so the two halves partition the list rather than overlapping
+    # it. The `owed` test on top of that is for the reply-owed rows, where the ledger
+    # holds a merge request he HAS spoken on because one thread went unanswered.
+    mine = [r for r in reviews
+            if r.get("whose_turn") == "mine" and (r.get("rounds") or 0) > 0
+            and r.get("ref") not in owed and r.get("ref") not in spoken
+            and id(r) not in stirred]
+    if mine:
+        out.append(fill(mine, "reviews already under way and waiting on me: "))
+    return out
+
+
 def blocked_beat(data, since, said=None):
     """The asks the room can act on, then one clause for everything Kyle owes.
 
@@ -979,7 +1094,13 @@ def blocked_beat(data, since, said=None):
         out.append(line([f"waiting on {who_of(r)}: ", ref_span(r), age_of(r)]))
 
     out = capped(out, "blocked")
-    for extra in (self_debt_line(owed), milestone_line(they + mine, since)):
+    # Outside the cap, like `self_debt_line` and for the same reason: neither of these can
+    # grow with the ledger. Between his own debts and the month-turned tail, because a
+    # review under way is nearer to "what I owe" than to "what has been stalled since
+    # April" -- and because the tail is the one line here that is about the past.
+    debt = self_debt_line(owed)
+    for extra in ([debt] + review_lines(data, since, said, named_refs(debt))
+                  + [milestone_line(they + mine, since)]):
         if extra:
             out.append(extra)
     return out
