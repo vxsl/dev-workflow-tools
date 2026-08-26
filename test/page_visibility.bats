@@ -357,3 +357,207 @@ for li in re.findall(r'<li>.*?</li>', strip, re.S):
 ZZTILE2
     [ "${lines[0]}" = "settled" ]
 }
+
+# --- the two folds that had no way to say "I know" --------------------------------------
+#
+# "'real work with no ticket' has some items that i need to be able to dismiss easily. i
+# should find it very comfortable to continually clean up noise." Both folds now carry the
+# same ✕ every other list on this page has, and the same law: de-emphasis is not hiding, so
+# the count excludes an acknowledged row and the row itself stays on the page.
+
+gap_doc() {
+    python3 - "$@" <<'ZZGAP'
+import json, sys, hashlib
+
+def dfp(*parts):
+    return hashlib.sha256("|".join(str(p or "") for p in parts).encode()).hexdigest()[:16]
+
+def arc(aid, days, acked=False):
+    a = {"id": aid, "label": aid, "kind": "cluster", "stage": "local-only",
+         "state": "local-only", "age_days": 4, "engagement": 400,
+         "unpushed_live": days * 2, "unpushed_days": days,
+         "unpushed_dates": ["2026-08-%02d" % (d + 1) for d in range(days)],
+         "fingerprint": "fp-" + aid, "branches": [], "mrs": [], "stashes": [],
+         "sessions": [], "issues": [], "demands": [],
+         "counts": {"branches": 1, "stashes": 0, "mrs": 0, "sessions": 2},
+         "brief": {"name": aid, "summary": "It reroutes the thing."}}
+    a["gap_fp"] = dfp("unticketed", aid, a["fingerprint"])
+    if acked:
+        a["gap_dismissed"] = True
+    return a
+
+def issue(key, acked=False):
+    i = {"key": key, "status": "To Do", "done": False, "summary": "about " + key,
+         "url": "https://j/" + key, "gap_fp": dfp("no-work", key, "To Do")}
+    if acked:
+        i["gap_dismissed"] = True
+    return i
+
+unt = [arc("big", 7), arc("acked", 5, acked=True), arc("small", 1)]
+empty = [issue("UL-1"), issue("UL-2", acked=True)]
+out = {"generated": 1756000000, "repo": "ul", "main": "origin/main", "me": "kyle",
+       "project_url": "https://gitlab.example/ul", "arc_count": len(unt), "arcs": unt,
+       "forgotten": [], "only_here": [x["id"] for x in unt],
+       "gap": {"unticketed_work": unt, "tickets_without_work": empty,
+               "status_mismatch": []}}
+for extra in sys.argv[1:]:
+    out.update(json.loads(extra))
+print(json.dumps(out))
+ZZGAP
+}
+
+@test "every row of both gap folds carries a fingerprint and a control" {
+    gap_doc >"$TEST_TMPDIR/d.json"
+    page "$(cat "$TEST_TMPDIR/d.json")" >"$TEST_TMPDIR/p.html"
+    # Three no-ticket rows and two empty-ticket rows, each with its own ✕.
+    [ "$(grep -c 'id="un-' "$TEST_TMPDIR/p.html")" -eq 3 ]
+    [ "$(grep -c 'id="nw-' "$TEST_TMPDIR/p.html")" -eq 2 ]
+    [ "$(grep -c '<td><button class="dis"' "$TEST_TMPDIR/p.html")" -eq 5 ]
+}
+
+# The count is what is left to deal with, not what the list holds: a closed fold reading
+# three over a table where one is faded is the one lie a collapse must never tell.
+@test "an acknowledged gap row is out of its fold's count and still on the page" {
+    gap_doc >"$TEST_TMPDIR/d.json"
+    page "$(cat "$TEST_TMPDIR/d.json")" >"$TEST_TMPDIR/p.html"
+    folds "$TEST_TMPDIR/p.html" | grep -q "Real work with no ticket | 2 |"
+    folds "$TEST_TMPDIR/p.html" | grep -q "Tickets with nothing behind them | 1 |"
+    # Still rendered, marked rather than removed.
+    grep -q 'data-ref="acked" data-dismissed="1"' "$TEST_TMPDIR/p.html"
+}
+
+# The lead names a row a reader can act on. Naming an acknowledged one would be the header
+# opening on the single row the reader has already dealt with.
+@test "the fold's lead skips what has been acknowledged" {
+    gap_doc >"$TEST_TMPDIR/d.json"
+    page "$(cat "$TEST_TMPDIR/d.json")" >"$TEST_TMPDIR/p.html"
+    ! folds "$TEST_TMPDIR/p.html" | grep -q "including acked"
+}
+
+# The opening sentence counts what is left, which is the rule the mismatch clause already
+# followed: a ✕ that still opens the page does nothing.
+@test "an acknowledged workstream is out of the opening sentence's count" {
+    gap_doc >"$TEST_TMPDIR/d.json"
+    page "$(cat "$TEST_TMPDIR/d.json")" >"$TEST_TMPDIR/p.html"
+    grep -q "2 workstreams of real work" "$TEST_TMPDIR/p.html"
+}
+
+# Acknowledged rows fade in place here rather than disappearing behind the disclosure --
+# the one place this page departs from its own convention, because this is the section
+# whose whole point is that clicking is comfortable enough to do twenty times.
+@test "an acknowledged gap row fades rather than vanishing" {
+    gap_doc >"$TEST_TMPDIR/d.json"
+    page "$(cat "$TEST_TMPDIR/d.json")" >"$TEST_TMPDIR/p.html"
+    [ "$(grep -c 'data-disgroup data-show="1"' "$TEST_TMPDIR/p.html")" -eq 2 ]
+}
+
+# A truncated table's visible rows are not its size. Without this the header would fall to
+# the truncation the first time anything was acknowledged on a longer list.
+@test "a truncated gap table tells the client what it did not render" {
+    python3 - >"$TEST_TMPDIR/many.json" <<'ZZMANY'
+import json, hashlib
+def dfp(*p):
+    return hashlib.sha256("|".join(map(str, p)).encode()).hexdigest()[:16]
+empty = [{"key": "UL-%d" % n, "status": "To Do", "done": False, "summary": "s",
+          "url": "https://j/x", "gap_fp": dfp("no-work", n)} for n in range(20)]
+print(json.dumps({"generated": 1756000000, "repo": "ul", "main": "origin/main",
+                  "me": "kyle", "arc_count": 0, "arcs": [], "forgotten": [],
+                  "only_here": [],
+                  "gap": {"unticketed_work": [], "tickets_without_work": empty,
+                          "status_mismatch": []}}))
+ZZMANY
+    page "$(cat "$TEST_TMPDIR/many.json")" >"$TEST_TMPDIR/p.html"
+    grep -q 'data-countplus="6"' "$TEST_TMPDIR/p.html"
+    folds "$TEST_TMPDIR/p.html" | grep -q "Tickets with nothing behind them | 20 |"
+}
+
+# --- the queue, given somewhere to be seen ----------------------------------------------
+#
+# It was the second-to-last fold on the page, which is a place you reach by having already
+# scrolled past everything the tidying is for.
+
+cur_doc() {
+    python3 - <<'ZZCUR'
+import json
+qs = [{"kind": "unticketed", "arc": "smp", "arc_id": "smp", "fp": "f1",
+       "fingerprint": "x", "branches": ["br-smp"], "scale": "7 days of work",
+       "days": 7, "commits": 14, "engagement": 400, "age_days": 4,
+       "stage": "local-only", "file_as": [], "why": "7 days of work, nothing names it"}]
+print(json.dumps({"generated": 1756000000, "repo": "ul", "main": "origin/main",
+                  "me": "kyle", "arc_count": 0, "arcs": [], "forgotten": [],
+                  "only_here": [], "curation": qs}))
+ZZCUR
+}
+
+@test "the queue has a fixed stop in the rail and a fixed chip on the strip" {
+    page "$(cur_doc)" >"$TEST_TMPDIR/p.html"
+    grep -q 'href="#curation">Tidy' "$TEST_TMPDIR/p.html"
+    grep -q 'data-door="curation"' "$TEST_TMPDIR/p.html"
+}
+
+# The fold's own law applied to a link at it: a chip reading "tidy · 0" is a chore invented
+# for a person who has none.
+@test "at zero questions there is no chip and no stop" {
+    page "$(python3 -c 'import json; print(json.dumps({"generated":1756000000,"repo":"ul","main":"origin/main","me":"kyle","arc_count":0,"arcs":[],"forgotten":[],"only_here":[]}))')" \
+        >"$TEST_TMPDIR/p.html"
+    ! grep -q 'data-door="curation"' "$TEST_TMPDIR/p.html"
+    ! grep -q '<a href="#curation"' "$TEST_TMPDIR/p.html"
+}
+
+# A mirror, never a second count: the section is the author of its own size and the chip
+# copies what it printed, so answering a question three screens down empties it in step.
+@test "the chip and the stop mirror the queue's own figure" {
+    page "$(cur_doc)" >"$TEST_TMPDIR/p.html"
+    grep -q 'data-count="curation"' "$TEST_TMPDIR/p.html"
+    [ "$(grep -c 'data-mirror="\[data-count=&quot;curation&quot;\]"' "$TEST_TMPDIR/p.html")" -ge 2 ]
+}
+
+# Three answers, because the question honestly has three -- and the row it is about is
+# elsewhere on the page, so the question carries that row's fingerprint rather than one of
+# its own.
+@test "a no-ticket question offers its three answers under the fold row's fingerprint" {
+    page "$(cur_doc)" >"$TEST_TMPDIR/p.html"
+    grep -q 'data-kind="unticketed"' "$TEST_TMPDIR/p.html"
+    for a in ticket fine noise; do
+        grep -q "data-a=\"$a\"" "$TEST_TMPDIR/p.html"
+    done
+    grep -q 'data-kind="unticketed" data-arcid="smp" data-arc="smp" data-fp="f1"' \
+        "$TEST_TMPDIR/p.html"
+}
+
+# The only answer whose consequence happens somewhere else. A question offering an outcome
+# it cannot carry out owes the reader the way to carry it out.
+@test "the question prints the command that files it" {
+    page "$(cur_doc)" >"$TEST_TMPDIR/p.html"
+    grep -q "work-arcs --jira-ify" "$TEST_TMPDIR/p.html"
+}
+
+# --- the loop, closed --------------------------------------------------------------------
+
+@test "the page carries the stores it has to be able to publish back" {
+    page "$(python3 -c '
+import json
+print(json.dumps({"generated":1756000000,"repo":"ul","main":"origin/main","me":"kyle",
+  "arc_count":0,"arcs":[],"forgotten":[],"only_here":[],
+  "acks":{"dismissed":{"aaa":{"ref":"UL-1","at":9,"note":"fine"}},"confirmed":{"br":{}}}}))')" \
+        >"$TEST_TMPDIR/p.html"
+    grep -q 'id="ackseed"' "$TEST_TMPDIR/p.html"
+    python3 - "$TEST_TMPDIR/p.html" <<'ZZSEED'
+import json, re, sys
+h = open(sys.argv[1]).read()
+seed = json.loads(re.search(
+    r'<script type="application/json" id="ackseed">(.*?)</script>', h, re.S).group(1))
+assert seed["dismissed"]["aaa"]["note"] == "fine", seed
+assert "br" in seed["confirmed"], seed
+# The page's own halves start empty: the pipeline has already logged every answer it has
+# seen, and only the client can know which seeded fingerprints it no longer holds.
+assert seed["answers"] == [] and seed["undismissed"] == [], seed
+ZZSEED
+}
+
+# The block is emitted on one line, which is what lets arcs-refresh cut it out exactly
+# rather than approximately.
+@test "the seed block is one line" {
+    page "$(cur_doc)" >"$TEST_TMPDIR/p.html"
+    [ "$(grep -c 'id="ackseed">.*</script>' "$TEST_TMPDIR/p.html")" -eq 1 ]
+}
