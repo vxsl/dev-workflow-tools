@@ -291,6 +291,11 @@ body{margin:0;background:var(--ground);color:var(--ink);font-family:var(--sans);
 .headline a{color:inherit;text-decoration:none;
   box-shadow:inset 0 -2px 0 0 color-mix(in oklab,var(--accent) 45%,transparent)}
 .headline a:hover,.headline a:focus-visible{box-shadow:inset 0 -3px 0 0 var(--accent)}
+/* Every candidate for the slot is in the document and all but one are hidden -- see
+   headline_block. The attribute has to be given teeth because .headline sets a margin and
+   the deck is a flow container: a hidden div with no display rule of its own is a hidden
+   div that still renders. */
+.headline[hidden]{display:none}
 
 /* The doors. The same three, in the same order, every time this page is opened: the
    standup, the ledger, what is in play. The first arrangement tried here chose what to
@@ -360,13 +365,17 @@ html{scroll-padding-top:1.5rem}
    lines reads as a menu, which is the shape this block exists to stop being. The rule
    thickens on hover, so the page still says plainly that every subject here is one click
    from what it is a claim about. */
-.brief{list-style:none;margin:.1rem 0 2rem;padding:0;max-width:60em;
+.brief{list-style:none;margin:.1rem 0 .55rem;padding:0;max-width:60em;
        display:flex;flex-direction:column;gap:.7rem}
 /* The label is a fixed rail, so five kickers form a column a reader can run down rather
    than five differently-indented starts. It collapses below the text on a narrow viewport,
-   where a 9rem rail would leave the sentence six words wide. */
-.brief li{display:grid;grid-template-columns:8.5rem 1fr;gap:.1rem .9rem;
+   where a 9rem rail would leave the sentence six words wide.
+   A third column for the controls, for the reason the ✕ column on every table here exists:
+   a control that trails the last word of its sentence sits somewhere different on every
+   line, and a control that moves from row to row cannot be aimed at. */
+.brief li{display:grid;grid-template-columns:8.5rem 1fr auto;gap:.1rem .9rem;
           align-items:baseline}
+.brief li[hidden]{display:none}
 .brief .bk{font-family:var(--sans);font-weight:600;font-size:.68rem;
            letter-spacing:.09em;color:var(--ink-faint);text-align:right;
            padding-top:.3rem}
@@ -375,10 +384,46 @@ html{scroll-padding-top:1.5rem}
 .brief a{color:inherit;text-decoration:none;
          box-shadow:inset 0 -1px 0 0 color-mix(in oklab,var(--accent) 45%,transparent)}
 .brief a:hover,.brief a:focus-visible{box-shadow:inset 0 -2px 0 0 var(--accent)}
+/* The line the client stepped past, back in the shortlist at the rank it always had. Faded
+   and struck rather than removed: this page has never once answered a ✕ by deleting the
+   thing, and the opening sentence is the last place to start. */
+.brief li[data-acked="1"] .bs,.brief li[data-acked="1"] .bk{opacity:.5}
+.brief .note.brnote{margin:0 0 2rem}
 @media (max-width:44rem){
   .brief li{grid-template-columns:1fr;gap:.05rem}
   .brief .bk{text-align:left;padding-top:0}
+  .brief li .acts{justify-self:start}
 }
+
+/* The controls at a brief line\u2019s end, and the one word each is aimed at.
+
+   The register is the ledger\u2019s ✕ rail and deliberately nothing more: this block is read
+   at a glance and a row of loud chips under a display sentence would make the controls the
+   thing the eye lands on. So the rail is mono at .62rem in the faint ink, the same family
+   every other figure on this page uses for data, and it earns colour only on hover.
+
+   The label is the subject\u2019s own words -- see line_acts -- so nothing here is a second
+   name for anything. It appears only on a line that names more than one row, where the
+   pair would otherwise be two identical ✕es with no way to tell which was which. */
+.acts{display:inline-flex;flex-wrap:wrap;gap:.5rem;align-items:center;
+      justify-self:end;vertical-align:middle}
+.headline .acts{display:flex;margin-top:.9rem}
+.ba{display:inline-flex;gap:.28rem;align-items:center}
+.bal{font-family:var(--mono);font-size:.62rem;color:var(--ink-faint);
+     letter-spacing:.02em;max-width:22em;overflow-wrap:anywhere}
+.ba .bo{font-family:var(--sans);font-size:.7rem;line-height:1.3;text-decoration:none;
+        border:1px solid var(--hairline);border-radius:2px;padding:.05rem .32rem;
+        color:var(--ink-faint);box-shadow:none}
+.ba .bo:hover,.ba .bo:focus-visible{border-color:var(--accent);color:var(--ink-soft);
+        box-shadow:none}
+/* The acknowledged state, said the way the tables say it: the control keeps its place and
+   changes its ink, so the click that made it can be unmade by the same click. */
+.ba[data-dismissed="1"] .dis{border-color:var(--parked);color:var(--ink-soft)}
+.ba[data-dismissed="1"] .bal{opacity:.55;text-decoration:line-through}
+/* And on the sentence itself, on the word the ✕ was aimed at rather than on the whole
+   line: a two-subject sentence with one subject acknowledged is a sentence still making
+   half its claim, and fading all of it would be the page overstating what was dealt with. */
+[data-sfp][data-sack="1"]{opacity:.55;text-decoration:line-through;box-shadow:none}
 
 h2{font-family:var(--display);font-weight:600;font-size:1.5rem;margin:0 0 .1rem;
    letter-spacing:-.018em;line-height:1.15}
@@ -1897,6 +1942,54 @@ INTERACT_JS = r"""
   // and one of the things it says is that a save FAILED, which must not be quietly
   // overwritten by a count two clicks later.
   var pubMsg='', pubFailed=false;
+  // --- the brief, and which of its lines opens the page ----------------------
+  // "please know that the main page title is BS. if i ack/dismiss de-2585 and !10408, will
+  // they disappear from the title?" -- yes, and on the click rather than on the next build.
+  //
+  // Everything needed for that is already in the document: the server drew every line at
+  // display size and every line as a shortlist row, and hid whichever of the pair the other
+  // is showing. So there is exactly one decision here and it is a test over `dstore` --
+  // which line is the first whose subjects have NOT all been acknowledged. That line is the
+  // headline. No sentence is composed, no line is re-ranked, and arc-morning stays the only
+  // author of which fact leads: this walks its order and stops.
+  //
+  // A deliberately separate attribute from `data-fp`, and the distinction is load-bearing.
+  // `[data-fp]` on this page means "a row that IS the fact": it is what `present`
+  // enumerates to decide which acknowledgements are still live, what the seed adopts as
+  // having arrived acknowledged, and what the display:none rule hides. A brief line is a
+  // projection of a row, and must be none of those three -- above all not the third, or the
+  // ✕ that acknowledged it would vanish with it and could never be clicked a second time.
+  var hlines=[].slice.call(document.querySelectorAll('[data-hline]')),
+      blines=[].slice.call(document.querySelectorAll('[data-bline]')),
+      backs=[].slice.call(document.querySelectorAll('[data-ackfp]')),
+      bsubs=[].slice.call(document.querySelectorAll('[data-sfp]'));
+  // The fingerprints one line's sentence names, and whether every one of them has been
+  // dealt with. A line naming none is never "all acknowledged" -- there is nothing there to
+  // have acknowledged -- so it can never be stepped past, which is the rule stated rather
+  // than a case handled.
+  function lineAcked(el){
+    var f=(el.dataset.linefps||'').split(' ').filter(function(x){ return !!x; });
+    if(!f.length) return false;
+    for(var i=0;i<f.length;i++) if(!(f[i] in dstore)) return false;
+    return true;
+  }
+  function applyBrief(){
+    // Clamped to the last candidate rather than allowed to run off the end: a morning on
+    // which every line has been acknowledged is still a morning, and a page that opens on
+    // nothing at all would have answered the last ✕ by deleting its own headline. The last
+    // line stays in the slot, struck, and one ✕ taken back brings it straight back.
+    var lead=0;
+    for(var i=0;i<hlines.length;i++){ lead=i; if(!lineAcked(hlines[i])) break; }
+    hlines.forEach(function(el,i){ el.hidden=(i!==lead); });
+    blines.forEach(function(el,i){
+      el.hidden=(i===lead);
+      el.dataset.acked=lineAcked(el)?'1':'0'; });
+    backs.forEach(function(el){
+      el.dataset.dismissed=(el.dataset.ackfp in dstore)?'1':'0'; });
+    bsubs.forEach(function(el){
+      el.dataset.sack=(el.dataset.sfp in dstore)?'1':'0'; });
+  }
+
   function setBar(){
     if(!bar) return;
     var any=ddirty||tdirty||cdirty||fdirty||idirty||rdirty||adirty;
@@ -2068,6 +2161,7 @@ INTERACT_JS = r"""
       function(el){ el.hidden=(unanswered===0); });
     document.querySelectorAll('.minimap a[href="#curation"]').forEach(
       function(el){ el.hidden=(unanswered===0); });
+    applyBrief();
     dets.forEach(function(el){
       var on=el.dataset.branch in tstore;
       el.classList.toggle('on', on);
@@ -2083,7 +2177,12 @@ INTERACT_JS = r"""
     var t=ev.target;
     var dis=t.closest?t.closest('.dis'):null;
     if(dis){ ev.preventDefault();
-      var el=dis.closest('[data-fp]'), fp=el&&el.dataset.fp;
+      // A row, or a brief line naming one. The same store, the same fingerprint and the
+      // same take-back channel either way -- the whole claim of the ✕ on a brief line is
+      // that acknowledging there IS acknowledging here, and a second branch that wrote its
+      // own entry would be a second author for what "dealt with" means.
+      var el=dis.closest('[data-fp],[data-ackfp]'),
+          fp=el&&(el.dataset.fp||el.dataset.ackfp);
       if(!fp) return;
       if(fp in dstore) delete dstore[fp]; else dstore[fp]=1;
       if(fp in dstore) keep(fp); else forget(fp);
@@ -2430,7 +2529,7 @@ UNTICKETED_ROWS = 12
 NOWORK_ROWS = 14
 
 
-def spans(parts, here, fps):
+def spans(parts, here, fps, mark=False):
     """One derived sentence's parts, each resolved to the strongest link it can carry.
 
     brief_block and standup_block had a copy of this each, and the headline made a third --
@@ -2441,6 +2540,12 @@ def spans(parts, here, fps):
     target is not on this page renders as plain text, which is the rule the run-over-run
     strip and the cliff section already follow -- an anchor to a row that was never rendered
     is the same lie as a link to a 404.
+
+    `mark` names the subject in the markup so the client can show it has been acknowledged.
+    Off by default and on only for the brief, which is the one block here that carries the
+    ✕: the standup is a projection with no controls and no state -- see standup_block -- and
+    a struck word in a paragraph nothing on the page can act on is a rendering with no
+    gesture behind it.
     """
     out = []
     for pt in parts or []:
@@ -2449,7 +2554,8 @@ def spans(parts, here, fps):
             continue
         t, of, fp = esc(pt.get("t", "")), pt.get("of"), pt.get("fp")
         if of and fp and fp in fps.get(of, ()):
-            out.append(f'<a href="#{EVIDENCE_ID[of]}{esc(fp)}">{t}</a>')
+            at = f' data-sfp="{esc(fp)}"' if mark else ""
+            out.append(f'<a{at} href="#{EVIDENCE_ID[of]}{esc(fp)}">{t}</a>')
         elif pt.get("arc") in here:
             out.append(f'<a href="#{anchor(pt["arc"])}">{t}</a>')
         elif pt.get("url"):
@@ -2490,8 +2596,78 @@ def brief_lines(data):
     return [{"lead": "", "parts": parts}] if parts else []
 
 
+def line_acts(line, here, fps):
+    """The controls one brief line carries, and the fingerprints they act on.
+
+    The brief was the one block on this page that stated facts you could act on and offered
+    nothing to act with. Every claim in it is a projection of a row that has a ✕ three
+    screens down, and reading "DE-2585 has sat with Neville Dipale 160 days" and then
+    scrolling to find the row to acknowledge is the page asking you to do its filing.
+
+    So each line ends with its own subjects' controls, in the ledger's register and never
+    louder than the words. Two of them, and only ever where the wire supports one:
+
+      ✕  where the subject is a row this page rendered. It is not a second acknowledgement
+         and not a second store -- the click writes the row's own fingerprint into the same
+         `dstore` the row's own ✕ writes, so acknowledging here IS acknowledging there and
+         the row below fades on the same click. A line with no such subject gets none: a
+         dead control is worse than an absent one.
+      ↗  where the subject also has a URL off this page. The words already link to the
+         evidence *on* the page -- see spans(), where a row here beats a link away from it
+         -- so this is the door that resolution closes, not a second copy of it. Where the
+         words themselves are the outbound link there is nothing to add and nothing is
+         added.
+
+    One group per subject, because a line can name two rows -- the ledger sentence names
+    both sides -- and one ✕ standing for both would acknowledge a row nobody clicked. The
+    group is labelled with the subject's own words only when there is more than one, which
+    is the whole of the rule: with one subject the sentence has already said what the
+    control is aimed at, and with two an unlabelled pair cannot be aimed at all. The words
+    are the part's own, so nothing here is a second name for anything and nothing is cut.
+    """
+    subs = []
+    for pt in line.get("parts") or []:
+        if isinstance(pt, str):
+            continue
+        of, fp, url = pt.get("of"), pt.get("fp"), pt.get("url")
+        # The same test spans() makes, so the ✕ exists exactly where the anchor does. A ✕
+        # on a fingerprint no row on this page claims would be an acknowledgement the
+        # store prunes on the next build while announcing that a fact nobody touched moved.
+        on_page = bool(of and fp and fp in fps.get(of, ()))
+        # And the same one for the arrow, read the other way round: the words are the
+        # outbound link precisely when neither anchor resolved, and in that case a second
+        # link half a millimetre from the first is what parts_text exists to refuse.
+        out_url = url if (url and (on_page or pt.get("arc") in here)) else ""
+        if on_page or out_url:
+            subs.append((pt, on_page, out_url))
+    if not subs:
+        return "", []
+    named = len(subs) > 1
+    out = ['<span class="acts">']
+    for pt, on_page, out_url in subs:
+        t = esc(pt.get("t", ""))
+        out.append('<span class="ba"'
+                   + (f' data-ackfp="{esc(pt["fp"])}" data-dismissed="0"'
+                      if on_page else "")
+                   + ">")
+        if named:
+            out.append(f'<span class="bal">{t}</span>')
+        if out_url:
+            out.append(f'<a class="bo" href="{esc(out_url)}" title="open {t}" '
+                       f'aria-label="open {t}">&#x2197;</a>')
+        if on_page:
+            out.append('<button class="dis" type="button" '
+                       f'title="acknowledge {t} — the same ✕ as its row below, and it '
+                       f'comes back when the fact moves" '
+                       f'aria-label="acknowledge {t}">&#x2715;</button>')
+        out.append("</span>")
+    out.append("</span>")
+    return "".join(out), [pt["fp"] for pt, on_page, _ in subs if on_page]
+
+
 def headline_block(data, here, fps):
-    """The one sentence this page opens with, set as the biggest thing on it.
+    """The sentence this page opens with, set as the biggest thing on it -- and its
+    successors, standing behind it.
 
     It opened on its own title for a year. "Work Arcs" at 2.4rem was the largest type on a
     page whose entire claim is that it leads with the most consequential fact, and a title
@@ -2504,23 +2680,50 @@ def headline_block(data, here, fps):
     has no business inventing a word for it. And nothing is dropped by the promotion -- the
     remaining lines render in the brief directly below, so the count is intact by
     construction rather than by an announced truncation.
+
+    Why every line is drawn here and not only the first: "please know that the main page
+    title is BS. if i ack/dismiss de-2585 and !10408, will they disappear from the title?"
+    They have to, and before the next build rather than after it -- a page whose loudest
+    sentence goes on naming what you have just dealt with is a page arguing with its own
+    ✕. The client cannot compose the replacement, because composing one would make this
+    page a second author for which fact leads, and within a month the brief and the
+    headline would open on different things. So the *server* draws every line at display
+    size, in arc-morning's own order, and the client only ever chooses which of them is
+    not hidden. The promotion applies a ranking; it never makes one.
+
+    Each candidate carries the fingerprints its sentence names, so that choice is a test
+    over the acknowledgement store and nothing else -- see apply(). A line naming no row
+    can never be fully acknowledged and so can never be stepped past, which is the right
+    behaviour rather than a special case: nothing has been dealt with there to step past.
     """
-    lines = brief_lines(data)
-    if not lines:
-        return ""
-    body = spans(lines[0].get("parts"), here, fps)
-    if not body:
-        return ""
-    lead = lines[0].get("lead") or ""
-    # The size comes off the sentence's own length. arc-morning writes anything from forty
-    # characters to two hundred and twenty, and a headline is read in one pass or it is not
-    # one: the longest of them at full display size runs six lines and has stopped being a
-    # headline by the third. Derived like everything else here rather than set by hand.
-    n = len(parts_text(lines[0].get("parts")))
-    step = " hl-s" if n > 150 else (" hl-m" if n > 90 else "")
-    return ('<div class="headline">'
-            + (f'<span class="eyebrow">{esc(lead)}</span>' if lead else "")
-            + f'<p{f" class=\"{step.strip()}\"" if step else ""}>{body}</p></div>')
+    out, n = [], 0
+    for ln in brief_lines(data):
+        body = spans(ln.get("parts"), here, fps, mark=True)
+        if not body:
+            continue
+        lead = ln.get("lead") or ""
+        # The size comes off the sentence's own length. arc-morning writes anything from
+        # forty characters to two hundred and twenty, and a headline is read in one pass or
+        # it is not one: the longest of them at full display size runs six lines and has
+        # stopped being a headline by the third. Derived like everything else here rather
+        # than set by hand -- and derived per candidate, because the line that gets promoted
+        # is a different length from the one it replaces and inheriting the first line's
+        # step would set a two-hundred-character sentence at forty-character size.
+        chars = len(parts_text(ln.get("parts")))
+        step = " hl-s" if chars > 150 else (" hl-m" if chars > 90 else "")
+        acts, lfps = line_acts(ln, here, fps)
+        out.append(f'<div class="headline" data-hline="{n}" '
+                   f'data-linefps="{esc(" ".join(lfps))}"'
+                   + ("" if n == 0 else " hidden") + ">"
+                   + (f'<span class="eyebrow">{esc(lead)}</span>' if lead else "")
+                   + f'<p{f" class=\"{step.strip()}\"" if step else ""}>{body}</p>'
+                   + acts + "</div>")
+        n += 1
+    # A live region, because the one thing this deck does that a reader cannot see coming is
+    # replace itself. It changes only when that reader has just clicked a ✕ of their own, so
+    # a polite announcement of the new opening sentence is the answer to the gesture rather
+    # than an interruption.
+    return (f'<div class="deck" aria-live="polite">{"".join(out)}</div>' if out else "")
 
 
 def standup_notes(data):
@@ -2669,8 +2872,9 @@ MIRROR_JS = r"""
 """
 
 
-def brief_block(data, here, fps, skip=0):
-    """The morning brief: one labelled line per fact, each linked to its own evidence.
+def brief_block(data, here, fps):
+    """The morning brief: one labelled line per fact, each linked to its own evidence and
+    carrying the controls that act on it.
 
     It was one paragraph and it was not being read. Five sentences, each carrying a claim, a
     number, a superlative and a subordinate clause, set in serif at 1.46rem and run together
@@ -2689,21 +2893,50 @@ def brief_block(data, here, fps, skip=0):
     renders as plain text, which is the rule the run-over-run strip and the cliff section
     already follow: an anchor to a row that was never rendered is the same lie as a link to
     a 404.
+
+    Every line is here, the promoted one included -- hidden while it is the headline and
+    revealed the moment it stops being. That is what makes the promotion cost nothing:
+    the line the client steps past does not vanish, it drops back into the shortlist at
+    the top, where its rank puts it, struck. De-emphasis is not hiding, and a fact that
+    disappeared because it was dealt with would be the page deciding you never want to see
+    it again.
+
+    The controls ride at the line's end in a rail of their own rather than trailing the
+    sentence's last word, which is the law the ✕ column on every table here already keeps:
+    a control that moves from row to row cannot be aimed at. See line_acts for what each
+    one is and why a line without a wire behind it gets none.
     """
-    lines = brief_lines(data)[skip:]
-    if not lines:
-        return ""
-    out = ['<ul class="brief">']
-    for ln in lines:
-        body = spans(ln.get("parts"), here, fps)
+    out, n = [], 0
+    for ln in brief_lines(data):
+        body = spans(ln.get("parts"), here, fps, mark=True)
         if not body:
             continue
-        out.append('<li>'
+        acts, lfps = line_acts(ln, here, fps)
+        out.append(f'<li data-bline="{n}" data-linefps="{esc(" ".join(lfps))}"'
+                   + (" hidden" if n == 0 else "") + ">"
                    + (f'<span class="bk">{esc(ln.get("lead") or "")}</span>'
                       if ln.get("lead") else '<span class="bk"></span>')
-                   + f'<span class="bs">{body}</span></li>')
-    out.append("</ul>")
-    return "".join(out) if len(out) > 2 else ""
+                   + f'<span class="bs">{body}</span>{acts}</li>')
+        n += 1
+    # Nothing below a headline that is the whole brief. One line is one fact, and there is
+    # no shortlist to hold it, nothing for it to be promoted past and nothing to demote it
+    # to -- the list would be an empty rail and the note under it would explain a promotion
+    # that cannot happen on this page. The controls it does have carry their own words.
+    if len(out) < 2:
+        return ""
+    # Said, because this block just grew two gestures and one of them moves the biggest
+    # thing on the page. Every other section here states its own contract in a note and
+    # this was the last one making claims without one.
+    return ('<ul class="brief">' + "".join(out) + "</ul>"
+            + '<p class="note brnote">Each line is one derived fact and its controls are '
+            "its row&rsquo;s own. <strong>&#x2715; acknowledges</strong> what the line "
+            "names &mdash; the same fingerprint and the same store as the &#x2715; on that "
+            "row below, so the row fades on this click too. Acknowledge everything the "
+            "opening line names and the next line takes its place at once; the line it "
+            "displaces drops back to the top of this list, struck, and &#x2715; takes it "
+            "back. <strong>&#x2197;</strong> opens the ticket, merge request or thread the "
+            "line quotes, for the lines whose words point at the evidence on this page "
+            "instead.</p>")
 
 
 # What the copy button does, and the whole of why it is a button rather than a link to a
@@ -4002,6 +4235,24 @@ def gone_quiet(r):
     return q >= QUIET_FLOOR and q * 2 > d
 
 
+def review_window(reviews):
+    """Which of the wire's reviews stand, as indices into it, in its own order.
+
+    Named and shared rather than inlined, because two places read this now: the section
+    draws its standing rows from it and the door three screens above names the first of
+    them. It was inlined while the door said `reviews[0]`, and that was the bug -- after the
+    quiet window landed, `reviews[0]` was a merge request nobody had said a word on for a
+    hundred and twenty-six days, sitting in the fold, while the door above went on
+    announcing it as the thing to read first. A door is a claim about what is under it, and
+    a door naming a row the section chose not to stand is a lie of emphasis.
+
+    Nothing is sorted. This is a selection over an order work-arcs composed -- see
+    reviewing() -- and a second one written here would be a second author for which review
+    matters most.
+    """
+    return [i for i, r in enumerate(reviews) if not gone_quiet(r)][:REVIEW_ROWS]
+
+
 def turn_runs(reviews):
     """Whose turn it is on each row, whether the wire is in two runs by it, and each side's
     size.
@@ -4117,7 +4368,7 @@ def reviewing(a, reviews, drafts, here, by_id):
     # they arrive -- and `rest` is every index the window did not take, also in the order
     # they arrive. Neither list sorts anything, which is the whole point: the fold holds the
     # wire's own sequence with five lines lifted out of it.
-    window = [i for i, q in enumerate(slow) if not q][:REVIEW_ROWS]
+    window = review_window(reviews)
     shown = set(window)
     rest = [i for i in range(len(reviews)) if i not in shown]
     headed = set()
@@ -4536,16 +4787,19 @@ def render(data, lede, focus_days, limit, cost=None):
     # The headline, then the rest of the brief under it -- and never a second opening
     # claim beside either, see headline_block and derive_lede. arc-morning's first line is
     # promoted to display size and its remaining lines render below it, so the promotion
-    # drops nothing: the count is intact by construction. A hand-passed --lede still wins
-    # over both, because it is the one opening sentence a person typed on purpose, and the
-    # derived lede is the degradation for a pipeline that never ran arc-morning.
+    # drops nothing: the count is intact by construction. Both blocks now draw every line
+    # and hide the one the other is showing, which is what lets a ✕ move the headline
+    # without anything here composing a sentence -- see headline_block. A hand-passed
+    # --lede still wins over both, because it is the one opening sentence a person typed on
+    # purpose, and the derived lede is the degradation for a pipeline that never ran
+    # arc-morning.
     here = {x.get("id") for x in arcs}
     head = headline_block(data, here, evidence_fps)
     if lede:
         a(f'<div class="headline"><p class="lede">{lede}</p></div>')
     elif head:
         a(head)
-        a(brief_block(data, here, evidence_fps, skip=1))
+        a(brief_block(data, here, evidence_fps))
     else:
         a(f'<div class="headline">'
           f'<p class="lede">{derive_lede(data, focus_days)}</p></div>')
@@ -4633,7 +4887,20 @@ def render(data, lede, focus_days, limit, cost=None):
                       # the same function -- a clock and a subject. A review row carries
                       # `days`, `ref` and `title` exactly as a ledger row does, so this is
                       # a reuse rather than a second composition of the same sentence.
-                      "lead": lead_of(reviews[0]) if reviews else ""})
+                      #
+                      # And it is the section's first STANDING row, not the wire's first.
+                      # The two parted company the day the quiet window landed: the wire is
+                      # longest-running first, so its head is the oldest engagement, and the
+                      # oldest engagement here is a merge request nobody has said a word on
+                      # since April. The section declines to stand that row; a door naming
+                      # it anyway is announcing as the thing to read first exactly the row
+                      # the section put in the fold. Where nothing stands at all -- every
+                      # review gone quiet -- the wire's head is the honest answer again,
+                      # because then the fold IS the section. The figure beside it is
+                      # untouched: it mirrors #rv-turn-mine, which is a fact about the whole
+                      # group wherever its rows are.
+                      "lead": (lead_of(reviews[(review_window(reviews) or [0])[0]])
+                               if reviews else "")})
     doors.append({"id": "play", "href": "play", "kick": "In play",
                   "fig": (mirrored(len(live), "#play-n") + " workstream"
                           + ("" if len(live) == 1 else "s")),

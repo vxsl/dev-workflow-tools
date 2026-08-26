@@ -23,11 +23,16 @@ function extractJS(pagePath) {
   return m[1];
 }
 
-// `.cls` and `[attr]`, which is every selector this harness has to answer yes to. A
-// descendant or compound selector matches nothing, which is correct for a fixture that
-// holds no trees, no filings and no curation questions.
+// `.cls` and `[attr]`, and a comma list of either, which is every selector this harness has
+// to answer yes to. A descendant or compound selector matches nothing, which is correct for
+// a fixture that holds no trees, no filings and no curation questions.
+//
+// The comma is not a convenience: `closest('[data-fp],[data-ackfp]')` is how one ✕ handler
+// serves a row and a brief line naming that row, and a shim that could not read it would
+// have made the page look like it had two handlers when it has one.
 function simpleMatch(el, sel) {
-  if (/[\s>,]/.test(sel)) return false;
+  if (sel.includes(',')) return sel.split(',').some(s => simpleMatch(el, s.trim()));
+  if (/[\s>]/.test(sel)) return false;
   const m = /^(?:\.([\w-]+)|\[data-([\w-]+)\])$/.exec(sel);
   if (!m) return false;
   if (m[1]) return el.classes.has(m[1]);

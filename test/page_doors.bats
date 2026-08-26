@@ -146,31 +146,69 @@ html = open(sys.argv[1]).read()
 # The title lives inside the masthead, which is the quiet line.
 mast = re.search(r'<div class="masthead">(.*?)</div></div>', html, re.S).group(1)
 print("TITLED" if "<h1>" in mast else "NO-TITLE")
-# The headline holds arc-morning's first line, and only that one.
-head = re.search(r'<div class="headline">(.*?)</div>', html, re.S).group(1)
+# The one candidate in the deck that is not hidden holds arc-morning's first line, and
+# only that one. The others are behind it in the document -- see headline_block -- and a
+# reader is shown exactly one of them.
+heads = re.findall(r'<div class="headline"([^>]*)>(.*?)</div>', html, re.S)
+open_heads = [h for at, h in heads if " hidden" not in at]
+print("ONE-OPEN" if len(open_heads) == 1 else "%d-OPEN" % len(open_heads))
+head = open_heads[0]
 print("FIRST" if "The first fact" in head else "NOT-FIRST")
 print("ONLY" if "The second fact" not in head else "ALSO-SECOND")
 # Its label rides above it, in arc-morning's own vocabulary.
 print(re.search(r'<span class="eyebrow">(.*?)</span>', head).group(1))
 ZZOPEN
     [ "${lines[0]}" = "TITLED" ]
-    [ "${lines[1]}" = "FIRST" ]
-    [ "${lines[2]}" = "ONLY" ]
-    [ "${lines[3]}" = "jira disagrees" ]
+    [ "${lines[1]}" = "ONE-OPEN" ]
+    [ "${lines[2]}" = "FIRST" ]
+    [ "${lines[3]}" = "ONLY" ]
+    [ "${lines[4]}" = "jira disagrees" ]
 }
 
-@test "promoting the first line drops nothing: the rest of the brief is still whole" {
+@test "every line is drawn at both sizes, and each shows the one the other hides" {
+    # The law the instant promotion rests on. A ✕ cannot rewrite the opening sentence
+    # without the page becoming a second author for which fact leads -- so the server draws
+    # every line as a headline AND as a shortlist row, and the client only ever chooses
+    # which of each pair is not hidden. Both halves have to be complete for that choice to
+    # be a choice.
+    page "$(doc)" > "$TEST_TMPDIR/p.html"
+    run python3 - "$TEST_TMPDIR/p.html" <<'ZZDECK'
+import re, sys
+html = open(sys.argv[1]).read()
+facts = ["The first fact", "The second fact", "The third fact"]
+deck = re.search(r'<div class="deck"[^>]*>(.*?)\n?<ul class="brief">', html, re.S).group(1)
+heads = re.findall(r'<div class="headline"([^>]*)>(.*?)</div>', deck, re.S)
+brief = re.search(r'<ul class="brief">(.*?)</ul>', html, re.S).group(1)
+rows = re.findall(r'<li([^>]*)>(.*?)</li>', brief, re.S)
+# Each fact once as a headline candidate and once as a row, in arc-morning's order.
+print([next(i for i, f in enumerate(facts) if f in h) for _, h in heads])
+print([next(i for i, f in enumerate(facts) if f in r) for _, r in rows])
+# And exactly one of each pair is showing, on opposite sides.
+print([" hidden" not in at for at, _ in heads])
+print([" hidden" not in at for at, _ in rows])
+ZZDECK
+    [ "${lines[0]}" = "[0, 1, 2]" ]
+    [ "${lines[1]}" = "[0, 1, 2]" ]
+    [ "${lines[2]}" = "[True, False, False]" ]
+    [ "${lines[3]}" = "[False, True, True]" ]
+}
+
+@test "promoting the first line drops nothing: it is in the list, not out of it" {
+    # The count is intact by construction rather than by an announced truncation. The
+    # promoted line is in the shortlist at the rank it always had, hidden while it is the
+    # headline -- so the moment the client steps past it, it is already there to be shown
+    # struck rather than composed from anything.
     page "$(doc)" > "$TEST_TMPDIR/p.html"
     run python3 - "$TEST_TMPDIR/p.html" <<'ZZWHOLE'
 import re, sys
 html = open(sys.argv[1]).read()
 brief = re.search(r'<ul class="brief">(.*?)</ul>', html, re.S).group(1)
 rows = re.findall(r'<span class="bs">(.*?)</span>', brief, re.S)
-print(len(rows), "FIRST-REPEATED" if any("The first fact" in r for r in rows)
-      else "NOT-REPEATED")
+first = [i for i, r in enumerate(rows) if "The first fact" in r]
+print(len(rows), first)
 ZZWHOLE
-    # Three facts in, one promoted, two below, and the promoted one is not printed twice.
-    [ "${lines[0]}" = "2 NOT-REPEATED" ]
+    # Three facts in, three rows, and the promoted one is the first of them.
+    [ "${lines[0]}" = "3 [0]" ]
 }
 
 @test "one brief line leaves a headline and no list under it" {
@@ -190,7 +228,7 @@ print(json.dumps({"brief": {"lines": [{"kind": "owed", "lead": "open loop",
     run python3 - "$TEST_TMPDIR/p.html" <<'ZZDERIVED'
 import re, sys
 html = open(sys.argv[1]).read()
-head = re.search(r'<div class="headline">(.*?)</div>', html, re.S).group(1)
+head = re.search(r'<div class="headline"[^>]*>(.*?)</div>', html, re.S).group(1)
 print("LEDE" if 'class="lede"' in head else "NO-LEDE")
 ZZDERIVED
     [ "${lines[0]}" = "LEDE" ]
@@ -201,7 +239,7 @@ ZZDERIVED
     run python3 - "$TEST_TMPDIR/p.html" <<'ZZHAND'
 import re, sys
 html = open(sys.argv[1]).read()
-head = re.search(r'<div class="headline">(.*?)</div>', html, re.S).group(1)
+head = re.search(r'<div class="headline"[^>]*>(.*?)</div>', html, re.S).group(1)
 print("TYPED" if "Typed on purpose." in head else "NOT-TYPED")
 print("NO-BRIEF" if 'ul class="brief"' not in html else "BRIEF")
 ZZHAND
