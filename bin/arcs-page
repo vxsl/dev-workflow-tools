@@ -1094,7 +1094,10 @@ td .dis{vertical-align:middle}
    reason the sprint chip is there: the summary grid is defined twice, once per breakpoint,
    and a sixth column would have had to be declared twice and would have squeezed the name
    on the narrow one. */
-.ws .revjoin{font-family:var(--mono);font-size:.68rem;white-space:nowrap}
+/* Wrapping allowed between the refs and not inside one: a workstream can join more merge
+   requests than a name cell is wide, and an anchor never breaks mid-token anyway. */
+.ws .revjoin{font-family:var(--mono);font-size:.68rem}
+.ws .revjoin a,.ws .revjoin>span{white-space:nowrap}
 .ws .revwho{font-size:.72rem;color:var(--ink-soft)}
 .ws .body{padding:.2rem .7rem 1rem 7.2rem;display:flex;flex-direction:column;gap:.6rem}
 @media (max-width:52rem){
