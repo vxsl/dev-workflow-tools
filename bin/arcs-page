@@ -812,6 +812,14 @@ a:hover{text-decoration-color:currentColor}
 /* `.quiet` already carries the surface, the radius and the padding this needs, so the
    empty state is styled by the same rule the ledger's own is. */
 section#reviewing .covered{margin:.55rem 0 0;font-size:.76rem;color:var(--ink-faint)}
+/* Somebody else's branches sitting in this repo with nothing of yours on them. Named, at
+   the foot of the one section they belong under, because a local head this tool stops
+   mentioning anywhere is a head nobody remembers to delete -- the same reason work-arcs
+   carries them rather than dropping them. A list and not rows: there is nothing to do to
+   one of these except delete it, so it gets no clock, no severity and no control. */
+#reviewing ul.cox{list-style:none;margin:.4rem 0 0;padding:0;display:flex;
+  flex-direction:column;gap:.15rem;font-size:.76rem;color:var(--ink-faint)}
+#reviewing ul.cox .br{font-family:var(--mono);font-size:.74rem;color:var(--ink-soft)}
 
 /* The rest of a side, and the silent review requests as one row.
 
@@ -1066,6 +1074,28 @@ td .dis{vertical-align:middle}
 .ws[data-stage="residue"][open]>summary{opacity:1}
 .ws[data-stage="residue"] .nm{text-decoration:line-through}
 .ws[data-stage="residue"]>summary:hover .nm{text-decoration:none}
+/* A workstream that is partly somebody else's ticket you are reading. Kyle: "for something
+   like ul-1816, since it's logan's ticket, is it really my own arc? or can it be shown as a
+   separate category of arc? or at least have some different styling to show that it's a
+   'review arc'?"
+
+   The edge, in the parked grey, and none of the hues a rung earns. Those hues all answer
+   "how far has your work got", and this row's authorship is split -- so it wears none of
+   them, which in a page where every other edge means something is itself the statement.
+   Placed after the rung rules on purpose: equal specificity, later wins, so a review arc
+   that is also out for review shows whose ticket it is rather than whose turn it is.
+
+   Deliberately NOT faded the way in-review and residue are. Those two want nothing from
+   him. This one holds six days of his own unpushed work sitting on Logan's ticket, and
+   dimming the row would de-emphasise the half of it that IS his. The chip says whose
+   ticket it is and the partition says where the row sits; neither needs it to whisper. */
+.ws[data-review="1"]{box-shadow:inset 3px 0 0 var(--parked)}
+/* Which merge requests joined and whose they are, inside the name cell for exactly the
+   reason the sprint chip is there: the summary grid is defined twice, once per breakpoint,
+   and a sixth column would have had to be declared twice and would have squeezed the name
+   on the narrow one. */
+.ws .revjoin{font-family:var(--mono);font-size:.68rem;white-space:nowrap}
+.ws .revwho{font-size:.72rem;color:var(--ink-soft)}
 .ws .body{padding:.2rem .7rem 1rem 7.2rem;display:flex;flex-direction:column;gap:.6rem}
 @media (max-width:52rem){
   .ws>summary{grid-template-columns:minmax(0,1fr) auto;row-gap:.1rem}
@@ -1073,6 +1103,20 @@ td .dis{vertical-align:middle}
   .ws .body{padding-left:.7rem}
 }
 .wslist{border-radius:6px;background:var(--surface);overflow:hidden}
+/* The boundary inside a time bucket, under which every row is somebody else's ticket. A
+   rendered line over a field on the wire, which is exactly what the whose-turn headings in
+   Reviewing are and exactly the precedent this follows: nothing above it or below it has
+   been reordered against its neighbours, and the count beside it is the group's own. No
+   border of its own -- the row above already carries a bottom rule, and two would read as a
+   gap in the list rather than a division of it. Hidden by the client when parking empties
+   it, because a heading standing over nothing is the same lie as a count that does not
+   match its list. */
+.wsgrp{display:flex;gap:.4rem;align-items:baseline;padding:.6rem .7rem .3rem}
+.wsgrp[hidden]{display:none}
+.wsgrp .gl{font-family:var(--sans);font-size:.7rem;font-weight:700;letter-spacing:.1em;
+  text-transform:uppercase;color:var(--parked)}
+.wsgrp .gn{font-family:var(--mono);font-size:.7rem;color:var(--ink-faint);
+  font-variant-numeric:tabular-nums;cursor:help}
 
 /* Parking is a claim about intent, which is the one thing here that cannot be derived. The
    control is a button rather than a checkbox because it is an action with a consequence, and
@@ -1406,6 +1450,17 @@ details.fold>summary .fl{color:var(--ink-soft);font-size:.84rem;min-width:0;flex
 /* The one chip on a row that a person put there. Full opacity because it is not a lens the
    row happens to fall under -- it is the reason the row says what it says. */
 .sprintchip.filed{opacity:1;letter-spacing:.08em}
+/* The same shape as the sprint chip and a different order of claim. That one is a lens the
+   row happens to fall under; this one is whose work the row is. Parked-grey because every
+   other hue on a workstream means "how far YOUR work has got", and half of a row wearing
+   this is not his work. Sans and not mono: mono on this page is data and only data -- a
+   sha, an iid, a clock -- and "review" is a word. Louder than the sprint chip at rest,
+   because two thirds of the rows in the window wear a sprint chip and a handful wear this,
+   so repetition is not what has to be defended against here. */
+.revchip{font-family:var(--sans);font-weight:600;font-size:.63rem;
+  letter-spacing:.05em;padding:0 .34rem;border-radius:3px;border:1px solid currentColor;
+  color:var(--parked);white-space:nowrap;vertical-align:.06em}
+.ws>summary:hover .revchip{color:var(--ink-soft)}
 
 .rung{display:flex;flex-wrap:wrap;align-items:baseline;gap:.2rem .7rem;margin:0 0 .35rem}
 /* Air between the recency groups inside In play. They are groups rather than zones -- no
@@ -1473,6 +1528,17 @@ PARK_JS = r"""
       var head=document.querySelector('[data-bucket="'+el.dataset.list+'"]');
       if(head) head.hidden=(n===0);
       el.hidden=(n===0);
+      // The reviewing boundary inside this bucket, held to the same rule as the header
+      // above it: it states a count over rows parking can move out from under it, so it is
+      // recounted from what is actually inside it, and a boundary with nothing left under
+      // it has nothing left to bound.
+      var g=el.querySelector('[data-revgroup]');
+      if(g){
+        var rn=el.querySelectorAll('.ws[data-review="1"]').length,
+            rc=g.querySelector('[data-revcount]');
+        if(rc) rc.textContent=rn;
+        g.hidden=(rn===0);
+      }
     });
     var pn=list?list.querySelectorAll('.ws').length:0,
         pc=document.querySelector('[data-count="parked"]');
@@ -2536,7 +2602,54 @@ UNTICKETED_ROWS = 12
 NOWORK_ROWS = 14
 
 
-def spans(parts, here, fps, mark=False):
+# ── a workstream that is somebody else's ticket you are reading ────────────────
+#
+# Kyle: "for something like ul-1816, since it's logan's ticket, is it really my own arc? or
+# can it be shown as a separate category of arc? or at least have some different styling to
+# show that it's a 'review arc'?"
+#
+# The question had two answers and the wire has already given one of them. A directory
+# holding nothing of his is not a workstream at all -- demote_checkouts stopped emitting
+# those and `arc.role` went with them -- so what reaches this page is the mixed case, which
+# is the one the question was actually about. `UL-1816` is three commits of his own on
+# `UL-1816-lazy-popup-fixes`, four branches of Logan's checked out beside them, and two of
+# Logan's merge requests joined to it as reviews he is giving. That is his work AND somebody
+# else's ticket, and the row was saying only the first half of it.
+#
+# So the test is one field: is a review of somebody else's merge request part of what this
+# workstream is. Nothing is derived here -- work-arcs joins a review to an arc by source
+# branch or by shared ticket and records which -- and nothing is filtered: these rows keep
+# their count, keep their time bucket, and keep their place inside it. What changes is that
+# they say whose ticket they are.
+def review_arc(arc):
+    """Is a review of somebody else's merge request part of what this workstream is?"""
+    return bool((arc or {}).get("reviews"))
+
+
+def review_chip(arc):
+    """The small chip that travels with the name, wherever on the page the name is drawn.
+
+    One function for it rather than one per section, because the whole point of it is that
+    the identity is the same claim in the brief, in the standup, on the row and in the
+    run-over-run strip -- and a chip composed five times is a chip that will say five things.
+
+    Every fact in the title is on the wire: which merge requests joined, and whose they are.
+    Named to three and then counted, never silently cut.
+    """
+    rs = (arc or {}).get("reviews") or []
+    if not rs:
+        return ""
+    refs = ", ".join(str(r.get("ref") or ("!" + str(r.get("iid")))) for r in rs[:3])
+    if len(rs) > 3:
+        refs += f" and {len(rs) - 3} more"
+    who = sorted({r.get("author") for r in rs if r.get("author")})
+    return (' <span class="revchip" title="somebody else&rsquo;s merge request is joined to '
+            f'this workstream, so part of what it is, is you reading it &mdash; {esc(refs)}'
+            + (", " + esc(", ".join(who)) + "&rsquo;s" if who else "")
+            + '">review</span>')
+
+
+def spans(parts, here, fps, mark=False, rv=None):
     """One derived sentence's parts, each resolved to the strongest link it can carry.
 
     brief_block and standup_block had a copy of this each, and the headline made a third --
@@ -2553,6 +2666,13 @@ def spans(parts, here, fps, mark=False):
     ✕: the standup is a projection with no controls and no state -- see standup_block -- and
     a struck word in a paragraph nothing on the page can act on is a rendering with no
     gesture behind it.
+
+    `rv` is the review arcs by id, and it is why the chip is applied here rather than in each
+    block: a sentence that names `UL-1816` is making the same claim about whose ticket it is
+    whether the brief, the standup or the headline is the one saying it. On every branch
+    below and not only the linked one -- the chip is about identity and the anchor is about
+    whether a row exists, and an arc outside the focus window is no less somebody else's
+    for having no row to point at.
     """
     out = []
     for pt in parts or []:
@@ -2560,15 +2680,16 @@ def spans(parts, here, fps, mark=False):
             out.append(esc(pt))
             continue
         t, of, fp = esc(pt.get("t", "")), pt.get("of"), pt.get("fp")
+        chip = review_chip((rv or {}).get(pt.get("arc")))
         if of and fp and fp in fps.get(of, ()):
             at = f' data-sfp="{esc(fp)}"' if mark else ""
-            out.append(f'<a{at} href="#{EVIDENCE_ID[of]}{esc(fp)}">{t}</a>')
+            out.append(f'<a{at} href="#{EVIDENCE_ID[of]}{esc(fp)}">{t}</a>' + chip)
         elif pt.get("arc") in here:
-            out.append(f'<a href="#{anchor(pt["arc"])}">{t}</a>')
+            out.append(f'<a href="#{anchor(pt["arc"])}">{t}</a>' + chip)
         elif pt.get("url"):
-            out.append(link(pt["url"], t))
+            out.append(link(pt["url"], t) + chip)
         else:
-            out.append(t)
+            out.append(t + chip)
     return "".join(out)
 
 
@@ -2672,7 +2793,7 @@ def line_acts(line, here, fps):
     return "".join(out), [pt["fp"] for pt, on_page, _ in subs if on_page]
 
 
-def headline_block(data, here, fps):
+def headline_block(data, here, fps, rv=None):
     """The sentence this page opens with, set as the biggest thing on it -- and its
     successors, standing behind it.
 
@@ -2705,7 +2826,7 @@ def headline_block(data, here, fps):
     """
     out, n = [], 0
     for ln in brief_lines(data):
-        body = spans(ln.get("parts"), here, fps, mark=True)
+        body = spans(ln.get("parts"), here, fps, mark=True, rv=rv)
         if not body:
             continue
         lead = ln.get("lead") or ""
@@ -2879,7 +3000,7 @@ MIRROR_JS = r"""
 """
 
 
-def brief_block(data, here, fps):
+def brief_block(data, here, fps, rv=None):
     """The morning brief: one labelled line per fact, each linked to its own evidence and
     carrying the controls that act on it.
 
@@ -2915,7 +3036,7 @@ def brief_block(data, here, fps):
     """
     out, n = [], 0
     for ln in brief_lines(data):
-        body = spans(ln.get("parts"), here, fps, mark=True)
+        body = spans(ln.get("parts"), here, fps, mark=True, rv=rv)
         if not body:
             continue
         acts, lfps = line_acts(ln, here, fps)
@@ -2983,7 +3104,7 @@ STANDUP_JS = r"""
 """
 
 
-def standup_block(data, here, fps):
+def standup_block(data, here, fps, rv=None):
     """The next standup's notes, as something to talk from rather than something to read.
 
     arc-standup did the assembling; this does the setting, and the two decisions worth
@@ -3041,12 +3162,12 @@ def standup_block(data, here, fps):
     for b in beats:
         rows = []
         for it in b["items"]:
-            body = spans(it.get("parts"), here, fps)
+            body = spans(it.get("parts"), here, fps, rv=rv)
             if not body:
                 continue
-            subs = "".join(f"<li>{spans(sb.get('parts'), here, fps)}</li>"
+            subs = "".join(f"<li>{spans(sb.get('parts'), here, fps, rv=rv)}</li>"
                            for sb in it.get("subs") or []
-                           if spans(sb.get("parts"), here, fps))
+                           if spans(sb.get("parts"), here, fps, rv=rv))
             rows.append(f"<li>{body}"
                         + (f'<ul class="sub">{subs}</ul>' if subs else "") + "</li>")
         if not rows:
@@ -4283,7 +4404,7 @@ def turn_runs(reviews):
     return turns, grouped, {t: turns.count(t) for t in set(turns)}
 
 
-def reviewing(a, reviews, drafts, here, by_id):
+def reviewing(a, reviews, drafts, here, by_id, approved=(), checkouts=()):
     """The reviews you are in the middle of, as work with a clock rather than as debts.
 
     Kyle: "me actively reviewing someone's MR is in its own category, e.x. i have 6802
@@ -4336,6 +4457,16 @@ def reviewing(a, reviews, drafts, here, by_id):
     directly under it: it is the same figure in the window and in the fold precisely so it
     reads as a property of the group rather than of the five lines below it, and the
     disclosure states its own size separately.
+
+    Three accountings ride at the foot of it, and every one of them exists because a number
+    that changed has to have an account of what changed it. The drafts were the first. The
+    second is the reviews you approved and nobody has moved on since: work-arcs takes those
+    off `reviews` -- correctly, your part is done -- and "23 ongoing" becoming "19" with no
+    word about the other four is a figure that quietly changed. The third is the branches of
+    other people's sitting in this repo with nothing of yours on them. Those used to be
+    counted as workstreams of his, which was the claim demote_checkouts withdrew; they are
+    named here rather than dropped, because a local head this tool stops mentioning anywhere
+    is a head nobody remembers to delete.
     """
     n = undismissed(reviews)
     a('<section id="reviewing">')
@@ -4448,6 +4579,21 @@ def reviewing(a, reviews, drafts, here, by_id):
             facts.append("in " + (f'<a class="arcl" href="#{anchor(arc)}"{via}>{label}</a>'
                                   if arc in here else
                                   f'<span class="arcl"{via}>{label}</span>'))
+        elif r.get("checked_out"):
+            # The other half of the join, and the reason it is not simply absent. This merge
+            # request's source branch IS sitting in this repo -- it used to be filed as a
+            # workstream of his and demote_checkouts withdrew that claim, on the grounds
+            # that a directory holding Logan's branch is not a piece of work of Kyle's. What
+            # it is instead is evidence about this review, and this is where the evidence
+            # goes: without it the branch would have left the page in silence, which is the
+            # one thing that rule was written not to do.
+            brs = [b for b in (r.get("checkout_branches") or []) if b]
+            sess = r.get("checkout_sessions") or 0
+            facts.append("checked out here"
+                         + (" as " + " ".join(f'<span class="rn">{esc(b)}</span>'
+                                              for b in brs) if brs else "")
+                         + (f' &middot; <span class="rn">{sess}</span> session'
+                            + ("" if sess == 1 else "s") if sess else ""))
         clk = r.get("days")
         asked = (f' title="from the merge request&rsquo;s creation — no note records '
                  f'when you were asked"' if r.get("asked_is_proxy")
@@ -4521,6 +4667,61 @@ def reviewing(a, reviews, drafts, here, by_id):
           + ("" if drafts == 1 else "s")
           + " of theirs left out &mdash; a merge request nobody has finished writing is "
             "not a review you are in the middle of.</p>")
+    if approved:
+        # Named rather than counted, because four linked refs cost one line and answer the
+        # only question the count raises. Each one is still open and still somebody else's,
+        # so the link is the whole of what a reader wants from it.
+        a(f'<p class="covered">{len(approved)} more you approved and nobody has moved on '
+          "since &mdash; "
+          + " ".join(link(r.get("url", ""), esc(str(r.get("ref")
+                                                    or "!" + str(r.get("iid")))), "ref")
+                     for r in approved)
+          + " &mdash; off this list because your part of "
+          + ("it" if len(approved) == 1 else "them")
+          + " is done, and back on it the moment they push.</p>")
+    if checkouts:
+        # The one place on the page these are named. Not rows and not a zone: there is
+        # nothing to do to one of these but delete it, so it gets no clock, no severity and
+        # no control -- and it gets a disclosure, because the count is the fact and the
+        # branch names are what you need only once you have decided to act on it.
+        wt = sum(1 for c in checkouts if c.get("worktree"))
+        a(f'<p class="covered">{len(checkouts)} branch'
+          + ("" if len(checkouts) == 1 else "es")
+          + " of other people&rsquo;s "
+          + ("is" if len(checkouts) == 1 else "are")
+          + " checked out in this repo with no commit of yours on "
+          + ("it" if len(checkouts) == 1 else "them")
+          + " and no review of yours joined &mdash; so "
+          + ("it is not a workstream" if len(checkouts) == 1 else "they are not workstreams")
+          + " and "
+          + ("has" if len(checkouts) == 1 else "have")
+          + " no row anywhere above."
+          + (f" {wt} of them still hold a worktree." if wt else "")
+          + "</p>")
+        a('<details class="more"><summary>which '
+          + ("branch" if len(checkouts) == 1 else "branches")
+          + "</summary>")
+        a('<ul class="cox">')
+        for c in checkouts:
+            bits = []
+            if c.get("owner"):
+                bits.append(esc(c["owner"]) + "&rsquo;s")
+            if isinstance(c.get("age_days"), int):
+                bits.append(f'{c["age_days"]}d old')
+            if c.get("worktree"):
+                bits.append("worktree")
+            if c.get("sessions"):
+                bits.append(f'{c["sessions"]} session'
+                            + ("" if c["sessions"] == 1 else "s"))
+            # Where it used to be filed, so a reader who remembers yesterday's page can find
+            # where a row went. It is the same sentence work-arcs writes to stderr and for
+            # the same reason: a workstream that vanished without an account of itself reads
+            # as a bug in the grouping.
+            if c.get("was_arc") and c["was_arc"] != c.get("branch"):
+                bits.append("was filed as " + esc(str(c["was_arc"])))
+            a(f'<li><span class="br">{esc(c.get("branch", "?"))}</span>'
+              + (" &middot; " + " &middot; ".join(bits) if bits else "") + "</li>")
+        a("</ul></details>")
     a("</section>")
 
 
@@ -4679,8 +4880,17 @@ def render(data, lede, focus_days, limit, cost=None):
         # judgement that stopped "waiting on review" rendering hot.
         got.sort(key=lambda x: (x.get("stage") == "in-review", x.get("urgency", 99),
                                 -x.get("unpushed_live", 0), -x.get("engagement", 0)))
+        # And then one partition over the top of all of it, which is not a sort. Everything
+        # above the line keeps the order the key above gave it and everything below it does
+        # too; what the split says is that the rows at the foot of this bucket are somebody
+        # else's ticket -- see review_arc. It is the outermost key rather than a term inside
+        # the tuple for the same reason the in-review split is: a partition can be read off
+        # the page ("everything under this line is X"), and a term in a sort key can only be
+        # reverse-engineered from the order it produced.
+        rvs = [x for x in got if review_arc(x)]
         if got:
-            buckets.append((key, title, got))
+            buckets.append((key, title,
+                            [x for x in got if not review_arc(x)] + rvs, len(rvs)))
     gap = data.get("gap") or {}
 
     # The Slack lens's boundary, composed once and printed on every card that carries a
@@ -4711,6 +4921,10 @@ def render(data, lede, focus_days, limit, cost=None):
     # The order comes down the wire, as it does in the section itself: work-arcs ranks the
     # forgotten arcs and a ranking written twice will differ in one of them.
     by_id = {x.get("id"): x for x in data.get("arcs", [])}
+    # Over every arc on the wire and not only the ones in the focus window: a brief sentence
+    # or a run-over-run line can name a workstream that has no row here, and it is no less
+    # somebody else's ticket for being outside the fortnight.
+    rvarcs = {x.get("id"): x for x in data.get("arcs", []) if review_arc(x)}
     order = data.get("forgotten")
     if order is None:
         order = [x.get("id") for x in data.get("arcs", [])]
@@ -4729,6 +4943,11 @@ def render(data, lede, focus_days, limit, cost=None):
     # ledger because that is the queue both views come off, and a count re-derived here
     # would be a second author for how many rows were dropped.
     review_drafts = (ledger or {}).get("reviews_drafts_skipped") or 0
+    # The reviews that left the ongoing list because you approved them and nobody has moved
+    # since. Gated on the same fact as the list itself -- they come off one sweep, and a
+    # sweep that half-answered half-answered for both -- so an unconsulted run accounts for
+    # nothing rather than claiming nought.
+    reviews_approved = list(data.get("reviews_approved") or []) if reviews_known else []
     evidence_fps = {
         "ledger": {e.get("fp") for e in ((ledger or {}).get("they_owe") or [])
                    + ((ledger or {}).get("you_owe") or []) if e.get("fp")},
@@ -4804,12 +5023,12 @@ def render(data, lede, focus_days, limit, cost=None):
     # purpose, and the derived lede is the degradation for a pipeline that never ran
     # arc-morning.
     here = {x.get("id") for x in arcs}
-    head = headline_block(data, here, evidence_fps)
+    head = headline_block(data, here, evidence_fps, rvarcs)
     if lede:
         a(f'<div class="headline"><p class="lede">{lede}</p></div>')
     elif head:
         a(head)
-        a(brief_block(data, here, evidence_fps))
+        a(brief_block(data, here, evidence_fps, rvarcs))
     else:
         a(f'<div class="headline">'
           f'<p class="lede">{derive_lede(data, focus_days)}</p></div>')
@@ -5026,7 +5245,7 @@ def render(data, lede, focus_days, limit, cost=None):
     # is absent on Tuesday is one whose absence you have to diagnose; the window is always
     # well-defined, so on an off day it simply shows what has piled up for the next one,
     # which is a useful thing to have seen before you get there.
-    a(standup_block(data, here, evidence_fps))
+    a(standup_block(data, here, evidence_fps, rvarcs))
 
     # --- the declared lens, one strip wide ---------------------------------
     # The only thing on this page that comes from a plan rather than from evidence. Every
@@ -5248,7 +5467,7 @@ def render(data, lede, focus_days, limit, cost=None):
             i = next((x for x in arc.get("issues", []) if x.get("key") == tkt), {})
             a(f'<li id="{anchor(arc.get("id"))}"><span class="nm">'
               + (link(i.get("url", ""), esc(tkt), "key") + " " if tkt else "")
-              + f'{nm}</span>'
+              + f'{nm}{review_chip(arc)}</span>'
               f'<span class="mr">{ref or "&mdash;"}</span>'
               + '<span class="ag{}"{}>{}d</span>'.format(
                   *age_mark(arc), arc.get("age_days", "?")))
@@ -5266,6 +5485,29 @@ def render(data, lede, focus_days, limit, cost=None):
             a("</li>")
         a("</ul>")
 
+    def review_join(arc):
+        """The merge requests that make this a review, and whose they are.
+
+        Named on the row and not only in the chip's title, because "whose ticket is this"
+        is the question the row was answering wrongly and a hover is not an answer to a
+        question you ask at a glance. The iid is a link, so the row is one click from the
+        thing it is a review of -- which is the only navigation this identity needs.
+
+        The owner is the address's local part, which is what the wire carries and as far as
+        it goes: `logan` is a fact and `Logan` is a guess about a colleague's name, on a
+        page read every morning. Two names where a workstream joins two people's merge
+        requests, and never more than the wire has.
+        """
+        rs = arc.get("reviews") or []
+        if not rs:
+            return ""
+        refs = " ".join(link(r.get("url", ""), esc(str(r.get("ref")
+                                                       or "!" + str(r.get("iid")))))
+                        for r in rs)
+        who = sorted({r.get("author") for r in rs if r.get("author")})
+        return (f' <span class="revjoin">{refs}</span>'
+                + (f'<span class="revwho"> {esc(", ".join(who))}</span>' if who else ""))
+
     def workstream_row(arc):
         """One line, with everything else behind a disclosure."""
         brief = arc.get("brief") or {}
@@ -5279,6 +5521,7 @@ def render(data, lede, focus_days, limit, cost=None):
           f'data-key="{esc(arc.get("label",""))}" '
           f'data-fp="{esc(arc.get("fingerprint",""))}" '
           f'data-stage="{esc(arc.get("stage") or "")}" '
+          f'data-review="{1 if review_arc(arc) else 0}" '
           f'data-parked="{1 if arc.get("parked") else 0}">')
         a("<summary>")
         a(link(i.get("url", ""), esc(tkt), "tkt") if tkt
@@ -5303,6 +5546,7 @@ def render(data, lede, focus_days, limit, cost=None):
         a(f'<span class="nm">{nm}'
           + (f' <span class="onbr">{esc(auth)}</span>' if auth and not tkt else "")
           + sprint_chip(arc) + (" " + filed if filed else "")
+          + review_chip(arc) + review_join(arc)
           + "</span>")
         a(f'<span class="st">{esc(arc.get("state",""))}</span>')
         a('<span class="ag{}"{}>{}</span>'.format(*age_mark(arc), esc(when)))
@@ -5493,7 +5737,8 @@ def render(data, lede, focus_days, limit, cost=None):
         i = next((x for x in arc.get("issues", []) if x.get("key") == tkt), {})
         a('<div class="news">')
         a("<h3>" + (link(i.get("url", ""), esc(tkt), "tkt") + " &middot; " if tkt else "")
-          + esc(brief.get("name") or arc.get("label", "?")) + "</h3>")
+          + esc(brief.get("name") or arc.get("label", "?"))
+          + review_chip(arc) + "</h3>")
         for d in arc["notify"][:3]:
             a(f'<div class="item" data-fp="{esc(d.get("fp",""))}" '
               f'data-dismissed="{1 if d.get("dismissed") else 0}">')
@@ -5594,12 +5839,12 @@ def render(data, lede, focus_days, limit, cost=None):
         if diffs:
             a('<ul class="lb">')
         for c in diffs:
-            here = c.get("id") in shown
+            has_row = c.get("id") in shown
             arc = by_id.get(c.get("id")) or {}
             nm = esc((arc.get("brief") or {}).get("name") or c.get("label") or "?")
             age = c.get("age_days")
-            a(f'<li data-bg="{0 if here else 1}">')
-            why = ("in the window below" if here
+            a(f'<li data-bg="{0 if has_row else 1}">')
+            why = ("in the window below" if has_row
                    else "outside the window below, so it has no row there")
             a(f'<span class="ag" title="{why}">'
               + (f"{esc(age)}d" if isinstance(age, int) else "&mdash;") + "</span>")
@@ -5608,10 +5853,10 @@ def render(data, lede, focus_days, limit, cost=None):
             # The name links to its own row where there is one, and stays plain text where
             # the window hides it -- an anchor to a row that was never rendered is the
             # same lie as a link to a 404.
-            named = (f'<a href="#{anchor(c.get("id"))}">{nm}</a>' if here else nm)
+            named = (f'<a href="#{anchor(c.get("id"))}">{nm}</a>' if has_row else nm)
             a('<span class="nm">'
               + (link(i.get("url", ""), esc(tkt), "tkt") + " &middot; " if tkt else "")
-              + named + "</span>")
+              + named + review_chip(arc) + "</span>")
             a('<span class="cls">')
             for e in c.get("evidence") or []:
                 a(f'<span class="cl" data-k="{esc(e.get("kind",""))}">'
@@ -5645,6 +5890,7 @@ def render(data, lede, focus_days, limit, cost=None):
                   + (f'<a href="#{anchor(arc)}">{nm}</a>' if arc and here_arc
                      else nm if arc
                      else link(c.get("url", ""), esc(c.get("ref", "")), "ref"))
+                  + (review_chip(by_id.get(arc)) if arc else "")
                   + "</span>")
                 a('<span class="cls">'
                   + f'<span class="cl" data-k="{esc(c.get("kind",""))}">'
@@ -5913,7 +6159,8 @@ def render(data, lede, focus_days, limit, cost=None):
     # rendered as "none" -- see reviewing(). Its door and its rail stop are gated on the
     # same fact, so the strip never points at a section this run did not emit.
     if reviews_known:
-        reviewing(a, reviews, review_drafts, here, by_id)
+        reviewing(a, reviews, review_drafts, here, by_id,
+                  reviews_approved, data.get("checkouts") or [])
 
     # --- the conditions, as peers ------------------------------------------
     # Still peers, still no hero figure and no severity hue: there is no honest exchange
@@ -6048,7 +6295,8 @@ def render(data, lede, focus_days, limit, cost=None):
             why = first_clause(brief.get("summary")) or brief.get("blocker") or ""
             branch = x.get("authoritative") or ""
             a(f'<li><a class="nm" href="#{anchor(x.get("id"))}">{esc(nm)}</a>'
-              f'<span class="dy">{esc(scale)}</span>'
+              + review_chip(x)
+              + f'<span class="dy">{esc(scale)}</span>'
               + (f'<span class="ag">{quiet}d quiet</span>' if quiet is not None
                  else '<span class="ag"></span>')
               + (f'<span class="wy">{esc(why)}</span>' if why else "")
@@ -6075,7 +6323,12 @@ def render(data, lede, focus_days, limit, cost=None):
       "tiebreak. The one split above all of that is whether the next move is yours: a "
       "row in <span style=\"color:var(--calm)\">green</span> is out for review with "
       "someone named on it and wants nothing from you, so it sits at the foot of its "
-      "group. Open a row for what it is, what it needs, and how its branches relate. "
+      "group. Under that, at the very foot of each group, are the workstreams where part "
+      "of what you are doing is reading somebody else&rsquo;s merge request &mdash; "
+      "<span class=\"revchip\">review</span>, with the merge request and its owner on "
+      "the row. They are still yours and still counted; nothing inside either side of "
+      "that line has been reordered. Open a row for what it is, what it needs, and how "
+      "its branches relate. "
       "<strong>Park</strong> sets one aside as backlog; it comes back on its own as soon "
       "as a commit lands on it.</p>")
     # Today and this week are open; last week and earlier are folded. The window still
@@ -6086,7 +6339,7 @@ def render(data, lede, focus_days, limit, cost=None):
     # The fold takes `data-bucket` because that is the hook the client's recount already
     # hides an emptied group by, and the figure sits in its own span inside the header so
     # `[data-count]` can be rewritten without taking the word "workstreams" with it.
-    for key, title, got in buckets:
+    for key, title, got, nrev in buckets:
         shut = key not in OPEN_BUCKETS
         if shut:
             fold(a, esc(title),
@@ -6100,7 +6353,17 @@ def render(data, lede, focus_days, limit, cost=None):
               f'<h2 id="{key}" style="font-size:1rem">{title}</h2>'
               f'<span class="n" data-count="{key}">{len(got)}</span></div>')
         a(f'<div class="wslist" data-list="{key}">')
-        for arc in got:
+        for i, arc in enumerate(got):
+            # The boundary, at the index the partition put it. Its count is the group's own
+            # and the client keeps it in step, exactly as it keeps the bucket header's: park
+            # every review row in a bucket and a line reading "reviewing 2" over nothing is
+            # the same small lie as a header reading 12 above a list of two.
+            if nrev and i == len(got) - nrev:
+                a(f'<div class="wsgrp" data-revgroup="{key}">'
+                  '<span class="gl">reviewing</span>'
+                  f'<span class="gn" data-revcount="{key}" title="somebody else&rsquo;s '
+                  'merge request is joined to each of these, so part of what they are is '
+                  f'you reading them">{nrev}</span></div>')
             workstream_row(arc)
         a("</div>")
         if shut:
@@ -6165,7 +6428,7 @@ def render(data, lede, focus_days, limit, cost=None):
             # the key, printing both says the key twice and the name not at all.
             key = (link(i.get("url", ""), esc(tkt), "key") + " "
                    if tkt and nm != esc(tkt) else "")
-            a(f'<span class="nm">{key}{named}</span>')
+            a(f'<span class="nm">{key}{named}{review_chip(x)}</span>')
             a(cliff_spark(act, cliff_span))
             a(f'<span class="ag" title="last active {esc(act.get("last_active") or "?")}">'
               f'{act.get("cliff_days","?")}d</span>')
