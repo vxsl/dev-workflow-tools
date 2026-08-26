@@ -4677,12 +4677,20 @@ PEERS_RECORDED = 12
 # which is common and usually right.
 CONFIDENCE_AT = float(os.environ.get("ARC_CONFIDENCE_AT", "0.34"))
 
-# Questions per build. Five is not a tuning parameter, it is the whole design: the
-# corpus has 56 memberships under the confidence line and would have more on a bigger
-# repo, and a queue that showed all of them would be a backlog nobody opens. Five is
-# what fits on a screen without scrolling and what a person will actually answer between
-# two other things. Answered ones pin and drop out; skipped ones come back.
-CURATION_CAP = int(os.environ.get("ARC_CURATION_CAP", "5"))
+# There is no cap here any more, and its absence is the design rather than an omission.
+#
+# Five questions a build was pacing, and the pacing was priced for a loop that no longer
+# exists: every answer cost an fzf round-trip or a rebuild, so five painless questions
+# beat a checklist grind and a sixth was a cost with no payer. The page closed the loop --
+# an answer is a click, applied in place, saved by the page itself -- and the economics
+# went with it. What is left of five is presentation, and presentation belongs where the
+# rendering is: `ARC_CURATION_CAP` is still read, by `arcs-page`, as the size of the
+# window it shows at once. A queue truncated here could never be un-truncated there.
+#
+# Capping at emission also spent the seats in the wrong order. The cap was a survival
+# filter across three kinds ranked against each other, so on this corpus membership took
+# four of the five every build and a no-ticket question was asked roughly never -- the
+# starvation is measured in `combined_queue`, which now interleaves instead.
 
 # How cold local-only work has to be before it is worth asking whether it was ever meant
 # to land, as a multiple of the arc's OWN typical gap between active days. The arithmetic
@@ -5000,10 +5008,10 @@ def curate(queue, cluster_assign):
 
     The whole loop exists because the clustering's residual error needs a human and an
     unguided human does not curate. So the rules are about the asking, not the answering:
-    never more than CURATION_CAP questions of both kinds together, skip costs nothing and
-    leaves no record, and an empty queue prints one line and exits rather than opening
-    anything. Nothing here notifies, mails or nags -- a queue nobody opens today is simply
-    a queue that is the same size tomorrow.
+    the queue is however long the doubts are and fzf shows one at a time with the remainder
+    counted in its header, skip costs nothing and leaves no record, and an empty queue
+    prints one line and exits rather than opening anything. Nothing here notifies, mails or
+    nags -- a queue nobody opens today is simply a queue that is the same size tomorrow.
 
     One fzf per question rather than a persistent list with callbacks: the answer has to
     be recorded by a process that holds the current assignment, and a callback shelling
@@ -5089,7 +5097,7 @@ def curate(queue, cluster_assign):
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def curation_queue(arcs, membership, cluster_assign, uncertain=(), cap=CURATION_CAP):
+def curation_queue(arcs, membership, cluster_assign, uncertain=()):
     """The memberships worth a human's attention, least confident first.
 
     Kyle's verdict on the arcs was that they hold a lot of false positives, and the
@@ -5154,7 +5162,9 @@ def curation_queue(arcs, membership, cluster_assign, uncertain=(), cap=CURATION_
     true. An arc with four strangers in it is asked again next build, one at a time,
     which is slower and right.
 
-    Capped, and absent entirely when nothing falls below the line.
+    Complete, and absent entirely when nothing falls below the line. What is asked first
+    is this order's business; how much of it a reader is shown at once is the page's, and
+    a list truncated here could never be un-truncated there.
     """
     unsure = set(uncertain or ())
     out = []
@@ -5225,7 +5235,7 @@ def curation_queue(arcs, membership, cluster_assign, uncertain=(), cap=CURATION_
             continue
         seen.add(q["arc_id"])
         once.append(q)
-    return once[:cap]
+    return once
 
 
 # ── is this still intended work? ───────────────────────────────────────────────
@@ -5436,8 +5446,7 @@ def _residue_promised(arcs, ledger):
     return out
 
 
-def residue_queue(arcs, ledger, jira_known, pinned=(), at_risk=(),
-                  cap=CURATION_CAP):
+def residue_queue(arcs, ledger, jira_known, pinned=(), at_risk=()):
     """The workstreams worth asking "was this ever meant to land?", worst distortion first.
 
     Derived, not asked about wholesale. The whole queue's rule is that asking about a
@@ -5558,7 +5567,7 @@ def residue_queue(arcs, ledger, jira_known, pinned=(), at_risk=(),
         })
     out.sort(key=lambda q: (place.get(q["arc_id"], len(place)), -q["beats"],
                             -q["days"], -q["commits"], q["arc_id"]))
-    return out[:cap], ""
+    return out, ""
 
 
 def answer_residue(q, intended):
@@ -5598,31 +5607,39 @@ def answer_residue(q, intended):
                 "via": q.get("via") or "cli"})
 
 
-# How many of the queue's slots an intent question is guaranteed, when there is one to
-# ask. One, and it exists because pure priority measured out as silence.
+# The order the three kinds are woven into one queue, repeating for as long as any of them
+# still has a question left. Read it as five seats handed out over and over rather than
+# five seats handed out once: whose seat each one is, not who survives the cut.
 #
-# Membership outranks residue, and the reason is sound: a branch in the wrong arc poisons
-# everything downstream of the grouping -- the arc's subject, its ticket, its brief, its
-# rung and every count on it -- and it poisons the intent question too, since "is this
-# workstream intended?" is unanswerable about a workstream that is two pieces of work in
-# a trenchcoat. A stale branch counted as debt one more day is a number slightly too
-# large. So membership takes four of the five and leads the list.
+# Membership leads, and the reason is sound: a branch in the wrong arc poisons everything
+# downstream of the grouping -- the arc's subject, its ticket, its brief, its rung and
+# every count on it -- and it poisons the intent question too, since "is this workstream
+# intended?" is unanswerable about a workstream that is two pieces of work in a trenchcoat.
+# A stale branch counted as debt one more day is a number slightly too large.
 #
-# But strict priority is not a ranking, it is an exclusion, and on this corpus it excludes
-# everything: 56 memberships sit under the confidence line and the queue offers 5 of them
-# every single build, against 29 workstreams eligible for an intent question. Measured on
-# the real graph the day this was written, the combined queue held five membership
-# questions and no intent question, and would have gone on holding none until every
-# grouping doubt in the repo was answered. A question that is never asked cannot fix the
-# ranking it was built to fix -- and the ranking is the whole point: without an intent
-# verdict, five days of dead experiments outrank a meaningful half-day fix forever.
+# But priority alone is an exclusion rather than a ranking, and on this corpus it excluded
+# everything below it: 56 memberships sit under the confidence line against 29 workstreams
+# eligible for an intent question and a fold of no-ticket rows, and a queue of five ranked
+# by priority held five membership questions and nothing else. The intent floor bought one
+# seat back for one kind and left the third starving -- the no-ticket question, the one
+# whose rows Kyle asked to be able to clear, was reached on the order of never.
 #
-# So one slot is reserved rather than competed for. Four of five is still the priority the
-# reasoning above asks for; nought of five was the priority collapsing into silence.
-RESIDUE_SLOTS = int(os.environ.get("ARC_RESIDUE_SLOTS", "1"))
+# Interleaving fixes what the floor patched. Every kind is asked in its own order, and the
+# weave decides only whose turn it is, so the queue can be as long as the doubts are and
+# no kind waits for another to run out. Three of the first five are still membership, which
+# is the priority above stated as a share instead of as an exclusion; residue takes the
+# third seat and no-ticket the fifth, so a reader who answers one screenful has answered
+# one of each.
+CURATION_WEAVE = ("membership", "membership", "residue", "membership", "unticketed")
+
+# Who fills a seat whose own kind has run out. The same priority as ever, now applying only
+# to the leftovers -- the weave says whose turn it is, this says who takes a turn nobody
+# claimed. Nothing is padded: a kind with no questions left simply yields, and a seat with
+# no claimant at all ends the queue rather than inventing a row.
+CURATION_FALLBACK = ("membership", "residue", "unticketed")
 
 
-def unticketed_queue(gap, cap=CURATION_CAP):
+def unticketed_queue(gap):
     """The workstreams Jira has never heard of, worth asking about, biggest first.
 
     The fold this reads from is the one Kyle named: "'real work with no ticket' has some
@@ -5648,8 +5665,8 @@ def unticketed_queue(gap, cap=CURATION_CAP):
     work invisible to Jira is invisible to capacity, burndown and every rollup, and the
     size of what is invisible is the size of that claim. Then commits, then engagement,
     then the id -- total, because arc-brief caches on evidence text and a queue that
-    shuffled between two builds of one graph would ask the same five questions in a
-    different order every morning.
+    shuffled between two builds of one graph would ask the same questions in a different
+    order every morning.
     """
     out = []
     for a in (gap or {}).get("unticketed_work") or []:
@@ -5685,7 +5702,7 @@ def unticketed_queue(gap, cap=CURATION_CAP):
                     f"nothing in Jira names it"),
         })
     out.sort(key=lambda q: (-q["days"], -q["commits"], -q["engagement"], q["arc_id"]))
-    return out[:cap]
+    return out
 
 
 def answer_unticketed(q, answer):
@@ -5720,31 +5737,43 @@ def answer_unticketed(q, answer):
                 "why": q.get("why"), "via": q.get("via") or "cli"})
 
 
-def combined_queue(memberships, residues, unticketed=(), cap=CURATION_CAP,
-                   floor=RESIDUE_SLOTS):
-    """One queue of at most `cap` questions, membership first and intent guaranteed a seat.
+def combined_queue(memberships, residues, unticketed=(), weave=CURATION_WEAVE,
+                   fallback=CURATION_FALLBACK):
+    """One queue holding every question all three kinds have, woven rather than ranked.
 
-    The cap is shared rather than one each, because it is a budget of attention and not a
-    budget of question types: five is what fits on a screen and what a person will answer
-    between two other things, and fifteen questions in three sections is the backlog the
-    whole loop was designed not to become.
+    There is no cap and no cut. Each kind arrives already in a total order of its own --
+    least confident, worst distortion, most days at stake -- and none of those orders is
+    comparable with the others: a confidence of 0.12 and six days of unpublished work are
+    not two readings of one scale, and any arithmetic pretending otherwise would be a
+    fourth ranking nobody could account for. So the kinds are not scored against each
+    other. They take turns, and `CURATION_WEAVE` is the rota.
 
-    Within it, membership leads and intent holds a floor -- see RESIDUE_SLOTS for the
-    measurement that made the floor necessary. Neither kind is padded: where there is
-    nothing to ask of one kind the other simply fills the queue, so a reserved slot can
-    never show a question that did not exist.
+    That is what replaces the cap. Truncating here decided which questions a person would
+    ever see, and it decided it in the one place that cannot see how many they are willing
+    to answer; the page shows a window on this list and says how much is behind it, which
+    is a decision about pacing made where the pacing happens.
 
-    No-ticket questions take what is left and hold no floor, and that is a claim about what
-    each kind costs to get wrong rather than about what each is worth. A branch in the
-    wrong arc poisons every number downstream of the grouping; a workstream wrongly called
-    residue is counted as debt it is not. A no-ticket row that goes unasked for a morning
-    is a sentence in a fold, and the fold now carries its own ✕ -- so this kind is the one
-    with somewhere else to be answered, which makes it the right one to yield the seat.
+    Total, and deterministically so: the weave position is the only cross-kind key and each
+    kind's own order is already total to its id, so two runs over one graph produce the
+    same sequence. That matters more than it sounds -- arc-brief caches on evidence text,
+    and a queue that reshuffled between two builds of one graph would re-ask the same
+    questions in a different order every morning.
     """
-    mem, res, unt = list(memberships), list(residues), list(unticketed)
-    keep = min(len(res), floor)
-    out = (mem[:max(0, cap - keep)] + res)[:cap]
-    return (out + unt)[:cap]
+    pools = {"membership": list(memberships), "residue": list(residues),
+             "unticketed": list(unticketed)}
+    out, i = [], 0
+    while any(pools.values()):
+        want = weave[i % len(weave)]
+        i += 1
+        if not pools[want]:
+            # Nobody claimed this seat, so priority takes it. A kind that has run out
+            # yields its turns rather than holding them empty, which is the whole
+            # difference between a rota and a reservation.
+            want = next((k for k in fallback if pools[k]), None)
+            if want is None:
+                break
+        out.append(pools[want].pop(0))
+    return out
 
 
 def co_members(cluster_assign, branch):
@@ -8821,12 +8850,15 @@ def main():
             # or the page silently changes its mind and nothing accounts for it.
             "stale_residue": stale_residue,
             "stale_intended": stale_intended,
-            # The questions this build would like answered, least confident first, or
+            # Every question this build would like answered, in one woven order, or
             # absent when it has none. Top-level rather than on the arcs, because the
-            # queue is ranked across every arc at once -- the five worth asking are the
-            # five worst anywhere, and a per-arc list could not express that. Absent and
-            # not empty when there is nothing to ask, so a renderer can test for the key
-            # rather than for a length and a silent build stays silent.
+            # queue is ranked across every arc at once -- the worst doubts are the worst
+            # anywhere, and a per-arc list could not express that. Complete rather than
+            # capped: how many of these a reader is shown at once is a decision about
+            # pacing and belongs where the rendering is, and a list truncated here could
+            # never be un-truncated there. Absent and not empty when there is nothing to
+            # ask, so a renderer can test for the key rather than for a length and a
+            # silent build stays silent.
             **({"curation": curation} if curation else {}),
             "gap": gap,
         }, sys.stdout, indent=1)

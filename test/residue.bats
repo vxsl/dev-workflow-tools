@@ -338,49 +338,53 @@ print(wa.residue_preview(q[0]))
     [[ "$output" == *"at-risk ranking         #2"* ]]
 }
 
-@test "the residue queue is capped on its own before it is merged" {
+@test "the residue queue is every workstream worth asking about, uncapped" {
+    # It used to be cut to the five-question budget before the merge. The budget is gone
+    # from emission -- the page shows a window and says what is behind it -- so what comes
+    # off here is the whole ranked list.
     run wa '
 print(len(wa.residue_queue([arc("A%d" % i) for i in range(9)], LEDGER, True)[0]))
 '
     [ "$status" -eq 0 ]
-    [[ "$output" == *"5"* ]]
+    [[ "$output" == *"9"* ]]
 }
 
-@test "one shared cap across both question types, membership first" {
-    # A budget of attention, not a budget of question types: five is what fits on a
-    # screen, and ten questions in two sections is the backlog this was designed not to
-    # become. Membership leads because a branch in the wrong arc poisons the residue
+@test "the two kinds take turns rather than one surviving the cut" {
+    # A rota, not a ranking across incomparable scales: a confidence of 0.12 and six days
+    # of unpublished work are not two readings of one measure. Membership leads and takes
+    # three seats of every five, because a branch in the wrong arc poisons the residue
     # question too -- "is this workstream intended?" is unanswerable about a workstream
     # that is two pieces of work.
     run wa '
 mem = [{"kind": "membership", "branch": "b%d" % i, "arc": "M%d" % i} for i in range(4)]
 res = [{"kind": "residue", "arc": "R%d" % i} for i in range(4)]
-print([q.get("branch") or q["arc"] for q in wa.combined_queue(mem, res)])
+print([q.get("branch") or q["arc"] for q in wa.combined_queue(mem, res)][:6])
 print([q.get("branch") or q["arc"] for q in wa.combined_queue(mem[:1], res)])
 '
     [ "$status" -eq 0 ]
-    [[ "$output" == *"['b0', 'b1', 'b2', 'b3', 'R0']"* ]]
+    [[ "$output" == *"['b0', 'b1', 'R0', 'b2', 'b3', 'R1']"* ]]
     [[ "$output" == *"['b0', 'R0', 'R1', 'R2', 'R3']"* ]]
 }
 
-@test "a full queue of membership questions still leaves intent a seat" {
-    # The case that made the floor necessary rather than tidy. Fifty-six memberships sit
-    # under the confidence line on this corpus and five are offered every build, so under
-    # strict priority the intent question is not merely last -- it is never asked, and a
+@test "a long membership queue never postpones the intent question" {
+    # The case that made the old floor necessary and that the rota now covers outright.
+    # Fifty-six memberships sit under the confidence line on this corpus, so under strict
+    # priority the intent question was not merely last -- it was never asked, and a
     # question that is never asked cannot fix the ranking it exists to fix.
     run wa '
 mem = [{"kind": "membership", "branch": "b%d" % i} for i in range(9)]
 res = [{"kind": "residue", "arc": "R%d" % i} for i in range(9)]
-print([q.get("branch") or q["arc"] for q in wa.combined_queue(mem, res)])
+q = [x.get("branch") or x["arc"] for x in wa.combined_queue(mem, res)]
+print(q[:5], len(q))
 '
     [ "$status" -eq 0 ]
-    [[ "$output" == *"['b0', 'b1', 'b2', 'b3', 'R0']"* ]]
+    [[ "$output" == *"['b0', 'b1', 'R0', 'b2', 'b3'] 18"* ]]
 }
 
-@test "a reserved slot never invents a question that does not exist" {
+@test "a seat nobody claims is filled, never invented" {
     run wa '
 mem = [{"kind": "membership", "branch": "b%d" % i} for i in range(9)]
-print([q["branch"] for q in wa.combined_queue(mem, [])])
+print([q["branch"] for q in wa.combined_queue(mem, [])][:5])
 print([q["arc"] for q in wa.combined_queue([], [{"kind": "residue", "arc": "R"}])])
 '
     [ "$status" -eq 0 ]

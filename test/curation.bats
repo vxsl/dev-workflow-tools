@@ -296,9 +296,13 @@ print(names(wa.curation_queue([arc("A", [br("stray"), br("anchor")])], mem, {}))
     [[ "$output" == "[]" ]]
 }
 
-# ── the cap and the spread ────────────────────────────────────────────────────
+# ── the whole queue and the spread ────────────────────────────────────────────
 
-@test "the queue never exceeds the cap" {
+@test "the queue is every doubt there is, not a rationed five" {
+    # The cap used to live here and pace the asking, back when every answer cost an fzf
+    # round-trip or a rebuild. The page closed the loop, so pacing is presentation, and
+    # presentation belongs where the rendering is -- a list truncated at emission could
+    # never be un-truncated on the page.
     run wa '
 mem, arcs = {}, []
 for i in range(20):
@@ -306,10 +310,10 @@ for i in range(20):
     mem["anchor%d" % i] = m(1.0)
     arcs.append(arc("A%d" % i, [br("b%d" % i), br("anchor%d" % i)]))
 q = wa.curation_queue(arcs, mem, {})
-print(len(q), wa.CURATION_CAP)
+print(len(q), hasattr(wa, "CURATION_CAP"))
 '
     [ "$status" -eq 0 ]
-    [[ "$output" == "5 5" ]]
+    [[ "$output" == "20 False" ]]
 }
 
 @test "one question per arc, so two branches holding each other up are asked once" {

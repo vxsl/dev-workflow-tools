@@ -158,14 +158,19 @@ echo "  page:  $OUT"
 # is where they get answered and a queue nobody knows about is a queue nobody opens. It
 # is deliberately not a notification: the DE team's taskmaster bot is the shape to avoid,
 # and a prompt that arrives uninvited is one the eye learns to skip.
-# Both kinds, counted apart, because they are two different doubts and the line is the
-# only place a person learns the queue exists. "3 the grouping is unsure of" said about a
-# queue holding two questions about intent would send them looking for the wrong thing.
+# All three kinds, counted apart, because they are three different doubts and the line is
+# the only place a person learns the queue exists. "3 the grouping is unsure of" said about
+# a queue holding two questions about intent would send them looking for the wrong thing.
+#
+# The total is the whole queue now rather than a capped five: work-arcs stopped truncating
+# at emission, so this figure is how many doubts exist and not how many were rationed. The
+# page shows a window on the same list; the command line walks all of it one at a time.
 q=$(python3 -c 'import json,sys
 d=json.load(open(sys.argv[1]))
 qs=d.get("curation") or []
 r=sum(1 for x in qs if x.get("kind")=="residue")
-print(len(qs), len(qs)-r, r)' "$graph" 2>/dev/null || echo "0 0 0")
+u=sum(1 for x in qs if x.get("kind")=="unticketed")
+print(len(qs), len(qs)-r-u, r, u)' "$graph" 2>/dev/null || echo "0 0 0 0")
 set -- $q
 if [ "${1:-0}" != "0" ]; then
     bits=""
@@ -173,6 +178,10 @@ if [ "${1:-0}" != "0" ]; then
     if [ "${3:-0}" != "0" ]; then
         [ -z "$bits" ] || bits="$bits, "
         bits="$bits$3 intent"
+    fi
+    if [ "${4:-0}" != "0" ]; then
+        [ -z "$bits" ] || bits="$bits, "
+        bits="$bits$4 no ticket"
     fi
     echo "  ask:   $1 question$([ "$1" = 1 ] || echo s) — $bits — work-arcs --curate"
 fi

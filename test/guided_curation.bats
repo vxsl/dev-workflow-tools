@@ -185,25 +185,30 @@ print(one == two, one)'
     [[ "$output" == "True "* ]]
 }
 
-# Membership leads and intent keeps its floor; no-ticket takes what is left and holds none.
-# That is a claim about what each kind costs to get wrong, not about what each is worth:
-# this is the one kind with somewhere else to be answered.
-@test "no-ticket questions take the seats the other two do not want" {
+# Membership leads and takes three seats of every five; the other two get one each, every
+# time round. The seat share is the old priority stated as a share instead of as an
+# exclusion -- and an exclusion is what it was, because a strict ranking across three
+# incomparable scales meant the third kind was reached on the order of never.
+@test "every kind gets a turn, and membership leads" {
     run wa '
 mem = [{"kind": "membership"}] * 2
 res = [{"kind": "residue"}]
 unt = [{"kind": "unticketed"}] * 4
 print([q["kind"] for q in wa.combined_queue(mem, res, unt)])'
-    [ "$output" = "['membership', 'membership', 'residue', 'unticketed', 'unticketed']" ]
+    [ "$output" = "['membership', 'membership', 'residue', 'unticketed', 'unticketed', 'unticketed', 'unticketed']" ]
 }
 
-@test "a full membership queue still leaves intent its seat and no-ticket none" {
+# The starvation this replaced, measured: a membership queue long enough to fill the old
+# cap on its own asked nothing else at all, and the no-ticket rows Kyle asked to be able
+# to clear were never offered.
+@test "a long membership queue still asks a no-ticket question early" {
     run wa '
 mem = [{"kind": "membership"}] * 9
 res = [{"kind": "residue"}] * 3
 unt = [{"kind": "unticketed"}] * 3
-print([q["kind"] for q in wa.combined_queue(mem, res, unt)])'
-    [ "$output" = "['membership', 'membership', 'membership', 'membership', 'residue']" ]
+q = [x["kind"] for x in wa.combined_queue(mem, res, unt)]
+print(q[:5], q.index("unticketed"), len(q))'
+    [ "$output" = "['membership', 'membership', 'residue', 'membership', 'unticketed'] 4 15" ]
 }
 
 # --- what an answer does ---------------------------------------------------------------
