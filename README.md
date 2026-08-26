@@ -1042,6 +1042,250 @@ arc-standup-notify --print           # the prep it is holding
 arc-standup-notify --force           # send it anyway, whatever the clock says
 ```
 
+### `arcs-page`
+Render `work-arcs --json` as the standing picture of your work. The first version listed
+artifacts — 97 stash rows, 261 branch rows — and was correctly called useless: `stash@{38}`
+on its own says nothing, and a flat list of branches is the same wall of text in a nicer
+font. The unit was wrong. This renders arcs, and each card leads with what the arc **is**
+rather than with how much of it there is, with the arc's spawn tree under the description
+and the counts at the bottom.
+
+```bash
+work-arcs --json | arc-brief | arc-morning | arcs-page --out page.html
+```
+
+It renders without `arc-brief` in the pipeline — the cards fall back to the cluster label
+and lose their descriptions, which is the honest degradation — and without `arc-morning`
+the opening sentence falls back to `derive_lede`, which is the same trade: one derived
+sentence instead of the composed several.
+
+**What opens, and what is a line.** Every section used to render fully expanded, all fifteen
+of them, and the verdict was *"it feels a bit all over the place ... just another bucket of
+slop to wrangle"*. The facts were not the problem; the arrangement was. A morning brief and a
+twenty-row table of last week's landed branches were structurally equal, so the page had no
+opinion about what it was for. On open it is the companion — the stamp, the brief, the
+standup notes, the sprint strip, what came back, the worst few loops in either direction,
+the rung strip, and the rows for today and this week. Everything else is one line: last week
+and earlier, the cliff, the parked, the retired, the three Jira tables, the questions and the
+cost, each a closed disclosure carrying its real count and its single worst item. Measured on
+the current graph at 1440px: 12898px of default-visible page became 4069px.
+
+De-emphasis is not hiding, and that is the law the arrangement rests on rather than a nicety.
+`fold()` refuses to render a header without a count, every truncation under one states its
+own remainder, nothing moved section, nothing was removed, and one click reaches all of it —
+an anchor jump opens every disclosure it lands inside rather than the innermost one. No fold
+persists: the one durable fact about how this page is used is that no manual control on it
+was touched in a fortnight, so the defaults have to be the selection and the controls the
+override. A remembered fold would walk the page back to fifteen expanded sections one morning
+at a time, and unlike a dismissal or a filing there is no fingerprint under it for anything
+to expire against.
+
+**It opened on its own title, which is the one thing on it that is never news.** *Work Arcs*
+set at 2.4rem was the largest type on a page whose entire claim is that it leads with the
+most consequential fact. The masthead and the build stamp are one quiet line in the corner
+now — every field they carried is still there — and the biggest thing on the page is
+`arc-morning`'s first sentence, promoted to a headline with that stage's own label for it as
+an eyebrow above. Nothing re-ranks to do that: `arc-morning` already decided which fact
+leads. Nothing is dropped either — the remaining lines render in the brief directly below, so
+the count is intact by construction rather than by an announced truncation. The headline
+takes its size from its own sentence's length, derived per candidate: `arc-morning` writes
+anything from forty characters to two hundred and twenty, and the long ones at full display
+size run six lines and have stopped being a headline by the third.
+
+**Every line in the brief carries the controls for what it names.** Each claim there is a
+projection of a row with a `✕` three screens down, and reading *"DE-2585 has sat with Neville
+Dipale 160 days"* and then scrolling to find that row is the page asking you to do its
+filing. So each line ends with its subjects' controls, in the ledger's own `✕` rail register
+and never louder than the words: `✕` where the subject is a row this page rendered, writing
+the row's own fingerprint into the same store on the same click, and `↗` where the subject
+also has a URL off the page. One group per subject, because the ledger sentence names both
+sides and one `✕` standing for both would acknowledge a row nobody clicked.
+
+**And the headline answers to them, before the next build rather than after it.** *"please
+know that the main page title is BS. if i ack/dismiss de-2585 and !10408, will they disappear
+from the title?"* They have to. The client cannot compose the replacement — composing one
+would make the page a second author for which fact leads, and within a month the brief and
+the headline would open on different things — so the **server** draws every line twice, once
+at display size and once as a shortlist row, each half hiding whatever the other is showing,
+and the client's whole decision is a test over the acknowledgement store for the first line
+whose subjects are not all acknowledged. Nothing is re-ranked and no sentence is written
+client-side. The displaced line drops back into the list at the rank it always had, struck
+rather than removed, and the `✕` takes it back. A line naming no row can never be stepped
+past, which is the rule rather than a case: nothing was dealt with there.
+
+**Under the headline, the cockpit strip; down the left, the rail.** The strip is a fixed row
+of doors — the standup, the ledger, reviewing, what is in play, and the tidy queue — each
+carrying its section's own count, its section's own next item, and one click into the zone it
+names. The rail is the same nav as a mini-map of every section this run rendered, standing
+still while the work scrolls past, with the build stamp at its foot. Both exist for the same
+reason: three screenfuls of standing picture is three screenfuls to scroll past to reach the
+section you opened the page for, and that scroll was most of what made this page feel like a
+chore. Under 60rem there is no room for a column, so the same markup becomes a sticky strip
+along the top — one media query, same anchors, same counts. The rail needs no script at all:
+`position:sticky` and nothing else.
+
+**The strip does not move, and that is a correction rather than a default.** The first
+arrangement chose what to lead with from the viewer's clock — a standup panel in the hours
+before the standup, a triage view in the morning, loose ends in the afternoon — and the
+verdict was *"no, i dont like the idea of it being unpredictable. emphasizing different
+sections depending on the time of day is not a good solution to what im asking for"*. Spatial
+memory is the feature. Everything has a place; nothing has a time, and no script on this page
+asks the browser what time it is in order to choose what to show — the only clock left in it
+stamps the second a person's declaration was recorded, and a test pins that.
+
+**A door never states a figure of its own.** Every count on the strip and in the mini-map is
+a copy of the element its section prints: rendered server-side from the same variable, then
+kept equal to it by `MIRROR_JS`, which copies text and never tallies rows. That is `fold()`'s
+law about a collapsed header applied to a link that points at one — a door claiming eight
+above a list showing two is the small kind of lie that costs a page its credit for every
+other number on it. A door or a stop is absent whenever its section is, because an anchor to
+a section that was never emitted is the same lie as a link to a 404.
+
+**A door carries a today-number, not a census.** *"23 ongoing"* reads the same on a morning
+when every review is with its author as on one when every review is with you; what can change
+what you do is how many are yours, which is a figure the section already prints over its own
+group — mirrored, with the census kept underneath and quieter, because dropping it would be
+hiding the denominator. The two doors into other people's loops also say their head rows in
+one shape: a review row carries `days`, `ref` and `title` exactly as a ledger row does, so
+both go through `lead_of()` rather than composing the same sentence twice. And the reviewing
+door follows the section's first **standing** row rather than the wire's head — the two
+parted company the day the quiet window landed, and a door naming the wire's head announces
+as the thing to read first exactly the row the section put in the fold.
+
+**The tidy chip is last on the strip and always last.** Nothing here is ordered by what the
+day looks like, and the queue is not a fourth thing the page is opened *for*; it is the one
+that makes the other three worth trusting, because the strip is the first thing read every
+morning and a queue that is never seen is a queue nobody answers. It is absent entirely at
+zero, which is the only state that must never be announced — a chip reading `tidy · 0` is a
+chore invented for a person who has none. Before it, the queue was the second-to-last fold on
+the page, which is a place you reach by having already scrolled past everything the tidying is
+for.
+
+**The questions are cards, and two of the three kinds have something to draw.** The section
+used to open on a ~180-word paragraph explaining all three types and then ask each one as
+prose: *"the questions section just looks like a wall of text ... some more graphical and/or
+semantic way to show it so i can understand what it's proposing at a glance."* A grouping
+question **is** structural, so it gets the page's own spawn tree with the branch ringed at
+the place file overlap puts it, on a dotted accent edge — a third treatment, because solid
+already means *cut from* and dashed already means *the same commits again*, and the claim
+would inherit a meaning it does not have. An intent question is temporal, so it gets the
+cliff sparkline with the cliff marked. A no-ticket question gets no picture at all: its fact
+is an absence, and a drawn absence is decoration. The omnibus paragraph died into the answers
+themselves — each button now carries what it does, because a consequence belongs on the
+control that causes it rather than in a preamble three inches above three controls sharing a
+page. One card is open at a time, the next few are a ranked strip, and the rest are in the
+document behind an announced count that `ARC_CURATION_CAP` sizes.
+
+Answering shrinks a question instead of removing it, which is what *reveals the next* means
+when the queue is server-rendered: the order is fixed, nothing is reordered, the answered
+rows stop taking a screenful and the next unanswered one is where the eye already was.
+Clicking the same answer again restores it.
+
+**Acknowledging on the curation folds fades rather than disappears**, which is the one place
+this page departs from its own convention and does so on purpose. Everywhere else a `✕` is
+something you do once to a row you have dealt with; here it is the gesture of the section —
+*"i should find it very comfortable to continually clean up noise"*. A row that vanishes the
+instant it is clicked cannot be un-clicked without first hunting for the toggle that brings
+it back, and a cleanup you cannot undo in place is one you do slowly and doubtfully. The
+disclosure still hides them all in one click, the count still excludes them, and the `✕` sits
+in an aligned column rather than trailing the last cell's text — a target that moves from row
+to row cannot be aimed at, and this is the section whose whole point is that clicking it is
+comfortable enough to do twenty times.
+
+**The loop, closed.** Every `✕` on this page has always been recorded honestly in the one
+place the pipeline cannot see: the browser's `localStorage`. Reaching the stores meant a
+download and a file moved into `~/.local/state/work-arcs` by hand, and in the whole life of
+the feature that was done zero times — so the `✕` worked perfectly and changed nothing about
+tomorrow, while the brief, the lede, the counts and the queue went on repeating what had
+already been dealt with.
+
+The page now writes itself. A few seconds after the clicking stops it publishes a new version
+of this artifact with **one block replaced** — `ackseed`, the JSON the next rebuild reads
+back before it renders anything — and nothing else about the document touched. Batched on a
+quiet period rather than sent per click, because every publish mints a version and reloads
+every open view: a save per `✕` would make clearing eight rows eight reloads, which is the
+opposite of the comfort this is for. Twenty clicks are one version.
+
+Never by serialising the DOM. What is in the document right now carries this viewer's open
+disclosures, the runtime the shell injected and every class the client has toggled. The
+page's own source is fetched back from where it is served and the seed is cut out of *that*,
+so what goes up is the document the pipeline built plus one line of JSON — refused outright
+unless it carries the block, because a publish replaces the artifact whole and a redirect to
+a login page would replace the dashboard with it. What is *stored* is this page's own markup
+with no document around it (the platform wraps it at publish time) and what is *served* is
+the runtime's preamble followed by those bytes verbatim, delimited by `<!-- frame-runtime -->`
+and `<!-- /frame-runtime -->`, so the client cuts at the closing delimiter before it
+publishes: keeping it would fold a copy of the runtime into the stored page, and the next
+serve would wrap that again.
+
+**What the page hands back is a union, and exactly one subtraction.** What it arrived
+carrying is the pipeline's record and `localStorage` is this browser's, so publishing the
+browser's alone would drop every acknowledgement made on another device out of the page's own
+account of itself. Both halves of what it arrived with count as the record — the seed block
+*and* the rows the rebuild baked as faded — because the seed is rewritten by the client on
+every publish while each row's `data-dismissed` stays the bytes the last rebuild wrote, so
+reading the seed alone lost every acknowledgement the moment the page had published once.
+
+The subtraction is **`undismissed`**: the fingerprints the page was seeded with and has been
+told to let go of. A union at the other end can only ever add, so this is the only way a `✕`
+clicked a second time reaches the pipeline — and it is a store of explicit take-backs rather
+than whatever the union happens to be missing, because an absence means nothing here: a
+fingerprint the page never rendered is absent too, and expiring one of those is
+`apply_dismissals`' job and not a click's. A take-back persists across reloads and expires
+itself once a freshly built page stops arriving with that fingerprint acknowledged.
+
+**Absence is silent and failure is loud**, which is one rule seen from both ends. This page is
+opened locally and out of the artifact all the time, and a banner about a capability nobody
+asked for on every one of those is noise; but a save that *failed* must never be quiet, so it
+turns the bar red, says so, and brings the manual save buttons straight back. `conflict` is
+neither: somebody published first, the shell is already reloading every view to the winner,
+and retrying would be fighting a version this page never saw. Every store's writer is wrapped
+rather than `schedulePublish` being called from each of the dozen click handlers — a handler
+added later that forgets the call is an acknowledgement that silently never leaves the
+browser, and that is the failure this ends. Capabilities are reached through `claude.use`
+under both names the artifact one has had, with the old `window.claude.<name>` member as the
+fallback: nothing here may assume which runtime it woke up on, because a version published
+today is still being read next week.
+
+The other end of the loop is [`arcs-refresh --ingest`](#arcs-refresh), which reads the
+published page back and hands the seed to `work-arcs --ingest-acks` **before** the rebuild
+starts. That ordering is the feature and not tidiness: `work-arcs` prunes, counts and asks its
+questions off those stores, so a judgement adopted after the build would be adopted into a
+page that had already ignored it, and would first appear a day late.
+
+**The JS is tested**, against a DOM shimmed down to the things each decision actually reads —
+which rows carry a fingerprint, what a count includes, what a store holds afterwards. It is
+not browser automation and must not become that.
+
+**What it looks like, and why.** The skin was the last thing anybody had an opinion about, and
+the opinion was *"the styling is kind of bad. something about it just doesn't grab me when i
+look at it."* Three things were doing it, and all three were one mistake made in different
+places.
+
+Mono was the voice of the whole page — every kicker, every tag, every table head, every
+button — and a caps-mono label over a serif sentence is the register of a report you have been
+handed rather than a thing you are glad exists. Three families, one job each: **Fraunces**
+carries the display voice, and its optical-size axis is the whole reason one file serves a
+3rem headline and a 1.15rem heading without either looking borrowed from the other;
+**Inter** is the body and every label, at 600 and letterspaced and in sentence case;
+**JetBrains Mono** is data and only data — a sha, a branch, an iid, a ticket key, a clock, a
+count.
+
+There was a hairline rectangle round every list, every tile, every side of the ledger and
+every collapsed header, and drawn all at once they were fifteen framed panels of equal weight,
+none of which had said anything yet. A frame is not structure. Surfaces one step off the
+ground do the grouping instead, at 6px and without a shadow; rules survive in exactly two
+places, both load-bearing — between the rows of a dense list, where forty rows with nothing
+between them is a paragraph rather than a table, and down the left of a quote, where the bar
+is what says the words are somebody else's.
+
+And the palette was blue-black on blue-white, which is the temperature of a terminal. Paper is
+warm and ink is warm. The severity vocabulary did not move — hot is what has failed, warm what
+wants an answer, calm what somebody else is holding — it simply has the chroma now to register
+before it is read. `fonts.googleapis.com` is the one external host this page is allowed, with
+a real stack behind every face and `display=swap` in front: a page that reads as a fallback
+grid the morning the CDN is slow has been designed once and shipped twice.
+
 ### `arcs-refresh`
 `arcs` rebuilds the work-arcs page; this runs it at 07:10 so the page is already fresh
 when you sit down, which was the point of the thing and was still a command you had to
