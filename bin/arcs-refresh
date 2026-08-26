@@ -920,38 +920,57 @@ frame_record() {
 
 # What the artifact currently serves.
 #
-# Two routes, and they answer different questions -- which cost one wrong guess to learn.
-# `/api/frame/read/<slug>` answers {contract, capabilities}, what the artifact is ALLOWED
-# to do, and carries no page at all. The page is `/api/frame/<slug>`, the CLI's own
-# model-read route, and `via=model_read` is sent because that is what the CLI sends and
-# something in front of this service has refused unfamiliar clients before (see the
-# User-Agent note in frame_call).
+# THREE routes, and none of them is the obvious one -- which cost a round of probing worth
+# writing down. `/api/frame/read/<slug>` answers {contract, capabilities}: what the artifact
+# is ALLOWED to do, and no page at all. `/api/frame/<slug>?via=model_read` is the boot
+# response: the version that is live and a short-lived `assetToken`, and still no page. The
+# page itself is on a different host entirely --
+#
+#     https://<slug>.frame.claudeusercontent.com/_f/<ver>/index.html?__frame_t=<token>
+#
+# -- which is where the browser loads it from, and the token in the query string is the
+# whole credential. The OAuth bearer is deliberately NOT sent there: it is a different
+# host, it would not be accepted, and a credential does not go anywhere it is not needed.
 FRAME_PAGE=""
 frame_page() {
-    local slug="$1" out
+    local slug="$1" ver token host code out
     FRAME_PAGE=""
     if ! frame_call_authed GET "/api/frame/$slug?via=model_read"; then
         return 1
     fi
     if [ "$FRAME_HTTP_CODE" != "200" ]; then
-        FRAME_ERROR="the read-back answered HTTP $FRAME_HTTP_CODE"
+        FRAME_ERROR="the boot read answered HTTP $FRAME_HTTP_CODE"
         return 1
     fi
-    out="$(mktemp)"
-    # A JSON body with the page under one of its keys, or the page itself. Both are handled
-    # because the second costs one line and turns a route change into a shrug rather than
-    # into a morning of acknowledgements silently not arriving.
-    if jq -e . "$FRAME_BODY" >/dev/null 2>&1; then
-        jq -r '[.content?, .html?, .page?, .source?, .body?, .index_html?,
-                .files?."index.html"?]
-               | map(select(type == "string")) | first // empty' \
-            "$FRAME_BODY" >"$out" 2>/dev/null || true
-    else
-        cp "$FRAME_BODY" "$out"
+    ver="$(jq -r '.ver // empty' "$FRAME_BODY" 2>/dev/null || true)"
+    token="$(jq -r '.assetToken // empty' "$FRAME_BODY" 2>/dev/null || true)"
+    if [ -z "$ver" ] || [ -z "$token" ]; then
+        # A public (non-member) serve has no token, and the CLI says the same thing about
+        # it: files are not readable that way. Worth its own sentence, because it is not a
+        # transient failure and no number of retries will change it.
+        FRAME_ERROR="the boot read carried no ${ver:+asset token}${ver:-version}, so the page cannot be fetched"
+        return 1
     fi
-    if [ ! -s "$out" ] || ! grep -qi '<!doctype html' "$out"; then
+    host="${WORK_ARCS_CONTENT_HOST:-$slug.frame.claudeusercontent.com}"
+    out="$(mktemp)"
+    code="$(curl -sS -m "$FRAME_TIMEOUT" -o "$out" -w '%{http_code}' \
+        --get --data-urlencode "__frame_t=$token" \
+        "https://$host/_f/$ver/index.html" 2>/dev/null || true)"
+    code="$(http_code_or_000 "$code")"
+    if [ "$code" != "200" ]; then
         rm -f "$out"
-        FRAME_ERROR="the read-back carried no page (keys: $(jq -r 'if type=="object" then (keys | join(",")) else type end' "$FRAME_BODY" 2>/dev/null || echo 'not JSON'))"
+        FRAME_ERROR="the content host answered HTTP $code for version $ver"
+        return 1
+    fi
+    # NOT a doctype test, and that is a fact about how an artifact is served rather than a
+    # relaxed check. What is stored is the page's own markup with no document around it --
+    # the platform wraps it at publish time -- and what comes back has the runtime's
+    # preamble in front, delimited by `<!-- frame-runtime -->` ... `<!-- /frame-runtime -->`
+    # and followed by the stored bytes verbatim. So the thing to test for is our page, and
+    # the page names itself in the one element every build of it has carried.
+    if ! grep -q '<title>' "$out"; then
+        rm -f "$out"
+        FRAME_ERROR="the content host answered with something that is not this page"
         return 1
     fi
     FRAME_PAGE="$out"

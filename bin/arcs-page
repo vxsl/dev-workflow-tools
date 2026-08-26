@@ -1942,6 +1942,8 @@ INTERACT_JS = r"""
   // cut out of THAT, so what is published is the document the pipeline built plus one line
   // of JSON.
   var SEEDRE=/(<script type="application\/json" id="ackseed">)([\s\S]*?)(<\/script>)/;
+  // Where the shell's injected preamble ends and this page's own stored bytes begin.
+  var RUNTIME_END='<!-- /frame-runtime -->';
   var art=null, pubTimer=null, pubBusy=false, pubAgain=false;
   var seedDis={};                        // the acknowledgements this page arrived carrying
   var PUBLISH_QUIET=4000;                // ms of stillness before a save
@@ -1984,15 +1986,29 @@ INTERACT_JS = r"""
         if(!r.ok) throw {code:'read_back_'+r.status};
         return r.text(); })
       .then(function(src){
-        // Two checks before anything is sent, and both are about not publishing something
-        // that is not this page. A publish replaces the artifact WHOLE, so a redirect to a
-        // login page or an error document would replace the dashboard with it -- there is
-        // no partial update to fall back on.
-        if(!/^\s*<!doctype html/i.test(src)) throw {code:'not_a_page'};
+        // What is STORED is this page's own markup with no document around it -- the
+        // platform wraps it at serve time -- and what comes back has the runtime's
+        // preamble in front of it, delimited and followed by the stored bytes verbatim.
+        // Cutting at the closing delimiter recovers exactly what was published; keeping it
+        // would fold a copy of the runtime into the stored page, and the next serve would
+        // wrap that again.
+        var cut=src.indexOf(RUNTIME_END);
+        if(cut>=0) src=src.slice(cut+RUNTIME_END.length);
+        // Then the checks, both about not publishing something that is not this page. A
+        // publish replaces the artifact WHOLE, so a login redirect or an error document
+        // would replace the dashboard with it -- there is no partial update to fall back
+        // on. The seed block is the stronger of the two and does the real work.
         if(!SEEDRE.test(src)) throw {code:'no_seed'};
         var body=JSON.stringify(ackPayload()).replace(/<\//g,'<\\/');
-        return art.publish(src.replace(SEEDRE,function(_,open,was,close){
-          return open+body+close; }));
+        var next=src.replace(SEEDRE,function(_,open,was,close){ return open+body+close; });
+        return art.publish(next).catch(function(e){
+          // The one retry, and it is a question about shape rather than a hope. What the
+          // pipeline publishes is a fragment and what this runtime documents wanting is a
+          // whole document; both are plausible and only one is right, so the second shape
+          // is tried once and any other failure passes straight through.
+          if(e&&e.code==='invalid_content') return art.publish('<!doctype html>\n'+next);
+          throw e;
+        });
       })
       .then(function(){
         // The view reloads to what was just published, so little after this runs for long.
