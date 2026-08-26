@@ -354,6 +354,38 @@ ZZACK
     [ "${lines[0]}" = "1 1" ]
 }
 
+@test "an acknowledged Jira mismatch leaves the fold header and the rail stop too" {
+    # The last fold on the page still stating its raw total. It was survivable while the
+    # only ✕ for these rows was three screens down the section; it stopped being survivable
+    # the day the opening sentence grew one, because acknowledging the ticket the headline
+    # names moved the headline and left this header, and the stop above it, unchanged.
+    mism="$(python3 -c '
+import json
+print(json.dumps({"gap": {"jira": True, "status_mismatch": [
+    {"fp": "g1", "ref": "UL-1", "stale_days": 40, "dismissed": True,
+     "issue": {"key": "UL-1", "status": "In Review", "url": "u"},
+     "arc": {"id": "today-one", "unpushed_live": 6, "unpushed_days": 6},
+     "why": "status In Review but six days never pushed"},
+    {"fp": "g2", "ref": "UL-2", "stale_days": 20,
+     "issue": {"key": "UL-2", "status": "Releasing", "url": "u"},
+     "arc": {"id": "week-one", "unpushed_live": 2, "unpushed_days": 2},
+     "why": "status Releasing but two days never pushed"}]}}))')"
+    page "$(doc "$mism")" > "$TEST_TMPDIR/p.html"
+    run python3 - "$TEST_TMPDIR/p.html" <<'ZZJIRA'
+import re, sys
+html = re.sub(r'<script.*?</script>', '', open(sys.argv[1]).read(), flags=re.S)
+stop = re.search(r'data-mirror="\[data-count=&quot;jira&quot;\]"[^>]*>([^<]*)<',
+                 html).group(1)
+hdr = re.search(r'data-count="jira"[^>]*>([^<]*)<', html).group(1)
+# And the fold names an unacknowledged row as its worst, not a faded one.
+lead = re.search(r'sid="jira".*?<span class="fl">(.*?)</span>', html, re.S)
+lead = re.sub(r'<[^>]+>', '', lead.group(1)) if lead else re.search(
+    r'<span class="fl">([^<]*UL-[^<]*)</span>', html).group(1)
+print(stop, hdr, "UL-2" in lead, "UL-1" in lead)
+ZZJIRA
+    [ "${lines[0]}" = "1 1 True False" ]
+}
+
 # ── what the doors name ──────────────────────────────────────────────────────
 
 @test "the ledger door names the older of the two sides' own first rows" {

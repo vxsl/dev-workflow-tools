@@ -4977,7 +4977,13 @@ def render(data, lede, focus_days, limit, cost=None):
         ("settled", "Retired", str(len(by_rung.get("landed", []))
                                    + len(by_rung.get("abandoned", []))))
         if by_rung.get("landed") or by_rung.get("abandoned") else None,
-        ("jira", "Jira", str(len(gap.get("status_mismatch") or []))) if mism else None,
+        # A mirror and not a second count, for the reason the two Jira folds under it
+        # already are: these rows have a ✕ -- two of them now, the table's and the opening
+        # sentence's -- and a rail stop stating a figure the section stopped showing is the
+        # one thing a mirror exists to prevent.
+        ("jira", "Jira", mirrored(len([m for m in gap.get("status_mismatch") or []
+                                       if not m.get("dismissed")]),
+                                  '[data-count="jira"]', "q")) if mism else None,
         # A mirror rather than a second count, now that these two folds have a ✕: the
         # section is the author of its own size and this copies what it printed, so
         # acknowledging a row three screens down cannot leave the rail claiming the
@@ -6235,13 +6241,25 @@ def render(data, lede, focus_days, limit, cost=None):
             # Folded, with the worst row on the header. The table is ranked
             # longest-uncorrected-first, so the first row IS the worst one and the header
             # can name it without a second ranking being written here.
-            worst = mism[0].get("issue", {})
+            #
+            # The figure is the unacknowledged count and the lead the first unacknowledged
+            # row, which is the law the two folds under this one already keep: a closed
+            # fold reading 9 over a table whose top row is faded is the one lie a collapse
+            # must never tell, and a ✕ that changes no figure anywhere does nothing. It was
+            # the last fold on the page still stating its raw total -- survivable while the
+            # only ✕ for these rows was three screens further down, and not survivable now
+            # that the opening sentence carries one: acknowledging UB-6668 from the headline
+            # moved the headline and left this header, and the rail stop above it, on 9.
+            live_mism = [m for m in gap.get("status_mismatch") or []
+                         if not m.get("dismissed")]
+            head_m = (live_mism or mism)[0]
+            worst = head_m.get("issue", {})
             fold(a, "Jira says otherwise",
-                 f"{len(gap.get('status_mismatch') or [])} contradicted",
+                 f'<span class="n" data-count="jira">{len(live_mism)}</span> contradicted',
                  esc("worst: " + str(worst.get("key", "?")) + " "
                      + str(worst.get("status", ""))
-                     + (f", {mism[0]['stale_days']}d uncorrected"
-                        if mism[0].get("stale_days") else "")),
+                     + (f", {head_m['stale_days']}d uncorrected"
+                        if head_m.get("stale_days") else "")),
                  sid="jira")
             # Both kinds the list holds, and the order it is in. The note used to describe
             # only the first kind, and it named no order at all -- which was honest while
@@ -6261,7 +6279,12 @@ def render(data, lede, focus_days, limit, cost=None):
               + ('<a href="#only-here">question</a>' if loc else "question")
               + ". <strong>&#x2715; acknowledges a row</strong> and it returns on its "
               "own if the status or the scale moves.</p>")
-            a('<div class="scroll" data-disgroup><table><thead><tr>'
+            # `countplus` is the tail this table does not render, for the reason the two
+            # folds below name at length: the client recounts the rows it can see, and on a
+            # truncated list that is not the section's size.
+            a('<div class="scroll" data-disgroup data-countfor="[data-count=jira]" '
+              f'data-countplus="{max(0, len(gap.get("status_mismatch") or []) - len(mism))}"'
+              "><table><thead><tr>"
               "<th>Ticket</th><th>Claim</th><th>Uncorrected</th><th>Reality</th>"
               "<th>Summary</th><th></th>"
               "</tr></thead><tbody>")
