@@ -134,6 +134,8 @@
 #   arcs-refresh --uninstall-timer  disable it and remove the units
 #   arcs-refresh --install-cron     the crontab line instead -- no catch-up, see above
 #   arcs-refresh --uninstall-cron   remove it, leave every other crontab line alone
+#   arcs-refresh --ingest           read the published page back and adopt what it recorded
+#   arcs-refresh --capabilities     what the artifact may do, and on what runtime contract
 #   arcs-refresh --hook             print the arc-record Stop hook block for settings.json
 #   arcs-refresh --publish          upload the page already on disk, without rebuilding it
 #
@@ -152,6 +154,9 @@
 #                                                  (~/.claude/.credentials.json)
 #   WORK_ARCS_PUBLISH            upload the page after building it          (default 1)
 #   WORK_ARCS_PUBLISH_SUPERSEDE  overwrite an artifact that moved under us  (default 1)
+#   WORK_ARCS_INGEST            read the published page back first   (default 1)
+#   WORK_ARCS_PUBLISH_CAPABILITIES  what the page may do at runtime  (artifact,downloads)
+#   WORK_ARCS_PUBLISH_CONTRACT      runtime contract to move to      (default: leave it)
 #   WORK_ARCS_PUBLISH_TRIES      attempts while the render service is busy  (default 3)
 #   WORK_ARCS_FRAME_BASE         the artifact API host        (https://claude.ai)
 #
@@ -234,6 +239,31 @@ OAUTH_BETA="${WORK_ARCS_OAUTH_BETA:-oauth-2025-04-20}"
 # headers before the URL. Overridable for the same reason the OAuth constants are: they
 # belong to somebody else and will move without asking.
 FRAME_BASE="${WORK_ARCS_FRAME_BASE:-https://claude.ai}"
+
+# Whether to read the published page back before rebuilding. On, because a page that
+# records judgements nothing ever reads is worse than one that records none: it is the old
+# chore wearing the face of a feature. Off is for a machine that is not the one Kyle
+# acknowledges rows on -- a second checkout, a test run -- where reading a page somebody
+# else is clicking would adopt their judgements into these stores.
+INGEST="${WORK_ARCS_INGEST:-1}"
+
+# What the published page is allowed to do at runtime, as a comma-separated list. Declared
+# on EVERY publish rather than once by hand, and that is the load-bearing part: a
+# declaration is a full set, so anything not restated is revoked -- a republish that
+# quietly omitted this would leave every ✕ on the page local again, which is the exact
+# failure this loop was built to end, wearing the face of a feature that works. Restating
+# it costs one field and makes the page's abilities a property of this file rather than of
+# whatever was typed into a session six weeks ago.
+#
+#   artifact   the page publishes new versions of itself, carrying what has been clicked
+#   downloads  the save buttons, which are the degradation where `artifact` is not granted
+PUBLISH_CAPABILITIES="${WORK_ARCS_PUBLISH_CAPABILITIES-artifact,downloads}"
+
+# The runtime contract the page runs on. EMPTY by default, and deliberately: omitting it
+# keeps whatever the artifact already has, and moving a live page's runtime is a decision
+# rather than a side effect of editing it. Set it to `latest` for the one publish that
+# performs an upgrade -- `artifact` needs a runtime that has it, and 0.1.x does not.
+PUBLISH_CONTRACT="${WORK_ARCS_PUBLISH_CONTRACT:-}"
 FRAME_CLIENT_VERSION="${WORK_ARCS_FRAME_CLIENT_VERSION:-2.1.245}"
 FRAME_TIMEOUT="${WORK_ARCS_FRAME_TIMEOUT:-60}"
 NOTIFY="$HOME/bin/notification/claude-notify.sh"
@@ -875,6 +905,151 @@ frame_record() {
     return 0
 }
 
+# --- reading the page back ---------------------------------------------------------------
+#
+# The other direction, and the half missing for the whole life of this file. The published
+# page records every ✕ and every answer a person gives it, and until now those reached the
+# pipeline only through a download the reader then moved into ~/.local/state/work-arcs by
+# hand -- which has never once been done. So the brief, the lede and the counts went on
+# repeating what had already been dealt with.
+#
+# The page now publishes itself with those judgements in one JSON block. This reads the
+# published HTML back before the rebuild, cuts that block out, and hands it to work-arcs,
+# which is the only thing that writes those stores. Nothing here knows what a dismissal is
+# or what expires one; it moves bytes.
+
+# What the artifact currently serves.
+#
+# Two routes, and they answer different questions -- which cost one wrong guess to learn.
+# `/api/frame/read/<slug>` answers {contract, capabilities}, what the artifact is ALLOWED
+# to do, and carries no page at all. The page is `/api/frame/<slug>`, the CLI's own
+# model-read route, and `via=model_read` is sent because that is what the CLI sends and
+# something in front of this service has refused unfamiliar clients before (see the
+# User-Agent note in frame_call).
+FRAME_PAGE=""
+frame_page() {
+    local slug="$1" out
+    FRAME_PAGE=""
+    if ! frame_call_authed GET "/api/frame/$slug?via=model_read"; then
+        return 1
+    fi
+    if [ "$FRAME_HTTP_CODE" != "200" ]; then
+        FRAME_ERROR="the read-back answered HTTP $FRAME_HTTP_CODE"
+        return 1
+    fi
+    out="$(mktemp)"
+    # A JSON body with the page under one of its keys, or the page itself. Both are handled
+    # because the second costs one line and turns a route change into a shrug rather than
+    # into a morning of acknowledgements silently not arriving.
+    if jq -e . "$FRAME_BODY" >/dev/null 2>&1; then
+        jq -r '[.content?, .html?, .page?, .source?, .body?, .index_html?,
+                .files?."index.html"?]
+               | map(select(type == "string")) | first // empty' \
+            "$FRAME_BODY" >"$out" 2>/dev/null || true
+    else
+        cp "$FRAME_BODY" "$out"
+    fi
+    if [ ! -s "$out" ] || ! grep -qi '<!doctype html' "$out"; then
+        rm -f "$out"
+        FRAME_ERROR="the read-back carried no page (keys: $(jq -r 'if type=="object" then (keys | join(",")) else type end' "$FRAME_BODY" 2>/dev/null || echo 'not JSON'))"
+        return 1
+    fi
+    FRAME_PAGE="$out"
+    return 0
+}
+
+# What the artifact is allowed to do, which is a different question from what it says. Read
+# rather than assumed, because the page's whole save-back rests on one declaration and a
+# republish that dropped it would leave every ✕ silently local again.
+FRAME_CAPS=""; FRAME_CONTRACT=""
+frame_capabilities() {
+    local slug="$1"
+    FRAME_CAPS=""; FRAME_CONTRACT=""
+    if ! frame_call_authed GET "/api/frame/read/$slug"; then
+        return 1
+    fi
+    if [ "$FRAME_HTTP_CODE" != "200" ]; then
+        FRAME_ERROR="the capability read answered HTTP $FRAME_HTTP_CODE"
+        return 1
+    fi
+    FRAME_CAPS="$(jq -c '.capabilities // {}' "$FRAME_BODY" 2>/dev/null || echo '{}')"
+    FRAME_CONTRACT="$(jq -r '.contract // empty' "$FRAME_BODY" 2>/dev/null || true)"
+    return 0
+}
+
+# The seed block, cut out of a published page. A literal marker and a literal terminator,
+# matched with awk rather than a regex over 370KB in shell -- and the page emits the block
+# on one line, which is what makes the cut exact rather than approximate.
+extract_ackseed() {
+    awk '
+        match($0, /<script type="application\/json" id="ackseed">/) {
+            rest = substr($0, RSTART + RLENGTH)
+            end = index(rest, "</script>")
+            if (end > 0) { print substr(rest, 1, end - 1); exit }
+        }
+    ' "$1"
+}
+
+# Read the published page, cut out what it recorded, and let work-arcs adopt it.
+#
+# Every failure is LOUD -- in the log and in the state file, under `ingest` and
+# `ingest_ok` -- and none of them stops the rebuild. Those two rules are the same rule: a
+# lost acknowledgement teaches distrust faster than no acknowledgement system does, so it
+# must never happen quietly; and a morning with no page at all is worse than a morning
+# whose page repeats one row, so it must never be fatal.
+#
+# Not a notification, and that is the third face of the same rule. The notification budget
+# is the whole reason a notification means anything, and this is a step that will fail on
+# any morning the network is slow -- costing that morning's clicks and nothing else,
+# because the page still holds them for the next run to pick up. What is worth waking
+# somebody for is a page nobody can see, which the publish failure already does.
+INGEST_NOTE=""; INGEST_OK=1
+ingest_acks() {
+    local slug seed out rc=0
+    INGEST_NOTE=""
+    if [ "$INGEST" != 1 ]; then
+        INGEST_NOTE="off (WORK_ARCS_INGEST=$INGEST)"
+        log "ingest: $INGEST_NOTE"
+        return 0
+    fi
+    if ! slug="$(artifact_slug)"; then
+        INGEST_NOTE="no artifact link to read back"
+        log "ingest: $INGEST_NOTE — nothing the published page recorded can reach the stores"
+        return 0
+    fi
+    if ! frame_page "$slug"; then
+        INGEST_NOTE="could not read the published page — $FRAME_ERROR"; INGEST_OK=0
+        log "ingest: $INGEST_NOTE"
+        log "        anything acknowledged on it since the last run is still only in the browser"
+        return 1
+    fi
+    seed="$(mktemp)"
+    extract_ackseed "$FRAME_PAGE" >"$seed"
+    rm -f "$FRAME_PAGE"; FRAME_PAGE=""
+    if [ ! -s "$seed" ]; then
+        rm -f "$seed"
+        # Not an error the first time: a page published before this existed carries no such
+        # block, and the rebuild this run is about to do puts one there.
+        INGEST_NOTE="the published page carries no seed block yet"
+        log "ingest: $INGEST_NOTE — this run's rebuild will publish one"
+        return 0
+    fi
+    # work-arcs is the only writer of its own stores, so this shells to it rather than
+    # merging here. See its --ingest-acks.
+    out="$(mktemp)"
+    if work-arcs --ingest-acks "$seed" >"$out" 2>&1; then
+        INGEST_NOTE="$(tr '\n' ';' <"$out" | sed 's/;$//')"
+    else
+        rc=1; INGEST_OK=0
+        INGEST_NOTE="work-arcs refused the seed: $(tr '\n' ';' <"$out" | sed 's/;$//')"
+    fi
+    while IFS= read -r line; do
+        [ -n "$line" ] && log "ingest: $line"
+    done <"$out"
+    rm -f "$seed" "$out"
+    return "$rc"
+}
+
 # Written next to the build stamp so `arcs` and the page can both tell a built page from a
 # published one. Kept separate from write_state because publishing happens after it and
 # can fail on its own -- a run that built and could not publish should say so in the state
@@ -937,10 +1112,17 @@ publish_page() {
         --arg description "$FRAME_DESCRIPTION" \
         --arg label "$label" \
         --arg version "$FRAME_VERSION" \
+        --arg caps "$PUBLISH_CAPABILITIES" \
+        --arg contract "$PUBLISH_CONTRACT" \
         --rawfile content "$page" \
         '{slug: $slug, title: $title, favicon: $favicon, label: $label, content: $content}
          + (if $description == "" then {} else {description: $description} end)
-         + (if $version == "" then {} else {baseVersion: $version} end)' \
+         + (if $version == "" then {} else {baseVersion: $version} end)
+         + (if $caps == "" then {}
+            else {capabilities: ($caps | split(",")
+                                       | map(select(length > 0) | {(.): {}}) | add)}
+            end)
+         + (if $contract == "" then {} else {contract: $contract} end)' \
         >"$req" 2>/dev/null
 
     if ! jq -e '.content | length > 0' "$req" >/dev/null 2>&1; then
@@ -980,6 +1162,20 @@ publish_page() {
                 log "publish: the render service is busy — retrying in ${wait}s (attempt $((tries + 1)) of $max_tries)"
                 sleep "$wait" ;;
             400|409|412)
+                # A field this control plane does not know, checked before the precondition
+                # is blamed for it. The CLI's own publish path makes exactly this retry for
+                # `force` and `baseVersion`, and for the same reason: a page that stops
+                # being published because a new field was added is a worse outcome than a
+                # page published without the field. Said out loud, because a silent drop
+                # here would take the page's own ability to save with it.
+                if jq -e 'has("capabilities") or has("contract")' "$req" >/dev/null 2>&1 \
+                   && frame_message | grep -qiE 'capabilit|contract|unknown|unrecognized|unexpected'; then
+                    log "publish: the artifact API refused the capability declaration — $(frame_message)"
+                    log "         retrying without it; the page will publish but will not be able to save itself"
+                    jq 'del(.capabilities) | del(.contract)' "$req" >"$req.tmp" 2>/dev/null \
+                        && mv "$req.tmp" "$req" || rm -f "$req.tmp"
+                    continue
+                fi
                 # The precondition failed: something published a different version between
                 # the read above and this write. Nothing of that version survives in what
                 # we are sending anyway -- the page is rebuilt whole from local state every
@@ -1030,11 +1226,15 @@ write_state() {
         --argjson dur "$dur" \
         --arg five "$five" \
         --arg seven "$seven" \
+        --arg ingest "$INGEST_NOTE" \
+        --argjson ingest_ok "$INGEST_OK" \
         '{published_at: (.published_at // null)}
          + {built_at: $at, built_at_iso: $iso, page: $page, bytes: $bytes,
             duration_s: $dur,
             five_hour: ($five | if . == "" then null else tonumber end),
-            seven_day: ($seven | if . == "" then null else tonumber end)}' \
+            seven_day: ($seven | if . == "" then null else tonumber end),
+            ingest: (if $ingest == "" then null else $ingest end),
+            ingest_ok: ($ingest_ok == 1)}' \
         >"$STATE_FILE.tmp" 2>/dev/null && mv "$STATE_FILE.tmp" "$STATE_FILE" || rm -f "$STATE_FILE.tmp"
 }
 
@@ -1080,6 +1280,12 @@ do_run() {
                 return 3
             fi ;;
     esac
+
+    # BEFORE the pipeline, which is the whole point of the ordering: work-arcs prunes,
+    # counts and asks its questions off these stores, so a judgement adopted after the
+    # build would be adopted into a page that had already ignored it, and would first show
+    # up a day late. Non-fatal by design -- see ingest_acks.
+    ingest_acks || true
 
     local out started rc=0
     out="$(mktemp)"
@@ -1180,6 +1386,22 @@ case "${1:-}" in
     --publish)
         page="${WORK_ARCS_PAGE:-$STATE/page.html}"
         if publish_page "$page"; then exit 0; fi
+        exit 1 ;;
+    # The read-back half on its own, for the same reason --publish is a flag: the question
+    # "does what the page recorded reach the stores right now?" should be answerable
+    # without spending a forty-second rebuild to ask it.
+    --ingest)
+        if ingest_acks; then echo "ok — $INGEST_NOTE"; exit 0; fi
+        echo "failed — $INGEST_NOTE" >&2
+        exit 1 ;;
+    # What the artifact is allowed to do. One line, no page, and the only way to check the
+    # declaration the whole save-back rests on without opening a browser.
+    --capabilities)
+        if slug="$(artifact_slug)" && frame_capabilities "$slug"; then
+            echo "contract ${FRAME_CONTRACT:-unset}, capabilities $FRAME_CAPS"
+            exit 0
+        fi
+        echo "failed — ${FRAME_ERROR:-WORK_ARCS_ARTIFACT_URL is not an artifact link}" >&2
         exit 1 ;;
     --force)       force=1 ;;
     "")            ;;
