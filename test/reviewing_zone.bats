@@ -248,6 +248,28 @@ ZZGRP
     [ "${lines[2]}" = "['10500', '10510', '10520', '10265']" ]
 }
 
+# Provenance, carried and not printed. Sixteen of twenty-three turns on the real corpus
+# are read off a push rather than off a note, so printing it would be the same majority
+# state repeated per row that the headings exist to undo.
+@test "how a turn was decided rides on the row rather than being printed on it" {
+    run python3 - "$REPO_ROOT/bin/arcs-page" "$(doc)" <<'ZZPROXY'
+import json, re, subprocess, sys
+d = json.loads(sys.argv[2])
+d["reviews"][0]["their_last_is_proxy"] = True
+r = subprocess.run([sys.executable, sys.argv[1], "--focus", "30"],
+                   input=json.dumps(d), capture_output=True, text=True)
+html = re.sub(r'<script.*?</script>', '', r.stdout, flags=re.S)
+ul = re.search(r'<ul class="reviewing".*?</ul>', html, re.S).group(0)
+rows = re.findall(r'<li data-fp=.*?</li>', ul, re.S)
+print("CARRIED" if "standing in for a word" in rows[0] else "LOST")
+print("QUIET" if "read off a push" not in ul else "PRINTED")
+print("ONLY-THAT-ROW" if "standing in for a word" not in rows[1] else "EVERYWHERE")
+ZZPROXY
+    [ "${lines[0]}" = "CARRIED" ]
+    [ "${lines[1]}" = "QUIET" ]
+    [ "${lines[2]}" = "ONLY-THAT-ROW" ]
+}
+
 # A heading over a group that is not a group is worse than the repetition it replaces, so
 # a wire order that does not partition keeps every row's own label.
 @test "an unsorted wire order gets no headings and keeps its row labels" {

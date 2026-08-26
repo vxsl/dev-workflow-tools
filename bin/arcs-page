@@ -555,7 +555,7 @@ blockquote b{font-weight:600;color:var(--ink)}
    dotted, in the accent, and named in the legend beside it. */
 .tree .edge.prop{stroke:var(--accent);stroke-dasharray:1 3;stroke-width:1.4;opacity:.85}
 .tree .askring{fill:none;stroke:var(--accent);stroke-width:1.2;opacity:.55}
-.tree .n.ask{fill:var(--ink);font-weight:700}
+.tree .n.asked{fill:var(--ink);font-weight:700}
 .tree .c.tie{fill:var(--accent);opacity:.9}
 .tree .dot{fill:var(--ink-faint)}
 .tree .dot.risk{fill:var(--hot)}
@@ -807,12 +807,13 @@ td .dis{vertical-align:middle}
 .cur .qh{display:flex;align-items:baseline;gap:.5rem;flex-wrap:wrap}
 .cur .qn{font-family:var(--mono);font-size:.68rem;color:var(--ink-faint);
   min-width:1.4em;text-align:right;flex:none}
-.cur .ask,.cur .tag{font-family:var(--sans);font-size:.7rem;font-weight:600;
+.cur .qh .ask,.cur .qh .tag{font-family:var(--sans);font-size:.7rem;font-weight:600;
   letter-spacing:.05em;text-transform:uppercase;color:var(--ink-faint);flex:none}
 /* A queued card says which of the three kinds it is; an open or answered one says the
    whole question. Four queued cards each repeating the same sentence is the wall of text
    coming back by a different door. */
-.cur .q:not(.open):not(.done) .ask,.cur .q.open .tag,.cur .q.done .tag{display:none}
+.cur .q:not(.open):not(.done) .qh .ask,.cur .q.open .qh .tag,
+.cur .q.done .qh .tag{display:none}
 .cur .qi{font-family:var(--sans);font-size:.74rem;color:var(--ink-faint)}
 /* The subject is set as a title, because on a card that is what it is. The exact ref is
    never far -- a membership card draws the branch in mono in its own picture, an
@@ -820,13 +821,15 @@ td .dis{vertical-align:middle}
    in being findable at a glance. */
 .cur .subj{font-family:var(--display);font-size:1.02rem;color:var(--ink);line-height:1.2}
 .cur .qh .key{font-family:var(--mono);font-size:.72rem;color:var(--ink-faint)}
+.cur .qh .arcn{font-family:var(--sans);font-size:.8rem;color:var(--ink-soft)}
 .cur .qbody{display:flex;flex-direction:column;gap:.5rem}
 .cur .q:not(.open) .qbody{display:none}
 /* Evidence: a picture where the question has structure, chips where it has facts, and
    nothing where it has neither. */
 .cur .qev{display:flex;gap:.9rem;align-items:flex-start;flex-wrap:wrap}
-.cur .qev .tree{border-top:0;padding-top:0;flex:1 1 20rem;min-width:0}
-.cur .facts{display:flex;flex-direction:column;gap:.4rem;flex:0 1 15rem;min-width:9rem}
+.cur .qev .tree{border-top:0;padding-top:0;flex:0 1 auto;min-width:0;max-width:100%}
+.cur .facts{display:flex;flex-direction:column;gap:.4rem;flex:1 1 17rem;
+  min-width:9rem;max-width:36rem}
 .cur .chips{display:flex;gap:.3rem;flex-wrap:wrap}
 .cur .chips .chip{color:var(--ink-faint);font-weight:500;letter-spacing:.03em}
 .cur .chips .chip.f{font-family:var(--mono);text-transform:none;letter-spacing:0}
@@ -842,17 +845,18 @@ td .dis{vertical-align:middle}
 .cur .meter{display:flex;align-items:center;gap:.4rem;font-family:var(--sans);
   font-size:.68rem;color:var(--ink-faint)}
 .cur .meter .track{flex:1 1 auto;height:4px;border-radius:2px;background:var(--surface-2);
-  overflow:hidden;min-width:3rem}
+  overflow:hidden;min-width:3rem;max-width:7rem}
 .cur .meter .fill{display:block;height:100%;background:var(--warm);border-radius:2px}
 .cur .meter .mv{font-family:var(--mono);color:var(--ink-soft)}
 .cur .qev .spark rect{fill:var(--ink-soft)}
 .cur .qev .spark .base{stroke:var(--hairline);stroke-width:1}
 .cur .qev .spark .now{stroke:var(--parked);stroke-width:1.2}
 /* The cliff itself, which is the one thing the sparkline in this section has to say that
-   the one in the fell-off-a-cliff list does not: where the work stopped, and how much of
-   the picture is the silence after it. */
-.cur .qev .spark .gap{fill:var(--hot);opacity:.09}
-.cur .qev .spark .stop{stroke:var(--hot);stroke-width:1.2;opacity:.7}
+   the one in the fell-off-a-cliff list does not: where the work stopped. On that list the
+   blank on the right is read against twenty rows on a shared axis and means something by
+   comparison; a card has nothing to compare itself to, so the silence has to be bracketed
+   -- this line at one end, the `now` line at the other. */
+.cur .qev .spark .stop{stroke:var(--accent);stroke-width:1.2;opacity:.8}
 .cur .qsay{font-family:var(--sans);font-size:.78rem;color:var(--ink-soft);
   text-wrap:pretty;margin:0}
 .cur .qsay a{color:var(--accent)}
@@ -2012,8 +2016,8 @@ INTERACT_JS = r"""
     });
     document.querySelectorAll('.cur .qmore').forEach(function(el){
       el.hidden=(hiddenq===0);
-      el.textContent='\u2026and '+hiddenq+' more behind these, in the same order — '
-                     +'each comes up as the one above it is answered.';
+      el.textContent='\u2026and '+hiddenq+' more behind these, in the same order '
+                     +'\u2014 each comes up as the one above it is answered.';
     });
     // The queue's own size, which the rail and the strip mirror. It is the count of what
     // is still worth a person's attention, so it falls as questions are answered and the
@@ -3124,7 +3128,7 @@ def spawn_svg(arc, limit=12, base="", detachable=False, proposed=None, pinned=()
             tail = f'<tspan class="c" dx="7">+{b["unpushed"]}</tspan>'
         else:
             tail = ""
-        label = (f'<text class="n{cls}{" ask" if b["name"] == ask else ""}" '
+        label = (f'<text class="n{cls}{" asked" if b["name"] == ask else ""}" '
                  f'data-branch="{esc(b["name"])}" '
                  f'x="{cx + 8}" y="{cy + 4}">'
                  f'{esc(b["name"])}{tail}</text>')
@@ -3348,7 +3352,7 @@ def fmt_day(epoch):
 SPARK_W, SPARK_H = 96, 18
 
 
-def cliff_spark(act, span, mark=False):
+def cliff_spark(act, span, mark=False, size=None):
     """One tick per active day, on a real time axis shared by the whole section, ending
     at today.
 
@@ -3390,7 +3394,7 @@ def cliff_spark(act, span, mark=False):
     series = act.get("series") or []
     if not series or span <= 0:
         return ""
-    w, h, pad = SPARK_W, SPARK_H, 1.5
+    w, h, pad = (size or (SPARK_W, SPARK_H)) + (1.5,)
     bar = max(1.6, min(4.0, w / (span + 1)))
     out = [f'<svg class="spark" width="{w}" height="{h}" viewBox="0 0 {w} {h}" '
            'aria-hidden="true" focusable="false">']
@@ -3402,10 +3406,13 @@ def cliff_spark(act, span, mark=False):
         out.append(f'<rect x="{x:.1f}" y="{pad}" width="{bar:.1f}" '
                    f'height="{h - pad * 2:.1f}" rx="0.6"/>')
     if mark:
+        # The moment the work stopped, marked; the silence after it left as paper. Shading
+        # it was tried and it made the silence the loudest thing on the card -- which is
+        # backwards, because the silence is the ABSENCE the two lines bracket. Blank
+        # between a stop and a now is what a cliff looks like, and it is what the
+        # fell-off-a-cliff list has always drawn.
         last = min(ago for ago, _ in series)
         x = max(0.0, (span - min(last, span)) / span * (w - bar)) + bar
-        out.append(f'<rect class="gap" x="{x:.1f}" y="0" '
-                   f'width="{max(0.0, w - x):.1f}" height="{h}"/>')
         out.append(f'<line class="stop" x1="{x:.1f}" y1="0" x2="{x:.1f}" y2="{h}"/>')
     out.append(f'<line class="base" x1="0" y1="{h - pad:.1f}" x2="{w}" '
                f'y2="{h - pad:.1f}"/>')
@@ -3584,6 +3591,11 @@ CURATION_WINDOW = max(1, int(os.environ.get("ARC_CURATION_CAP", "5")))
 # question is a thing you answer in a glance and a fifteen-row tree is a thing you read.
 CURATION_TREE = 8
 
+# Bigger than the cliff list's, because it is doing more work. On that list a sparkline is
+# one cell in a row of twenty and is read by comparison with its neighbours; here it is the
+# whole evidence for a question, and the shape has to carry on its own.
+CURATION_SPARK = (150, 22)
+
 # What each kind is actually asking, as a question. Fixed page copy, and that is the whole
 # licence this section has to author anything: the phrasing is a fact about the queue,
 # every other word on a card is a fact about the work and comes down the wire.
@@ -3628,13 +3640,46 @@ CURATION_ANSWERS = {
 }
 
 
-def curation_subject(q):
+# What a ticket key looks like, and the only thing on a card allowed to be set in mono
+# besides a branch inside its own picture. Everything else in the subject slot is a name a
+# model derived or a person typed, and mono on this page is data and only data.
+KEYISH = re.compile(r"^[A-Z][A-Z0-9]*-\d+$")
+
+
+def curation_name(q, arc, key):
+    """The name a workstream goes by on this page, never a name composed here.
+
+    The brief's, where there is one, exactly as the reviewing zone, the cliff list and the
+    gap folds already do -- and the wire label as the fallback. The two differ often enough
+    to matter: a workstream the split pass named after a file reads as slop, and the only
+    place that can be improved is the prompt that derived it.
+
+    Never the label where a display name exists, and never the display name where a
+    LOOKUP is wanted: `--jira-ify` takes the label, and a card printing the pretty name
+    into a command would print a command that does not run.
+    """
+    return str((arc.get("brief") or {}).get("name") or q.get(key) or "?")
+
+
+def curation_subject(q, arc=None):
     """What a card is about, in one phrase: the branch for a membership, the workstream
     for the other two. Never composed here beyond choosing which field it is -- a page
     that reworded a name would be a second author for it."""
     if q.get("kind") in ("residue", "unticketed"):
-        return str(q.get("arc") or q.get("arc_id") or "?")
+        return curation_name(q, arc or {}, "arc")
     return str(q.get("branch") or q.get("arc") or "?")
+
+
+def arc_name_span(name):
+    """The arc a membership question sits in, set as what it is.
+
+    A ticket key is data and takes the mono the rest of this page gives every key. A
+    derived phrase -- "dove: hydrate layer default timeFilter from data pipeline" -- is
+    not, and setting it in mono says it is a string to be copied when it is a sentence
+    somebody wrote.
+    """
+    cls = "key" if KEYISH.match(name.strip()) else "arcn"
+    return f'<span class="{cls}">{esc(name)}</span>'
 
 
 def curation_answers(a, q):
@@ -3727,7 +3772,7 @@ def residue_card(a, q, arc, span, linked):
       "<small>and no remote has any of it</small></div>")
     a('<div class="facts">')
     if act.get("series") and span > 0:
-        a(cliff_spark(act, span, mark=True))
+        a(cliff_spark(act, span, mark=True, size=CURATION_SPARK))
     a('<span class="chips">')
     k, gapd = q.get("cliff_days"), q.get("gap_days")
     if isinstance(k, int):
@@ -3797,9 +3842,10 @@ def curation_cards(a, queue, by_id, gap, here):
     """
     n = len(queue)
     first = queue[0]
+    first_arc = by_id.get(first.get("arc_id")) or {}
     fold(a, "Did the derivation get this right?",
          f'<span class="n" data-count="curation">{n}</span> unanswered',
-         esc("first: " + curation_subject(first) + " — "
+         esc("first: " + curation_subject(first, first_arc) + " — "
              + CURATION_ASK.get(first.get("kind") or "membership", "").lower()),
          sid="curation", attrs=" data-cur")
     a('<p class="note">Where the tool is least sure of itself, one card at a time and in '
@@ -3861,9 +3907,10 @@ def curation_cards(a, queue, by_id, gap, here):
           f'<span class="qn">{i + 1}</span>'
           f'<span class="ask">{esc(CURATION_ASK.get(kind, ""))}</span>'
           f'<span class="tag">{esc(CURATION_TAG.get(kind, kind))}</span>'
-          f'<span class="subj">{esc(curation_subject(q))}</span>'
-          + (f'<span class="qi">in</span><span class="key">{esc(q.get("arc") or "")}'
-             "</span>" if kind == "membership" and q.get("arc") else "")
+          f'<span class="subj">{esc(curation_subject(q, arc))}</span>'
+          + (f'<span class="qi">in</span>'
+             + arc_name_span(curation_name(q, arc, "arc"))
+             if kind == "membership" and q.get("arc") else "")
           + "</span>")
         a('<div class="qbody">')
         if kind == "residue":
@@ -3936,8 +3983,9 @@ def reviewing(a, reviews, drafts, here, by_id):
       "engagement has run since you were asked; <b>rounds</b> counts batches of your own "
       "comments, so six notes in one sitting are one round and not six; whose turn it is "
       "is read off the notes where they answer it, and off the merge request&rsquo;s own "
-      "last update where a push is all there is to go on &mdash; a row says which of the "
-      "two it is. A workstream is named on a row only where the join is a fact: its "
+      "last update where a push is all there is to go on &mdash; hovering a row says "
+      "which of the two it is. A workstream is named on a row only where the join is a "
+      "fact: its "
       "source branch is checked out here, or both sides name the same ticket. Most of "
       "these join to nothing, which is normal rather than a failure &mdash; most of what "
       "you review was never checked out on this laptop. <strong>&#x2715; acknowledges a "
@@ -3997,13 +4045,6 @@ def reviewing(a, reviews, drafts, here, by_id):
             facts.append("no round yet")
         if not grouped:
             facts.append(turn)
-        elif r.get("their_last_is_proxy"):
-            # The exception the group heading cannot carry, kept on the row it belongs to.
-            # It is the one thing about whose-turn that is not the same for everybody in
-            # the group, and it is rare -- which is exactly what a row is for.
-            facts.append('<span class="turn" title="no note is newer than the merge '
-                         "request&rsquo;s own last update, so a push is standing in for "
-                         'a word">read off a push</span>')
         quiet = r.get("quiet_days")
         if isinstance(quiet, int) and quiet > 0:
             facts.append(f'quiet <span class="rn">{quiet}</span>d')
@@ -4023,7 +4064,15 @@ def reviewing(a, reviews, drafts, here, by_id):
                  f'when you were asked"' if r.get("asked_is_proxy")
                  else f' title="asked {esc(r.get("asked") or "")}"'
                  if r.get("asked") else "")
+        # How this row's turn was decided, carried and not printed. It was a title on the
+        # per-row label before the label moved to the heading, and it stays a title: on
+        # this corpus sixteen of twenty-three turns are read off a push, so printing it
+        # would be the same majority-state-repeated-per-row the heading exists to undo --
+        # and it is provenance, which a reader looks up once rather than reads every day.
         a(f'<li data-fp="{esc(fp)}" data-turn="{mine}"'
+          + (' title="no note is newer than the merge request&rsquo;s own last update, '
+             'so a push is standing in for a word"'
+             if r.get("their_last_is_proxy") else "")
           + (f' id="rv-{esc(fp)}"' if fp else "")
           + f' data-dismissed="{1 if r.get("dismissed") else 0}">'
           + f'<span class="clk"{asked}>'
