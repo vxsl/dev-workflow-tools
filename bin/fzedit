@@ -51,6 +51,9 @@
 # pane outside this session, which is where the actual work is happening, and the home
 # rung prunes the OTHER worktrees of that repo (see sibling_exclude_args).
 #
+# `home` is a little wider than its name: it also sweeps FZEDIT_EXTRA_ROOTS, /tmp by
+# default, so a scratchpad or a generated file is openable by name too. See EXTRA_ROOTS.
+#
 # Usage:
 #   fzedit              # FZF_PERSIST_MODE env var (default: persist)
 #   fzedit --persist    # force persist mode (stays open)
@@ -157,6 +160,10 @@ DEFAULT_REPO="${FZEDIT_DEFAULT_REPO:-}"
 EXCLUDE_DIRS=(
     -E node_modules -E .git -E dist -E build -E .next -E .cache
     -E target -E vendor -E __pycache__ -E .venv -E venv -E .stack-work
+    # Compile and test caches. Structural like the rest, but they earn their line
+    # because of EXTRA_ROOTS: 24.5k of the 26.1k files in /tmp on this machine were
+    # node-compile-cache and pytest-of-kyle, and 1.5k of it was the part worth having.
+    -E node-compile-cache -E 'pytest-of-*' -E .pytest_cache -E node-jiti
 )
 
 # Swept ahead of the rest of $HOME on the home rung, so their files rank above an
@@ -174,6 +181,28 @@ if [ -n "${FZEDIT_PREFERRED_DIRS:-}" ]; then
 fi
 
 PREFERRED_EXTS=(-e hs -e js -e ts -e tsx -e py -e sh -e md -e yaml -e toml)
+
+# Roots swept ALONGSIDE $HOME on the home rung, colon-separated.
+#
+# /tmp by default, because it is where everything transient lands -- a scratchpad an
+# agent wrote, a diff dumped mid-review, the file a script just generated -- and none of
+# it is under $HOME, so no sweep here could see any of it. The pad is the "open a file"
+# tool first, and "the file I made ten minutes ago" was the one thing it could not open.
+#
+# AFTER the $HOME pass, not before it like PREFERRED_DIRS: these are not where the work
+# is, they are where the debris is, so they should be reachable by name without
+# outranking a real source file that matches as well.
+#
+# Home rung only. The narrow rungs are counts of one checkout's git state, and a
+# directory outside every checkout has nothing to say about those -- which also keeps
+# the ladder honestly nested (conflicts ⊂ changed ⊂ files ⊂ home).
+#
+# FZEDIT_EXTRA_ROOTS= (empty) turns it off entirely; the suite sets exactly that, so a
+# hermetic $HOME does not quietly start sweeping the real /tmp.
+EXTRA_ROOTS=()
+if [ -n "${FZEDIT_EXTRA_ROOTS-/tmp}" ]; then
+    IFS=':' read -r -a EXTRA_ROOTS <<< "${FZEDIT_EXTRA_ROOTS-/tmp}"
+fi
 
 # Everything under $HOME that is a file but is never a thing you open in an editor.
 # Measured on this machine: ~1.05M of the 2.86M paths a bare `fd ~/` returns, and not
@@ -723,6 +752,22 @@ sweep_home() {
     mapfile -t ex < <(exclude_args_under "$HOME" "${prunable[@]}")
     fd . "$HOME" --type f --follow --hidden --no-ignore-vcs \
         "${EXCLUDE_DIRS[@]}" "${bare[@]}" "${ex[@]}"
+    # And the roots that are not under $HOME at all -- /tmp by default. Last, so their
+    # rows sort below every real one (see EXTRA_ROOTS).
+    for dir in "${EXTRA_ROOTS[@]}"; do
+        [ -d "$dir" ] || continue
+        # A root the $HOME pass already walked would only be swept twice for one set of
+        # rows: list_home dedupes, so this costs an fd walk and buys nothing.
+        path_under "$dir" "$HOME" && continue
+        # Ignored descendants are pruned here too, re-anchored per root the same way.
+        # But an extra root that lies INSIDE a pruned tree is still swept, unlike a
+        # preferred dir: a preferred dir only reranks rows the $HOME pass already found,
+        # so dropping it loses nothing, whereas this pass is the ONLY one that can find
+        # these files at all, and the root is in the list because someone named it.
+        mapfile -t ex < <(exclude_args_under "$dir" "${prunable[@]}")
+        fd . "$dir" --type f --follow --hidden --no-ignore-vcs \
+            "${EXCLUDE_DIRS[@]}" "${bare[@]}" "${ex[@]}"
+    done
 }
 
 # History first (it's the "recently opened" prior), then the cached sweep, deduped.
@@ -2214,6 +2259,7 @@ help_text() {
 ${B}fzedit${O} ${D}— the file pad.${O}
 
 ${B}scope — the rung ladder${O}   ${D}conflicts ⊂ changed ⊂ files ⊂ home${O}
+  ${D}home is \$HOME plus ${EXTRA_ROOTS[*]:-nothing else} — a scratch file is openable by name.${O}
   ${D}the block above is the worktree you are scoped to, in its own colour — the${O}
   ${D}same block the p10k prompt draws. White on red means that checkout is NOT${O}
   ${D}on the branch its name promises.${O}
@@ -2281,7 +2327,7 @@ ${B}misc${O}
   F5             refresh, ignoring every cache below
   F1             this page ${D}— q or esc closes it${O}
 
-${D}config: .env (paths, FZEDIT_MARGIN) · ~/.config/fzedit/ignore (home-sweep noise)${O}
+${D}config: .env (paths, FZEDIT_MARGIN, FZEDIT_EXTRA_ROOTS) · ~/.config/fzedit/ignore${O}
 ${D}the fd sweeps are cached ${SWEEP_TTL}s and the worktree list ${WT_ROWS_TTL}s, so TAB is instant;${O}
 ${D}history, changed and conflicts are never cached and are always live.${O}
 EOF

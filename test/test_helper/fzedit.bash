@@ -35,6 +35,12 @@ setup_fzedit_env() {
     # FZEDIT_DEFAULT_REPO for itself.
     export FZEDIT_ENV=/dev/null
 
+    # The home rung also sweeps FZEDIT_EXTRA_ROOTS, /tmp by default. A hermetic $HOME is
+    # not hermetic if every listing walks the real /tmp -- and mktemp puts TEST_TMPDIR
+    # itself in there, so the suite would be reading its own scaffolding back. Tests that
+    # care set it themselves.
+    export FZEDIT_EXTRA_ROOTS=
+
     export TEST_TMUX_PANES="$TEST_TMPDIR/tmux_panes"
     : > "$TEST_TMUX_PANES"
     export TEST_TMUX_SESSIONS="$TEST_TMPDIR/tmux_sessions"

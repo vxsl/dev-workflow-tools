@@ -1118,6 +1118,59 @@ ED
     [[ "$out" == *"$HOME/loose/preferred.ts"* ]]
 }
 
+# The whole point of the extra roots: a file that is not under $HOME at all -- an agent's
+# scratchpad, a dumped diff, whatever a script just generated -- was unreachable from
+# every rung, and those are exactly the files you want to open ten minutes later.
+@test "home rung sweeps an extra root outside \$HOME" {
+    setup_repo_under_home
+    mkdir -p "$TEST_TMPDIR/scratchroot/sub"
+    echo x > "$TEST_TMPDIR/scratchroot/sub/generated.md"
+    export FZEDIT_EXTRA_ROOTS="$TEST_TMPDIR/scratchroot"
+    pin_scope "$H_MAIN"
+    out="$(rows_of_type f | cut -f2)"
+    [[ "$out" == *"$TEST_TMPDIR/scratchroot/sub/generated.md"* ]]
+}
+
+# Extra rows on "conflicts (0)" would say the opposite of what the rung promises, and
+# would break the nesting the ladder is built on (conflicts ⊂ changed ⊂ files ⊂ home).
+@test "the narrow rungs do not sweep the extra roots" {
+    setup_repo_under_home
+    mkdir -p "$TEST_TMPDIR/scratchroot"
+    echo x > "$TEST_TMPDIR/scratchroot/generated.md"
+    export FZEDIT_EXTRA_ROOTS="$TEST_TMPDIR/scratchroot"
+    export FZEDIT_DEFAULT_RUNG=files
+    pin_scope "$H_MAIN"
+    out="$(rows_of_type f | cut -f2)"
+    [[ "$out" != *"generated.md"* ]]
+}
+
+# An extra root only ever ADDS rows nothing else can reach, so an ignore pattern that
+# happens to cover it must not silently delete the whole pass -- unlike a preferred dir,
+# which only reranks rows the $HOME sweep already found.
+@test "an extra root is swept even when an ignore pattern covers its descendants" {
+    setup_repo_under_home
+    mkdir -p "$TEST_TMPDIR/scratchroot/junkdir"
+    echo x > "$TEST_TMPDIR/scratchroot/keep-me.md"
+    echo y > "$TEST_TMPDIR/scratchroot/junkdir/dropped.md"
+    mkdir -p "$HOME/.config/fzedit"
+    echo 'junkdir' > "$HOME/.config/fzedit/ignore"
+    export FZEDIT_EXTRA_ROOTS="$TEST_TMPDIR/scratchroot"
+    pin_scope "$H_MAIN"
+    out="$(rows_of_type f | cut -f2)"
+    [[ "$out" == *"$TEST_TMPDIR/scratchroot/keep-me.md"* ]]
+    [[ "$out" != *"dropped.md"* ]]
+}
+
+@test "an extra root already under \$HOME is not swept twice" {
+    setup_repo_under_home
+    mkdir -p "$HOME/inside"
+    echo x > "$HOME/inside/once.md"
+    export FZEDIT_EXTRA_ROOTS="$HOME/inside"
+    pin_scope "$H_MAIN"
+    n=$(rows_of_type f | cut -f2 | grep -c "^$HOME/inside/once.md\$")
+    [ "$n" -eq 1 ]
+}
+
 @test "home rung still reaches files under \$HOME outside any repo" {
     setup_repo_under_home
     pin_scope "$H_MAIN"
