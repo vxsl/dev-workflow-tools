@@ -32,7 +32,7 @@ teardown() {
 
 # Runs a python snippet with work-arcs imported as `wa`.
 wa() {
-    python3 - "$REPO_ROOT/bin/work-arcs" <<PY
+    python3 - "$ARCS_ROOT/bin/work-arcs" <<PY
 import importlib.machinery, importlib.util, sys, json
 loader = importlib.machinery.SourceFileLoader("wa", sys.argv[1])
 spec = importlib.util.spec_from_loader("wa", loader)
@@ -167,7 +167,7 @@ PY
 
 # Renders a whole page from a work-arcs document handed over as JSON on argv.
 page() {
-    python3 - "$REPO_ROOT/bin/arcs-page" "$1" <<'PY'
+    python3 - "$ARCS_ROOT/bin/arcs-page" "$1" <<'PY'
 import json, subprocess, sys
 r = subprocess.run([sys.executable, sys.argv[1], "--focus", "30"],
                    input=sys.argv[2], capture_output=True, text=True)
@@ -246,10 +246,10 @@ PY
     # six days of unpublished work and wants nothing from anybody, the other has a branch
     # that stopped merging. The order used to run straight from the volume.
     run python3 - "$(doc)" <<'PY'
-import json, re, subprocess, sys
+import json, os, re, subprocess, sys
 doc = json.loads(sys.argv[1])
 doc["arcs"] = [a for a in doc["arcs"] if a["stage"] in ("local-only", "came-back")]
-r = subprocess.run([sys.executable, "bin/arcs-page", "--focus", "30"],
+r = subprocess.run([sys.executable, os.environ["ARCS_ROOT"] + "/bin/arcs-page", "--focus", "30"],
                    input=json.dumps(doc), capture_output=True, text=True)
 print(re.findall(r'id="ws-([a-z-]+)-', r.stdout))
 PY
@@ -259,12 +259,12 @@ PY
 @test "volume still orders two rows that want the same thing" {
     # Demoted to the tiebreak it always should have been, not removed.
     run python3 - "$(doc)" <<'PY'
-import json, re, subprocess, sys
+import json, os, re, subprocess, sys
 doc = json.loads(sys.argv[1])
 one = dict(doc["arcs"][2], id="small-pile", label="small-pile", unpushed_live=2)
 two = dict(doc["arcs"][2], id="big-pile", label="big-pile", unpushed_live=20)
 doc["arcs"] = [one, two]
-r = subprocess.run([sys.executable, "bin/arcs-page", "--focus", "30"],
+r = subprocess.run([sys.executable, os.environ["ARCS_ROOT"] + "/bin/arcs-page", "--focus", "30"],
                    input=json.dumps(doc), capture_output=True, text=True)
 print(re.findall(r'id="ws-([a-z-]+)-', r.stdout))
 PY
@@ -276,11 +276,11 @@ PY
     # nothing from him, whatever its urgency says -- here the local-only arc has no
     # demands at all and would sort last on urgency alone.
     run python3 - "$(doc)" <<'PY'
-import json, re, subprocess, sys
+import json, os, re, subprocess, sys
 doc = json.loads(sys.argv[1])
 quiet = dict(doc["arcs"][2], id="quiet-local", label="quiet-local", urgency=99)
 doc["arcs"] = [doc["arcs"][1], quiet]
-r = subprocess.run([sys.executable, "bin/arcs-page", "--focus", "30"],
+r = subprocess.run([sys.executable, os.environ["ARCS_ROOT"] + "/bin/arcs-page", "--focus", "30"],
                    input=json.dumps(doc), capture_output=True, text=True)
 print(re.findall(r'id="ws-([a-z-]+)-', r.stdout))
 PY
@@ -310,10 +310,10 @@ PY
 
 @test "the table renders the ranking it was handed and never re-derives one" {
     run python3 - "$(doc "$(gap 3)")" <<'PY'
-import json, re, subprocess, sys
+import json, os, re, subprocess, sys
 doc = json.loads(sys.argv[1])
 doc["gap"]["status_mismatch"] = list(reversed(doc["gap"]["status_mismatch"]))
-r = subprocess.run([sys.executable, "bin/arcs-page", "--focus", "30"],
+r = subprocess.run([sys.executable, os.environ["ARCS_ROOT"] + "/bin/arcs-page", "--focus", "30"],
                    input=json.dumps(doc), capture_output=True, text=True)
 table = re.search(r'<h2[^>]*>Jira says otherwise</h2>.*?</table>', r.stdout, re.S)
 print(re.findall(r'browse/(UL-\d+)', table.group(0)))
@@ -326,9 +326,9 @@ PY
     # sentence ran its own max() over the whole list, the two could disagree -- and the
     # link in the sentence pointed at an anchor the truncation had removed.
     run python3 - "$(doc "$(gap 20)")" <<'PY'
-import json, re, subprocess, sys
+import json, os, re, subprocess, sys
 doc = json.loads(sys.argv[1])
-r = subprocess.run([sys.executable, "bin/arcs-page", "--focus", "30"],
+r = subprocess.run([sys.executable, os.environ["ARCS_ROOT"] + "/bin/arcs-page", "--focus", "30"],
                    input=json.dumps(doc), capture_output=True, text=True)
 lede = re.search(r'<p class="lede">.*?</p>', r.stdout, re.S).group(0)
 named = re.search(r"<em>(UL-\d+)</em>", lede).group(1)
@@ -359,10 +359,10 @@ PY
     # disagrees with the table it points at, and an acknowledgement that still opens the
     # page with the same ticket does nothing at all.
     run python3 - "$(doc "$(gap 3)")" <<'PY'
-import json, re, subprocess, sys
+import json, os, re, subprocess, sys
 doc = json.loads(sys.argv[1])
 doc["gap"]["status_mismatch"][0]["dismissed"] = True
-r = subprocess.run([sys.executable, "bin/arcs-page", "--focus", "30"],
+r = subprocess.run([sys.executable, os.environ["ARCS_ROOT"] + "/bin/arcs-page", "--focus", "30"],
                    input=json.dumps(doc), capture_output=True, text=True)
 lede = re.search(r'<p class="lede">.*?</p>', r.stdout, re.S).group(0)
 print(re.search(r"<em>(UL-\d+)</em>", lede).group(1), "of 2" in lede)
@@ -375,12 +375,12 @@ PY
     # has touched in three weeks. It has no scale to print, and under a ranking that can
     # put it first, "never reached a remote" is a sentence the page would open on.
     run python3 - "$(doc "$(gap 1)")" <<'PY'
-import json, re, subprocess, sys
+import json, os, re, subprocess, sys
 doc = json.loads(sys.argv[1])
 m = doc["gap"]["status_mismatch"][0]
 m["arc"] = {"unpushed_live": 0, "unpushed_days": 0}
 m["why"] = "status 'In Progress' but untouched 34d"
-r = subprocess.run([sys.executable, "bin/arcs-page", "--focus", "30"],
+r = subprocess.run([sys.executable, os.environ["ARCS_ROOT"] + "/bin/arcs-page", "--focus", "30"],
                    input=json.dumps(doc), capture_output=True, text=True)
 lede = re.search(r'<p class="lede">.*?</p>', r.stdout, re.S).group(0)
 print("REMOTE" if "reached a remote" in lede else "NO-REMOTE")

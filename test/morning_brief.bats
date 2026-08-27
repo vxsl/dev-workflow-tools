@@ -35,7 +35,7 @@ teardown() {
 # scope. GENERATED fixes "now" at Thursday 14 August 2026, so every day count in a test is
 # a fact about the fixture rather than about the day the suite runs.
 am() {
-    python3 - "$REPO_ROOT/bin/arc-morning" <<PY
+    python3 - "$ARCS_ROOT/bin/arc-morning" <<PY
 import importlib.machinery, importlib.util, sys, json
 loader = importlib.machinery.SourceFileLoader("am", sys.argv[1])
 spec = importlib.util.spec_from_loader("am", loader)

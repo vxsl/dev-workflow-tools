@@ -66,7 +66,7 @@ import headless_claude as h; print(h.$1)"
     add_transcript "$PROJECTS/-home-kyle-work-repo/real.jsonl" \
         "the dev server reloads twice on every save and it is driving me up the wall"
 
-    run "$REPO_ROOT/bin/arc-backfill" --projects "$PROJECTS"
+    run "$ARCS_ROOT/bin/arc-backfill" --projects "$PROJECTS"
     [ "$status" -eq 0 ]
 
     log="$XDG_STATE_HOME/work-arcs/turns.jsonl"

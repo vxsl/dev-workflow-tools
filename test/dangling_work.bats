@@ -54,7 +54,7 @@ on() {
 
 # Runs a python snippet with work-arcs imported as `wa`, against the fixture repo.
 wa() {
-    python3 - "$REPO_ROOT/bin/work-arcs" "$ARC_REPO" <<PY
+    python3 - "$ARCS_ROOT/bin/work-arcs" "$ARC_REPO" <<PY
 import importlib.machinery, importlib.util, sys, json
 loader = importlib.machinery.SourceFileLoader("wa", sys.argv[1])
 spec = importlib.util.spec_from_loader("wa", loader)
@@ -91,7 +91,7 @@ PY
 
 # Renders a whole page from a work-arcs document handed over as JSON on argv.
 page() {
-    python3 - "$REPO_ROOT/bin/arcs-page" "$1" <<'PY' > "$TEST_TMPDIR/page.html"
+    python3 - "$ARCS_ROOT/bin/arcs-page" "$1" <<'PY' > "$TEST_TMPDIR/page.html"
 import json, subprocess, sys
 doc = json.loads(sys.argv[2])
 r = subprocess.run([sys.executable, sys.argv[1], "--focus", "30"],
@@ -328,7 +328,7 @@ PY
     # Sixteen days of work touched yesterday sits below three days nobody has opened for a
     # month, and the row has to be able to say why.
     run python3 - "$(doc 2)" <<'PY'
-import json, re, subprocess, sys
+import json, os, re, subprocess, sys
 doc = json.loads(sys.argv[1])
 live = [x for x in doc["arcs"] if x["unpushed_live"]]
 live[0].update(unpushed_days=16, unpushed_live=48, age_days=1,
@@ -337,7 +337,7 @@ live[1].update(unpushed_days=3, unpushed_live=9, age_days=30,
                unpushed_dates=["2026-08-%02d" % (d + 1) for d in range(3)])
 live.sort(key=lambda x: (-(x["unpushed_days"] * max(x["age_days"], 1)), x["id"]))
 doc["only_here"] = [x["id"] for x in live]
-r = subprocess.run([sys.executable, "bin/arcs-page", "--focus", "40"],
+r = subprocess.run([sys.executable, os.environ["ARCS_ROOT"] + "/bin/arcs-page", "--focus", "40"],
                    input=json.dumps(doc), capture_output=True, text=True)
 m = re.search(r'<details class="atrisk".*?</details>', r.stdout, re.S)
 print(re.findall(r'<span class="dy">([^<]*)</span><span class="ag">([^<]*)</span>',
@@ -351,12 +351,12 @@ PY
     # them on the local-only rung -- so falling back to it printed "3 days of work, only
     # here" beside a cell already reading "3 days of work".
     run python3 - "$(doc 1)" <<'PY'
-import json, re, subprocess, sys
+import json, os, re, subprocess, sys
 doc = json.loads(sys.argv[1])
 for x in doc["arcs"]:
     if x["unpushed_live"]:
         x["brief"] = {"name": "no summary here"}
-r = subprocess.run([sys.executable, "bin/arcs-page", "--focus", "30"],
+r = subprocess.run([sys.executable, os.environ["ARCS_ROOT"] + "/bin/arcs-page", "--focus", "30"],
                    input=json.dumps(doc), capture_output=True, text=True)
 m = re.search(r'<details class="atrisk".*?</details>', r.stdout, re.S)
 print("WY" if 'class="wy"' in m.group(0) else "NO-WY")
@@ -371,10 +371,10 @@ PY
     # ranking -- the arcs list untouched -- must reverse the rows.
     forward=$(page "$(doc 4)" | grep -o 'class="nm" href="#ws-workstream-[0-9]*')
     reversed=$(python3 - "$(doc 4)" <<'PY' | grep -o 'class="nm" href="#ws-workstream-[0-9]*'
-import json, subprocess, sys
+import json, os, subprocess, sys
 doc = json.loads(sys.argv[1])
 doc["only_here"] = list(reversed(doc["only_here"]))
-r = subprocess.run([sys.executable, "bin/arcs-page", "--focus", "30"],
+r = subprocess.run([sys.executable, os.environ["ARCS_ROOT"] + "/bin/arcs-page", "--focus", "30"],
                    input=json.dumps(doc), capture_output=True, text=True)
 sys.stdout.write(r.stdout)
 PY
@@ -411,10 +411,10 @@ PY
     # existed -- sorts to the end rather than being dropped. The tile says 4 and the list
     # has to be able to show 4.
     run python3 - "$(doc 4)" <<'PY'
-import json, re, subprocess, sys
+import json, os, re, subprocess, sys
 doc = json.loads(sys.argv[1])
 doc["only_here"] = []
-r = subprocess.run([sys.executable, "bin/arcs-page", "--focus", "30"],
+r = subprocess.run([sys.executable, os.environ["ARCS_ROOT"] + "/bin/arcs-page", "--focus", "30"],
                    input=json.dumps(doc), capture_output=True, text=True)
 m = re.search(r'<details class="atrisk".*?</details>', r.stdout, re.S)
 print(len(re.findall(r'class="nm" href', m.group(0))) if m else "NO DISCLOSURE")
@@ -428,7 +428,7 @@ PY
     # and the disclosure marker rendered as a tofu box with "be" beside it. The original
     # rules used the literal glyphs for exactly this reason. Checked over every content
     # string in the stylesheet, because the next one will be written the same way.
-    run python3 - "$REPO_ROOT/bin/arcs-page" <<'PY'
+    run python3 - "$ARCS_ROOT/bin/arcs-page" <<'PY'
 import importlib.machinery, importlib.util, re, sys
 loader = importlib.machinery.SourceFileLoader("pg", sys.argv[1])
 spec = importlib.util.spec_from_loader("pg", loader)
@@ -445,7 +445,7 @@ PY
 @test "a summary with no sentence break is dropped rather than chopped mid-thought" {
     # A phrase cut at a character count says less than nothing. Where the first sentence
     # is too long for one line the row falls back to a fact it already has.
-    run python3 - "$REPO_ROOT/bin/arcs-page" <<'PY'
+    run python3 - "$ARCS_ROOT/bin/arcs-page" <<'PY'
 import importlib.machinery, importlib.util, sys
 loader = importlib.machinery.SourceFileLoader("pg", sys.argv[1])
 spec = importlib.util.spec_from_loader("pg", loader)

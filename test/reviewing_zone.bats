@@ -84,7 +84,7 @@ ZZDOC
 
 # Renders a whole page from a work-arcs document handed over as JSON on argv.
 page() {
-    python3 - "$REPO_ROOT/bin/arcs-page" "$@" <<'ZZPAGE'
+    python3 - "$ARCS_ROOT/bin/arcs-page" "$@" <<'ZZPAGE'
 import subprocess, sys
 r = subprocess.run([sys.executable, sys.argv[1], "--focus", "30"] + sys.argv[3:],
                    input=sys.argv[2], capture_output=True, text=True)
@@ -375,7 +375,7 @@ ZZSPLIT
 # are read off a push rather than off a note, so printing it would be the same majority
 # state repeated per row that the headings exist to undo.
 @test "how a turn was decided rides on the row rather than being printed on it" {
-    run python3 - "$REPO_ROOT/bin/arcs-page" "$(doc)" <<'ZZPROXY'
+    run python3 - "$ARCS_ROOT/bin/arcs-page" "$(doc)" <<'ZZPROXY'
 import json, re, subprocess, sys
 d = json.loads(sys.argv[2])
 d["reviews"][0]["their_last_is_proxy"] = True
@@ -396,7 +396,7 @@ ZZPROXY
 # A heading over a group that is not a group is worse than the repetition it replaces, so
 # a wire order that does not partition keeps every row's own label.
 @test "an unsorted wire order gets no headings and keeps its row labels" {
-    run python3 - "$REPO_ROOT/bin/arcs-page" "$(doc)" <<'ZZMIX'
+    run python3 - "$ARCS_ROOT/bin/arcs-page" "$(doc)" <<'ZZMIX'
 import json, re, subprocess, sys
 d = json.loads(sys.argv[2])
 d["reviews"] = [d["reviews"][i] for i in (0, 3, 1, 2)]
@@ -490,7 +490,7 @@ ZZFIG
 # element the section never printed is the same lie as a link to a 404. It falls back to the
 # figure the section did print.
 @test "an unpartitioned wire leaves the door mirroring a figure that exists" {
-    run python3 - "$REPO_ROOT/bin/arcs-page" "$(doc)" <<'ZZFALL'
+    run python3 - "$ARCS_ROOT/bin/arcs-page" "$(doc)" <<'ZZFALL'
 import json, re, subprocess, sys
 d = json.loads(sys.argv[2])
 d["reviews"] = [d["reviews"][i] for i in (0, 3, 1, 2)]

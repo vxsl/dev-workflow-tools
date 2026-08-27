@@ -37,7 +37,7 @@ teardown() {
 
 # Runs a python snippet with work-arcs imported as wa and gap fixtures in scope.
 wa() {
-    python3 - "$REPO_ROOT/bin/work-arcs" <<PY
+    python3 - "$ARCS_ROOT/bin/work-arcs" <<PY
 import importlib.machinery, importlib.util, sys, json
 loader = importlib.machinery.SourceFileLoader("wa", sys.argv[1])
 spec = importlib.util.spec_from_loader("wa", loader)
@@ -258,7 +258,7 @@ print(len(wa.CURATION_LABELS.read_text().splitlines()))'
  "confirmed": {"br-x": {"from": "arc-1", "with": ["br-y"], "at": 101}},
  "answers": [{"kind": "unticketed", "answer": "ticket", "arc_id": "smp", "at": 103}]}
 EOF
-    run python3 "$REPO_ROOT/bin/work-arcs" --ingest-acks "$seed"
+    run python3 "$ARCS_ROOT/bin/work-arcs" --ingest-acks "$seed"
     [ "$status" -eq 0 ]
     [ "$(jq -r '.aaa111.note' "$XDG_STATE_HOME/work-arcs/dismissed.json")" = "fine" ]
     [ "$(jq -r '."br-x".from' "$XDG_STATE_HOME/work-arcs/confirmed.json")" = "arc-1" ]
@@ -273,7 +273,7 @@ EOF
         >"$XDG_STATE_HOME/work-arcs/dismissed.json"
     echo '{"dismissed": {"aaa111": {"ref": "theirs", "at": 99, "note": "fine"}}}' \
         >"$TEST_TMPDIR/seed.json"
-    run python3 "$REPO_ROOT/bin/work-arcs" --ingest-acks "$TEST_TMPDIR/seed.json"
+    run python3 "$ARCS_ROOT/bin/work-arcs" --ingest-acks "$TEST_TMPDIR/seed.json"
     [ "$status" -eq 0 ]
     [ "$(jq -r '.aaa111.note' "$XDG_STATE_HOME/work-arcs/dismissed.json")" = "noise" ]
 }
@@ -285,7 +285,7 @@ EOF
     echo '{"gone": {"ref": "x", "at": 1, "note": ""}, "kept": {"ref": "y", "at": 1}}' \
         >"$XDG_STATE_HOME/work-arcs/dismissed.json"
     echo '{"dismissed": {}, "undismissed": ["gone"]}' >"$TEST_TMPDIR/seed.json"
-    run python3 "$REPO_ROOT/bin/work-arcs" --ingest-acks "$TEST_TMPDIR/seed.json"
+    run python3 "$ARCS_ROOT/bin/work-arcs" --ingest-acks "$TEST_TMPDIR/seed.json"
     [ "$status" -eq 0 ]
     [ "$(jq -r 'has("gone")' "$XDG_STATE_HOME/work-arcs/dismissed.json")" = "false" ]
     [ "$(jq -r 'has("kept")' "$XDG_STATE_HOME/work-arcs/dismissed.json")" = "true" ]
@@ -296,8 +296,8 @@ EOF
 @test "adopting the same page twice records one answer" {
     echo '{"answers": [{"kind": "unticketed", "answer": "fine", "arc_id": "smp", "at": 7}]}' \
         >"$TEST_TMPDIR/seed.json"
-    python3 "$REPO_ROOT/bin/work-arcs" --ingest-acks "$TEST_TMPDIR/seed.json"
-    python3 "$REPO_ROOT/bin/work-arcs" --ingest-acks "$TEST_TMPDIR/seed.json"
+    python3 "$ARCS_ROOT/bin/work-arcs" --ingest-acks "$TEST_TMPDIR/seed.json"
+    python3 "$ARCS_ROOT/bin/work-arcs" --ingest-acks "$TEST_TMPDIR/seed.json"
     [ "$(wc -l <"$XDG_STATE_HOME/work-arcs/curation-labels.jsonl")" -eq 1 ]
 }
 
@@ -306,14 +306,14 @@ EOF
 # reads as success.
 @test "a seed that cannot be read is a failure and not a silent no-op" {
     echo 'not json at all' >"$TEST_TMPDIR/seed.json"
-    run python3 "$REPO_ROOT/bin/work-arcs" --ingest-acks "$TEST_TMPDIR/seed.json"
+    run python3 "$ARCS_ROOT/bin/work-arcs" --ingest-acks "$TEST_TMPDIR/seed.json"
     [ "$status" -eq 1 ]
 }
 
 @test "a section of the wrong shape is named, and the rest is still adopted" {
     echo '{"dismissed": {"ok1": 1}, "confirmed": ["not", "an", "object"]}' \
         >"$TEST_TMPDIR/seed.json"
-    run python3 "$REPO_ROOT/bin/work-arcs" --ingest-acks "$TEST_TMPDIR/seed.json"
+    run python3 "$ARCS_ROOT/bin/work-arcs" --ingest-acks "$TEST_TMPDIR/seed.json"
     [ "$status" -eq 1 ]
     [[ "$output" == *"confirmed"* ]]
     [ "$(jq -r 'has("ok1")' "$XDG_STATE_HOME/work-arcs/dismissed.json")" = "true" ]
@@ -323,7 +323,7 @@ EOF
 # becomes the entry the CLI writes, so a click and --dismiss leave the same kind of record.
 @test "a bare acknowledgement from the page is given the shape a store keeps" {
     echo '{"dismissed": {"bare": 1}}' >"$TEST_TMPDIR/seed.json"
-    run python3 "$REPO_ROOT/bin/work-arcs" --ingest-acks "$TEST_TMPDIR/seed.json"
+    run python3 "$ARCS_ROOT/bin/work-arcs" --ingest-acks "$TEST_TMPDIR/seed.json"
     [ "$status" -eq 0 ]
     [ "$(jq -r '.bare | type' "$XDG_STATE_HOME/work-arcs/dismissed.json")" = "object" ]
 }
@@ -334,6 +334,6 @@ EOF
     unset JIRA_REPO WORK_ARCS_REPO
     echo '{"dismissed": {"x": 1}}' >"$TEST_TMPDIR/seed.json"
     run env -u JIRA_REPO -u WORK_ARCS_REPO \
-        python3 "$REPO_ROOT/bin/work-arcs" --ingest-acks "$TEST_TMPDIR/seed.json"
+        python3 "$ARCS_ROOT/bin/work-arcs" --ingest-acks "$TEST_TMPDIR/seed.json"
     [ "$status" -eq 0 ]
 }

@@ -95,7 +95,7 @@ pushed() {
 
 # Runs a python snippet with work-arcs imported as wa, against the fixture repo.
 wa() {
-    python3 - "$REPO_ROOT/bin/work-arcs" "$ARC_REPO" <<PY
+    python3 - "$ARCS_ROOT/bin/work-arcs" "$ARC_REPO" <<PY
 import importlib.machinery, importlib.util, sys, json, re
 loader = importlib.machinery.SourceFileLoader("wa", sys.argv[1])
 spec = importlib.util.spec_from_loader("wa", loader)

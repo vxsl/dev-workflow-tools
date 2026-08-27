@@ -43,7 +43,7 @@ teardown() {
 # Runs a python snippet with arc-standup imported as `su` and the payload builders in
 # scope. Every test names its own instant, because that is the input under test.
 su() {
-    python3 - "$REPO_ROOT/bin/arc-standup" <<PY
+    python3 - "$ARCS_ROOT/bin/arc-standup" <<PY
 import importlib.machinery, importlib.util, sys, json
 from datetime import datetime
 loader = importlib.machinery.SourceFileLoader("su", sys.argv[1])

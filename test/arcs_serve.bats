@@ -133,7 +133,7 @@ free_port() {
 start_daemon() {
     PORT="$(free_port)"
     BASE="http://127.0.0.1:$PORT"
-    "$REPO_ROOT/bin/arcs-serve" --port "$PORT" >"$TEST_TMPDIR/daemon.out" 2>&1 &
+    "$ARCS_ROOT/bin/arcs-serve" --port "$PORT" >"$TEST_TMPDIR/daemon.out" 2>&1 &
     DAEMON_PID=$!
     local i
     for i in $(seq 1 200); do

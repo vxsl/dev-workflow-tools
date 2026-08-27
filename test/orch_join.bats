@@ -63,7 +63,7 @@ teardown() {
 # orch's four sources. Nothing is created until a test asks for it, so "the database does
 # not exist" is a state a test can simply not leave.
 wa() {
-    python3 - "$REPO_ROOT/bin/work-arcs" "$ARC_REPO" <<PY
+    python3 - "$ARCS_ROOT/bin/work-arcs" "$ARC_REPO" <<PY
 import importlib.machinery, importlib.util, json, os, sqlite3, sys, time
 from pathlib import Path
 loader = importlib.machinery.SourceFileLoader("wa", sys.argv[1])

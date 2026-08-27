@@ -64,7 +64,7 @@ ZZDOC
 
 # Renders a whole page from a work-arcs document handed over as JSON on argv.
 page() {
-    python3 - "$REPO_ROOT/bin/arcs-page" "$1" <<'ZZPAGE'
+    python3 - "$ARCS_ROOT/bin/arcs-page" "$1" <<'ZZPAGE'
 import subprocess, sys
 r = subprocess.run([sys.executable, sys.argv[1], "--focus", "30"],
                    input=sys.argv[2], capture_output=True, text=True)
@@ -161,7 +161,7 @@ ZZINNER
 @test "a section refuses to collapse without a size to state" {
     # The law in the code rather than only in a comment: fold() asserts, so a section
     # added later cannot quietly hide how much it is holding.
-    run python3 - "$REPO_ROOT/bin/arcs-page" <<'ZZASSERT'
+    run python3 - "$ARCS_ROOT/bin/arcs-page" <<'ZZASSERT'
 import importlib.machinery, importlib.util, sys
 loader = importlib.machinery.SourceFileLoader("ap", sys.argv[1])
 spec = importlib.util.spec_from_loader("ap", loader)
@@ -757,7 +757,7 @@ ZZANS
 # would acknowledge -- and only where the fold actually rendered that row. An anchor into
 # nothing is a dead link in the one block whose whole claim is that its sentences check out.
 @test "a no-ticket card links the fold row it is about, and only where that row exists" {
-    run python3 - "$REPO_ROOT/bin/arcs-page" "$(cards_doc)" <<'ZZLINK'
+    run python3 - "$ARCS_ROOT/bin/arcs-page" "$(cards_doc)" <<'ZZLINK'
 import json, re, subprocess, sys
 d = json.loads(sys.argv[2])
 d["gap"] = {"unticketed_work": [

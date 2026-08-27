@@ -39,7 +39,7 @@ teardown() {
 
 # Runs a python snippet with work-arcs imported as `wa` and the Slack fakes in scope.
 wa() {
-    python3 - "$REPO_ROOT/bin/work-arcs" <<PY
+    python3 - "$ARCS_ROOT/bin/work-arcs" <<PY
 import importlib.machinery, importlib.util, sys, json, os
 from pathlib import Path
 loader = importlib.machinery.SourceFileLoader("wa", sys.argv[1])
@@ -341,7 +341,7 @@ print("untouched", wa.DISMISSED.read_text() == before)'
 
 @test "each pipeline stage rejects a non-JSON payload with a sentence" {
     for prog in arc-brief arc-morning arcs-page; do
-        run bash -c "printf 'not json {' | '$REPO_ROOT/bin/$prog' --out /dev/null 2>&1"
+        run bash -c "printf 'not json {' | '$ARCS_ROOT/bin/$prog' --out /dev/null 2>&1"
         [[ "$output" != *Traceback* ]] || { echo "$prog: $output"; return 1; }
         [[ "$output" == *"$prog:"* ]]
     done
@@ -352,7 +352,7 @@ print("untouched", wa.DISMISSED.read_text() == before)'
     # several frames deeper -- in arcs-page's case after work-arcs and both model passes
     # had already been paid for.
     for prog in arc-brief arc-morning arcs-page; do
-        run bash -c "printf '[1,2,3]' | '$REPO_ROOT/bin/$prog' --out /dev/null 2>&1"
+        run bash -c "printf '[1,2,3]' | '$ARCS_ROOT/bin/$prog' --out /dev/null 2>&1"
         [[ "$output" != *Traceback* ]] || { echo "$prog: $output"; return 1; }
         [[ "$output" == *"list"* ]]
     done

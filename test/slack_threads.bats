@@ -49,7 +49,7 @@ teardown() {
 }
 
 wa() {
-    python3 - "$REPO_ROOT/bin/work-arcs" <<PY
+    python3 - "$ARCS_ROOT/bin/work-arcs" <<PY
 import importlib.machinery, importlib.util, sys, json, time
 loader = importlib.machinery.SourceFileLoader("wa", sys.argv[1])
 spec = importlib.util.spec_from_loader("wa", loader)

@@ -50,9 +50,9 @@ setup() {
     # is never sourced into a test.
     FAKE_REPO="$TEST_TMPDIR/repo"
     mkdir -p "$FAKE_REPO/bin"
-    cp "$REPO_ROOT/bin/arcs-refresh" "$FAKE_REPO/bin/arcs-refresh"
-    cp -r "$REPO_ROOT/systemd" "$FAKE_REPO/systemd"
-    cp -r "$REPO_ROOT/lib" "$FAKE_REPO/lib"
+    cp "$ARCS_ROOT/bin/arcs-refresh" "$FAKE_REPO/bin/arcs-refresh"
+    cp -r "$ARCS_ROOT/systemd" "$FAKE_REPO/systemd"
+    cp -r "$ARCS_ROOT/lib" "$FAKE_REPO/lib"
     REFRESH="$FAKE_REPO/bin/arcs-refresh"
     # A real-shaped artifact link, because the slug is parsed out of it and a publish with
     # no slug is the one failure that is silent and permanent -- it makes a second
@@ -871,27 +871,27 @@ EOF
 # reason for the whole move -- so it is asserted on the shipped file, not just the flag.
 
 @test "the shipped timer catches up after a missed run" {
-    grep -q "^Persistent=true$" "$REPO_ROOT/systemd/work-arcs-refresh.timer"
-    grep -q "^OnCalendar=07:10$" "$REPO_ROOT/systemd/work-arcs-refresh.timer"
-    grep -q "^WantedBy=timers.target$" "$REPO_ROOT/systemd/work-arcs-refresh.timer"
+    grep -q "^Persistent=true$" "$ARCS_ROOT/systemd/work-arcs-refresh.timer"
+    grep -q "^OnCalendar=07:10$" "$ARCS_ROOT/systemd/work-arcs-refresh.timer"
+    grep -q "^WantedBy=timers.target$" "$ARCS_ROOT/systemd/work-arcs-refresh.timer"
 }
 
 # Waking a laptop in a bag at 07:10 to rebuild a page nobody is looking at yet is worse
 # than rebuilding it when the lid opens.
 @test "the shipped timer does not wake the machine to do it" {
-    ! grep -q "^WakeSystem" "$REPO_ROOT/systemd/work-arcs-refresh.timer"
+    ! grep -q "^WakeSystem" "$ARCS_ROOT/systemd/work-arcs-refresh.timer"
 }
 
 # 90 seconds is the default and the pipeline is four to nine minutes, so without this the
 # unit kills its own run mid-flight, holding the lock, with the baseline already moved.
 @test "the shipped service allows the pipeline time to finish" {
-    grep -q "^TimeoutStartSec=45min$" "$REPO_ROOT/systemd/work-arcs-refresh.service"
+    grep -q "^TimeoutStartSec=45min$" "$ARCS_ROOT/systemd/work-arcs-refresh.service"
 }
 
 # Stood down on quota and a held lock are the design working; a unit left in `failed` for
 # either would train `systemctl --user status` to be ignored.
 @test "the shipped service does not call a quota skip a failure" {
-    grep -q "^SuccessExitStatus=3 4$" "$REPO_ROOT/systemd/work-arcs-refresh.service"
+    grep -q "^SuccessExitStatus=3 4$" "$ARCS_ROOT/systemd/work-arcs-refresh.service"
 }
 
 @test "--install-timer writes both units and enables the timer" {
@@ -1069,7 +1069,7 @@ EOF
     run "$REFRESH" --hook
     [ "$status" -eq 0 ]
     [[ "$output" == *"claude-stop-hook.sh"* ]]
-    [[ "$output" == *"bin/arc-record"* ]]
+    [[ "$output" == *"/bin/arc-record"* ]]
     [[ "$output" == *"NOT installed"* ]]
 }
 
@@ -1078,7 +1078,7 @@ EOF
     grep -q "arc-record Stop hook is not installed" "$LOG"
 
     mkdir -p "$HOME/.claude"
-    echo '{"hooks":{"Stop":[{"hooks":[{"command":"~/bin/dev-workflow-tools/bin/arc-record"}]}]}}' \
+    echo '{"hooks":{"Stop":[{"hooks":[{"command":"~/bin/work-arcs/bin/arc-record"}]}]}}' \
         >"$HOME/.claude/settings.json"
     : >"$LOG"
     rm -f "$STATE/page.html"

@@ -41,7 +41,7 @@ teardown() {
 # Runs a python snippet with arc-brief imported as `ab`. NOW fixes the clock at a fixed
 # instant so an age in a test is a fact about the fixture and not about the day it runs.
 ab() {
-    python3 - "$REPO_ROOT/bin/arc-brief" <<PY
+    python3 - "$ARCS_ROOT/bin/arc-brief" <<PY
 import importlib.machinery, importlib.util, sys, json, time
 loader = importlib.machinery.SourceFileLoader("ab", sys.argv[1])
 spec = importlib.util.spec_from_loader("ab", loader)

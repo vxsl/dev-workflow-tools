@@ -33,6 +33,8 @@ setup() {
     export XDG_STATE_HOME="$TEST_TMPDIR/state"
     mkdir -p "$XDG_STATE_HOME/work-arcs"
     export ROOT="$REPO_ROOT"
+    # arcs-page lives in the extracted work-arcs repo; the JS test helper does not
+    export ARCS="$ARCS_ROOT"
     export JIRA_PROJECTS="UL,UB"
 }
 
@@ -118,7 +120,7 @@ ZZDOC
 }
 
 page() {
-    python3 - "$REPO_ROOT/bin/arcs-page" "$1" <<'ZZPAGE'
+    python3 - "$ARCS_ROOT/bin/arcs-page" "$1" <<'ZZPAGE'
 import subprocess, sys
 r = subprocess.run([sys.executable, sys.argv[1], "--focus", "30"],
                    input=sys.argv[2], capture_output=True, text=True)
@@ -230,7 +232,7 @@ const assert = require('assert');
     seed: {dismissed: {}},
     rows: [{fp: 'lgA', ref: 'DE-1'}, {fp: 'lgB', ref: '!2'}, {fp: 'gpA', ref: 'UL-9'}],
     brief: [{fps: ['lgA', 'lgB']}, {fps: ['gpA']}, {fps: []}]});
-  await h.load(process.env.ROOT + '/bin/arcs-page');
+  await h.load(process.env.ARCS + '/bin/arcs-page');
   assert.strictEqual(h.headline(), 0, 'opens on the first line');
   assert.deepStrictEqual(h.listed(), [false, true, true], 'and the rest are the list');
 
@@ -262,7 +264,7 @@ const assert = require('assert');
     seed: {dismissed: {}},
     rows: [{fp: 'lgA', ref: 'DE-1'}, {fp: 'lgB', ref: '!2'}, {fp: 'gpA', ref: 'UL-9'}],
     brief: [{fps: ['lgA', 'lgB']}, {fps: ['gpA']}]});
-  await h.load(process.env.ROOT + '/bin/arcs-page');
+  await h.load(process.env.ARCS + '/bin/arcs-page');
   h.clickLine(0, 'lgA', 'head');
   h.clickLine(0, 'lgB', 'head');
   assert.strictEqual(h.headline(), 1, 'promoted');
@@ -285,7 +287,7 @@ const assert = require('assert');
     seed: {dismissed: {}},
     rows: [{fp: 'lgA', ref: 'DE-1'}, {fp: 'lgB', ref: '!2'}],
     brief: [{fps: ['lgA', 'lgB']}]});
-  await h.load(process.env.ROOT + '/bin/arcs-page');
+  await h.load(process.env.ARCS + '/bin/arcs-page');
   h.clickLine(0, 'lgA', 'head');
   assert.strictEqual(h.faded('lgA'), true, 'the row three screens down fades on this click');
   assert.strictEqual(h.faded('lgB'), false, 'and only that row');
@@ -311,7 +313,7 @@ const assert = require('assert');
     seed: {dismissed: {}},
     rows: [{fp: 'lgA', ref: 'DE-1'}, {fp: 'lgB', ref: '!2'}, {fp: 'gpA', ref: 'UL-9'}],
     brief: [{fps: ['lgA', 'lgB']}, {fps: ['gpA']}]});
-  await h.load(process.env.ROOT + '/bin/arcs-page');
+  await h.load(process.env.ARCS + '/bin/arcs-page');
   h.click('lgA'); h.click('lgB');
   assert.strictEqual(h.headline(), 1,
     'acknowledging the rows themselves is the same acknowledgement');
@@ -331,7 +333,7 @@ const assert = require('assert');
     seed: {dismissed: {}},
     rows: [{fp: 'gpA', ref: 'UL-9'}],
     brief: [{fps: []}, {fps: ['gpA']}]});
-  await h.load(process.env.ROOT + '/bin/arcs-page');
+  await h.load(process.env.ARCS + '/bin/arcs-page');
   assert.strictEqual(h.headline(), 0, 'it opens the page');
   h.click('gpA');
   assert.strictEqual(h.headline(), 0, 'and every other line being dealt with does not move it');
@@ -350,7 +352,7 @@ const assert = require('assert');
     seed: {dismissed: {}},
     rows: [{fp: 'lgA', ref: 'DE-1'}, {fp: 'gpA', ref: 'UL-9'}],
     brief: [{fps: ['lgA']}, {fps: ['gpA']}]});
-  await h.load(process.env.ROOT + '/bin/arcs-page');
+  await h.load(process.env.ARCS + '/bin/arcs-page');
   h.click('lgA'); h.click('gpA');
   // Clamped rather than run off the end: answering the last ✕ by deleting the page's own
   // headline would be the one thing this page has never done to a fact.
@@ -376,7 +378,7 @@ const assert = require('assert');
     seed: {dismissed: {}},
     rows: [{fp: 'lgA', dismissed: true, ref: 'DE-1'}, {fp: 'gpA', ref: 'UL-9'}],
     brief: [{fps: ['lgA']}, {fps: ['gpA']}]});
-  await h.load(process.env.ROOT + '/bin/arcs-page');
+  await h.load(process.env.ARCS + '/bin/arcs-page');
   assert.strictEqual(h.headline(), 1, 'opens on the line that has not been dealt with');
   assert.deepStrictEqual(h.subjectStruck(0, 'lgA'), [true, true],
     'and says why about the one that has');

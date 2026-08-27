@@ -38,7 +38,7 @@ teardown() {
 
 # Runs a python snippet with work-arcs imported as `wa` and the arc builders in scope.
 wa() {
-    python3 - "$REPO_ROOT/bin/work-arcs" <<PY
+    python3 - "$ARCS_ROOT/bin/work-arcs" <<PY
 import importlib.machinery, importlib.util, sys, time, json
 loader = importlib.machinery.SourceFileLoader("wa", sys.argv[1])
 spec = importlib.util.spec_from_loader("wa", loader)
@@ -421,7 +421,7 @@ print(v(a)["verdict"])'
 
 # Runs a python snippet with arcs-page imported as `pg`.
 pg() {
-    python3 - "$REPO_ROOT/bin/arcs-page" <<PY
+    python3 - "$ARCS_ROOT/bin/arcs-page" <<PY
 import importlib.machinery, importlib.util, sys, re
 loader = importlib.machinery.SourceFileLoader("pg", sys.argv[1])
 spec = importlib.util.spec_from_loader("pg", loader)
@@ -444,7 +444,7 @@ PY
 
 # Renders a whole page from a minimal work-arcs document.
 page() {
-    python3 - "$REPO_ROOT/bin/arcs-page" "$1" <<'PY' > "$TEST_TMPDIR/page.html"
+    python3 - "$ARCS_ROOT/bin/arcs-page" "$1" <<'PY' > "$TEST_TMPDIR/page.html"
 import json, subprocess, sys
 doc = json.loads(sys.argv[2])
 r = subprocess.run([sys.executable, sys.argv[1], "--focus", "14"],
@@ -660,6 +660,6 @@ else:
     # every new one would drift the same way, so the rule is that ages come from `days_ago`
     # and nothing else. `late` in close_commitments is the one documented exception: it is
     # the interval between two named instants, not an age against now.
-    run grep -nE '\(time\.time\(\) - [^)]*\) *// *(86400|DAY)' "$REPO_ROOT/bin/work-arcs"
+    run grep -nE '\(time\.time\(\) - [^)]*\) *// *(86400|DAY)' "$ARCS_ROOT/bin/work-arcs"
     [ "$status" -ne 0 ]
 }

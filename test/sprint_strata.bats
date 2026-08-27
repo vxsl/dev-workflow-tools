@@ -48,7 +48,7 @@ teardown() {
 # Runs a python snippet with work-arcs imported as `wa`, a stubbable Jira and the arc
 # builders in scope.
 wa() {
-    python3 - "$REPO_ROOT/bin/work-arcs" <<PY
+    python3 - "$ARCS_ROOT/bin/work-arcs" <<PY
 import importlib.machinery, importlib.util, sys, time, json
 loader = importlib.machinery.SourceFileLoader("wa", sys.argv[1])
 spec = importlib.util.spec_from_loader("wa", loader)

@@ -83,7 +83,7 @@ dirty_worktree() {
 }
 
 wa() {
-    python3 - "$REPO_ROOT/bin/work-arcs" "$ARC_REPO" <<'PY' "$1"
+    python3 - "$ARCS_ROOT/bin/work-arcs" "$ARC_REPO" <<'PY' "$1"
 import importlib.machinery, importlib.util, sys, json
 loader = importlib.machinery.SourceFileLoader("wa", sys.argv[1])
 spec = importlib.util.spec_from_loader("wa", loader)

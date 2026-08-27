@@ -48,7 +48,7 @@ teardown() {
 
 # Runs a python snippet with work-arcs imported as wa and some arc fixtures in scope.
 wa() {
-    python3 - "$REPO_ROOT/bin/work-arcs" <<PY
+    python3 - "$ARCS_ROOT/bin/work-arcs" <<PY
 import importlib.machinery, importlib.util, sys, json
 loader = importlib.machinery.SourceFileLoader("wa", sys.argv[1])
 spec = importlib.util.spec_from_loader("wa", loader)
@@ -97,7 +97,7 @@ fake_fzf() {
 
 # Runs a python snippet with arc-cluster imported as ac.
 ac() {
-    python3 - "$REPO_ROOT/bin/arc-cluster" <<PY
+    python3 - "$ARCS_ROOT/bin/arc-cluster" <<PY
 import importlib.machinery, importlib.util, sys, json, collections
 loader = importlib.machinery.SourceFileLoader("ac", sys.argv[1])
 spec = importlib.util.spec_from_loader("ac", loader)

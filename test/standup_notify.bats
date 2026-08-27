@@ -43,10 +43,10 @@ setup() {
     # is never read into a test -- it carries a real artifact URL and real tokens.
     FAKE_REPO="$TEST_TMPDIR/repo"
     mkdir -p "$FAKE_REPO/bin"
-    cp "$REPO_ROOT/bin/arc-standup-notify" "$FAKE_REPO/bin/"
-    cp "$REPO_ROOT/bin/arc-standup" "$FAKE_REPO/bin/"
-    cp -r "$REPO_ROOT/lib" "$FAKE_REPO/lib"
-    cp -r "$REPO_ROOT/systemd" "$FAKE_REPO/systemd"
+    cp "$ARCS_ROOT/bin/arc-standup-notify" "$FAKE_REPO/bin/"
+    cp "$ARCS_ROOT/bin/arc-standup" "$FAKE_REPO/bin/"
+    cp -r "$ARCS_ROOT/lib" "$FAKE_REPO/lib"
+    cp -r "$ARCS_ROOT/systemd" "$FAKE_REPO/systemd"
     NOTIFY_CMD="$FAKE_REPO/bin/arc-standup-notify"
     echo 'WORK_ARCS_ARTIFACT_URL="https://example.invalid/artifact"' >"$FAKE_REPO/.env"
 
@@ -394,14 +394,14 @@ EOF
 }
 
 @test "the unit treats a declined wake-up as success and a failed delivery as failure" {
-    grep -q "^SuccessExitStatus=3$" "$REPO_ROOT/systemd/work-arcs-standup.service"
-    ! grep -qE "^SuccessExitStatus=.*\b1\b" "$REPO_ROOT/systemd/work-arcs-standup.service"
+    grep -q "^SuccessExitStatus=3$" "$ARCS_ROOT/systemd/work-arcs-standup.service"
+    ! grep -qE "^SuccessExitStatus=.*\b1\b" "$ARCS_ROOT/systemd/work-arcs-standup.service"
 }
 
 @test "the unit does not tear the popup down the moment the run returns" {
     # The notification is a process here, not a message handed to a daemon: the default
     # control-group kill would deliver the prep and take it away in the same second.
-    grep -q "^KillMode=process$" "$REPO_ROOT/systemd/work-arcs-standup.service"
+    grep -q "^KillMode=process$" "$ARCS_ROOT/systemd/work-arcs-standup.service"
 }
 
 # --- the cadence is the authority ------------------------------------------------------
@@ -524,8 +524,8 @@ EOF
     # The single property that separates this timer from the refresh timer beside it. A
     # missed 10:15 is a standup that has already happened; firing late is worse than not
     # firing, which is the opposite of what a missed page rebuild is worth.
-    grep -q "^Persistent=false" "$REPO_ROOT/systemd/work-arcs-standup.timer"
-    ! grep -q "^WakeSystem=true" "$REPO_ROOT/systemd/work-arcs-standup.timer"
+    grep -q "^Persistent=false" "$ARCS_ROOT/systemd/work-arcs-standup.timer"
+    ! grep -q "^WakeSystem=true" "$ARCS_ROOT/systemd/work-arcs-standup.timer"
 }
 
 @test "install derives the schedule from the cadence rather than from a constant" {

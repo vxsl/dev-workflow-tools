@@ -56,7 +56,7 @@ on() {
 }
 
 wa() {
-    python3 - "$REPO_ROOT/bin/work-arcs" "$ARC_REPO" <<PY
+    python3 - "$ARCS_ROOT/bin/work-arcs" "$ARC_REPO" <<PY
 import importlib.machinery, importlib.util, sys, json
 loader = importlib.machinery.SourceFileLoader("wa", sys.argv[1])
 spec = importlib.util.spec_from_loader("wa", loader)
@@ -252,7 +252,7 @@ print(g["status_mismatch"][0]["why"])'
 @test "the tile unions days across workstreams rather than summing them" {
     # A Tuesday spent on two workstreams is one Tuesday. Summing per-arc day counts would
     # be the same double-count in days that per-branch summing was in commits.
-    run python3 - "$REPO_ROOT/bin/arcs-page" <<'PY'
+    run python3 - "$ARCS_ROOT/bin/arcs-page" <<'PY'
 import importlib.machinery, importlib.util, sys
 loader = importlib.machinery.SourceFileLoader("ap", sys.argv[1])
 spec = importlib.util.spec_from_loader("ap", loader)

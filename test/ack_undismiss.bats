@@ -35,6 +35,8 @@ setup() {
     export XDG_STATE_HOME="$TEST_TMPDIR/state"
     mkdir -p "$XDG_STATE_HOME/work-arcs"
     export ROOT="$REPO_ROOT"
+    # arcs-page lives in the extracted work-arcs repo; the JS test helper does not
+    export ARCS="$ARCS_ROOT"
 }
 
 teardown() {
@@ -60,7 +62,7 @@ const assert = require('assert');
   // a previous publish had already rewritten without it.
   const h = makeHarness({seed: {dismissed: {}},
                          rows: [{fp: 'baked', dismissed: true, ref: '!1'}]});
-  await h.load(process.env.ROOT + '/bin/arcs-page');
+  await h.load(process.env.ARCS + '/bin/arcs-page');
   assert.strictEqual(h.faded('baked'), true, 'arrives faded');
   h.click('baked');
   assert.strictEqual(h.faded('baked'), false, 'the un-click un-fades in place');
@@ -81,7 +83,7 @@ const assert = require('assert');
 (async () => {
   const first = makeHarness({seed: {dismissed: {}},
                              rows: [{fp: 'baked', dismissed: true, ref: '!1'}]});
-  await first.load(process.env.ROOT + '/bin/arcs-page');
+  await first.load(process.env.ARCS + '/bin/arcs-page');
   first.click('baked');
   await first.publish();
   // What comes back from a publish is the same baked markup with one block replaced, so
@@ -90,7 +92,7 @@ const assert = require('assert');
   const back = makeHarness({seed: {dismissed: {}},
                             rows: [{fp: 'baked', dismissed: true, ref: '!1'}],
                             storage: first.storage()});
-  await back.load(process.env.ROOT + '/bin/arcs-page');
+  await back.load(process.env.ARCS + '/bin/arcs-page');
   assert.strictEqual(back.faded('baked'), false, 'the fade stays lifted on reload');
   assert.ok('baked' in back.read('work-arcs:undismissed:v1'),
     'and the take-back still names the fingerprint: '
@@ -101,7 +103,7 @@ const assert = require('assert');
                              rows: [{fp: 'baked', dismissed: true, ref: '!1'},
                                     {fp: 'other', dismissed: false, ref: '!2'}],
                              storage: back.storage()});
-  await again.load(process.env.ROOT + '/bin/arcs-page');
+  await again.load(process.env.ARCS + '/bin/arcs-page');
   again.click('other');
   const seed = await again.publish();
   assert.deepStrictEqual(seed.undismissed, ['baked'],
@@ -118,7 +120,7 @@ const assert = require('assert');
 (async () => {
   const first = makeHarness({seed: {dismissed: {}},
                              rows: [{fp: 'baked', dismissed: true, ref: '!1'}]});
-  await first.load(process.env.ROOT + '/bin/arcs-page');
+  await first.load(process.env.ARCS + '/bin/arcs-page');
   first.click('baked');
   // A rebuild has since read the take-back: the row is no longer baked faded and the seed
   // no longer carries it. There is nothing left to take back, and holding on to it would
@@ -126,7 +128,7 @@ const assert = require('assert');
   const fresh = makeHarness({seed: {dismissed: {}},
                              rows: [{fp: 'baked', dismissed: false, ref: '!1'}],
                              storage: first.storage()});
-  await fresh.load(process.env.ROOT + '/bin/arcs-page');
+  await fresh.load(process.env.ARCS + '/bin/arcs-page');
   assert.deepStrictEqual(fresh.read('work-arcs:undismissed:v1'), {},
     'the store expired itself');
   fresh.click('baked');
@@ -146,7 +148,7 @@ const assert = require('assert');
 (async () => {
   const h = makeHarness({seed: {dismissed: {'baked': {ref: '!1', at: 9, note: ''}}},
                          rows: [{fp: 'baked', dismissed: true, ref: '!1'}]});
-  await h.load(process.env.ROOT + '/bin/arcs-page');
+  await h.load(process.env.ARCS + '/bin/arcs-page');
   h.click('baked');
   h.click('baked');
   const seed = await h.publish();
@@ -171,7 +173,7 @@ const assert = require('assert');
   const h = makeHarness({
     seed: {dismissed: {'elsewhere': {ref: 'UL-9', at: 700, note: 'fine'}}},
     rows: [{fp: 'here', dismissed: false, ref: '!2'}]});
-  await h.load(process.env.ROOT + '/bin/arcs-page');
+  await h.load(process.env.ARCS + '/bin/arcs-page');
   h.click('here');
   const seed = await h.publish();
   assert.ok('elsewhere' in seed.dismissed, 'the seed half survives');
@@ -195,7 +197,7 @@ const assert = require('assert');
     seed: {dismissed: {'old': {ref: '!1', at: 1700000000, note: 'noise'}}},
     rows: [{fp: 'old', dismissed: true, ref: '!1'},
            {fp: 'new', dismissed: false, ref: '!2'}]});
-  await h.load(process.env.ROOT + '/bin/arcs-page');
+  await h.load(process.env.ARCS + '/bin/arcs-page');
   h.click('new');
   const seed = await h.publish();
   assert.strictEqual(seed.dismissed.old.at, 1700000000,
@@ -215,7 +217,7 @@ ZZJS
 # will not recognise that acknowledgement as its own and its ✕ will go nowhere, silently.
 
 @test "every fade the page bakes is a fingerprint the seed block carries" {
-    python3 - "$REPO_ROOT/bin/arcs-page" >"$TEST_TMPDIR/p.html" <<'ZZDOC'
+    python3 - "$ARCS_ROOT/bin/arcs-page" >"$TEST_TMPDIR/p.html" <<'ZZDOC'
 import json, subprocess, sys
 row = {"kind": "review-owed", "who": "person", "days": 4, "ref": "!101",
        "title": "a merge request", "url": "u", "asked": "2026-08-01",

@@ -33,6 +33,8 @@ setup() {
     export XDG_STATE_HOME="$TEST_TMPDIR/state"
     mkdir -p "$XDG_STATE_HOME/work-arcs"
     export ROOT="$REPO_ROOT"
+    # arcs-page lives in the extracted work-arcs repo; the JS test helper does not
+    export ARCS="$ARCS_ROOT"
     export JIRA_PROJECTS="UL,UB"
 }
 
@@ -162,7 +164,7 @@ ZZDOC
 }
 
 page() {
-    python3 - "$REPO_ROOT/bin/arcs-page" "$1" <<'ZZPAGE'
+    python3 - "$ARCS_ROOT/bin/arcs-page" "$1" <<'ZZPAGE'
 import subprocess, sys
 r = subprocess.run([sys.executable, sys.argv[1], "--focus", "30"],
                    input=sys.argv[2], capture_output=True, text=True)

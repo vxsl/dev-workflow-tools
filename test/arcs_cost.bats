@@ -73,7 +73,7 @@ PY
 }
 
 cost() {
-    "$REPO_ROOT/bin/arcs-cost" --json > "$TEST_TMPDIR/cost.json"
+    "$ARCS_ROOT/bin/arcs-cost" --json > "$TEST_TMPDIR/cost.json"
     python3 - "$TEST_TMPDIR/cost.json" "$1" <<'PY'
 import json, sys
 d = json.load(open(sys.argv[1]))
@@ -193,7 +193,7 @@ print(json.dumps({'ts': int(time.time()), 'marker': 'start',
     run python3 -c "
 import importlib.util as u
 from importlib.machinery import SourceFileLoader
-s = u.spec_from_loader('ac', SourceFileLoader('ac', '$REPO_ROOT/bin/arcs-cost'))
+s = u.spec_from_loader('ac', SourceFileLoader('ac', '$ARCS_ROOT/bin/arcs-cost'))
 m = u.module_from_spec(s); s.loader.exec_module(m)
 m.fetch_usage = lambda: {'five_hour': {'utilization': 9.0, 'resets_at': '2026-08-19T11:00:00.2+00:00'},
                          'seven_day': {'utilization': 9.0, 'resets_at': '2026-08-19T11:00:00.3+00:00'}}
@@ -208,7 +208,7 @@ print(sum(1 for _ in open(m.SAMPLES)))"
 @test "sampling degrades silently with no credentials" {
     export HOME="$TEST_TMPDIR/nohome"
     mkdir -p "$HOME"
-    run "$REPO_ROOT/bin/arcs-cost" --sample start
+    run "$ARCS_ROOT/bin/arcs-cost" --sample start
     [ "$status" -eq 0 ]
     [ -z "$output" ]
 }

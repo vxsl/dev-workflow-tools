@@ -48,7 +48,7 @@ teardown() {
 # Runs a python snippet with work-arcs imported as `wa` and the fixtures in scope. `now` is
 # frozen so a doc's age is a fact about the fixture, never about the clock.
 wa() {
-    python3 - "$REPO_ROOT/bin/work-arcs" <<PY
+    python3 - "$ARCS_ROOT/bin/work-arcs" <<PY
 import importlib.machinery, importlib.util, sys, json, time, types
 loader = importlib.machinery.SourceFileLoader("wa", sys.argv[1])
 spec = importlib.util.spec_from_loader("wa", loader)
@@ -142,7 +142,7 @@ PY
 
 # Runs a python snippet with arc-morning imported as `am`.
 am() {
-    python3 - "$REPO_ROOT/bin/arc-morning" <<PY
+    python3 - "$ARCS_ROOT/bin/arc-morning" <<PY
 import importlib.machinery, importlib.util, sys, json
 loader = importlib.machinery.SourceFileLoader("am", sys.argv[1])
 spec = importlib.util.spec_from_loader("am", loader)
@@ -735,7 +735,7 @@ print("".join(x if isinstance(x, str) else "[REF]"
 
 # Renders a whole page from a minimal work-arcs document, the same way forgotten_arcs does.
 page() {
-    python3 - "$REPO_ROOT/bin/arcs-page" "$1" <<'PY' > "$TEST_TMPDIR/page.html"
+    python3 - "$ARCS_ROOT/bin/arcs-page" "$1" <<'PY' > "$TEST_TMPDIR/page.html"
 import json, subprocess, sys
 doc = json.loads(sys.argv[2])
 r = subprocess.run([sys.executable, sys.argv[1], "--focus", "14"],
@@ -805,7 +805,7 @@ ZZONCE
     # promise, so getting this wrong prints a colleague saying a sentence Kyle said.
     run python3 -c "
 import importlib.machinery, importlib.util, sys
-loader = importlib.machinery.SourceFileLoader('ap', '$REPO_ROOT/bin/arcs-page')
+loader = importlib.machinery.SourceFileLoader('ap', '$ARCS_ROOT/bin/arcs-page')
 spec = importlib.util.spec_from_loader('ap', loader)
 ap = importlib.util.module_from_spec(spec)
 sys.argv = ['ap']
@@ -819,7 +819,7 @@ print('kinds', ap.COMMITMENT_KINDS)
 
 @test "every program agrees on which rows are promises" {
     run python3 -c "
-import sys; sys.path.insert(0, '$REPO_ROOT/lib')
+import sys; sys.path.insert(0, '$ARCS_ROOT/lib')
 from commitments import COMMITMENT_KINDS, is_commitment
 print(COMMITMENT_KINDS)
 print(is_commitment({'kind': 'meeting-commitment'}),

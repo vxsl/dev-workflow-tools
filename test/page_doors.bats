@@ -90,7 +90,7 @@ ZZDOC
 # Renders a whole page from a work-arcs document handed over as JSON on argv. Any further
 # arguments are passed straight to arcs-page.
 page() {
-    python3 - "$REPO_ROOT/bin/arcs-page" "$@" <<'ZZPAGE'
+    python3 - "$ARCS_ROOT/bin/arcs-page" "$@" <<'ZZPAGE'
 import subprocess, sys
 r = subprocess.run([sys.executable, sys.argv[1], "--focus", "30"] + sys.argv[3:],
                    input=sys.argv[2], capture_output=True, text=True)
@@ -273,7 +273,7 @@ print(json.dumps({"standup": {"for": {"when": "Friday 10:30"},
     # The whole of the rejected design in one assertion: no script here asks the browser
     # what time it is in order to choose what the reader sees.
     run grep -nE 'new Date|Date\.now|getHours|getDay|toLocaleTime' \
-        "$REPO_ROOT/bin/arcs-page"
+        "$ARCS_ROOT/bin/arcs-page"
     # The clock is allowed in exactly one shape: the second a person's declaration was
     # recorded, stamped onto the stored entry. That is a record of when something was said,
     # never a decision about what to render.
