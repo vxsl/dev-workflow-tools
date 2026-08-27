@@ -12,6 +12,12 @@ if [ -n "$TICKET_SELECTION_LOADED" ]; then
 fi
 TICKET_SELECTION_LOADED=1
 
+# Stage Jira credentials in a 0600 curl config instead of passing them as
+# `curl -u`, which would leak the API token into the long-lived fzf preview argv.
+_TICKET_SELECTION_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
+# shellcheck disable=SC1091
+source "$_TICKET_SELECTION_LIB_DIR/jira-curl.sh"
+
 # Refresh ticket cache if missing or stale, delegating to jira-fzf --fetch-only.
 # If the caller already started a background fetch (TICKET_FETCH_PID), waits for
 # it instead of launching a new one.
@@ -64,6 +70,7 @@ select_ticket_or_slack() {
     echo -e "${CYAN}┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛${RESET}" >&2
 
     refresh_tickets_cache_if_needed
+    jira_curl_conf_init || true
 
     local selection
     selection=$( { echo -e "NEW\t✨ Create new ticket"; echo -e "HOTFIX\t🔥 Hotfix (no ticket needed)"; get_cached_tickets; } | $FZF \
@@ -73,7 +80,7 @@ select_ticket_or_slack() {
         --border=rounded \
         --delimiter='\t' \
         --with-nth=1,2 \
-        --preview='key=$(echo {} | cut -f1); if [ "$key" = "NEW" ]; then echo "Create a new Jira ticket"; else curl -s -u "'"${JIRA_EMAIL}:${JIRA_API_TOKEN}"'" "https://'"${JIRA_DOMAIN}"'/rest/api/3/issue/${key}?fields=summary,status,assignee" 2>/dev/null | jq -r "\"Status: \" + .fields.status.name + \"\nAssignee: \" + (.fields.assignee.displayName // \"Unassigned\") + \"\n\n\" + .fields.summary" 2>/dev/null || echo "Loading..."; fi' \
+        --preview='key=$(echo {} | cut -f1); if [ "$key" = "NEW" ]; then echo "Create a new Jira ticket"; else curl -s -K "$JIRA_CURL_CONF" "https://'"${JIRA_DOMAIN}"'/rest/api/3/issue/${key}?fields=summary,status,assignee" 2>/dev/null | jq -r "\"Status: \" + .fields.status.name + \"\nAssignee: \" + (.fields.assignee.displayName // \"Unassigned\") + \"\n\n\" + .fields.summary" 2>/dev/null || echo "Loading..."; fi' \
         --preview-window=right:40%:wrap \
         --header="Enter: select │ Type ticket title or paste Slack thread/channel URL" \
         --print-query)

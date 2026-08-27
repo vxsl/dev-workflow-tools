@@ -121,6 +121,11 @@ JIRA_PROJECT="${JIRA_PROJECT}"
 CACHE_DIR="$HOME/.cache/jira-fzf"
 
 require_env JIRA_DOMAIN JIRA_PROJECT JIRA_EMAIL JIRA_API_TOKEN
+
+# Keep the API token out of every argv (see lib/jira-curl.sh). Must run before
+# the fzf preview command is built, since that string references JIRA_CURL_CONF.
+source "$SCRIPT_DIR/../lib/jira-curl.sh"
+jira_curl_conf_init || { echo "Failed to stage Jira credentials" >&2; exit 1; }
 MR_CACHE_FILE="$CACHE_DIR/mr_cache.json"
 
 # Initialize MR cache if it doesn't exist
@@ -231,7 +236,7 @@ done
 # Function to call Jira API (v3)
 jira_api() {
     local endpoint="$1"
-    curl -s -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
+    curl -s -K "$JIRA_CURL_CONF" \
         "https://${JIRA_DOMAIN}/rest/api/3/${endpoint}" \
         -H "Content-Type: application/json"
 }
@@ -240,7 +245,7 @@ jira_api() {
 jira_api_post() {
     local endpoint="$1"
     local data="$2"
-    curl -s -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
+    curl -s -K "$JIRA_CURL_CONF" \
         -X POST \
         "https://${JIRA_DOMAIN}/rest/api/3/${endpoint}" \
         -H "Content-Type: application/json" \
@@ -305,7 +310,7 @@ get_all_tickets() {
             url="${url}&nextPageToken=${next_page_token}"
         fi
         
-        local response=$(curl -s --max-time 15 -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" "$url")
+        local response=$(curl -s --max-time 15 -K "$JIRA_CURL_CONF" "$url")
         
         if [ $? -ne 0 ] || ! echo "$response" | jq -e '.issues' >/dev/null 2>&1; then
             if [ $page -eq 0 ]; then
@@ -474,7 +479,7 @@ search_tickets_by_query() {
     local jql_encoded=$(echo "$jql" | jq -sRr @uri)
     
     # Fetch search results (limit to 50 to keep it fast)
-    local response=$(curl -s --max-time 5 -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
+    local response=$(curl -s --max-time 5 -K "$JIRA_CURL_CONF" \
         "https://${JIRA_DOMAIN}/rest/api/3/search/jql?jql=${jql_encoded}&maxResults=50&fields=summary,status,priority,assignee,issuetype,created,updated" 2>/dev/null)
     
     if [ $? -ne 0 ] || ! echo "$response" | jq -e '.issues' >/dev/null 2>&1; then
@@ -705,7 +710,7 @@ MR Markdown Link (fetches MR URL)"
                 # Auto-detect field ID if not configured
                 if [ -z "$qa_field_id" ]; then
                     local editmeta
-                    editmeta=$(curl -s --max-time 5 -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
+                    editmeta=$(curl -s --max-time 5 -K "$JIRA_CURL_CONF" \
                         "https://${JIRA_DOMAIN}/rest/api/3/issue/${key}/editmeta" 2>/dev/null)
                     qa_field_id=$(echo "$editmeta" | jq -r '.fields | to_entries[] | select(.value.name | test("[Qq][Aa].*[Bb]ranch|[Bb]ranch.*[Qq][Aa]"; "i")) | .key' 2>/dev/null | head -1)
                 fi
@@ -718,7 +723,7 @@ MR Markdown Link (fetches MR URL)"
                     qa_url=$(jq -r ".fields.${qa_field_id} // empty" "$tmpfile" 2>/dev/null)
                 fi
                 if [ -z "$qa_url" ]; then
-                    qa_url=$(curl -s --max-time 5 -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
+                    qa_url=$(curl -s --max-time 5 -K "$JIRA_CURL_CONF" \
                         "https://${JIRA_DOMAIN}/rest/api/3/issue/${key}?fields=${qa_field_id}" 2>/dev/null | \
                         jq -r ".fields.${qa_field_id} // empty" 2>/dev/null)
                 fi
@@ -847,7 +852,7 @@ fetch_mr_url_for_ticket() {
     printf "\n  \033[2m◌ Checking Jira comments for MR link...\033[0m" >&2
     
     # Fetch comments
-    local comments=$(curl -s -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
+    local comments=$(curl -s -K "$JIRA_CURL_CONF" \
         "https://${JIRA_DOMAIN}/rest/api/3/issue/${ticket_key}/comment" 2>/dev/null)
     
     # Look for GitLab merge request URLs in comments - use tail -1 to get most recent
@@ -953,7 +958,7 @@ OPTS
 
                 if [ -z "$qa_field_id" ]; then
                     local editmeta
-                    editmeta=$(curl -s --max-time 5 -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
+                    editmeta=$(curl -s --max-time 5 -K "$JIRA_CURL_CONF" \
                         "https://${JIRA_DOMAIN}/rest/api/3/issue/${key}/editmeta" 2>/dev/null)
                     qa_field_id=$(echo "$editmeta" | jq -r '.fields | to_entries[] | select(.value.name | test("[Qq][Aa].*[Bb]ranch|[Bb]ranch.*[Qq][Aa]"; "i")) | .key' 2>/dev/null | head -1)
                 fi
@@ -965,7 +970,7 @@ OPTS
                     qa_url=$(jq -r ".fields.${qa_field_id} // empty" "$tmpfile" 2>/dev/null)
                 fi
                 if [ -z "$qa_url" ]; then
-                    qa_url=$(curl -s --max-time 5 -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
+                    qa_url=$(curl -s --max-time 5 -K "$JIRA_CURL_CONF" \
                         "https://${JIRA_DOMAIN}/rest/api/3/issue/${key}?fields=${qa_field_id}" 2>/dev/null | \
                         jq -r ".fields.${qa_field_id} // empty" 2>/dev/null)
                 fi
@@ -1497,7 +1502,7 @@ if [ "$1" = "--open-qa-branch" ]; then
     if [[ "$key" =~ ^${JIRA_PROJECT_REGEX}-[0-9]+$ ]] && [ -n "${JIRA_QA_BRANCH_DOMAIN:-}" ]; then
         qa_field_id="${JIRA_QA_BRANCH_FIELD:-}"
         if [ -z "$qa_field_id" ]; then
-            editmeta=$(curl -s --max-time 5 -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
+            editmeta=$(curl -s --max-time 5 -K "$JIRA_CURL_CONF" \
                 "https://${JIRA_DOMAIN}/rest/api/3/issue/${key}/editmeta" 2>/dev/null)
             qa_field_id=$(echo "$editmeta" | jq -r '.fields | to_entries[] | select(.value.name | test("[Qq][Aa].*[Bb]ranch|[Bb]ranch.*[Qq][Aa]"; "i")) | .key' 2>/dev/null | head -1)
         fi
@@ -1508,7 +1513,7 @@ if [ "$1" = "--open-qa-branch" ]; then
                 qa_url=$(jq -r ".fields.${qa_field_id} // empty" "$tmpfile" 2>/dev/null)
             fi
             if [ -z "$qa_url" ]; then
-                qa_url=$(curl -s --max-time 5 -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
+                qa_url=$(curl -s --max-time 5 -K "$JIRA_CURL_CONF" \
                     "https://${JIRA_DOMAIN}/rest/api/3/issue/${key}?fields=${qa_field_id}" 2>/dev/null | \
                     jq -r ".fields.${qa_field_id} // empty" 2>/dev/null)
             fi
@@ -1664,7 +1669,7 @@ export JIRA_FZF_NO_LABELS="$NO_LABELS"
                 ) &
                 
                 # Fetch data
-                curl -s --max-time 10 -u "'"${JIRA_EMAIL}"':'"${JIRA_API_TOKEN}"'" \
+                curl -s --max-time 10 -K "$JIRA_CURL_CONF" \
                     "https://'"${JIRA_DOMAIN}"'/rest/api/3/issue/${key}" \
                     -H "Content-Type: application/json" \
                     -o "$tmpfile" 2>/dev/null
@@ -1693,7 +1698,7 @@ export JIRA_FZF_NO_LABELS="$NO_LABELS"
             fi
             
             # Get current user name for comparison
-            me_response=$(curl -s --max-time 5 -u "'"${JIRA_EMAIL}"':'"${JIRA_API_TOKEN}"'" \
+            me_response=$(curl -s --max-time 5 -K "$JIRA_CURL_CONF" \
                 "https://'"${JIRA_DOMAIN}"'/rest/api/3/myself" 2>/dev/null)
             me_name=$(echo "$me_response" | jq -r ".displayName // empty" 2>/dev/null)
             
