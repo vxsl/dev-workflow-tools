@@ -299,11 +299,18 @@ get_all_tickets() {
     # Fetch fresh data with pagination - API limits to 100 per page
     local jql="project IN (${JIRA_PROJECT_JQL_LIST}) AND issuetype != Epic ORDER BY ${sort_order}"
     local jql_encoded=$(echo "$jql" | jq -sRr @uri)
-    local all_issues="[]"
     local next_page_token=""
     local page=0
     local max_pages=10  # Fetch up to 1000 tickets (10 pages × 100)
-    
+
+    # Accumulate one compact issue per line in a file rather than in a shell
+    # variable. The variable form ended in `jq -n --argjson issues "$all_issues"`,
+    # which puts the whole result set in argv — that is E2BIG ("Argument list
+    # too long") somewhere past the second page. It only ever worked because
+    # pagination was broken and the set never grew beyond 100 issues.
+    local pages_file
+    pages_file=$(mktemp)
+
     while [ $page -lt $max_pages ]; do
         local url="https://${JIRA_DOMAIN}/rest/api/3/search/jql?jql=${jql_encoded}&maxResults=100&fields=summary,status,priority,assignee,issuetype,created,updated"
         if [ -n "$next_page_token" ]; then
@@ -316,16 +323,21 @@ get_all_tickets() {
             if [ $page -eq 0 ]; then
                 echo "Error fetching tickets" >&2
                 echo "$response" | jq '.' >&2
+                rm -f "$pages_file"
                 return 1
             fi
             break
         fi
-        
-        # Append issues to all_issues
-        all_issues=$(echo "$all_issues" $(echo "$response" | jq '.issues') | jq -s 'add')
-        
-        # Check if there are more pages
-        local is_last=$(echo "$response" | jq -r '.isLast // true')
+
+        printf '%s\n' "$response" | jq -c '.issues[]' >> "$pages_file"
+
+        # Check if there are more pages.
+        # NOT `.isLast // true` — jq's `//` treats `false` as absent, so the
+        # common case (isLast: false, more pages to come) came back as "true"
+        # and pagination stopped after page 0. The cache was silently capped at
+        # 100 tickets, and anything outside that window was unreachable from
+        # the picker. Ask whether the key is present instead.
+        local is_last=$(echo "$response" | jq -r 'if has("isLast") then (.isLast | tostring) else "true" end')
         if [ "$is_last" = "true" ]; then
             break
         fi
@@ -338,10 +350,26 @@ get_all_tickets() {
         page=$((page + 1))
     done
     
-    # Create combined response
-    local combined=$(jq -n --argjson issues "$all_issues" '{issues: $issues}')
-    echo "$combined" > "$TICKETS_CACHE"
-    echo "$combined"
+    # Create combined response. Build it into a temp file and move it into
+    # place, so a partial write can never leave a torn cache behind, and a
+    # fetch that came back empty can never replace a good one.
+    local cache_tmp="${TICKETS_CACHE}.$$"
+    if jq -s '{issues: .}' < "$pages_file" > "$cache_tmp" 2>/dev/null \
+        && [ "$(jq -r '.issues | length' "$cache_tmp" 2>/dev/null || echo 0)" -gt 0 ]; then
+        mv -f "$cache_tmp" "$TICKETS_CACHE"
+    else
+        rm -f "$cache_tmp"
+    fi
+    rm -f "$pages_file"
+
+    # First run with a genuinely empty result set: nothing was kept, so there
+    # is no file to cat. Answer in the shape callers parse rather than letting
+    # cat complain to stderr.
+    if [ -f "$TICKETS_CACHE" ]; then
+        cat "$TICKETS_CACHE"
+    else
+        echo '{"issues": []}'
+    fi
 }
 
 # Function to format ticket for display
@@ -464,31 +492,93 @@ format_branch() {
         "$branch_display" "$date_display" "$subject_display"
 }
 
+# Resolve a query that names a ticket outright — "5683", "UB-5683", "ub-5683" —
+# by fetching the key directly.
+#
+# The text search below cannot do this: Jira's `text ~` matches summary,
+# description and comments, but never the issue key. So a ticket the cached
+# window doesn't reach was invisible to the picker no matter what you typed,
+# even when you knew its number.
+#
+# A bare number is ambiguous across boards, so try every configured project in
+# parallel and return whichever ones exist (same shape as
+# disambiguate_ticket_number, but keeping all hits rather than picking one).
+lookup_tickets_by_key() {
+    local query="$1"
+    local -a keys=()
+
+    if [[ "$query" =~ ^[0-9]+$ ]]; then
+        local proj
+        for proj in "${JIRA_PROJECT_LIST[@]}"; do
+            keys+=("${proj}-${query}")
+        done
+    elif [[ "$query" =~ ^[A-Za-z]+-[0-9]+$ ]]; then
+        keys+=("$(echo "$query" | tr '[:lower:]' '[:upper:]')")
+    fi
+
+    if [ ${#keys[@]} -eq 0 ]; then
+        echo '{"issues": []}'
+        return 0
+    fi
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    local key
+    for key in "${keys[@]}"; do
+        (
+            curl -s --max-time 5 -K "$JIRA_CURL_CONF" \
+                "https://${JIRA_DOMAIN}/rest/api/3/issue/${key}?fields=summary,status,priority,assignee,issuetype,created,updated" \
+                2>/dev/null | jq -c 'select(.key != null)' > "$tmpdir/$key" 2>/dev/null
+        ) &
+    done
+    wait 2>/dev/null
+
+    local found
+    found=$(cat "$tmpdir"/* 2>/dev/null | jq -s '{issues: .}' 2>/dev/null)
+    rm -rf "$tmpdir"
+
+    if [ -z "$found" ]; then
+        echo '{"issues": []}'
+    else
+        echo "$found"
+    fi
+}
+
 # Function to search tickets by text query via API
 search_tickets_by_query() {
     local query="$1"
-    
+
     # If query is empty or too short, skip API search
     if [ -z "$query" ] || [ ${#query} -lt 3 ]; then
         echo '{"issues": []}'
         return 0
     fi
-    
+
+    # Key hits go first — if you typed a ticket number, that exact ticket is
+    # the answer, not whatever else mentions those digits.
+    local key_results=$(lookup_tickets_by_key "$query")
+
     # Build JQL for text search
     local jql="project IN (${JIRA_PROJECT_JQL_LIST}) AND issuetype != Epic AND text ~ \"${query}*\" ORDER BY updated DESC"
     local jql_encoded=$(echo "$jql" | jq -sRr @uri)
-    
+
     # Fetch search results (limit to 50 to keep it fast)
     local response=$(curl -s --max-time 5 -K "$JIRA_CURL_CONF" \
         "https://${JIRA_DOMAIN}/rest/api/3/search/jql?jql=${jql_encoded}&maxResults=50&fields=summary,status,priority,assignee,issuetype,created,updated" 2>/dev/null)
-    
+
     if [ $? -ne 0 ] || ! echo "$response" | jq -e '.issues' >/dev/null 2>&1; then
-        # On error, return empty results
-        echo '{"issues": []}'
+        # Text search failed — the key hits are still good on their own
+        echo "$key_results"
         return 0
     fi
-    
-    echo "$response"
+
+    # Merge, key hits first, first occurrence of each key wins. unique_by would
+    # re-sort by key and bury the exact match among the text matches.
+    echo "$key_results" "$response" | jq -s '
+        [.[0].issues[], .[1].issues[]] as $all |
+        {issues: (reduce $all[] as $i ([];
+            if any(.[]; .key == $i.key) then . else . + [$i] end))}
+    '
 }
 
 # Function to generate ticket list
