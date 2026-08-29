@@ -894,6 +894,43 @@ EOF
     grep -q "^SuccessExitStatus=3 4$" "$ARCS_ROOT/systemd/work-arcs-refresh.service"
 }
 
+# --- the shipped units name this checkout ------------------------------------------------
+#
+# The extraction (90c0d5d) moved the arcs binaries and these units into work-arcs but not
+# the absolute paths written inside the moved files, and ~/bin/dev-workflow-tools/bin/ has
+# not held an arcs binary since. Two of the three were masked: --install-timer rewrites
+# ExecStart to the checkout it ran from, so the installed copies under
+# ~/.config/systemd/user/ stayed right while the shipped ones rotted, and the timers went
+# on running green. work-arcs-serve.service is not masked -- its header block tells you to
+# copy it into place verbatim, and nothing rewrites it on the way -- so following the
+# repo's own install instructions produced a unit whose ExecStart resolved to nothing.
+#
+# The defect is exactly "a path into another repo", so that is what the first of these
+# looks for by name.
+
+@test "no shipped unit names a path into the repo these were extracted from" {
+    [ -d "$ARCS_ROOT/systemd" ]
+    run grep -rn "dev-workflow-tools" "$ARCS_ROOT/systemd"
+    [ "$status" -eq 1 ]
+}
+
+# The grep above catches one wrong repo by name. This catches the general case, which is
+# the thing a person copying a unit actually depends on: that the program named on the
+# line is there to run. %h is systemd's spelling of $HOME, so a shipped path has to name
+# this checkout under it -- resolving %h/bin/work-arcs against ARCS_ROOT and asking for an
+# executable is the whole assertion, and it covers Documentation=file: as well as
+# ExecStart because a stale doc pointer is the same rot one line earlier.
+@test "every path a shipped unit names resolves to a program in this checkout" {
+    local prefix="%h/bin/work-arcs/" p rest bad=""
+    while read -r p; do
+        rest="${p#$prefix}"
+        if [ "$rest" = "$p" ] || [ ! -x "$ARCS_ROOT/$rest" ]; then
+            bad="$bad $p"
+        fi
+    done < <(grep -ho "%h/[^ ]*" "$ARCS_ROOT"/systemd/*)
+    [ -z "$bad" ] || { echo "does not resolve under $ARCS_ROOT:$bad"; false; }
+}
+
 @test "--install-timer writes both units and enables the timer" {
     run "$REFRESH" --install-timer
     [ "$status" -eq 0 ]
