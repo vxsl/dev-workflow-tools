@@ -6,20 +6,6 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 # Source the extracted core functions
 source "$REPO_ROOT/lib/rr-core.sh"
 
-# work-arcs was extracted to its own repo (github.com/vxsl/work-arcs). Tests
-# that exercise it resolve its checkout through ARCS_ROOT rather than
-# $REPO_ROOT, so this suite still works with the arcs code living elsewhere.
-# ~/.profile puts every dir under ~/bin on PATH, which is why that is the
-# default location.
-export ARCS_ROOT="${ARCS_ROOT:-$HOME/bin/work-arcs}"
-
-# Call at the top of a test that needs the arcs binaries. Skips rather than
-# fails when the arcs repo is not checked out, so a fresh clone of this repo
-# alone still gets a green suite.
-require_arcs() {
-    [ -d "$ARCS_ROOT/bin" ] || skip "work-arcs not checked out at $ARCS_ROOT (set ARCS_ROOT)"
-}
-
 # Create a temp directory for each test
 setup_temp_dir() {
     TEST_TMPDIR=$(mktemp -d)
