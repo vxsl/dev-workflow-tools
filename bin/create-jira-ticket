@@ -10,6 +10,9 @@
 #   create-jira-ticket --labels "front-end,bug"           Set the default label offered
 #   create-jira-ticket --no-labels                        Create with no labels at all
 #   create-jira-ticket --project UB                       Board to file on (skips the Step 0 picker)
+#   create-jira-ticket --estimate 4                       Estimate, in days (the per-board field)
+#   create-jira-ticket --priority High                    Priority (skips the Step 3 picker)
+#   create-jira-ticket --non-interactive --summary "..."  No prompts at all -- see below
 #   create-jira-ticket --dry-run                          Test without creating
 #
 # Resolved rather than asked:
@@ -17,8 +20,36 @@
 #   Sprint    the board's running sprint (else the next one due to start)
 #   Assignee  you
 #
+# --non-interactive, and why it exists
+#   Every step below reads /dev/tty -- Step 1 through `read -e -i`, Steps 2-5 through
+#   fzf, Step 6 through $EDITOR -- so --summary pre-fills a prompt rather than answering
+#   it. That is right for a person and impossible for a caller with no terminal: a
+#   systemd-started daemon, a hook, a scheduled run. --non-interactive answers every step
+#   from the flags and from the same defaults the prompts already offer (Task, Medium, no
+#   parent, the default label, the resolved board/sprint/assignee), and REFUSES rather
+#   than guessing where a flag is the only possible answer: --summary is required, and so
+#   is a board when more than one is configured and neither --project nor
+#   JIRA_DEFAULT_PROJECT says which.
+#
+#   It does not change one byte of what the interactive path does. The two arms differ
+#   only in where an answer comes from, so a ticket filed by a daemon is the same ticket
+#   the picker would have filed.
+#
+# --estimate, which is per board and not per Jira
+#   The estimate field is a CUSTOM field with a different id on every board -- UB's is
+#   customfield_10137, UL's is customfield_10314, DE's is customfield_10139 -- and Jira
+#   holds several fields whose display name is some casing of "Estimate (in days)". So
+#   the id is resolved from the resolved board's own create screen, by name, case-
+#   insensitively (UL calls it "Estimate (in Days)" and UB calls it "Estimate (in days)";
+#   an exact match finds one of them and silently misses the other). Exactly one match is
+#   accepted; zero or several is reported and the ticket is still created, because a
+#   ticket that lands without its estimate is worth more than no ticket. The unit is
+#   DAYS, which is what the field itself says.
+#
 # Output:
 #   Prints JSON to stdout on success: {"key": "PROJ-1234", "summary": "Ticket summary"}
+#   With --estimate it also carries "estimate" and "estimate_field" when the field was
+#   resolved and written, or "estimate_error" saying why it was not.
 #   Prints errors to stderr
 #   Exit code 0 on success, 1 on failure
 
@@ -50,6 +81,9 @@ NO_LABELS=false
 OUTPUT_FILE=""
 CLEAR_SCREEN=false
 ISSUE_TYPE=""
+NON_INTERACTIVE=false
+PRIORITY_OVERRIDE=""
+ESTIMATE=""
 
 # Parse command line arguments
 INITIAL_SUMMARY=""
@@ -68,6 +102,9 @@ while [[ "$#" -gt 0 ]]; do
         --clear) CLEAR_SCREEN=true; shift ;;
         --issue-type) ISSUE_TYPE="$2"; shift 2 ;;
         --project) PROJECT_OVERRIDE="$2"; shift 2 ;;
+        --priority) PRIORITY_OVERRIDE="$2"; shift 2 ;;
+        --estimate) ESTIMATE="$2"; shift 2 ;;
+        --non-interactive) NON_INTERACTIVE=true; shift ;;
         *)
             echo "Unknown argument: $1" >&2
             exit 1
@@ -75,11 +112,30 @@ while [[ "$#" -gt 0 ]]; do
     esac
 done
 
-# Find fzf
+# What --non-interactive cannot answer for you. Refused up front rather than at the step
+# that needs it, so a caller with no terminal gets one sentence instead of a run that
+# fetches project metadata and then blocks on a read that will never return.
+if [ "$NON_INTERACTIVE" = true ] && [ -z "$INITIAL_SUMMARY" ]; then
+    echo "Error: --non-interactive needs --summary (there is no prompt to fill)" >&2
+    exit 1
+fi
+
+# The estimate is a number of days, checked here rather than by Jira: a field id resolved
+# and then rejected for its value costs two round trips to say what a regex says for free.
+if [ -n "$ESTIMATE" ] && ! printf '%s' "$ESTIMATE" | grep -qE '^[0-9]+(\.[0-9]+)?$'; then
+    echo "Error: --estimate takes a number of days, not '$ESTIMATE'" >&2
+    exit 1
+fi
+
+# Find fzf. Required only where something is going to be picked: --non-interactive picks
+# nothing, and a daemon whose PATH has no fzf must not be turned away by a dependency it
+# was never going to reach.
 if [ -x "$HOME/.zsh/fzf/bin/fzf" ]; then
     FZF="$HOME/.zsh/fzf/bin/fzf"
 elif command -v fzf &> /dev/null; then
     FZF="fzf"
+elif [ "$NON_INTERACTIVE" = true ]; then
+    FZF=""
 else
     echo "Error: fzf not found" >&2
     exit 1
@@ -213,7 +269,12 @@ get_default_sprint() {
 # Usage: get_createmeta_fields <issuetype_name>
 get_createmeta_fields() {
     local issuetype_name="$1"
-    local encoded_type=$(echo "$issuetype_name" | jq -sRr @uri)
+    # printf and not echo. `echo Task | jq -sRr @uri` is "Task%0A" -- the trailing newline
+    # is part of what -s slurps -- so every call here asked Jira for an issue type whose
+    # name ends in a line break, got a project with no issue types back, and returned {}.
+    # Which looked exactly like "this board's screen has none of these fields", so the Bug
+    # prompts silently skipped themselves on every board and nothing said so.
+    local encoded_type=$(printf '%s' "$issuetype_name" | jq -sRr @uri)
     local response=$(curl -s --max-time 10 -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
         "https://${JIRA_DOMAIN}/rest/api/3/issue/createmeta?projectKeys=${JIRA_PROJECT}&issuetypeNames=${encoded_type}&expand=projects.issuetypes.fields" \
         -H "Content-Type: application/json" 2>&1)
@@ -230,6 +291,63 @@ field_present() {
 # Usage: field_options "$meta" <field_id>
 field_options() {
     echo "$1" | jq -r --arg f "$2" '.[$f].allowedValues[]? | .value // .name // .id' 2>/dev/null
+}
+
+# fzf, or nothing at all under --non-interactive.
+#
+# Every picker in Steps 2-5 already has an answer for an empty selection, because Esc has
+# always been a way out of them: the bug fields fall back through resolve_default, the
+# priority falls back to Medium, the parent to none and the labels to the default. So the
+# whole of --non-interactive's behaviour at those steps is "the selection is empty", and
+# routing them through one function is what keeps the two arms from being two copies of
+# the same defaults that can drift apart.
+pick() {
+    [ "$NON_INTERACTIVE" = true ] && return 0
+    $FZF "$@"
+}
+
+# What this script hands back to whoever called it, in one place.
+#
+# There were four copies of this line -- dry-run to a file, dry-run to stdout, real to a
+# file, real to stdout -- and the estimate would have made it eight. A caller parses
+# stdout, so the shape of it is a contract; a contract kept in four places is a contract
+# three of them will eventually break.
+#
+# `estimate` and `estimate_field` appear only when an estimate was asked for AND written,
+# and `estimate_error` only when it was asked for and was not. A caller can therefore
+# tell "no estimate wanted" from "wanted and not set" without comparing strings, which is
+# the same rule the rest of this repo keeps about absence meaning nothing was claimed.
+emit_result() {
+    local key="$1" summ="$2" desc="$3"
+    local out
+    out=$(jq -nc --arg key "$key" --arg summary "$summ" --arg description "$desc" \
+        '{key: $key, summary: $summary, description: $description}')
+    if [ -n "$estimate_id" ]; then
+        out=$(printf '%s' "$out" | jq -c --argjson est "$ESTIMATE" --arg f "$estimate_id" \
+            '. + {estimate: $est, estimate_field: $f}')
+    elif [ -n "$estimate_error" ]; then
+        out=$(printf '%s' "$out" | jq -c --arg e "$estimate_error" '. + {estimate_error: $e}')
+    fi
+    if [ -n "$OUTPUT_FILE" ]; then
+        printf '%s\n' "$out" > "$OUTPUT_FILE"
+    else
+        printf '%s\n' "$out"
+    fi
+}
+
+# Every field on a create screen whose display name is "Estimate (in days)", one per
+# line. A function rather than an inline jq because it is the whole of the rule and the
+# rule is what a test has to be able to run: handed a createmeta fields object, it says
+# which ids -- if any -- an estimate may be written to.
+#
+# ascii_downcase, which is the part that is not decoration: UL spells the field
+# "Estimate (in Days)" and UB spells it "Estimate (in days)". An exact match resolves one
+# board and misses the other, and misses it without a word.
+estimate_field_ids() {
+    printf '%s' "$1" | jq -r '
+        to_entries[]
+        | select((.value.name // "") | ascii_downcase == "estimate (in days)")
+        | .key' 2>/dev/null || true
 }
 
 # Choose a default value: prefer $preferred if it's a valid allowed value,
@@ -278,6 +396,14 @@ if [ -n "$_project_choice" ]; then
     if [ "$_project_source" = "JIRA_DEFAULT_PROJECT" ]; then
         printf "  \033[38;5;114m✓\033[0m Board: \033[0m%s\033[0m \033[2m(JIRA_DEFAULT_PROJECT)\033[0m\n\n" "$JIRA_PROJECT" >&2
     fi
+elif [ "${#JIRA_PROJECT_LIST[@]}" -gt 1 ] && [ "$NON_INTERACTIVE" = true ]; then
+    # The one thing --non-interactive will not decide. Which board a ticket lands on is
+    # not a default, it is a fact about the work, and picking the first entry would file
+    # somebody's ticket on the wrong team's board without saying so.
+    printf "\033[38;5;167m  ✗ Error: --non-interactive needs --project (or JIRA_DEFAULT_PROJECT); JIRA_PROJECTS holds %s\033[0m\n" \
+        "${JIRA_PROJECT_LIST[*]}" >&2
+    rm -rf "$tmpdir"
+    exit 1
 elif [ "${#JIRA_PROJECT_LIST[@]}" -gt 1 ]; then
     printf "\033[38;5;109m┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\033[0m\n" >&2
     printf "\033[38;5;109m┃\033[0m \033[38;5;81mStep 0:\033[0m Select board                                    \033[38;5;109m┃\033[0m\n" >&2
@@ -314,12 +440,19 @@ echo "" >&2
 printf "\033[38;5;109m┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\033[0m\n" >&2
 printf "\033[38;5;109m┃\033[0m \033[38;5;81mStep 1/6:\033[0m Enter ticket summary                         \033[38;5;109m┃\033[0m\n" >&2
 printf "\033[38;5;109m┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\033[0m\n" >&2
-echo -n "  ✏️  " >&2
-# Read summary with pre-filled value for editing
-if [ -n "$INITIAL_SUMMARY" ]; then
-    read -e -i "$INITIAL_SUMMARY" summary < /dev/tty
+# --summary pre-fills a prompt on the interactive path and IS the answer on the other.
+# The trim below is shared, so a caller passing a padded string gets the same summary a
+# person typing one does.
+if [ "$NON_INTERACTIVE" = true ]; then
+    summary="$INITIAL_SUMMARY"
 else
-    read summary < /dev/tty
+    echo -n "  ✏️  " >&2
+    # Read summary with pre-filled value for editing
+    if [ -n "$INITIAL_SUMMARY" ]; then
+        read -e -i "$INITIAL_SUMMARY" summary < /dev/tty
+    else
+        read summary < /dev/tty
+    fi
 fi
 summary=$(echo "$summary" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
 
@@ -340,6 +473,12 @@ echo "" >&2
 if [ -n "$ISSUE_TYPE" ]; then
     issue_type="$ISSUE_TYPE"
     printf "  \033[38;5;114m✓\033[0m Type: \033[0m%s\033[0m (preset)\n" "$issue_type" >&2
+    echo "" >&2
+elif [ "$NON_INTERACTIVE" = true ]; then
+    # Task, which is what the picker's own list leads with for ordinary work and what
+    # every caller of this that does not care has always meant.
+    issue_type="Task"
+    printf "  \033[38;5;114m✓\033[0m Type: \033[0m%s\033[0m (default)\n" "$issue_type" >&2
     echo "" >&2
 else
     printf "\033[38;5;109m┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\033[0m\n" >&2
@@ -375,7 +514,7 @@ if [ "$issue_type" = "Bug" ]; then
     # How was the bug found? (default: Discovered internally)
     if field_present "$bug_meta" "customfield_10156"; then
         _opts=$(field_options "$bug_meta" "customfield_10156")
-        bug_found=$(echo "$_opts" | $FZF --prompt="  🔍 How was the bug found? > " --height=10 --reverse --border=rounded --header="Press Enter for default (Discovered internally)" || true)
+        bug_found=$(echo "$_opts" | pick --prompt="  🔍 How was the bug found? > " --height=10 --reverse --border=rounded --header="Press Enter for default (Discovered internally)" || true)
         [ -z "$bug_found" ] && bug_found=$(resolve_default "Discovered internally  " "$_opts")
         printf "  \033[38;5;114m✓\033[0m Found: \033[0m%s\033[0m\n" "$bug_found" >&2
         bug_fields+=$'\n'"    , \"customfield_10156\": $(echo "$bug_found" | jq -R '[{value: .}]')"
@@ -384,7 +523,7 @@ if [ "$issue_type" = "Bug" ]; then
     # Does this bug affect sales demo? (default: No)
     if field_present "$bug_meta" "customfield_10165"; then
         _opts=$(field_options "$bug_meta" "customfield_10165")
-        bug_demo=$(echo "$_opts" | $FZF --prompt="  📊 Affects sales demo? > " --height=10 --reverse --border=rounded --header="Press Enter for default (No)" || true)
+        bug_demo=$(echo "$_opts" | pick --prompt="  📊 Affects sales demo? > " --height=10 --reverse --border=rounded --header="Press Enter for default (No)" || true)
         [ -z "$bug_demo" ] && bug_demo=$(resolve_default "No" "$_opts")
         printf "  \033[38;5;114m✓\033[0m Affects demo: \033[0m%s\033[0m\n" "$bug_demo" >&2
         bug_fields+=$'\n'"    , \"customfield_10165\": $(echo "$bug_demo" | jq -R '[{value: .}]')"
@@ -393,7 +532,7 @@ if [ "$issue_type" = "Bug" ]; then
     # Which environment? (default: Production)
     if field_present "$bug_meta" "customfield_10177"; then
         _opts=$(field_options "$bug_meta" "customfield_10177")
-        bug_env=$(echo "$_opts" | $FZF --prompt="  🌐 Environment? > " --height=10 --reverse --border=rounded --header="Press Enter for default (Production)" || true)
+        bug_env=$(echo "$_opts" | pick --prompt="  🌐 Environment? > " --height=10 --reverse --border=rounded --header="Press Enter for default (Production)" || true)
         [ -z "$bug_env" ] && bug_env=$(resolve_default "Production (home.urbanlogiq.ca or home.urbanlogiq.us) " "$_opts")
         printf "  \033[38;5;114m✓\033[0m Environment: \033[0m%s\033[0m\n" "$bug_env" >&2
         bug_fields+=$'\n'"    , \"customfield_10177\": $(echo "$bug_env" | jq -R '[{value: .}]')"
@@ -402,7 +541,7 @@ if [ "$issue_type" = "Bug" ]; then
     # Which customers affected? (default: None, multi-select)
     if field_present "$bug_meta" "customfield_10170"; then
         _opts=$(field_options "$bug_meta" "customfield_10170")
-        bug_customers=$(echo "$_opts" | $FZF --prompt="  👥 Affected customers? > " --height=20 --reverse --border=rounded --multi --bind 'tab:toggle+down' --header="TAB=multi-select, Enter for default (None)" || true)
+        bug_customers=$(echo "$_opts" | pick --prompt="  👥 Affected customers? > " --height=20 --reverse --border=rounded --multi --bind 'tab:toggle+down' --header="TAB=multi-select, Enter for default (None)" || true)
         [ -z "$bug_customers" ] && bug_customers=$(resolve_default "None" "$_opts")
         printf "  \033[38;5;114m✓\033[0m Customers: \033[0m%s\033[0m\n" "$(echo "$bug_customers" | tr '\n' ', ' | sed 's/,$//')" >&2
         bug_fields+=$'\n'"    , \"customfield_10170\": $(echo "$bug_customers" | jq -R . | jq -s 'map({value: .})')"
@@ -412,21 +551,36 @@ if [ "$issue_type" = "Bug" ]; then
 fi
 
 # Step 3: Priority (default to Medium - first in list)
-printf "\033[38;5;109m┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\033[0m\n" >&2
-printf "\033[38;5;109m┃\033[0m \033[38;5;81mStep 3/6:\033[0m Select priority \033[2m(default: Medium)\033[0m            \033[38;5;109m┃\033[0m\n" >&2
-printf "\033[38;5;109m┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\033[0m\n" >&2
-priority=$(get_priorities | $FZF --prompt="  ⚡ Priority > " --height=10 --reverse --border=rounded --header="Press Enter for default (Medium)")
-if [ -z "$priority" ]; then
+# --priority and --non-interactive both skip the picker, and both skip the /priority
+# fetch that fills it: the id is looked up by name further down either way, so asking
+# Jira for the list here would be a round trip whose only consumer is a picker nobody is
+# going to see.
+if [ -n "$PRIORITY_OVERRIDE" ]; then
+    priority="$PRIORITY_OVERRIDE"
+elif [ "$NON_INTERACTIVE" = true ]; then
     priority="Medium"
+else
+    printf "\033[38;5;109m┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\033[0m\n" >&2
+    printf "\033[38;5;109m┃\033[0m \033[38;5;81mStep 3/6:\033[0m Select priority \033[2m(default: Medium)\033[0m            \033[38;5;109m┃\033[0m\n" >&2
+    printf "\033[38;5;109m┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\033[0m\n" >&2
+    priority=$(get_priorities | $FZF --prompt="  ⚡ Priority > " --height=10 --reverse --border=rounded --header="Press Enter for default (Medium)")
+    if [ -z "$priority" ]; then
+        priority="Medium"
+    fi
 fi
 printf "  \033[38;5;114m✓\033[0m Priority: \033[0m%s\033[0m\n" "$priority" >&2
 echo "" >&2
 
 # Step 4: Parent Issue (optional, default: None)
-printf "\033[38;5;109m┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\033[0m\n" >&2
-printf "\033[38;5;109m┃\033[0m \033[38;5;81mStep 4/6:\033[0m Select parent issue \033[2m(default: None)\033[0m          \033[38;5;109m┃\033[0m\n" >&2
-printf "\033[38;5;109m┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\033[0m\n" >&2
-parent_line=$(get_parent_issues | $FZF --prompt="  🔗 Parent Issue > " --height=15 --reverse --border=rounded --header="Press Enter for no parent")
+# Same reasoning as Step 3: the default is "None", so under --non-interactive the JQL
+# search that fills the picker has no reader.
+parent_line=""
+if [ "$NON_INTERACTIVE" != true ]; then
+    printf "\033[38;5;109m┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\033[0m\n" >&2
+    printf "\033[38;5;109m┃\033[0m \033[38;5;81mStep 4/6:\033[0m Select parent issue \033[2m(default: None)\033[0m          \033[38;5;109m┃\033[0m\n" >&2
+    printf "\033[38;5;109m┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\033[0m\n" >&2
+    parent_line=$(get_parent_issues | $FZF --prompt="  🔗 Parent Issue > " --height=15 --reverse --border=rounded --header="Press Enter for no parent")
+fi
 parent_key=""
 if [ -n "$parent_line" ] && [ "$parent_line" != "None" ]; then
     parent_key=$(echo "$parent_line" | awk '{print $1}')
@@ -447,7 +601,13 @@ else
     printf "\033[38;5;109m┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\033[0m\n" >&2
     printf "\033[38;5;109m┃\033[0m \033[38;5;81mStep 5/6:\033[0m Select labels \033[2m(TAB=multi, default: $DEFAULT_LABELS)\033[0m \033[38;5;109m┃\033[0m\n" >&2
     printf "\033[38;5;109m┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\033[0m\n" >&2
-    labels_input=$(get_labels | $FZF --prompt="  🏷️  Labels > " --height=15 --reverse --border=rounded --multi --bind 'tab:toggle+down' --header="TAB to select multiple, Enter to use default ($DEFAULT_LABELS), or pick $NO_LABEL_SENTINEL")
+    # Empty under --non-interactive, which is the same thing Esc leaves behind, so the
+    # arm below hands back the default without a second copy of what the default is.
+    # The label list is not fetched either: it exists to fill a picker.
+    labels_input=""
+    if [ "$NON_INTERACTIVE" != true ]; then
+        labels_input=$(get_labels | $FZF --prompt="  🏷️  Labels > " --height=15 --reverse --border=rounded --multi --bind 'tab:toggle+down' --header="TAB to select multiple, Enter to use default ($DEFAULT_LABELS), or pick $NO_LABEL_SENTINEL")
+    fi
     if [ -z "$labels_input" ]; then
         # Esc / no selection — unchanged, the default still applies.
         labels="$DEFAULT_LABELS"
@@ -484,6 +644,12 @@ fi
 echo "" >&2
 
 # Step 6: Description
+# --non-interactive takes --description whole and opens no editor. It is deliberately
+# NOT run through the comment-stripping template below: what a caller passed is what it
+# meant, and a line of its prose that happened to start with # is not a template comment.
+if [ "$NON_INTERACTIVE" = true ]; then
+    desc_text="$USER_DESCRIPTION"
+else
 printf "\033[38;5;109m┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\033[0m\n" >&2
 printf "\033[38;5;109m┃\033[0m \033[38;5;81mStep 6/6:\033[0m Enter description \033[2m(save & quit to continue)\033[0m \033[38;5;109m┃\033[0m\n" >&2
 printf "\033[38;5;109m┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\033[0m\n" >&2
@@ -512,6 +678,7 @@ EOFDESC
 
 $EDITOR "$tmpdir/description" < /dev/tty > /dev/tty
 desc_text=$(grep -v '^#' "$tmpdir/description")
+fi
 desc_preview=$(printf '%s' "$desc_text" | head -c 50)
 
 # Convert plain text to Atlassian Document Format (ADF) for API v3
@@ -610,6 +777,46 @@ if [ -n "$labels" ]; then
     labels_field=", \"labels\": $labels_json"
 fi
 
+# The estimate, whose field id belongs to the BOARD and not to Jira.
+#
+# There is no one "estimate in days" field: UB's is customfield_10137, UL's is
+# customfield_10314, DE's is customfield_10139, and several more exist on screens this
+# script never touches. So the id is read off the resolved board's own create screen for
+# the resolved issue type -- the same createmeta call the Bug fields already use, for the
+# same reason: sending a field that is not on this screen makes Jira reject the whole
+# create.
+#
+# Matched case-insensitively, which is not fussiness. UL spells it "Estimate (in Days)"
+# and UB spells it "Estimate (in days)", so an exact match resolves one board and misses
+# the other -- and it misses it silently, which is the worst way for this to be wrong.
+#
+# Exactly one match is written. Zero or several is REPORTED AND SURVIVED: the ticket is
+# still created, because a ticket that lands without its estimate is worth more than no
+# ticket, and the caller is told which happened in the JSON it reads back.
+estimate_field=""
+estimate_id=""
+estimate_error=""
+if [ -n "$ESTIMATE" ]; then
+    est_meta=$(get_createmeta_fields "$issue_type")
+    est_ids=$(estimate_field_ids "$est_meta")
+    est_n=$(printf '%s' "$est_ids" | grep -c . || true)
+    if [ "$est_n" = "1" ]; then
+        estimate_id="$est_ids"
+        estimate_field=", \"$estimate_id\": $ESTIMATE"
+        printf "  \033[38;5;114m✓\033[0m Estimate: \033[0m%s day(s)\033[0m \033[2m(%s on %s)\033[0m\n" \
+            "$ESTIMATE" "$estimate_id" "$JIRA_PROJECT" >&2
+    elif [ "$est_n" = "0" ]; then
+        estimate_error="no field named 'Estimate (in days)' on ${JIRA_PROJECT}'s ${issue_type} screen"
+        printf "  \033[38;5;221m⚠\033[0m Estimate: \033[2m%s — creating without it\033[0m\n" \
+            "$estimate_error" >&2
+    else
+        estimate_error="${est_n} fields named 'Estimate (in days)' on ${JIRA_PROJECT}'s ${issue_type} screen — refusing to guess"
+        printf "  \033[38;5;221m⚠\033[0m Estimate: \033[2m%s — creating without it\033[0m\n" \
+            "$estimate_error" >&2
+    fi
+    echo "" >&2
+fi
+
 # Create the ticket
 payload=$(cat <<EOFPAYLOAD
 {
@@ -628,6 +835,7 @@ payload=$(cat <<EOFPAYLOAD
     $assignee_field
     $parent_field
     $labels_field
+    $estimate_field
     $bug_fields
   }
 }
@@ -659,15 +867,15 @@ if [ "$DRY_RUN" = true ]; then
     if [ -n "$sprint_id" ]; then
         printf "  \033[2mSprint:\033[0m      \033[0m%s\033[0m \033[2m(will be added via Agile API)\033[0m\n" "$sprint_id" >&2
     fi
+    if [ -n "$estimate_id" ]; then
+        printf "  \033[2mEstimate:\033[0m    \033[0m%s day(s)\033[0m \033[2m(%s)\033[0m\n" "$ESTIMATE" "$estimate_id" >&2
+    elif [ -n "$estimate_error" ]; then
+        printf "  \033[2mEstimate:\033[0m    \033[2mnot set — %s\033[0m\n" "$estimate_error" >&2
+    fi
     echo "" >&2
     rm -rf "$tmpdir"
-    
-    # Output JSON result
-    if [ -n "$OUTPUT_FILE" ]; then
-        jq -nc --arg key "${JIRA_PROJECT}-9999" --arg summary "$summary" --arg description "$desc_text" '{key: $key, summary: $summary, description: $description}' > "$OUTPUT_FILE"
-    else
-        jq -nc --arg key "${JIRA_PROJECT}-9999" --arg summary "$summary" --arg description "$desc_text" '{key: $key, summary: $summary, description: $description}'
-    fi
+
+    emit_result "${JIRA_PROJECT}-9999" "$summary" "$desc_text"
     exit 0
 else
     echo "" >&2
@@ -715,13 +923,8 @@ else
         echo -e "  \033[2mReturning ticket info to caller...\033[0m" >&2
         echo "" >&2
         rm -rf "$tmpdir"
-        
-        # Output JSON result
-        if [ -n "$OUTPUT_FILE" ]; then
-            jq -nc --arg key "$new_key" --arg summary "$summary" --arg description "$desc_text" '{key: $key, summary: $summary, description: $description}' > "$OUTPUT_FILE"
-        else
-            jq -nc --arg key "$new_key" --arg summary "$summary" --arg description "$desc_text" '{key: $key, summary: $summary, description: $description}'
-        fi
+
+        emit_result "$new_key" "$summary" "$desc_text"
         exit 0
     else
         echo "" >&2
