@@ -17,6 +17,30 @@ Add to `~/.zshrc`:
 source ~/bin/dev-workflow-tools/shell/dev-workflow.zsh
 ```
 
+### Required scheduled job — run this once per machine
+
+```bash
+wt-gc --install-timer     # hourly systemd user timer; verify with: wt-gc --check
+```
+
+**This is not optional if you use worktrees, and skipping it degrades silently.**
+
+`git status` and `git diff` take `.git/index.lock` while refreshing the index. Git removes
+it on SIGTERM but **not** on SIGKILL, so anything that kills a process group holding git —
+an agent session torn down, `ticket-bot` escalating past its grace period, `tmux
+kill-session` — can strand one. Git then never mentions it again: every later status call
+in that worktree recomputes the stat cache, fails to take the lock, and throws the result
+away. The worktree re-hashes every tracked byte on every call, forever.
+
+Twenty-five of these accumulated over five weeks on the machine this was found on. They
+made `rr`'s dirty-check pass cost **33 CPU-seconds across 271 worktrees instead of 6**,
+saturating nine cores on every branch switch. Nothing anywhere reported it; the symptom is
+indistinguishable from "this repo is just big". The timer sweeps them hourly and
+`Persistent=true` means it catches up after the laptop sleeps.
+
+`r` prints a reminder at most once a day while the timer is missing. Silence it with
+`DEV_WORKFLOW_NO_SETUP_HINT=1`, or remove the timer with `wt-gc --uninstall-timer`.
+
 ### Dependencies
 
 Required: `git`, `fzf`, `jq`, `curl`, `glab`
@@ -1666,3 +1690,32 @@ The `shell/dev-workflow.zsh` provides:
 
 **Jira tickets not showing**
 → Check credentials, verify `JIRA_PROJECT`, try `r -r`
+
+### `wt-gc`
+
+Two kinds of worktree rot, one tool. Dry run by default; `--apply` to act.
+
+```bash
+wt-gc                          # sweep abandoned locks + report stale build artifacts
+wt-gc --apply                  # ...and actually delete the artifacts
+wt-gc --locks-only --apply     # locks only; this is what the timer runs
+wt-gc --check                  # is the timer installed? are any locks pending?
+wt-gc --install-timer [WHEN]   # install the hourly sweep (once per machine)
+wt-gc --uninstall-timer
+```
+
+**Disk.** Each worktree accretes a Rust `target/` (5–55G) and a `node_modules/` (~900M)
+that nothing reaps. `--days N` evicts artifacts untouched for N days; `--free-target SIZE`
+instead evicts least-recently-built until `df` reports enough free, which self-corrects
+against however fast a fleet of agent worktrees is refilling the disk.
+
+**Abandoned `index.lock` files.** See *Required scheduled job* above for why this matters.
+A lock is swept only when it is empty **and** older than `--lock-age` (default 60 min) and
+no live process holds it. A non-empty lock is a half-written index — a different and worse
+failure — and is always left alone with a note. After clearing one, wt-gc runs
+`git update-index --refresh` in that worktree, because removing the lock only unblocks the
+write: nothing is actually faster until a refreshed stat cache persists.
+
+The timer deliberately runs `--locks-only`. Unattended `rm -rf` of build artifacts on a
+schedule is a different decision, and `test/lock_sweep.bats` asserts nobody acquires it by
+accident.

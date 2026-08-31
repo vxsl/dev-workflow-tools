@@ -1,0 +1,38 @@
+# dev-workflow-lock-sweep.service -- clear abandoned git index.lock files.
+# Started by dev-workflow-lock-sweep.timer.
+#
+# Installed by `wt-gc --install-timer`, which copies this into
+# ~/.config/systemd/user/ and rewrites ExecStart to the checkout it was invoked from. The
+# path below is where that checkout actually lives, so a hand-copied unit works as it
+# stands and this file is not a template you have to fill in to read.
+#
+# WHY THIS EXISTS. `git status` and `git diff` take .git/index.lock while they refresh the
+# index. On SIGTERM git removes it; on SIGKILL it does not. Anything that kills a process
+# group containing git -- an agent session torn down, ticket-bot escalating past its 3s
+# grace, tmux kill-session -- can therefore strand one. Git then never says another word
+# about it: every later status call in that worktree computes a refreshed stat cache,
+# fails to take the lock, and silently throws the result away. A worktree holding a few
+# hundred MB of tracked test_data re-hashes all of it on every single call, forever.
+#
+# Twenty-five of these accumulated over five weeks unnoticed and made rr's dirty-check
+# pass cost 33 CPU-seconds across 271 worktrees instead of 6. The cost is invisible by
+# construction, which is the whole argument for sweeping on a schedule rather than
+# waiting to be annoyed enough to look.
+#
+# --locks-only is deliberate and load-bearing. Plain `wt-gc --apply` rm -rf's stale
+# target/ and node_modules/ directories, which is not something to do unattended on a
+# timer. This unit removes empty lock files and refreshes the indexes they were blocking;
+# it deletes nothing else.
+
+[Unit]
+Description=Clear abandoned git index.lock files in worktrees
+
+[Service]
+Type=oneshot
+
+ExecStart=%h/bin/dev-workflow-tools/bin/wt-gc --locks-only --apply
+
+# Unblocking a lock is instant; the refresh that makes it pay off is not. Re-hashing the
+# tracked bytes of every worktree that was blocked costs about 1.5s each, and the run
+# that finds five weeks of arrears has a lot of them to do at once.
+TimeoutStartSec=15min

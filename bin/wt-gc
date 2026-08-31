@@ -16,8 +16,23 @@
 # artifacts until df reports enough free space, which self-corrects against
 # whatever rate the agents happen to be running at.
 #
+# wt-gc also sweeps abandoned git index.lock files, which is a different kind of rot in
+# the same worktrees. git takes .git/index.lock while it refreshes the index and removes
+# it on SIGTERM -- but not on SIGKILL. So anything that kills a process group holding git
+# (an agent session torn down, ticket-bot escalating past its grace period, tmux
+# kill-session) can strand one, and git never mentions it again: every later status call
+# recomputes the stat cache, fails to take the lock, and discards the result. A worktree
+# with a few hundred MB of tracked test_data then re-hashes all of it on every call,
+# forever. Twenty-five of these accrued over five weeks unnoticed and made rr's
+# dirty-check pass cost 33 CPU-seconds across 271 worktrees instead of 6.
+#
+# That cost is invisible by construction, so it wants a schedule rather than a person
+# noticing: `wt-gc --install-timer` installs an hourly systemd user timer that runs the
+# sweep alone. Run it once per machine. `wt-gc --check` says whether it is installed.
+#
 # Usage: wt-gc [--days N | --free-target SIZE] [--apply] [--repos DIR]
-#              [--artifacts "a b c"]
+#              [--artifacts "a b c"] [--locks-only | --no-locks] [--lock-age MIN]
+#        wt-gc --check | --install-timer [OnCalendar] | --uninstall-timer
 # Default is a dry run; pass --apply to actually delete.
 
 set -euo pipefail
@@ -31,7 +46,20 @@ DAYS="${WT_GC_DAYS:-21}"
 REPOS_DIR="${WT_GC_REPOS:-$HOME/work/repos}"
 ARTIFACTS="${WT_GC_ARTIFACTS:-target node_modules}"
 FREE_TARGET="${WT_GC_FREE_TARGET:-}"
+ACTION=sweep
+TIMER_WHEN=""
 APPLY=0
+
+# An index.lock younger than this is very likely a git that is still running, so the sweep
+# leaves it alone. An hour is far longer than any git call in these repos takes and far
+# shorter than the weeks a stranded one otherwise survives.
+LOCK_MIN_AGE_MIN="${WT_GC_LOCK_MIN_AGE_MIN:-60}"
+DO_LOCKS=1
+LOCKS_ONLY=0
+
+TIMER_UNIT="dev-workflow-lock-sweep.timer"
+SERVICE_UNIT="dev-workflow-lock-sweep.service"
+UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -40,7 +68,14 @@ while [ $# -gt 0 ]; do
         --repos)       REPOS_DIR="${2:?--repos needs a value}"; shift 2 ;;
         --artifacts)   ARTIFACTS="${2:?--artifacts needs a value}"; shift 2 ;;
         --apply)       APPLY=1; shift ;;
-        -h|--help)     sed -n '2,24p' "$0" | sed 's/^# \?//'; exit 0 ;;
+        --locks-only)  LOCKS_ONLY=1; shift ;;
+        --no-locks)    DO_LOCKS=0; shift ;;
+        --lock-age)    LOCK_MIN_AGE_MIN="${2:?--lock-age needs minutes}"; shift 2 ;;
+        --check)         ACTION=check; shift ;;
+        --install-timer) ACTION=install; shift
+                         if [ $# -gt 0 ] && [ "${1#-}" = "$1" ]; then TIMER_WHEN="$1"; shift; fi ;;
+        --uninstall-timer) ACTION=uninstall; shift ;;
+        -h|--help)     sed -n '2,37p' "$0" | sed 's/^# \?//'; exit 0 ;;
         *)             echo "✗ Unknown argument: $1" >&2; exit 1 ;;
     esac
 done
@@ -51,6 +86,187 @@ if [ ! -d "$REPOS_DIR" ]; then
 fi
 
 cutoff=$(date -d "$DAYS days ago" +%s)
+
+# ============================================================================
+# Abandoned index.lock sweep
+# ============================================================================
+
+# Every gitdir that can hold an index.lock: a main repo's .git, plus one per linked
+# worktree under .git/worktrees/. Linked worktrees keep a .git *file* pointing back here,
+# so enumerating the main repos covers every worktree exactly once -- including the nested
+# ones (ul.hotfix/<slug>), whose gitdirs live in the same flat directory.
+index_lock_paths() {
+    local repo wt
+    for repo in "$REPOS_DIR"/*/; do
+        [ -d "$repo.git" ] || continue
+        printf '%s\n' "$repo.git/index.lock"
+        for wt in "$repo.git/worktrees"/*/; do
+            [ -d "$wt" ] || continue
+            printf '%s\n' "${wt%/}/index.lock"
+        done
+    done
+}
+
+# A lock's gitdir is not its worktree, and the refresh has to run in the worktree. Linked
+# worktrees record the way back in a `gitdir` file; a main repo's .git is simply inside it.
+worktree_of_lock() {
+    local gitdir="${1%/index.lock}" dotgit
+    if [ -f "$gitdir/gitdir" ]; then
+        dotgit=$(<"$gitdir/gitdir")
+        printf '%s\n' "${dotgit%/.git}"
+    else
+        printf '%s\n' "${gitdir%/.git}"
+    fi
+}
+
+sweep_locks() {
+    local now cutoff_lock lock mtime size age wt
+    local scanned=0 found=0 cleared=0 young=0 nonempty=0 held=0 refreshed=0
+    local -a to_refresh=()
+    now=$(date +%s)
+    cutoff_lock=$((now - LOCK_MIN_AGE_MIN * 60))
+
+    while IFS= read -r lock; do
+        scanned=$((scanned + 1))
+        [ -f "$lock" ] || continue
+        found=$((found + 1))
+        mtime=$(stat -c %Y "$lock" 2>/dev/null) || continue
+        size=$(stat -c %s "$lock" 2>/dev/null) || continue
+        age=$(((now - mtime) / 60))
+
+        # Age is the guard that does the real work: a git that is still running has a lock
+        # seconds old, not hours.
+        if [ "$mtime" -ge "$cutoff_lock" ]; then
+            young=$((young + 1)); continue
+        fi
+        # An empty lock is the placeholder git creates and then dies holding. A non-empty
+        # one is a partially written index -- a different and more serious failure, and not
+        # ours to paper over silently.
+        if [ "$size" -ne 0 ]; then
+            printf 'keeping %s -- %s bytes, not an empty placeholder\n' "${lock#"$REPOS_DIR"/}" "$size" >&2
+            nonempty=$((nonempty + 1)); continue
+        fi
+        # Belt and braces for the genuinely long-running git the age window would misjudge.
+        if command -v fuser >/dev/null 2>&1 && fuser -s "$lock" 2>/dev/null; then
+            printf 'keeping %s -- a live process holds it\n' "${lock#"$REPOS_DIR"/}" >&2
+            held=$((held + 1)); continue
+        fi
+
+        wt=$(worktree_of_lock "$lock")
+        if [ "$APPLY" -eq 1 ]; then
+            rm -f "$lock"
+            [ -d "$wt" ] && to_refresh+=("$wt")
+            printf 'cleared %s (stale %sh)\n' "${lock#"$REPOS_DIR"/}" "$((age / 60))" >&2
+        else
+            printf 'would clear %s (stale %sh)\n' "${lock#"$REPOS_DIR"/}" "$((age / 60))" >&2
+        fi
+        cleared=$((cleared + 1))
+    done < <(index_lock_paths)
+
+    # Removing the lock only unblocks the write. Nothing is actually faster until some git
+    # command persists a refreshed stat cache, and until then the worktree keeps re-hashing
+    # every tracked byte on every call -- so do it here, while we still know which
+    # worktrees were blocked. update-index exits non-zero when entries are genuinely
+    # modified, which is a report and not a failure.
+    if [ "${#to_refresh[@]}" -gt 0 ]; then
+        for wt in "${to_refresh[@]}"; do
+            git -C "$wt" update-index -q --refresh 2>/dev/null || true
+            refreshed=$((refreshed + 1))
+        done
+    fi
+
+    if [ "$cleared" -eq 0 ]; then
+        printf '\u2713 No abandoned index.lock files (%s gitdirs scanned, %s present)\n' "$scanned" "$found" >&2
+    elif [ "$APPLY" -eq 1 ]; then
+        printf '\u2713 Cleared %s abandoned index.lock file(s); refreshed %s index(es)\n' "$cleared" "$refreshed" >&2
+    else
+        printf '\u2713 Would clear %s abandoned index.lock file(s)\n' "$cleared" >&2
+        printf '  (dry run -- re-run with --apply, or let the timer do it)\n' >&2
+    fi
+    [ "$young" -gt 0 ] && printf '  %s lock(s) newer than %s min -- assumed still in use\n' "$young" "$LOCK_MIN_AGE_MIN" >&2
+    [ "$nonempty" -gt 0 ] && printf '  %s non-empty lock(s) left alone -- inspect those by hand\n' "$nonempty" >&2
+    [ "$held" -gt 0 ] && printf '  %s lock(s) held by a live process\n' "$held" >&2
+    return 0
+}
+
+# ============================================================================
+# Scheduling
+# ============================================================================
+
+have_systemd_user() { systemctl --user show-environment >/dev/null 2>&1; }
+
+install_timer() {
+    local when="${1:-}" tmpl="$SCRIPT_DIR/../systemd" self
+    if [ ! -f "$tmpl/$SERVICE_UNIT" ] || [ ! -f "$tmpl/$TIMER_UNIT" ]; then
+        echo "wt-gc: no unit files in $tmpl" >&2; return 2
+    fi
+    if ! have_systemd_user; then
+        echo "wt-gc: no systemd user manager answering here." >&2
+        echo "       A crontab line is the fallback, but read the timer header first: cron" >&2
+        echo "       does not catch up after the machine sleeps, and a missed sweep is not" >&2
+        echo "       an error in a log, it is an absence from one." >&2
+        return 2
+    fi
+
+    # The shipped unit names this checkout's real path so a hand-copied copy works, but the
+    # checkout that ran --install-timer is the authority on where it lives.
+    self="$(readlink -f "${BASH_SOURCE[0]}")"
+    mkdir -p "$UNIT_DIR"
+    sed "s|^ExecStart=.*|ExecStart=$self --locks-only --apply|" \
+        "$tmpl/$SERVICE_UNIT" >"$UNIT_DIR/$SERVICE_UNIT"
+    if [ -n "$when" ]; then
+        sed "s|^OnCalendar=.*|OnCalendar=$when|" "$tmpl/$TIMER_UNIT" >"$UNIT_DIR/$TIMER_UNIT"
+    else
+        cp "$tmpl/$TIMER_UNIT" "$UNIT_DIR/$TIMER_UNIT"
+    fi
+
+    systemctl --user daemon-reload
+    systemctl --user enable --now "$TIMER_UNIT"
+    echo "installed: $UNIT_DIR/$TIMER_UNIT (Persistent=true)"
+    systemctl --user list-timers --all --no-pager "$TIMER_UNIT" 2>/dev/null || true
+}
+
+uninstall_timer() {
+    if have_systemd_user; then
+        systemctl --user disable --now "$TIMER_UNIT" >/dev/null 2>&1 || true
+    fi
+    rm -f "$UNIT_DIR/$TIMER_UNIT" "$UNIT_DIR/$SERVICE_UNIT"
+    have_systemd_user && systemctl --user daemon-reload || true
+    echo "removed $TIMER_UNIT and $SERVICE_UNIT from $UNIT_DIR"
+}
+
+# What a fresh machine needs told to it. Exits non-zero when something is missing, so this
+# is usable from a hook or another script and not just by eye.
+run_check() {
+    local rc=0
+    if ! have_systemd_user; then
+        echo "? no systemd user manager here -- schedule 'wt-gc --locks-only --apply' hourly by other means"
+        rc=1
+    elif systemctl --user is-enabled "$TIMER_UNIT" >/dev/null 2>&1; then
+        printf '\u2713 %s is enabled\n' "$TIMER_UNIT"
+        systemctl --user list-timers --all --no-pager "$TIMER_UNIT" 2>/dev/null | sed -n '2p'
+    else
+        printf '\u2717 %s is NOT installed.\n' "$TIMER_UNIT"
+        echo "  Abandoned index.lock files will accumulate silently and make every git"
+        echo "  call in the affected worktrees re-hash its tracked bytes, forever."
+        echo "  Fix, once per machine:  wt-gc --install-timer"
+        rc=1
+    fi
+    APPLY=0            # --check reports; it never removes anything
+    sweep_locks
+    return $rc
+}
+
+case "$ACTION" in
+    check)     run_check; exit $? ;;
+    install)   install_timer "$TIMER_WHEN"; exit $? ;;
+    uninstall) uninstall_timer; exit $? ;;
+esac
+
+if [ "$DO_LOCKS" -eq 1 ] || [ "$LOCKS_ONLY" -eq 1 ]; then
+    sweep_locks
+fi
+[ "$LOCKS_ONLY" -eq 1 ] && exit 0
 
 # Never reap the worktree we are standing in -- it is almost certainly in use.
 current_wt=""

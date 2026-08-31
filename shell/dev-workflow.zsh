@@ -95,6 +95,42 @@ alias w="wt select"  # Interactive worktree switcher
 alias gcb="git checkout -b"                   # Create and checkout new branch
 alias gc="git for-each-ref --sort=-committerdate refs/heads/ --format='%(align:left,40)%(refname:short)%(end)%(committerdate:relative)' | fzf --preview 'git log -p main..{1} --color=always' | cut -c1-40 | xargs git switch"
 
+# ============================================================================
+# Setup guidance (once per machine)
+# ============================================================================
+# One scheduled job has to exist for these tools to keep behaving: wt-gc's sweep for
+# abandoned git index.lock files. git takes .git/index.lock while refreshing the index and
+# removes it on SIGTERM -- but not on SIGKILL. So anything that kills a process group
+# holding git (an agent session torn down, ticket-bot escalating past its grace period,
+# tmux kill-session) can strand one, and git never mentions it again: every later status
+# call in that worktree recomputes the stat cache, fails to take the lock, and discards the
+# result. The worktree then re-hashes every tracked byte on every call, forever. Twenty-five
+# accrued over five weeks here and made rr's dirty pass cost 33 CPU-seconds across 271
+# worktrees instead of 6.
+#
+# A fresh machine has to be told once, because the symptom is indistinguishable from "this
+# repo is just big". This is deliberately NOT run at shell startup: console output during
+# zsh init is what makes p10k's instant prompt complain. It runs from r() instead, which is
+# both free (no fork unless the once-a-day stamp has expired) and the exact tool whose speed
+# depends on the answer. Set DEV_WORKFLOW_NO_SETUP_HINT=1 to silence it.
+_dev_workflow_setup_hint() {
+    [[ -n "${DEV_WORKFLOW_NO_SETUP_HINT:-}" ]] && return
+    local stamp="${XDG_CACHE_HOME:-$HOME/.cache}/dev-workflow-tools/setup-hint"
+    # A glob qualifier, not a fork: matches only if the stamp is under 24h old. Written
+    # without the (#q...) marker on purpose -- that form needs EXTENDED_GLOB, which this
+    # file must not assume, and a bare qualifier list is already unambiguous here.
+    local fresh=( ${stamp}(Nmh-24) )
+    (( $#fresh )) && return
+    mkdir -p "${stamp:h}" 2>/dev/null && : >| "$stamp" 2>/dev/null
+    (( $+commands[systemctl] )) || return
+    systemctl --user is-enabled dev-workflow-lock-sweep.timer &>/dev/null && return
+    print -ru2 -- ""
+    print -ru2 -- "dev-workflow-tools: the abandoned-index.lock sweep is not scheduled."
+    print -ru2 -- "  Without it, git silently re-hashes every tracked byte in affected"
+    print -ru2 -- "  worktrees on every status call, and rr's branch list slows to a crawl."
+    print -ru2 -- "  Run once:  wt-gc --install-timer          (why: wt-gc --check)"
+}
+
 # Interactive branch/worktree switcher with Jira integration
 r() {
     local output
@@ -133,6 +169,8 @@ r() {
         echo "→ Switching to branch: $target_branch"
         git switch "$target_branch"
     fi
+
+    _dev_workflow_setup_hint
 
     return $exit_code
 }

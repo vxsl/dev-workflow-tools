@@ -1,0 +1,32 @@
+# dev-workflow-lock-sweep.timer -- hourly, and after a wake for an hour it slept through.
+#
+# Persistent=true is the reason this is a timer and not a crontab line. A stranded
+# index.lock is silent, so the failure mode of a missed run is not an error in a log, it
+# is an absence from one -- and the way you eventually find out is that rr feels slow and
+# you have no idea why. systemd stamps each run and fires on next start for one it owes.
+#
+# Hourly rather than daily because the sweep is nearly free when there is nothing to do
+# (one stat per worktree gitdir) and because the window between "a session got killed"
+# and "every git call in that worktree is slow" should not be a working day.
+#
+# WakeSystem is deliberately NOT set. There is nothing here worth spinning up a sleeping
+# laptop for; the arrears get cleared on the next wake.
+#
+# `wt-gc --install-timer [OnCalendar]` writes this into ~/.config/systemd/user/ with
+# OnCalendar rewritten to whatever was asked for, and enables it.
+
+[Unit]
+Description=Hourly sweep for abandoned git index.lock files
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+
+# Nothing here is time-of-day sensitive, so let systemd batch this with whatever else it
+# is already waking up to do rather than insisting on the top of the hour.
+AccuracySec=5min
+
+Unit=dev-workflow-lock-sweep.service
+
+[Install]
+WantedBy=timers.target
