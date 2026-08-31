@@ -2826,7 +2826,23 @@ export AUTO_WT_ROWS_FILE
 # still takes them with it.
 _remote_rows_file=$(mktemp -t rr_remote_rows.XXXXXX)
 _branchless_rows_file=$(mktemp -t rr_ticket_rows.XXXXXX)
-trap 'rm -f "$AUTO_WT_ROWS_FILE" "$_remote_rows_file" "$_branchless_rows_file"' EXIT
+# The generator below runs in its own process group so that killing it reaches the whole
+# pipeline -- the dirty-check xargs fan-out and its children included, which a kill of the
+# subshell pid alone never touched. The price of owning a process group is that terminal
+# SIGINT no longer lands on it, so every exit path has to come through here: without this,
+# a Ctrl-C at the picker leaves 24 git processes hashing test_data with nobody left to read
+# the answer. TERM and not KILL, because git removes its index.lock on TERM and strands it
+# on KILL -- and a stranded lock makes every later status call in that worktree re-hash
+# every tracked byte, forever. Measured: 3/3 stranded under KILL, 0/5 under TERM.
+_rr_cleanup() {
+    [ -n "${_gen_pid:-}" ] && kill -TERM -- "-$_gen_pid" 2>/dev/null
+    rm -f "$AUTO_WT_ROWS_FILE" "$_remote_rows_file" "$_branchless_rows_file"
+    [ -n "${_data_fifo:-}" ] && rm -f "$_data_fifo"
+    return 0
+}
+trap _rr_cleanup EXIT
+trap '_rr_cleanup; exit 130' INT
+trap '_rr_cleanup; exit 143' TERM
 load_auto_worktrees
 
 # Pre-load valid branch refs (eliminates git show-ref per branch)
@@ -3183,6 +3199,13 @@ header_text=$(get_header_text)
 _data_fifo=$(mktemp -u)
 mkfifo "$_data_fifo"
 
+# Job control, for exactly one reason: with monitor mode on, bash puts this background job
+# in a process group of its own, which is what lets _rr_cleanup kill the entire pipeline
+# instead of just the subshell that fronts it. Turned straight back off after the launch so
+# nothing else in the script acquires job-control semantics. A subshell forked as a
+# background job does not itself do job control, so the generator's own `&` jobs stay in
+# its group rather than escaping into new ones -- verified, not assumed.
+set -m
 {
     # Output header as first line
     echo "$header_text"
@@ -3415,6 +3438,7 @@ mkfifo "$_data_fifo"
         }
 } > "$_data_fifo" 2>/dev/null &
 _gen_pid=$!
+set +m
 
 # fzf reads from the FIFO — $() returns the instant fzf exits, without waiting for generators
 selected_line=$(
@@ -3470,8 +3494,12 @@ selected_line=$(
     } < "$_data_fifo")
 
 # Kill the background data pipeline and clean up — do it in the background so
-# navigation is not held up waiting for JIRA fetches or sort buffers to die.
-{ kill "$_gen_pid" 2>/dev/null; wait "$_gen_pid" 2>/dev/null; rm -f "$_data_fifo"; } >/dev/null 2>/dev/null &
+# navigation is not held up waiting for JIRA fetches or sort buffers to die. The negative
+# pid is the point: `kill "$_gen_pid"` reached only the subshell fronting the pipeline, so
+# the dirty-check fan-out and its 24 git children ran to completion after rr had exited,
+# burning nine cores on a question nobody was waiting for an answer to any more. They never
+# noticed because the pass writes nothing until it finishes, so no SIGPIPE ever arrived.
+{ kill -TERM -- "-$_gen_pid" 2>/dev/null; wait "$_gen_pid" 2>/dev/null; rm -f "$_data_fifo"; } >/dev/null 2>/dev/null &
 
 # Check if user requested a worktree action via keybinding
 ACTION_FILE="$CACHE_DIR/action"

@@ -3603,11 +3603,32 @@ except KeyboardInterrupt:
                 pass
         info["log_file"].close()
 
-    # Wait briefly for cleanup
+    # Wait for cleanup, then escalate. Two things were wrong with three seconds.
+    #
+    # First, the grace is load-bearing in a way that is not obvious from here. These
+    # children run git in worktrees, and git removes .git/index.lock on SIGTERM but leaves
+    # it behind on SIGKILL. A lock stranded here is permanent and completely silent: every
+    # later status call in that worktree recomputes the stat cache, fails to take the lock,
+    # and throws the result away -- so the worktree re-hashes every tracked byte on every
+    # git call, forever. Twenty-five of those accumulated in ul over five weeks and cost
+    # rr's dirty pass 33 CPU-seconds across 271 worktrees instead of 6. Three seconds is
+    # not long enough for a Claude session to finish a git call and go, and the cost of
+    # guessing low is paid every day afterwards by a tool that never mentions why.
+    #
+    # Second, the budget was per child in a sequential loop, so N stuck children meant
+    # N x timeout of Ctrl-C. SIGTERM already went to every one of them above and they shut
+    # down concurrently, so one shared deadline is both kinder and more correct.
+    SHUTDOWN_GRACE_SEC = 20
+    deadline = time.monotonic() + SHUTDOWN_GRACE_SEC
     for ticket, info in running_procs.items():
         try:
-            info["proc"].wait(timeout=3)
+            info["proc"].wait(timeout=max(0.5, deadline - time.monotonic()))
         except subprocess.TimeoutExpired:
+            print(
+                f"  {ticket} did not exit in {SHUTDOWN_GRACE_SEC}s -- SIGKILL. "
+                f"If it was mid-git this may strand an index.lock; "
+                f"'wt-gc --locks-only --apply' clears it, and the hourly timer will."
+            )
             try:
                 os.killpg(os.getpgid(info["proc"].pid), signal.SIGKILL)
             except (ProcessLookupError, PermissionError):
