@@ -169,10 +169,22 @@ lift_emit_fn() {
     # Every existing caller parses {key, summary, description}. Adding a key it does not
     # know about is additive; adding one on every run would not be.
     run bash -c 'eval "$(awk "/^emit_result\\(\\) \\{/,/^\\}/" "$0")"
-                 OUTPUT_FILE="" ESTIMATE="" estimate_id="" estimate_error=""
+                 OUTPUT_FILE="" ESTIMATE="" estimate_id="" estimate_error="" JIRA_DOMAIN=""
                  emit_result UB-1234 "a thing" "a body"' "$CJT"
     run python3 -c 'import json,sys; print(sorted(json.loads(sys.argv[1])))' "$output"
     [ "${lines[0]}" = "['description', 'key', 'summary']" ]
+}
+
+@test "the result carries the ticket's url, which only this repo's .env can build" {
+    # It was printed to stderr inside a box-drawing banner and nowhere a caller could
+    # read it, so anything wanting to link what it had just created had to rebuild the
+    # URL from a JIRA_DOMAIN it may not have.
+    run bash -c 'eval "$(awk "/^emit_result\\(\\) \\{/,/^\\}/" "$0")"
+                 OUTPUT_FILE="" ESTIMATE="" estimate_id="" estimate_error=""
+                 JIRA_DOMAIN=example.atlassian.net
+                 emit_result UB-1234 "a thing" "a body"' "$CJT"
+    run python3 -c 'import json,sys; print(json.loads(sys.argv[1])["url"])' "$output"
+    [ "${lines[0]}" = "https://example.atlassian.net/browse/UB-1234" ]
 }
 
 @test "--output-file gets the result and stdout stays empty" {

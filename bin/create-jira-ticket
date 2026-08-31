@@ -322,6 +322,14 @@ emit_result() {
     local out
     out=$(jq -nc --arg key "$key" --arg summary "$summ" --arg description "$desc" \
         '{key: $key, summary: $summary, description: $description}')
+    # Where the ticket lives. This was printed to stderr inside a coloured banner and
+    # nowhere a caller could read it, so anything wanting to link the ticket it had just
+    # created had to rebuild the URL out of JIRA_DOMAIN itself -- from an environment the
+    # caller may not have, since the domain is in THIS repo's .env.
+    if [ -n "${JIRA_DOMAIN:-}" ]; then
+        out=$(printf '%s' "$out" | jq -c --arg u "https://${JIRA_DOMAIN}/browse/${key}" \
+            '. + {url: $u}')
+    fi
     if [ -n "$estimate_id" ]; then
         out=$(printf '%s' "$out" | jq -c --argjson est "$ESTIMATE" --arg f "$estimate_id" \
             '. + {estimate: $est, estimate_field: $f}')
