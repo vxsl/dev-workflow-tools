@@ -1,0 +1,426 @@
+#!/usr/bin/env bash
+# jira-transition — move ONE issue to ONE status, non-interactively, refusing rather
+# than guessing.
+#
+# Usage:
+#   jira-transition KEY --to "<status name>"      Move the issue to that STATUS
+#   jira-transition KEY --transition-id <id>      Move it by transition id, no matching
+#   jira-transition KEY --list                    Print the live transitions, exit 0
+#   jira-transition KEY --to "..." --expect "<current status>"
+#   jira-transition KEY --to "..." --dry-run
+#
+#   --expect "<status>"   Refuse unless the issue's status is exactly this right now
+#   --dry-run             Resolve everything, print the result, send no write
+#   --json                Accepted and ignored: JSON is the only output there is
+#
+# What this is for
+#   The work-arcs page offers "correct Jira to match reality" on a contradiction row,
+#   and drives this the way [ticket it] drives create-jira-ticket --non-interactive:
+#   a caller with no terminal, acting on a status it looked up some minutes ago.
+#
+# What it is NOT, and why
+#   The only transition code in this repo before it was publish-changes' inline arm.
+#   That arm has three defects this script exists to not have:
+#
+#   1. It picks a transition by regex over transition NAMES. A transition's name is
+#      not the name of the status it lands on. On UL, transition id 4 is called
+#      "Qualifying" and lands on "In Qualification"; on DE, id 5 is "Ready for review"
+#      and lands on "Peer Review". A caller that knows what status it wants -- which
+#      is the only thing a caller ever knows -- cannot express it in transition names.
+#      So --to is matched against `to.name`, case-insensitively, and the id that is
+#      POSTed is `transition.id`. Asking for "Qualifying" is a refusal, because no
+#      status is called that.
+#
+#   2. It bundles a comment and a field write in with the move, so when something
+#      failed there was no way to say which half. This script transitions and does
+#      nothing else. It READS the assignee (to say who owns the issue it just moved)
+#      and never writes one: an assignment is a different fact from a status.
+#
+#   3. It treats empty stdout as success -- and `curl -s` prints nothing on a
+#      connection failure too, so a network outage reported as a successful
+#      transition. Every request here is made with `-o body -w '%{http_code}'` and
+#      judged on the CODE plus curl's own exit status. 204 is success. Anything else,
+#      including a curl that never connected, is a refusal.
+#
+# --expect, and the clock
+#   A cockpit reads Jira at 09:14 and its operator clicks at 17:00. In between,
+#   somebody moved the ticket. Without a guard, this script would happily apply an
+#   eight-hour-old decision to a status that no longer exists. --expect names the
+#   status the caller believed was current; a mismatch is refused and BOTH names are
+#   said, so the caller can show the operator what changed instead of a stack trace.
+#   The comparison is exact, not case-folded like --to: --to has to resolve a human's
+#   typing to exactly one action, while --expect is a guard, and a guard that is
+#   fussier than strictly necessary costs at most one refusal.
+#
+# Screens and required fields
+#   A transition whose screen requires fields cannot be satisfied by this script --
+#   there is nobody here to fill it in. Every UB/UL/DE transition probed on
+#   2026-09-01 came back `hasScreen: false` with no required fields, but that is a
+#   measurement of one morning and not a promise. So the chosen transition is checked
+#   before the POST and refused by name if it wants a screen or any required field.
+#   That check applies to --transition-id too: naming an id is a way to skip the
+#   matching, not a way to authorise a write that will fail or land half-done.
+#
+# The list is per issue, never cached
+#   The transitions endpoint is not a global table. DE returns nine entries that are
+#   the same everywhere plus one that exists only from a particular status, and every
+#   board can be edited under us. So the issue's own list is fetched on every run, and
+#   nothing about it is remembered between runs.
+#
+# Output contract
+#   On success the LAST line of stdout is exactly one JSON object:
+#     {"key","from","to","transition_id","transition_name","dry_run","url"}
+#   "from" is the status before, "to" is the status read back after (the declared
+#   target under --dry-run), and "url" is the browse link, which only this repo's
+#   .env can build. --list prints one JSON array instead and exits 0.
+#   A refusal is ONE sentence on stderr, a non-zero exit, and NO JSON on stdout, so a
+#   caller parsing the last line cannot mistake a refusal for a result.
+#
+# Never interactive
+#   There is no prompt, no picker, and no route to a terminal anywhere in here. A
+#   flag that is missing is refused, never asked for. That is not a mode: it is the
+#   whole design, and test/jira_transition.bats asserts it structurally.
+#
+# Exit codes: 0 on success (and on --list), 1 on every refusal.
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$(type -P "$0" || echo "$0")")")" && pwd)"
+
+# Load environment variables
+if [ -f "$SCRIPT_DIR/../.env" ]; then
+    set -a  # automatically export all variables
+    source "$SCRIPT_DIR/../.env"
+    set +a
+fi
+source "$SCRIPT_DIR/../lib/env-validate.sh"
+source "$SCRIPT_DIR/../lib/jira-curl.sh"
+
+# Every refusal goes through here, so "one sentence on stderr, nothing on stdout,
+# non-zero exit" is a property of one function rather than of fifteen call sites.
+refuse() {
+    printf '%s\n' "$1" >&2
+    exit 1
+}
+
+# The usage block is the top of this file, so there is one copy of it and it cannot
+# drift from the flags below. It goes to stderr because stdout belongs to the result.
+usage() {
+    sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//' >&2
+}
+
+# --- arguments ------------------------------------------------------------------------
+
+KEY=""
+TO_STATUS=""
+TRANSITION_ID=""
+EXPECT_STATUS=""
+DRY_RUN=false
+LIST_ONLY=false
+
+# `shift 2` on a flag whose value is missing fails, and under `set -e` that exits with
+# no message at all. Each value-taking flag checks for its value first, so the caller
+# gets a sentence instead of a silent status 1.
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --to)
+            [ "$#" -ge 2 ] || refuse "jira-transition: --to needs a status name."
+            TO_STATUS="$2"; shift 2 ;;
+        --transition-id)
+            [ "$#" -ge 2 ] || refuse "jira-transition: --transition-id needs an id."
+            TRANSITION_ID="$2"; shift 2 ;;
+        --expect)
+            [ "$#" -ge 2 ] || refuse "jira-transition: --expect needs a status name."
+            EXPECT_STATUS="$2"; shift 2 ;;
+        --list) LIST_ONLY=true; shift ;;
+        --dry-run) DRY_RUN=true; shift ;;
+        --json) shift ;;
+        --help|-h) usage; exit 0 ;;
+        -*)
+            refuse "jira-transition: unknown option '$1'." ;;
+        *)
+            if [ -n "$KEY" ]; then
+                refuse "jira-transition moves one issue at a time; got '$KEY' and '$1'."
+            fi
+            KEY="$1"; shift ;;
+    esac
+done
+
+if [ -z "$KEY" ]; then
+    refuse "jira-transition needs an issue key, e.g. jira-transition UL-1797 --list."
+fi
+if [ -n "$TO_STATUS" ] && [ -n "$TRANSITION_ID" ]; then
+    refuse "jira-transition takes --to or --transition-id, not both — they are two answers to one question."
+fi
+if [ "$LIST_ONLY" = true ] && { [ -n "$TO_STATUS" ] || [ -n "$TRANSITION_ID" ]; }; then
+    refuse "jira-transition: --list prints the transitions and moves nothing; drop --to/--transition-id or drop --list."
+fi
+if [ "$LIST_ONLY" != true ] && [ -z "$TO_STATUS" ] && [ -z "$TRANSITION_ID" ]; then
+    refuse "jira-transition $KEY needs --to, --transition-id or --list; it will not choose a status for you."
+fi
+
+# The key names its own project, so there is no JIRA_PROJECT here: this tool is handed
+# an issue, not a board to guess one on.
+require_env JIRA_DOMAIN JIRA_EMAIL JIRA_API_TOKEN
+
+if ! printf '%s' "$KEY" | grep -qE '^[A-Z][A-Z0-9]+-[0-9]+$'; then
+    refuse "jira-transition: '$KEY' is not an issue key (expected something like UL-1797)."
+fi
+
+for tool in jq curl; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+        refuse "jira-transition needs $tool, which is not on PATH."
+    fi
+done
+
+# Credentials go into a 0600 file that curl reads with -K, never into an argv where
+# `ps` would show the token to every local user. See lib/jira-curl.sh.
+jira_curl_conf_init || refuse "jira-transition could not stage the Jira credentials for curl."
+
+RUN_TMP=$(mktemp -d)
+trap 'rm -rf "$RUN_TMP"' EXIT
+
+# --- the rules, each one a function so a test can run the rule and not a copy of it ----
+
+# One request. Sets HTTP_CODE (curl's own view of the response code, "000" when there
+# was no response at all), CURL_RC (curl's exit status) and HTTP_BODY.
+#
+# The body goes to a file and the code to stdout, because the alternative -- reading
+# the body off stdout and calling an empty one success -- is exactly the bug in
+# publish-changes: `curl -s` also prints nothing when it never reached the host.
+#
+# `HTTP_CODE=$(curl ...) || rc=$?` rather than `local code=$(curl ...)`: `local` is
+# itself a command, so its exit status masks curl's, and every non-zero curl would
+# read as a success. It is on the right of `||` so that `set -e` leaves it alone.
+jira_http() {
+    local method="$1" endpoint="$2" data="${3:-}"
+    local rc=0
+    local body_file="$RUN_TMP/body"
+    : > "$body_file"
+    local curl_args=(
+        -s --max-time 30
+        -K "$JIRA_CURL_CONF"
+        -X "$method"
+        -H "Accept: application/json"
+        -o "$body_file"
+        -w '%{http_code}'
+    )
+    if [ -n "$data" ]; then
+        curl_args+=(-H "Content-Type: application/json" -d "$data")
+    fi
+    HTTP_CODE=""
+    HTTP_CODE=$(curl "${curl_args[@]}" "https://${JIRA_DOMAIN}/rest/api/3/${endpoint}") || rc=$?
+    CURL_RC="$rc"
+    HTTP_BODY=$(cat "$body_file")
+    return 0
+}
+
+# Every transition on this issue that lands on the wanted STATUS, one compact JSON
+# object per line.
+#
+# The match is on `to.name` and not on `name`. UL id 4 is named "Qualifying" and lands
+# on "In Qualification"; DE id 5 is named "Ready for review" and lands on "Peer
+# Review". A caller knows the status it wants, never the name of the arrow that gets
+# there. Case-insensitive because "in progress" and "In Progress" are the same status
+# and a caller should not have to know which casing the board chose.
+transitions_matching_status() {
+    local transitions_json="$1" want="$2"
+    printf '%s' "$transitions_json" | jq -c --arg want "$want" \
+        '[.transitions[]? | select(((.to.name) // "") | ascii_downcase == ($want | ascii_downcase))][]' \
+        2>/dev/null || true
+}
+
+# The transition with this id, if the issue currently offers it. An id that is not in
+# the issue's own list is refused rather than POSTed: ids are per workflow, and one
+# copied from another board is a write that either fails or, worse, succeeds somewhere
+# unintended.
+transition_by_id() {
+    local transitions_json="$1" want="$2"
+    printf '%s' "$transitions_json" | jq -c --arg want "$want" \
+        '[.transitions[]? | select((.id | tostring) == $want)][]' \
+        2>/dev/null || true
+}
+
+# The field ids this transition's screen insists on, one per line. Empty is the
+# common case and the only one this script can act on.
+transition_required_fields() {
+    printf '%s' "$1" | jq -r \
+        '(.fields // {}) | to_entries[] | select(.value.required == true) | .key' \
+        2>/dev/null || true
+}
+
+# Every status reachable from where the issue stands, for the refusal that has to say
+# what the caller could have asked for instead. Sorted and de-duplicated because two
+# transitions can land on one status and a refusal that says "Done, Done" reads like a
+# bug in the refusal.
+reachable_status_names() {
+    printf '%s' "$1" | jq -r \
+        '[.transitions[]? | (.to.name) // empty] | unique | join(", ")' \
+        2>/dev/null || true
+}
+
+# What --list prints: the live list, reduced to the five things a caller has to decide
+# on. `to` is the status name, kept separate from `name` precisely because they differ.
+list_transitions_json() {
+    printf '%s' "$1" | jq -c '[.transitions[]? | {
+            id: (.id | tostring),
+            name: (.name // ""),
+            to: ((.to.name) // ""),
+            hasScreen: (.hasScreen // false),
+            required: [((.fields // {}) | to_entries[] | select(.value.required == true) | .key)]
+        }]' 2>/dev/null || true
+}
+
+# The result contract, in one place. A caller parses the last line of stdout, so this
+# is the whole of what a successful run promises; refusals never reach it.
+emit_result() {
+    local key="$1" from="$2" to="$3" tid="$4" tname="$5" dry="$6"
+    jq -nc --arg key "$key" --arg from "$from" --arg to "$to" \
+        --arg transition_id "$tid" --arg transition_name "$tname" \
+        --argjson dry_run "$dry" \
+        --arg url "https://${JIRA_DOMAIN}/browse/${key}" \
+        '{key: $key, from: $from, to: $to, transition_id: $transition_id,
+          transition_name: $transition_name, dry_run: $dry_run, url: $url}'
+}
+
+# Jira says why it refused in errorMessages[] or in errors{}; both, either, or neither
+# may be populated. Anything left over is the raw body, truncated -- a refusal that
+# quotes 40KB of an HTML error page is not a sentence.
+jira_error_text() {
+    local body="$1" text
+    text=$(printf '%s' "$body" | jq -r \
+        '[((.errorMessages // [])[]), ((.errors // {}) | to_entries[] | "\(.key): \(.value)")] | join("; ")' \
+        2>/dev/null || true)
+    if [ -z "$text" ] || [ "$text" = "null" ]; then
+        text=$(printf '%s' "$body" | tr '\n' ' ' | cut -c1-200)
+    fi
+    if [ -z "$text" ]; then
+        text="no message"
+    fi
+    printf '%s' "$text"
+}
+
+# --- 1. where the issue stands right now ----------------------------------------------
+
+jira_http GET "issue/${KEY}?fields=status,assignee"
+if [ "$CURL_RC" -ne 0 ]; then
+    refuse "jira-transition could not reach Jira to look up $KEY (curl exit $CURL_RC); nothing was changed."
+fi
+if [ "$HTTP_CODE" != "200" ]; then
+    refuse "jira-transition could not look up $KEY: Jira answered HTTP $HTTP_CODE ($(jira_error_text "$HTTP_BODY"))."
+fi
+
+CURRENT_STATUS=$(printf '%s' "$HTTP_BODY" | jq -r '.fields.status.name // empty' 2>/dev/null || true)
+ASSIGNEE_NAME=$(printf '%s' "$HTTP_BODY" | jq -r '.fields.assignee.displayName // empty' 2>/dev/null || true)
+if [ -z "$CURRENT_STATUS" ]; then
+    refuse "jira-transition found no status on $KEY, so it has nothing to move from."
+fi
+
+printf '%s is in "%s" (assignee: %s)\n' "$KEY" "$CURRENT_STATUS" "${ASSIGNEE_NAME:-unassigned}" >&2
+
+# The guard against a stale caller. Both names are said, because "refused" without the
+# two statuses is a message the operator cannot act on.
+if [ -n "$EXPECT_STATUS" ] && [ "$EXPECT_STATUS" != "$CURRENT_STATUS" ]; then
+    refuse "jira-transition refused: $KEY is in \"$CURRENT_STATUS\" now, not \"$EXPECT_STATUS\" as --expect said, so somebody has moved it since you looked."
+fi
+
+# --- 2. what the issue itself offers --------------------------------------------------
+
+jira_http GET "issue/${KEY}/transitions?expand=transitions.fields"
+if [ "$CURL_RC" -ne 0 ]; then
+    refuse "jira-transition could not reach Jira for $KEY's transitions (curl exit $CURL_RC); nothing was changed."
+fi
+if [ "$HTTP_CODE" != "200" ]; then
+    refuse "jira-transition could not list $KEY's transitions: Jira answered HTTP $HTTP_CODE ($(jira_error_text "$HTTP_BODY"))."
+fi
+TRANSITIONS_JSON="$HTTP_BODY"
+
+if [ "$LIST_ONLY" = true ]; then
+    list_transitions_json "$TRANSITIONS_JSON"
+    exit 0
+fi
+
+# --- 3. choose exactly one transition, or refuse --------------------------------------
+
+CHOSEN=""
+if [ -n "$TRANSITION_ID" ]; then
+    CHOSEN=$(transition_by_id "$TRANSITIONS_JSON" "$TRANSITION_ID")
+    MATCH_COUNT=$(printf '%s' "$CHOSEN" | grep -c . || true)
+    if [ "$MATCH_COUNT" != "1" ]; then
+        AVAILABLE=$(printf '%s' "$TRANSITIONS_JSON" | jq -r '[.transitions[]? | (.id | tostring)] | join(", ")' 2>/dev/null || true)
+        refuse "jira-transition: $KEY does not offer transition $TRANSITION_ID from \"$CURRENT_STATUS\" (it offers ${AVAILABLE:-none})."
+    fi
+else
+    CHOSEN=$(transitions_matching_status "$TRANSITIONS_JSON" "$TO_STATUS")
+    MATCH_COUNT=$(printf '%s' "$CHOSEN" | grep -c . || true)
+    if [ "$MATCH_COUNT" = "0" ]; then
+        # Zero is a real answer and not always a typo: UL has no ABANDONED status at
+        # all, so "move it to Abandoned" is a thing that board cannot do. Saying what
+        # IS reachable turns a dead end into the next question.
+        REACHABLE=$(reachable_status_names "$TRANSITIONS_JSON")
+        refuse "jira-transition: no transition on $KEY reaches \"$TO_STATUS\" from \"$CURRENT_STATUS\"; reachable are ${REACHABLE:-none}."
+    fi
+    if [ "$MATCH_COUNT" != "1" ]; then
+        AMBIGUOUS=$(printf '%s' "$CHOSEN" | jq -r '"\(.id) (\(.name))"' 2>/dev/null | paste -sd', ' -)
+        refuse "jira-transition: $MATCH_COUNT transitions on $KEY reach \"$TO_STATUS\" — $AMBIGUOUS — so name the one you mean with --transition-id."
+    fi
+fi
+
+CHOSEN_ID=$(printf '%s' "$CHOSEN" | jq -r '.id | tostring')
+CHOSEN_NAME=$(printf '%s' "$CHOSEN" | jq -r '.name // ""')
+CHOSEN_TO=$(printf '%s' "$CHOSEN" | jq -r '(.to.name) // ""')
+CHOSEN_HAS_SCREEN=$(printf '%s' "$CHOSEN" | jq -r '(.hasScreen // false) | tostring')
+CHOSEN_REQUIRED=$(transition_required_fields "$CHOSEN" | paste -sd', ' -)
+
+# Never POST a transition that cannot be satisfied. A screen with required fields
+# means Jira is going to ask something there is nobody here to answer; the honest
+# outcome is a refusal that names the fields, not a 400 the caller has to decode.
+if [ "$CHOSEN_HAS_SCREEN" = "true" ] || [ -n "$CHOSEN_REQUIRED" ]; then
+    refuse "jira-transition refused: transition $CHOSEN_ID (\"$CHOSEN_NAME\" → \"$CHOSEN_TO\") on $KEY opens a screen${CHOSEN_REQUIRED:+ and requires $CHOSEN_REQUIRED}, and there is nobody here to fill it in."
+fi
+
+# --- 4. the write, judged on the status code ------------------------------------------
+
+if [ "$DRY_RUN" = true ]; then
+    printf 'dry run: would POST transition %s ("%s") to move %s to "%s"\n' \
+        "$CHOSEN_ID" "$CHOSEN_NAME" "$KEY" "$CHOSEN_TO" >&2
+    emit_result "$KEY" "$CURRENT_STATUS" "$CHOSEN_TO" "$CHOSEN_ID" "$CHOSEN_NAME" true
+    exit 0
+fi
+
+PAYLOAD=$(jq -nc --arg id "$CHOSEN_ID" '{transition: {id: $id}}')
+jira_http POST "issue/${KEY}/transitions" "$PAYLOAD"
+
+# A curl that never got an answer is a refusal, full stop. It is not "probably fine":
+# the whole point of this script is that a caller can believe its exit code.
+if [ "$CURL_RC" -ne 0 ]; then
+    refuse "jira-transition could not reach Jira to move $KEY (curl exit $CURL_RC); the transition is unconfirmed, not done."
+fi
+# 204 is the only success Jira has for this endpoint. Everything else carries Jira's
+# own words, which are more use than any sentence this script could invent.
+if [ "$HTTP_CODE" != "204" ]; then
+    refuse "jira-transition: Jira refused to move $KEY to \"$CHOSEN_TO\" with HTTP $HTTP_CODE ($(jira_error_text "$HTTP_BODY"))."
+fi
+
+# --- 5. say where it actually landed --------------------------------------------------
+
+# Read the status back rather than reporting the target the workflow declared. A
+# post-function can move an issue on past the status the transition named, and a
+# caller that shows the operator "now in X" should be showing what Jira says, not what
+# this script hoped. If the read-back itself fails the move still happened -- 204 is
+# 204 -- so the declared target is reported and the shortfall is said out loud.
+FINAL_STATUS="$CHOSEN_TO"
+jira_http GET "issue/${KEY}?fields=status"
+if [ "$CURL_RC" -eq 0 ] && [ "$HTTP_CODE" = "200" ]; then
+    READ_BACK=$(printf '%s' "$HTTP_BODY" | jq -r '.fields.status.name // empty' 2>/dev/null || true)
+    if [ -n "$READ_BACK" ]; then
+        FINAL_STATUS="$READ_BACK"
+    fi
+else
+    printf 'moved %s, but could not confirm its status afterwards; reporting the declared target\n' \
+        "$KEY" >&2
+fi
+
+printf '%s: "%s" → "%s" via transition %s ("%s")\n' \
+    "$KEY" "$CURRENT_STATUS" "$FINAL_STATUS" "$CHOSEN_ID" "$CHOSEN_NAME" >&2
+emit_result "$KEY" "$CURRENT_STATUS" "$FINAL_STATUS" "$CHOSEN_ID" "$CHOSEN_NAME" false
