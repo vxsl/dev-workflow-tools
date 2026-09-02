@@ -30,6 +30,8 @@
 #   - fzf
 #   - jq (for Jira integration)
 #   - curl (for Jira integration)
+#   - bin/jira-transition (every status move goes through it; this script POSTs
+#     no transition of its own)
 #
 # Environment variables (for Jira integration):
 #   JIRA_EMAIL          - Your Jira email
@@ -343,6 +345,129 @@ get_ticket_description() {
         sed '/^$/d'
 }
 
+# Every transition in a `jira-transition --list` array that lands on a review STATUS,
+# one compact JSON object per line.
+#
+# The match is on `.to` -- the status the arrow leads to -- and never on `.name`. This
+# script used to match the same regex against transition NAMES, which is a different
+# string: DE's arrow onto "Peer Review" is named "Ready for review", and UL's arrow
+# onto "In Qualification" is named "Qualifying". The only thing this caller knows is
+# the status it wants the ticket to be in, so that is what is matched. The regex is the
+# old one, unchanged, because the three boards spell that status three ways: "MR" on
+# UB, "In Review" on UL, "Peer Review" on DE.
+review_transitions() {
+    local list_json="$1"
+    printf '%s' "$list_json" | jq -c \
+        '[.[]? | select(((.to) // "") | test("MR|merge|review"; "i"))][]' 2>/dev/null || true
+}
+
+# Move $key to its board's review status, using bin/jira-transition and judging the
+# result only by that tool's exit status and its last-line JSON.
+#
+# Returns 0 only when the ticket actually moved. Every other outcome -- no tool, no
+# match, several matches, a refusal from the tool -- prints one line and returns
+# non-zero. It never fails the run: the MR exists by the time this is called, and a
+# status that would not move is a line on the screen, not a reason to unwind an MR.
+move_ticket_to_review() {
+    local key="$1"
+    local current_status="$2"
+    local jt="$SCRIPT_DIR/jira-transition"
+
+    # No silent fallback to an inline POST. The reason this call exists is that the
+    # inline version could not tell a dead network from a moved ticket.
+    if [ ! -x "$jt" ]; then
+        echo -e "  ${RED}✗${RESET} Status: jira-transition not found in ${SCRIPT_DIR}; ${key} left in ${current_status}" >&2
+        return 1
+    fi
+
+    # jira-transition says where the issue stands on stderr and refuses in one sentence
+    # there too, so stderr is kept and quoted back only when something went wrong.
+    local err_file
+    err_file=$(mktemp)
+    local list_json=""
+    local rc=0
+    list_json=$("$jt" "$key" --list 2>"$err_file") || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        echo -e "  ${RED}✗${RESET} Status: Could not read ${key}'s transitions ($(tail -n 1 "$err_file"))" >&2
+        rm -f "$err_file"
+        return 1
+    fi
+
+    local matches
+    matches=$(review_transitions "$list_json")
+    local match_count
+    match_count=$(printf '%s' "$matches" | grep -c . || true)
+
+    if [ "$match_count" -eq 0 ]; then
+        local reachable
+        reachable=$(printf '%s' "$list_json" | jq -r '[.[]? | .to] | unique | join(", ")' 2>/dev/null || true)
+        echo -e "  ${YELLOW}⚠${RESET} Status: No transition from ${current_status} reaches a review status (reachable: ${reachable:-none})" >&2
+        rm -f "$err_file"
+        return 1
+    fi
+    if [ "$match_count" -ne 1 ]; then
+        # Two arrows onto one status is a question this script cannot answer -- they can
+        # differ in post-functions -- so it says which two and leaves the ticket alone
+        # rather than taking the first one the board happened to list.
+        local ambiguous
+        ambiguous=$(printf '%s' "$matches" | jq -rs 'map("\(.id) (\(.name) → \(.to))") | join(", ")' 2>/dev/null || true)
+        echo -e "  ${YELLOW}⚠${RESET} Status: ${match_count} transitions on ${key} reach review — ${ambiguous} — so it was not moved; run: jira-transition ${key} --transition-id <id>" >&2
+        rm -f "$err_file"
+        return 1
+    fi
+
+    local tid
+    tid=$(printf '%s' "$matches" | jq -r '.id // empty' 2>/dev/null || true)
+    local to_status
+    to_status=$(printf '%s' "$matches" | jq -r '.to // empty' 2>/dev/null || true)
+
+    local result=""
+    rc=0
+    result=$("$jt" "$key" --transition-id "$tid" 2>"$err_file") || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        echo -e "  ${RED}✗${RESET} Status: Could not move ${key} to ${to_status} ($(tail -n 1 "$err_file"))" >&2
+        rm -f "$err_file"
+        return 1
+    fi
+    rm -f "$err_file"
+
+    # jira-transition's contract: on success the last line of stdout is the result
+    # object, and a refusal never reaches stdout at all. An exit 0 with nothing to read
+    # is therefore not a transition, and is not reported as one.
+    local landed
+    landed=$(printf '%s' "$result" | tail -n 1 | jq -r '.to // empty' 2>/dev/null || true)
+    local moved_from
+    moved_from=$(printf '%s' "$result" | tail -n 1 | jq -r '.from // empty' 2>/dev/null || true)
+    if [ -z "$landed" ]; then
+        echo -e "  ${RED}✗${RESET} Status: jira-transition exited 0 without saying where ${key} landed" >&2
+        return 1
+    fi
+
+    echo -e "  ${GREEN}✓${RESET} Status: ${moved_from:-$current_status} → ${landed}" >&2
+    return 0
+}
+
+# Assigning the ticket is a different fact from moving it -- jira-transition reads an
+# assignee and never writes one -- so it is its own step, run only after a move that
+# actually happened, and it can never turn a failed move into a reported success.
+assign_ticket_to_me() {
+    local key="$1"
+    local current_user_id=$(curl -s --max-time 10 -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
+        "https://${JIRA_DOMAIN}/rest/api/3/myself" 2>/dev/null | jq -r '.accountId // empty')
+
+    if [ -n "$current_user_id" ]; then
+        local assign_result=$(curl -s --max-time 10 -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
+            -X PUT \
+            "https://${JIRA_DOMAIN}/rest/api/3/issue/${key}" \
+            -H "Content-Type: application/json" \
+            -d "{\"fields\": {\"assignee\": {\"accountId\": \"$current_user_id\"}}}" 2>/dev/null)
+        if [ -z "$assign_result" ]; then
+            echo -e "  ${GREEN}✓${RESET} Assignee: Assigned to you" >&2
+        fi
+    fi
+    return 0
+}
+
 # Update Jira ticket with MR info
 update_jira_ticket() {
     local key="$1"
@@ -478,45 +603,17 @@ update_jira_ticket() {
     fi
     
     # 3. Status transition and assignee (skip for draft MRs)
+    #
+    # The move itself is bin/jira-transition's job, not this script's. This arm used to
+    # POST the transition inline and read an empty stdout as success -- which `curl -s`
+    # also prints when it never reached Jira at all, so an outage was reported here as a
+    # moved ticket. Nothing below judges a Jira write by the emptiness of its output.
     if [ -n "$is_draft" ]; then
         echo -e "  ${DIM}─${RESET} Status: ${DIM}${current_status} (draft MR, not moving to review)${RESET}" >&2
-    else
-        local transitions=$(curl -s --max-time 10 -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
-            "https://${JIRA_DOMAIN}/rest/api/3/issue/${key}/transitions" 2>/dev/null)
-        local mr_transition_id=$(echo "$transitions" | jq -r '[.transitions[] | select(.name | test("MR|[Mm]erge|[Rr]eview"; "i"))][0].id // empty' 2>/dev/null)
-        local mr_transition_name=$(echo "$transitions" | jq -r '[.transitions[] | select(.name | test("MR|[Mm]erge|[Rr]eview"; "i"))][0].name // empty' 2>/dev/null)
-
-        if echo "$current_status" | grep -qi "MR\|merge\|review"; then
-            echo -e "  ${DIM}─${RESET} Status: ${DIM}${current_status} (already in review)${RESET}" >&2
-        elif [ -n "$mr_transition_id" ]; then
-            local transition_result=$(curl -s --max-time 10 -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
-                -X POST \
-                "https://${JIRA_DOMAIN}/rest/api/3/issue/${key}/transitions" \
-                -H "Content-Type: application/json" \
-                -d "{\"transition\": {\"id\": \"$mr_transition_id\"}}" 2>/dev/null)
-            if [ -z "$transition_result" ]; then
-                echo -e "  ${GREEN}✓${RESET} Status: ${current_status} → ${mr_transition_name}" >&2
-
-                # Auto-assign ticket to current user when moving to MR
-                local current_user_id=$(curl -s --max-time 10 -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
-                    "https://${JIRA_DOMAIN}/rest/api/3/myself" 2>/dev/null | jq -r '.accountId // empty')
-
-                if [ -n "$current_user_id" ]; then
-                    local assign_result=$(curl -s --max-time 10 -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
-                        -X PUT \
-                        "https://${JIRA_DOMAIN}/rest/api/3/issue/${key}" \
-                        -H "Content-Type: application/json" \
-                        -d "{\"fields\": {\"assignee\": {\"accountId\": \"$current_user_id\"}}}" 2>/dev/null)
-                    if [ -z "$assign_result" ]; then
-                        echo -e "  ${GREEN}✓${RESET} Assignee: Assigned to you" >&2
-                    fi
-                fi
-            else
-                echo -e "  ${RED}✗${RESET} Status: Could not transition" >&2
-            fi
-        else
-            echo -e "  ${YELLOW}⚠${RESET} Status: No MR transition available from ${current_status}" >&2
-        fi
+    elif echo "$current_status" | grep -qi "MR\|merge\|review"; then
+        echo -e "  ${DIM}─${RESET} Status: ${DIM}${current_status} (already in review)${RESET}" >&2
+    elif move_ticket_to_review "$key" "$current_status"; then
+        assign_ticket_to_me "$key"
     fi
 }
 
