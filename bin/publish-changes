@@ -361,6 +361,29 @@ review_transitions() {
         '[.[]? | select(((.to) // "") | test("MR|merge|review"; "i"))][]' 2>/dev/null || true
 }
 
+# Of several arrows that already agree on where they land, the one whose own name IS
+# that status.
+#
+# This is not a name match, and it is not the bug this arm was rewritten to remove. The
+# destination is still the only thing matched: nothing reaches this function that was
+# not already selected on `.to`, and it is never consulted while there is one candidate.
+# All it decides is which of two arrows onto one agreed status to take.
+#
+# It takes the arrow named for its destination because that is the board's canonical
+# way in. DE offers both 41 "Peer Review" and 5 "Ready for review" onto "Peer Review":
+# 41 is offered from everywhere and is named for where it goes, while 5 exists only from
+# one status and is a shortcut spelled as an instruction. Naming the destination is the
+# workflow author saying "this is the arrow onto that status".
+#
+# If this leaves nothing, or still leaves several, the caller refuses exactly as it did
+# before. A tie-break that cannot break the tie must not invent one.
+transitions_named_for_destination() {
+    local matches="$1"
+    printf '%s' "$matches" | jq -c \
+        'select(((((.name) // "") | ascii_downcase)) == ((((.to) // "") | ascii_downcase)))' \
+        2>/dev/null || true
+}
+
 # Move $key to its board's review status, using bin/jira-transition and judging the
 # result only by that tool's exit status and its last-line JSON.
 #
@@ -406,14 +429,32 @@ move_ticket_to_review() {
         return 1
     fi
     if [ "$match_count" -ne 1 ]; then
-        # Two arrows onto one status is a question this script cannot answer -- they can
-        # differ in post-functions -- so it says which two and leaves the ticket alone
-        # rather than taking the first one the board happened to list.
-        local ambiguous
-        ambiguous=$(printf '%s' "$matches" | jq -rs 'map("\(.id) (\(.name) → \(.to))") | join(", ")' 2>/dev/null || true)
-        echo -e "  ${YELLOW}⚠${RESET} Status: ${match_count} transitions on ${key} reach review — ${ambiguous} — so it was not moved; run: jira-transition ${key} --transition-id <id>" >&2
-        rm -f "$err_file"
-        return 1
+        # Several arrows reach a review status. Try the one tie-break that requires no
+        # guessing before refusing -- and only where every candidate already agrees on
+        # the destination, because two arrows onto two different statuses is a
+        # disagreement about where the ticket should GO, which no rule about names is
+        # entitled to settle.
+        local destination_count
+        destination_count=$(printf '%s' "$matches" | jq -r '((.to) // "") | ascii_downcase' 2>/dev/null | sort -u | grep -c . || true)
+        local canonical=""
+        local canonical_count=0
+        if [ "$destination_count" -eq 1 ]; then
+            canonical=$(transitions_named_for_destination "$matches")
+            canonical_count=$(printf '%s' "$canonical" | grep -c . || true)
+        fi
+
+        if [ "$canonical_count" -eq 1 ]; then
+            matches="$canonical"
+        else
+            # Still a question this script cannot answer -- two arrows onto one status
+            # can differ in post-functions -- so it says which ones and leaves the ticket
+            # alone rather than taking whichever the board happened to list first.
+            local ambiguous
+            ambiguous=$(printf '%s' "$matches" | jq -rs 'map("\(.id) (\(.name) → \(.to))") | join(", ")' 2>/dev/null || true)
+            echo -e "  ${YELLOW}⚠${RESET} Status: ${match_count} transitions on ${key} reach review — ${ambiguous} — so it was not moved; run: jira-transition ${key} --transition-id <id>" >&2
+            rm -f "$err_file"
+            return 1
+        fi
     fi
 
     local tid

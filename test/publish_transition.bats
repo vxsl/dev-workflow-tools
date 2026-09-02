@@ -15,9 +15,11 @@
 # the MR already exists, so the shape is part of what is being tested.
 #
 # The fixtures are the three boards as measured on 2026-09-01, from a ticket in
-# progress: UB reaches "MR" by transition 71, UL reaches "In Review" by 3, and DE
-# offers TWO arrows onto "Peer Review" (41 and 5), which is the ambiguity this arm now
-# refuses instead of resolving by list order.
+# progress: UB reaches "MR" by transition 71, UL reaches "In Review" by 3, and DE offers
+# TWO arrows onto "Peer Review" -- 41 "Peer Review" and 5 "Ready for review". That last
+# pair is settled by one tie-break and nothing else: of arrows that already agree on
+# where they land, take the one named for the status it lands on. Where that tie-break
+# does not apply, or does not decide, the arm still refuses and says which ids it saw.
 
 setup() {
     REPO_ROOT="$(cd "$(dirname "$BATS_TEST_FILENAME")/.." && pwd)"
@@ -166,6 +168,7 @@ drive_move() {
         echo 'set -e'
         printf 'SCRIPT_DIR=%q\n' "$STUB_DIR"
         awk '/^review_transitions\(\) \{/,/^\}/' "$PC"
+        awk '/^transitions_named_for_destination\(\) \{/,/^\}/' "$PC"
         awk '/^move_ticket_to_review\(\) \{/,/^\}/' "$PC"
         echo 'if move_ticket_to_review "$1" "$2"; then echo MOVED; else echo SKIPPED; fi'
         echo 'echo CARRIED-ON'
@@ -266,22 +269,69 @@ jt_calls() {
     [ "$(jt_calls)" = "1" ]
 }
 
-@test "DE's two arrows onto Peer Review are a refusal that names both, not a coin toss" {
+@test "DE's two arrows onto Peer Review are settled by the one named for the status" {
     # Measured on DE from IN PROGRESS: 41 "Peer Review" and 5 "Ready for review" both
-    # land on "Peer Review". The old code took the first one the board listed.
+    # land on "Peer Review". The old code took whichever the board listed first, which
+    # is not a reason. 41 is named for where it goes -- the board's canonical arrow onto
+    # that status -- and 5 is a shortcut offered only from one place.
     stub_jt
     list_de
+    export JT_TO="Peer Review"
+    run drive_move DE-2575 "IN PROGRESS"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"MOVED"* ]]
+    [[ "$output" == *"Status: IN PROGRESS → Peer Review"* ]]
+    run cat "$JT_LOG"
+    [ "${lines[1]}" = "DE-2575 --transition-id 41" ]
+}
+
+@test "the tie-break decides between arrows, never where the ticket goes" {
+    # Two review statuses in reach is a disagreement about the DESTINATION, and the fact
+    # that one arrow is named for its own status does not settle it. Refuse.
+    stub_jt
+    cat > "$JT_LIST_FILE" <<'EOF'
+[{"id":"71","name":"MR","to":"MR","hasScreen":false,"required":[]},
+ {"id":"9","name":"Hand it over","to":"Peer Review","hasScreen":false,"required":[]}]
+EOF
+    run drive_move UB-7028 "IN PROGRESS"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"SKIPPED"* ]]
+    [[ "$output" == *"CARRIED-ON"* ]]
+    [[ "$output" == *"2 transitions on UB-7028 reach review"* ]]
+    [ "$(jt_calls)" = "1" ]
+}
+
+@test "two arrows onto one status and neither named for it is still a refusal" {
+    stub_jt
+    cat > "$JT_LIST_FILE" <<'EOF'
+[{"id":"41","name":"Send it back","to":"Peer Review","hasScreen":false,"required":[]},
+ {"id":"5","name":"Ready for review","to":"Peer Review","hasScreen":false,"required":[]}]
+EOF
     run drive_move DE-2575 "IN PROGRESS"
     [ "$status" -eq 0 ]
     [[ "$output" == *"SKIPPED"* ]]
     [[ "$output" == *"CARRIED-ON"* ]]
     [[ "$output" == *"2 transitions on DE-2575 reach review"* ]]
-    [[ "$output" == *"41"* ]]
+    [[ "$output" == *"41 (Send it back"* ]]
     [[ "$output" == *"5 (Ready for review"* ]]
     [[ "$output" == *"--transition-id"* ]]
     # Refused means not moved: no second call, and no curl of its own either.
     [ "$(jt_calls)" = "1" ]
     [ ! -s "$CURL_LOG" ]
+}
+
+@test "two arrows both named for the status they reach is a refusal, not a coin toss" {
+    # A tie-break that cannot break the tie must not invent one.
+    stub_jt
+    cat > "$JT_LIST_FILE" <<'EOF'
+[{"id":"41","name":"Peer Review","to":"Peer Review","hasScreen":false,"required":[]},
+ {"id":"42","name":"peer review","to":"Peer Review","hasScreen":false,"required":[]}]
+EOF
+    run drive_move DE-2575 "IN PROGRESS"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"SKIPPED"* ]]
+    [[ "$output" == *"2 transitions on DE-2575 reach review"* ]]
+    [ "$(jt_calls)" = "1" ]
 }
 
 @test "a --list that could not reach Jira is a failure, and no move is attempted" {
@@ -436,6 +486,32 @@ jt_calls() {
     [ -z "$(review_transitions '')" ]
 }
 
+# --- transitions_named_for_destination, the tie-break on its own -----------------------
+
+@test "transitions_named_for_destination keeps the arrow named for where it lands" {
+    lift transitions_named_for_destination
+    m='{"id":"41","name":"Peer Review","to":"Peer Review"}
+{"id":"5","name":"Ready for review","to":"Peer Review"}'
+    run bash -c 'printf "%s" "$1" | jq -r .id' _ "$(transitions_named_for_destination "$m")"
+    [ "${lines[0]}" = "41" ]
+}
+
+@test "transitions_named_for_destination does not care how the board capitalises" {
+    lift transitions_named_for_destination
+    m='{"id":"71","name":"mr","to":"MR"}'
+    run bash -c 'printf "%s" "$1" | jq -r .id' _ "$(transitions_named_for_destination "$m")"
+    [ "${lines[0]}" = "71" ]
+}
+
+@test "transitions_named_for_destination yields nothing when no arrow is named for it" {
+    lift transitions_named_for_destination
+    m='{"id":"9","name":"Hand it over","to":"In Review"}
+{"id":"5","name":"Ready for review","to":"Peer Review"}'
+    [ -z "$(transitions_named_for_destination "$m")" ]
+    [ -z "$(transitions_named_for_destination 'not json')" ]
+    [ -z "$(transitions_named_for_destination '')" ]
+}
+
 # --- structural: the inline transition is gone, not merely bypassed --------------------
 
 @test "publish-changes POSTs no transition of its own" {
@@ -455,6 +531,14 @@ jt_calls() {
     [ "${lines[0]}" = "1" ]
     run bash -c "awk '/^review_transitions\\(\\) \\{/,/^\\}/' \"\$1\" | grep -c '.name | test' || true" _ "$PC"
     [ "${lines[0]}" = "0" ]
+}
+
+@test "the tie-break is only ever handed transitions already selected on the destination" {
+    # If it were fed the raw list it would be a name match, which is the defect.
+    run bash -c "awk '/^move_ticket_to_review\\(\\) \\{/,/^\\}/' \"\$1\" | grep -c 'transitions_named_for_destination \"\$matches\"'" _ "$PC"
+    [ "${lines[0]}" = "1" ]
+    run bash -c "awk '/^move_ticket_to_review\\(\\) \\{/,/^\\}/' \"\$1\" | grep -c 'transitions_named_for_destination' " _ "$PC"
+    [ "${lines[0]}" = "1" ]
 }
 
 @test "the move helper reaches Jira only through the tool" {
