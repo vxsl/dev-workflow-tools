@@ -488,6 +488,81 @@ move_ticket_to_review() {
     return 0
 }
 
+# ---- Jira writes ---------------------------------------------------------------------
+#
+# One write, judged the way bin/jira-transition judges one.
+#
+# The two PUTs below this used to read curl's stdout and call an empty one a success.
+# `curl -s` prints nothing on a 204 -- and prints nothing when it never reached the host
+# either, so a dead network was reported here as a QA branch that had been set and a
+# ticket that had been assigned. The body therefore goes to a FILE (-o) and the response
+# code comes back on stdout (-w), which is the only shape in which those two outcomes
+# look different.
+#
+# Sets JIRA_WRITE_CODE (empty when curl printed no code at all), JIRA_WRITE_RC (curl's
+# own exit status) and JIRA_WRITE_BODY. Returns 0 only when curl itself succeeded AND
+# Jira answered 2xx. Credentials are still -u, unchanged.
+#
+# `JIRA_WRITE_CODE=$(curl ...) || rc=$?` and not `local code=$(curl ...)`: `local` is
+# itself a command, so its exit status would mask curl's and every failed request would
+# read as a success -- the same mistake wearing a different hat.
+jira_write() {
+    local method="$1" url="$2" data="${3:-}"
+    local rc=0
+    local body_file
+    body_file=$(mktemp)
+    local args=(
+        -s --max-time 10
+        -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}"
+        -X "$method"
+        "$url"
+        -o "$body_file"
+        -w '%{http_code}'
+    )
+    if [ -n "$data" ]; then
+        args+=(-H "Content-Type: application/json" -d "$data")
+    fi
+    JIRA_WRITE_CODE=""
+    JIRA_WRITE_CODE=$(curl "${args[@]}" 2>/dev/null) || rc=$?
+    JIRA_WRITE_RC="$rc"
+    JIRA_WRITE_BODY=$(cat "$body_file" 2>/dev/null || true)
+    rm -f "$body_file"
+    [ "$rc" -eq 0 ] || return 1
+    case "$JIRA_WRITE_CODE" in
+        2??) return 0 ;;
+    esac
+    return 1
+}
+
+# What Jira said about a write it refused, on one line. Empty when the body carries no
+# message, or is not JSON at all -- which is what a proxy's HTML error page looks like.
+jira_error_text() {
+    printf '%s' "${1:-}" | jq -r '
+        [ (.errorMessages // [])[], ((.errors // {}) | to_entries[] | "\(.key): \(.value)") ]
+        | map(select(. != "")) | join("; ")' 2>/dev/null || true
+}
+
+# One phrase for why the last jira_write did not happen: a curl that never got an answer,
+# a curl that answered with no code at all, or the code Jira sent plus whatever it said
+# alongside it. This is what turns "Could not set" into a line worth reading.
+jira_write_reason() {
+    if [ "${JIRA_WRITE_RC:-0}" -ne 0 ]; then
+        printf 'curl exit %s' "${JIRA_WRITE_RC}"
+        return 0
+    fi
+    if [ -z "${JIRA_WRITE_CODE:-}" ]; then
+        printf 'curl returned no HTTP code'
+        return 0
+    fi
+    local text
+    text=$(jira_error_text "${JIRA_WRITE_BODY:-}")
+    if [ -n "$text" ]; then
+        printf 'HTTP %s: %s' "$JIRA_WRITE_CODE" "$text"
+    else
+        printf 'HTTP %s' "$JIRA_WRITE_CODE"
+    fi
+}
+
 # Assigning the ticket is a different fact from moving it -- jira-transition reads an
 # assignee and never writes one -- so it is its own step, run only after a move that
 # actually happened, and it can never turn a failed move into a reported success.
@@ -496,14 +571,17 @@ assign_ticket_to_me() {
     local current_user_id=$(curl -s --max-time 10 -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
         "https://${JIRA_DOMAIN}/rest/api/3/myself" 2>/dev/null | jq -r '.accountId // empty')
 
+    # The account lookup is a READ, and an empty answer is already handled the only way
+    # it can be: no id, no PUT, nothing claimed. The write below is the part that used to
+    # call silence a success.
     if [ -n "$current_user_id" ]; then
-        local assign_result=$(curl -s --max-time 10 -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
-            -X PUT \
-            "https://${JIRA_DOMAIN}/rest/api/3/issue/${key}" \
-            -H "Content-Type: application/json" \
-            -d "{\"fields\": {\"assignee\": {\"accountId\": \"$current_user_id\"}}}" 2>/dev/null)
-        if [ -z "$assign_result" ]; then
+        if jira_write PUT "https://${JIRA_DOMAIN}/rest/api/3/issue/${key}" \
+            "{\"fields\": {\"assignee\": {\"accountId\": \"$current_user_id\"}}}"; then
             echo -e "  ${GREEN}✓${RESET} Assignee: Assigned to you" >&2
+        else
+            # One line, and the run goes on. The MR exists by the time this is reached,
+            # and an assignment that did not take is not a reason to unwind it.
+            echo -e "  ${RED}✗${RESET} Assignee: Could not assign ${key} to you ($(jira_write_reason))" >&2
         fi
     fi
     return 0
@@ -622,19 +700,19 @@ update_jira_ticket() {
                 if [ "$current_qa" = "$qa_branch" ]; then
                     echo -e "  ${DIM}─${RESET} QA Branch: ${DIM}${qa_branch} (already set)${RESET}" >&2
                 else
-                    local qa_field_result=$(curl -s --max-time 10 -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
-                        -X PUT \
-                        "https://${JIRA_DOMAIN}/rest/api/3/issue/${key}" \
-                        -H "Content-Type: application/json" \
-                        -d "{\"fields\": {\"$qa_field_id\": \"$qa_branch\"}}" 2>/dev/null)
-                    if [ -z "$qa_field_result" ]; then
+                    # Judged on curl's exit status and the HTTP code, never on an empty
+                    # body: 204 and "never reached Jira" both print nothing.
+                    if jira_write PUT "https://${JIRA_DOMAIN}/rest/api/3/issue/${key}" \
+                        "{\"fields\": {\"$qa_field_id\": \"$qa_branch\"}}"; then
                         if [ -n "$current_qa" ]; then
                             echo -e "  ${GREEN}✓${RESET} QA Branch: ${current_qa} → ${qa_branch}" >&2
                         else
                             echo -e "  ${GREEN}✓${RESET} QA Branch: ${qa_branch}" >&2
                         fi
                     else
-                        echo -e "  ${RED}✗${RESET} QA Branch: Could not set" >&2
+                        # Said once, and the run carries on to the status and the
+                        # assignee. A field that did not take never unwinds the MR.
+                        echo -e "  ${RED}✗${RESET} QA Branch: Could not set ${qa_field_id} to ${qa_branch} ($(jira_write_reason))" >&2
                     fi
                 fi
             else
